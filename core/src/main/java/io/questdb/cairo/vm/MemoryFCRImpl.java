@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,13 +24,19 @@
 
 package io.questdb.cairo.vm;
 
+import io.questdb.cairo.vm.api.MemoryCR;
 import io.questdb.cairo.vm.api.MemoryFR;
 
 /**
  * Fixed page memory implementation. It augments a pointer of fixed size with accessor methods without
  * owning the pointer. Therefore, memory cannot be extended.
  */
-public class MemoryFCRImpl extends AbstractMemoryCR implements MemoryFR {
+public class MemoryFCRImpl extends AbstractMemoryCR implements MemoryFR, MemoryCR {
+
+    @Override
+    public long addressHi() {
+        return lim;
+    }
 
     @Override
     public void close() {
@@ -41,6 +47,11 @@ public class MemoryFCRImpl extends AbstractMemoryCR implements MemoryFR {
     @Override
     public void extend(long size) {
         throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long getFd() {
+        return -1;
     }
 
     @Override

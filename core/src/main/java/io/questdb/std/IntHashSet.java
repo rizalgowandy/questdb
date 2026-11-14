@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +24,14 @@
 
 package io.questdb.std;
 
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
+import org.jetbrains.annotations.NotNull;
+
 import java.util.Arrays;
 
 
-public class IntHashSet extends AbstractIntHashSet {
+public class IntHashSet extends AbstractIntHashSet implements Sinkable {
 
     private static final int MIN_INITIAL_CAPACITY = 16;
     private final IntList list;
@@ -36,7 +40,6 @@ public class IntHashSet extends AbstractIntHashSet {
         this(MIN_INITIAL_CAPACITY);
     }
 
-    @SuppressWarnings("CopyConstructorMissesField")
     public IntHashSet(IntHashSet that) {
         this(that.capacity, that.loadFactor, noEntryKey);
         addAll(that);
@@ -48,14 +51,14 @@ public class IntHashSet extends AbstractIntHashSet {
 
     public IntHashSet(int initialCapacity, double loadFactor, int noKeyValue) {
         super(initialCapacity, loadFactor, noKeyValue);
-        this.list = new IntList(free);
+        list = new IntList(free);
         clear();
     }
 
     /**
      * Adds key to hash set preserving key uniqueness.
      *
-     * @param key immutable sequence of characters.
+     * @param key key to be added.
      * @return false if key is already in the set and true otherwise.
      */
     public boolean add(int key) {
@@ -69,6 +72,12 @@ public class IntHashSet extends AbstractIntHashSet {
     }
 
     public final void addAll(IntHashSet that) {
+        for (int i = 0, k = that.size(); i < k; i++) {
+            add(that.get(i));
+        }
+    }
+
+    public final void addAll(IntList that) {
         for (int i = 0, k = that.size(); i < k; i++) {
             add(that.get(i));
         }
@@ -88,39 +97,6 @@ public class IntHashSet extends AbstractIntHashSet {
         list.clear();
     }
 
-    public boolean excludes(int key) {
-        return keyIndex(key) > -1;
-    }
-
-    public int remove(int key) {
-        int keyIndex = keyIndex(key);
-        if (keyIndex < 0) {
-            removeAt(keyIndex);
-            return -keyIndex - 1;
-        }
-        return -1;
-    }
-
-    public void removeAt(int index) {
-        if (index < 0) {
-            int index1 = -index - 1;
-            int key = keys[index1];
-            super.removeAt(index);
-            list.remove(key);
-        }
-    }
-
-    @Override
-    protected void erase(int index) {
-        keys[index] = noEntryKeyValue;
-    }
-
-    @Override
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        erase(from);
-    }
-
     public boolean contains(int key) {
         return keyIndex(key) < 0;
     }
@@ -134,6 +110,31 @@ public class IntHashSet extends AbstractIntHashSet {
     }
 
     @Override
+    public int remove(int key) {
+        int keyIndex = keyIndex(key);
+        if (keyIndex < 0) {
+            removeAt(keyIndex);
+            return -keyIndex - 1;
+        }
+        return -1;
+    }
+
+    @Override
+    public void removeAt(int index) {
+        if (index < 0) {
+            int index1 = -index - 1;
+            int key = keys[index1];
+            super.removeAt(index);
+            list.remove(key);
+        }
+    }
+
+    @Override
+    public void toSink(@NotNull CharSink<?> sink) {
+        list.toSink(sink, noEntryKeyValue);
+    }
+
+    @Override
     public String toString() {
         return list.toString();
     }
@@ -142,7 +143,7 @@ public class IntHashSet extends AbstractIntHashSet {
         int newCapacity = capacity * 2;
         free = capacity = newCapacity;
         int len = Numbers.ceilPow2((int) (newCapacity / loadFactor));
-        this.keys = new int[len];
+        keys = new int[len];
         Arrays.fill(keys, noEntryKeyValue);
         mask = len - 1;
         int n = list.size();
@@ -151,5 +152,16 @@ public class IntHashSet extends AbstractIntHashSet {
             final int key = list.getQuick(i);
             keys[keyIndex(key)] = key;
         }
+    }
+
+    @Override
+    protected void erase(int index) {
+        keys[index] = noEntryKeyValue;
+    }
+
+    @Override
+    protected void move(int from, int to) {
+        keys[to] = keys[from];
+        erase(from);
     }
 }

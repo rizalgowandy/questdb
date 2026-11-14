@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
@@ -51,9 +52,9 @@ public class EqIntStrCFunctionFactory implements FunctionFactory {
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
         try {
-            final CharSequence value = args.getQuick(1).getStr(null);
+            final CharSequence value = args.getQuick(1).getStrA(null);
             if (value == null) {
-                return new Func(args.getQuick(0), Numbers.INT_NaN);
+                return new Func(args.getQuick(0), Numbers.INT_NULL);
             }
             return new Func(args.getQuick(0), Numbers.parseInt(value));
         } catch (NumericException e) {
@@ -79,12 +80,31 @@ public class EqIntStrCFunctionFactory implements FunctionFactory {
         public boolean getBool(Record rec) {
             return negated != (left.getInt(rec) == right);
         }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val('!');
+            }
+            sink.val('=');
+            if (right != Numbers.INT_NULL) {
+                sink.val(right);
+            } else {
+                sink.val("null");
+            }
+        }
     }
 
     private static class NegatedAwareBooleanConstantFunc extends NegatableBooleanFunction implements ConstantFunction {
         @Override
         public boolean getBool(Record rec) {
             return negated;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(negated);
         }
     }
 }

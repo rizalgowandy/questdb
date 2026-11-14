@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,16 +27,14 @@ package io.questdb.griffin.engine.functions.columns;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.GeoIntFunction;
-import org.jetbrains.annotations.TestOnly;
 
 import static io.questdb.griffin.engine.functions.columns.ColumnUtils.STATIC_COLUMN_COUNT;
 
-public class GeoIntColumn extends GeoIntFunction {
+public class GeoIntColumn extends GeoIntFunction implements ColumnFunction {
     private static final GeoIntColumn[] COLUMNS;
-
     protected final int columnIndex;
 
-    public GeoIntColumn(int columnIndex, int columnType) {
+    private GeoIntColumn(int columnIndex, int columnType) {
         super(columnType);
         this.columnIndex = columnIndex;
     }
@@ -55,18 +53,18 @@ public class GeoIntColumn extends GeoIntFunction {
     }
 
     @Override
+    public int getColumnIndex() {
+        return columnIndex;
+    }
+
+    @Override
     public int getGeoInt(Record rec) {
         return rec.getGeoInt(columnIndex);
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return true;
-    }
-
-    @TestOnly
-    int getColumnIndex() {
-        return columnIndex;
     }
 
     static {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,11 +35,11 @@ public class ObjHashSet<T> extends AbstractSet<T> implements Mutable {
 
     private static final int MIN_INITIAL_CAPACITY = 16;
     private static final Object noEntryKey = new Object();
-    private final double loadFactor;
     private final ObjList<T> list;
-    private T[] keys;
-    private int free;
+    private final double loadFactor;
     private int capacity;
+    private int free;
+    private T[] keys;
     private int mask;
 
     public ObjHashSet() {
@@ -64,9 +64,19 @@ public class ObjHashSet<T> extends AbstractSet<T> implements Mutable {
         clear();
     }
 
+    public boolean add(T key) {
+        return addAt(keyIndex(key), key);
+    }
+
     public void addAll(ObjHashSet<? extends T> that) {
         for (int i = 0, n = that.size(); i < n; i++) {
             this.add(that.get(i));
+        }
+    }
+
+    public void addAll(ObjList<? extends T> that) {
+        for (int i = 0, n = that.size(); i < n; i++) {
+            this.add(that.getQuick(i));
         }
     }
 
@@ -78,18 +88,10 @@ public class ObjHashSet<T> extends AbstractSet<T> implements Mutable {
         return false;
     }
 
-    public T get(int index) {
-        return list.getQuick(index);
-    }
-
-    @Override
-    @NotNull
-    public Iterator<T> iterator() {
-        throw new UnsupportedOperationException();
-    }
-
-    public int size() {
-        return capacity - free;
+    public final void clear() {
+        free = capacity;
+        Arrays.fill(keys, noEntryKey);
+        list.clear();
     }
 
     @SuppressWarnings("unchecked")
@@ -98,8 +100,18 @@ public class ObjHashSet<T> extends AbstractSet<T> implements Mutable {
         return keyIndex((T) o) < 0;
     }
 
-    public boolean add(T key) {
-        return addAt(keyIndex(key), key);
+    public T get(int index) {
+        return list.getQuick(index);
+    }
+
+    public ObjList<T> getList() {
+        return list;
+    }
+
+    @Override
+    @NotNull
+    public Iterator<T> iterator() {
+        throw new UnsupportedOperationException();
     }
 
     public int keyIndex(T key) {
@@ -129,10 +141,8 @@ public class ObjHashSet<T> extends AbstractSet<T> implements Mutable {
         return false;
     }
 
-    public final void clear() {
-        free = capacity;
-        Arrays.fill(keys, noEntryKey);
-        list.clear();
+    public int size() {
+        return capacity - free;
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,19 +24,24 @@
 
 package io.questdb.griffin.engine;
 
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.VirtualRecord;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
+import org.jetbrains.annotations.Nullable;
 
 public abstract class AbstractVirtualFunctionRecordCursor implements RecordCursor {
     protected final VirtualRecord recordA;
-    private final VirtualRecord recordB;
-    protected RecordCursor baseCursor;
     private final ObjList<Function> functions;
+    private final VirtualRecord recordB;
     private final boolean supportsRandomAccess;
+    protected RecordCursor baseCursor;
 
     public AbstractVirtualFunctionRecordCursor(ObjList<Function> functions, boolean supportsRandomAccess) {
         this.functions = functions;
@@ -53,21 +58,17 @@ public abstract class AbstractVirtualFunctionRecordCursor implements RecordCurso
     @Override
     public void close() {
         baseCursor = Misc.free(baseCursor);
+        for (int i = 0, n = functions.size(); i < n; i++) {
+            Function function = functions.getQuick(i);
+            if (function != null) {
+                function.cursorClosed();
+            }
+        }
     }
 
     @Override
     public Record getRecord() {
         return recordA;
-    }
-
-    @Override
-    public boolean hasNext() {
-        return baseCursor.hasNext();
-    }
-
-    @Override
-    public long size() {
-        return baseCursor.size();
     }
 
     @Override
@@ -79,17 +80,13 @@ public abstract class AbstractVirtualFunctionRecordCursor implements RecordCurso
     }
 
     @Override
-    public void recordAt(Record record, long atRowId) {
-        if (supportsRandomAccess) {
-            baseCursor.recordAt(((VirtualRecord) record).getBaseRecord(), atRowId);
-        } else {
-            throw new UnsupportedOperationException();
-        }
+    public SymbolTable getSymbolTable(int columnIndex) {
+        return (SymbolTable) functions.getQuick(columnIndex);
     }
 
     @Override
-    public SymbolTable getSymbolTable(int columnIndex) {
-        return (SymbolTable) functions.getQuick(columnIndex);
+    public boolean hasNext() {
+        return baseCursor.hasNext();
     }
 
     @Override
@@ -97,17 +94,54 @@ public abstract class AbstractVirtualFunctionRecordCursor implements RecordCurso
         return ((SymbolFunction) functions.getQuick(columnIndex)).newSymbolTable();
     }
 
-    @Override
-    public void toTop() {
-        baseCursor.toTop();
-        GroupByUtils.toTop(functions);
-    }
-
     public void of(RecordCursor cursor) {
-        this.baseCursor = cursor;
+        baseCursor = cursor;
         recordA.of(baseCursor.getRecord());
         if (recordB != null) {
             recordB.of(baseCursor.getRecordB());
         }
+        cursor.toTop();
+    }
+
+    @Override
+    public void recordAt(Record record, long atRowId) {
+        if (supportsRandomAccess) {
+            if (baseCursor != null) {
+                baseCursor.recordAt(((VirtualRecord) record).getBaseRecord(), atRowId);
+            }
+        } else {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    @Override
+    public void setParquetDecodeHint(ParquetDecodeHint hint) {
+        if (baseCursor != null) {
+            baseCursor.setParquetDecodeHint(hint);
+        }
+    }
+
+    @Override
+    public void setRecordAtRows(@Nullable RecordCursor.RowIdSource source) {
+        if (baseCursor != null) {
+            baseCursor.setRecordAtRows(source);
+        }
+    }
+
+    @Override
+    public long size() {
+        return baseCursor != null ? baseCursor.size() : -1;
+    }
+
+    @Override
+    public void toTop() {
+        if (baseCursor != null) {
+            baseCursor.toTop();
+            GroupByUtils.toTop(functions);
+        }
+    }
+
+    protected ObjList<Function> getFunctions() {
+        return functions;
     }
 }

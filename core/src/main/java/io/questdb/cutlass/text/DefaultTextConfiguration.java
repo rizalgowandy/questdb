@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,9 +30,9 @@ import io.questdb.cutlass.json.JsonLexer;
 import io.questdb.cutlass.text.types.InputFormatConfiguration;
 import io.questdb.std.datetime.DateLocale;
 import io.questdb.std.datetime.DateLocaleFactory;
-import io.questdb.std.datetime.microtime.TimestampFormatFactory;
 import io.questdb.std.datetime.millitime.DateFormatFactory;
-import io.questdb.std.datetime.millitime.DateFormatUtils;
+
+import static io.questdb.std.datetime.DateLocaleFactory.EN_LOCALE;
 
 public class DefaultTextConfiguration implements TextConfiguration {
     private final InputFormatConfiguration inputFormatConfiguration;
@@ -42,19 +42,18 @@ public class DefaultTextConfiguration implements TextConfiguration {
     }
 
     public DefaultTextConfiguration(String confRoot) {
-        this(confRoot, "/text_loader.json");
+        this(DefaultTextConfiguration.class, confRoot, "/text_loader.json");
     }
 
-    public DefaultTextConfiguration(String confRoot, String resourceName) {
+    public DefaultTextConfiguration(Class<?> resourceLoader, String confRoot, String resourceName) {
         this.inputFormatConfiguration = new InputFormatConfiguration(
-                new DateFormatFactory(),
+                DateFormatFactory.INSTANCE,
                 DateLocaleFactory.INSTANCE,
-                new TimestampFormatFactory(),
-                DateFormatUtils.enLocale
+                EN_LOCALE
         );
 
         try (JsonLexer lexer = new JsonLexer(1024, 1024)) {
-            inputFormatConfiguration.parseConfiguration(lexer, confRoot, resourceName);
+            inputFormatConfiguration.parseConfiguration(resourceLoader, lexer, confRoot, resourceName);
         } catch (JsonException e) {
             throw new CairoError(e);
         }
@@ -63,6 +62,21 @@ public class DefaultTextConfiguration implements TextConfiguration {
     @Override
     public int getDateAdapterPoolCapacity() {
         return 16;
+    }
+
+    @Override
+    public int getDecimalAdapterPoolCapacity() {
+        return 16;
+    }
+
+    @Override
+    public DateLocale getDefaultDateLocale() {
+        return EN_LOCALE;
+    }
+
+    @Override
+    public InputFormatConfiguration getInputFormatConfiguration() {
+        return inputFormatConfiguration;
     }
 
     @Override
@@ -92,12 +106,12 @@ public class DefaultTextConfiguration implements TextConfiguration {
 
     @Override
     public int getRollBufferLimit() {
-        return 4096;
+        return 16 * 1024;
     }
 
     @Override
     public int getRollBufferSize() {
-        return 1024;
+        return 4 * 1024;
     }
 
     @Override
@@ -121,12 +135,7 @@ public class DefaultTextConfiguration implements TextConfiguration {
     }
 
     @Override
-    public InputFormatConfiguration getInputFormatConfiguration() {
-        return inputFormatConfiguration;
-    }
-
-    @Override
-    public DateLocale getDefaultDateLocale() {
-        return DateFormatUtils.enLocale;
+    public boolean isUseLegacyStringDefault() {
+        return false;
     }
 }

@@ -1,0 +1,447 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cairo.wal;
+
+import io.questdb.cairo.AbstractRecordMetadata;
+import io.questdb.cairo.CommitMode;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.cairo.vm.Vm;
+import io.questdb.cairo.vm.api.MemoryMARW;
+import io.questdb.cairo.vm.api.MemoryMR;
+import io.questdb.cairo.wal.seq.TableRecordMetadataSink;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.IntList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Transient;
+import io.questdb.std.str.Path;
+
+import static io.questdb.cairo.TableUtils.META_FILE_NAME;
+import static io.questdb.cairo.TableUtils.openSmallFile;
+import static io.questdb.cairo.wal.WalUtils.WAL_FORMAT_VERSION;
+import static io.questdb.cairo.wal.WalUtils.writeSequencerMetadataOptionalSections;
+
+public class WalWriterMetadata extends AbstractRecordMetadata implements TableRecordMetadata, TableRecordMetadataSink {
+    private final FilesFacade ff;
+    private final boolean fullSequencerMetadata;
+    private final MemoryMARW metaMem;
+    private final IntList readColumnOrder = new IntList();
+    private final MemoryMR roMetaMem;
+    private boolean hasUnflushedWrite;
+    private long structureVersion = -1;
+    private int tableId;
+    private TableToken tableToken;
+
+    public WalWriterMetadata(FilesFacade ff) {
+        this(ff, false);
+    }
+
+    public WalWriterMetadata(FilesFacade ff, boolean readonly) {
+        this(ff, readonly, false);
+    }
+
+    private WalWriterMetadata(FilesFacade ff, boolean readonly, boolean fullSequencerMetadata) {
+        this.ff = ff;
+        this.fullSequencerMetadata = fullSequencerMetadata;
+        if (!readonly) {
+            roMetaMem = metaMem = Vm.getCMARWInstance();
+        } else {
+            metaMem = null;
+            roMetaMem = Vm.getCMRInstance();
+        }
+    }
+
+    public static WalWriterMetadata newSequencerMetadataSink(FilesFacade ff) {
+        // Checkpointing writes txn_seq/_meta, so preserve the sequencer-only optional sections.
+        return new WalWriterMetadata(ff, false, true);
+    }
+
+    public static void syncToMetaFile(
+            MemoryMARW metaMem,
+            long structureVersion,
+            int columnCount,
+            int timestampIndex,
+            int tableId,
+            RecordMetadata metadata
+    ) {
+        syncToMetaFile(metaMem, structureVersion, columnCount, timestampIndex, tableId, metadata, null, false);
+    }
+
+    @Override
+    public void addColumn(
+            String columnName,
+            int columnType,
+            byte indexType,
+            int indexValueBlockCapacity,
+            boolean symbolTableStatic,
+            int writerIndex,
+            boolean isDedupKey,
+            boolean symbolIsCached,
+            int symbolCapacity,
+            @Transient IntList coveringColumnIndices
+    ) {
+        if (fullSequencerMetadata) {
+            addFullSequencerColumn(
+                    columnName,
+                    columnType,
+                    indexType,
+                    indexValueBlockCapacity,
+                    symbolTableStatic,
+                    writerIndex,
+                    isDedupKey,
+                    symbolIsCached,
+                    symbolCapacity,
+                    coveringColumnIndices
+            );
+        } else {
+            // WAL segment _meta stays lightweight; checkpointed txn_seq/_meta uses fullSequencerMetadata.
+            addColumn0(
+                    columnName,
+                    columnType,
+                    symbolCapacity,
+                    symbolIsCached,
+                    isDedupKey
+            );
+        }
+    }
+
+    public void addColumn(
+            CharSequence columnName,
+            int columnType,
+            boolean isDedupKey,
+            boolean symbolIsCached,
+            int symbolCapacity
+    ) {
+        addColumn0(
+                columnName,
+                columnType,
+                symbolCapacity,
+                symbolIsCached,
+                isDedupKey
+        );
+        structureVersion++;
+    }
+
+    public void changeColumnType(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            byte indexType,
+            int indexValueBlockCapacity
+    ) {
+        TableUtils.changeColumnTypeInMetadata(
+                columnName,
+                columnType,
+                symbolCapacity,
+                symbolCacheFlag,
+                indexType,
+                indexValueBlockCapacity,
+                columnNameIndexMap,
+                columnMetadata
+        );
+        columnCount++;
+        structureVersion++;
+    }
+
+    @Override
+    public void clear() {
+        reset();
+    }
+
+    @Override
+    public void close() {
+        clear(true, Vm.TRUNCATE_TO_PAGE);
+    }
+
+    public void close(boolean truncate, byte truncateMode) {
+        clear(truncate, truncateMode);
+    }
+
+    public void disableDeduplicate() {
+        structureVersion++;
+    }
+
+    public boolean enableDeduplication() {
+        boolean isSubsetOfOldKeys = true;
+        for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+            isSubsetOfOldKeys &= isDedupKey(columnIndex);
+        }
+        structureVersion++;
+        return isSubsetOfOldKeys;
+    }
+
+    @Override
+    public long getMetadataVersion() {
+        return structureVersion;
+    }
+
+    @Override
+    public int getTableId() {
+        return tableId;
+    }
+
+    @Override
+    public TableToken getTableToken() {
+        return tableToken;
+    }
+
+    @Override
+    public boolean isWalEnabled() {
+        return true;
+    }
+
+    @Override
+    public boolean requiresFullReadColumnOrder() {
+        return fullSequencerMetadata;
+    }
+
+    @Override
+    public void of(
+            TableToken tableToken,
+            int tableId,
+            int timestampIndex,
+            int compressedTimestampIndex,
+            long structureVersion,
+            int columnCount,
+            @Transient IntList readColumnOrder
+    ) {
+        this.tableToken = tableToken;
+        this.tableId = tableId;
+        this.timestampIndex = timestampIndex;
+        this.structureVersion = structureVersion;
+        this.readColumnOrder.clear();
+        if (fullSequencerMetadata && readColumnOrder != null) {
+            this.readColumnOrder.addAll(readColumnOrder);
+        }
+    }
+
+    public void removeColumn(CharSequence columnName) {
+        TableUtils.removeColumnFromMetadata(columnName, columnNameIndexMap, columnMetadata);
+        structureVersion++;
+    }
+
+    public void renameColumn(CharSequence columnName, CharSequence newName) {
+        TableUtils.renameColumnInMetadata(columnName, newName, columnNameIndexMap, columnMetadata);
+        structureVersion++;
+    }
+
+    public void renameTable(TableToken toTableToken) {
+        assert toTableToken != null;
+        tableToken = toTableToken;
+        structureVersion++;
+    }
+
+    public void switchTo(Path path, int pathLen, boolean truncate) {
+        if (metaMem.getFd() > -1) {
+            metaMem.close(truncate, Vm.TRUNCATE_TO_POINTER);
+        }
+        openSmallFile(ff, path, pathLen, metaMem, META_FILE_NAME, MemoryTag.MMAP_SEQUENCER_METADATA);
+        syncToMetaFile(
+                metaMem,
+                structureVersion,
+                columnCount,
+                timestampIndex,
+                tableId,
+                this,
+                readColumnOrder,
+                fullSequencerMetadata
+        );
+        hasUnflushedWrite = true;
+    }
+
+    /**
+     * Makes the segment _meta durable before the WAL writer sequences a record in its segment, in the modes that
+     * promise durability across a power loss, and does nothing when the file has not changed since its last flush.
+     * The Enterprise uploader reads it to ship every data record of the segment. One flush per segment open or
+     * in-place rewrite, nothing per commit.
+     */
+    void syncBeforeSequencing(int commitMode) {
+        if (hasUnflushedWrite && CommitMode.isPowerLossDurable(commitMode)) {
+            if (commitMode == CommitMode.SYNC) {
+                // MS_SYNC is a range fsync: the file is on the device.
+                metaMem.sync(false);
+            } else {
+                // As for the event files: the ordering barrier puts the file on the medium ahead of the sequencer
+                // record, and the sequencer flush at the commit point is the full device flush.
+                metaMem.flushFile(true);
+            }
+            hasUnflushedWrite = false;
+        }
+    }
+
+    private static void syncToMetaFile(
+            MemoryMARW metaMem,
+            long structureVersion,
+            int columnCount,
+            int timestampIndex,
+            int tableId,
+            RecordMetadata metadata,
+            IntList readColumnOrder,
+            boolean fullSequencerMetadata
+    ) {
+        final boolean firstWrite = metaMem.getAppendOffset() == 0;
+        metaMem.jumpTo(0);
+        // Size of metadata
+        if (firstWrite) {
+            metaMem.putInt(0);
+        } else {
+            // When overwriting the file, don't "blip" the size to zero
+            // in case there are concurrent readers.
+            metaMem.skip(Integer.BYTES);
+        }
+        metaMem.putInt(WAL_FORMAT_VERSION);
+        metaMem.putLong(structureVersion);
+        final long columnCountOffset = metaMem.getAppendOffset();
+        if (firstWrite) {
+            metaMem.putInt(0);
+        } else {
+            // Same as for the file-size, keep the old size until
+            // a new col count is patched at the end.
+            metaMem.skip(Integer.BYTES);
+        }
+        metaMem.putInt(timestampIndex);
+        metaMem.putInt(tableId);
+        // we do not persist suspended flag anymore, suspended flag is in SeqTxnTracker
+        // field is kept for backwards compatibility only, the value is irrelevant
+        metaMem.putBool(false);
+        for (int i = 0; i < columnCount; i++) {
+            final int columnType = metadata.getColumnType(i);
+            metaMem.putInt(columnType);
+            metaMem.putStr(metadata.getColumnName(i));
+        }
+
+        if (fullSequencerMetadata) {
+            long checkSum = columnCount;
+            for (int i = 0; i < columnCount; i++) {
+                final int columnType = metadata.getColumnType(i);
+                checkSum = checkSum * 31 + columnType;
+                checkSum = checkSum * 31 + metadata.getColumnName(i).hashCode();
+            }
+            writeSequencerMetadataOptionalSections(metaMem, columnCount, checkSum, metadata, readColumnOrder);
+        }
+
+        // To avoid consistency issues with concurrent readers,
+        // update the column count and file size last.
+        final long size = metaMem.getAppendOffset();
+        metaMem.putInt(0, (int) size);
+        metaMem.putInt(columnCountOffset, columnCount);
+    }
+
+    private void addColumn0(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            boolean isDedupKey
+    ) {
+        final String name = columnName.toString();
+        if (columnType > 0) {
+            columnNameIndexMap.put(name, columnMetadata.size());
+        }
+        // sequencer metadata is servicing WALs, and it does not have
+        // information about symbol indexing and index storage parameters
+        // therefore we ignore the incoming parameters and assume defaults
+        columnMetadata.add(
+                new TableColumnMetadata(
+                        name,
+                        columnType,
+                        IndexType.NONE,
+                        0,
+                        false,
+                        null,
+                        columnMetadata.size(),
+                        isDedupKey,
+                        0,
+                        symbolCacheFlag,
+                        symbolCapacity
+                )
+        );
+        columnCount++;
+    }
+
+    private void addFullSequencerColumn(
+            CharSequence columnName,
+            int columnType,
+            byte indexType,
+            int indexValueBlockCapacity,
+            boolean symbolTableStatic,
+            int writerIndex,
+            boolean isDedupKey,
+            boolean symbolCacheFlag,
+            int symbolCapacity,
+            @Transient IntList coveringColumnIndices
+    ) {
+        final String name = columnName.toString();
+        if (columnType > 0) {
+            columnNameIndexMap.put(name, columnMetadata.size());
+        }
+        TableColumnMetadata columnMetadata = new TableColumnMetadata(
+                name,
+                columnType,
+                indexType,
+                indexValueBlockCapacity,
+                symbolTableStatic,
+                null,
+                writerIndex,
+                isDedupKey,
+                0,
+                symbolCacheFlag,
+                symbolCapacity
+        );
+        if (coveringColumnIndices != null) {
+            columnMetadata.setCoveringColumnIndices(new IntList(coveringColumnIndices));
+        }
+        this.columnMetadata.add(columnMetadata);
+        columnCount++;
+    }
+
+    private void reset() {
+        columnMetadata.clear();
+        columnNameIndexMap.clear();
+        readColumnOrder.clear();
+        columnCount = 0;
+        timestampIndex = -1;
+        tableToken = null;
+        tableId = -1;
+    }
+
+    protected void clear(boolean truncate, byte truncateMode) {
+        reset();
+        // Free roMetaMem even if metaMem.close throws, so a fault on one metadata memory cannot leak the other.
+        try {
+            if (metaMem != null) {
+                metaMem.close(truncate, truncateMode);
+            }
+        } finally {
+            Misc.free(roMetaMem);
+        }
+    }
+}

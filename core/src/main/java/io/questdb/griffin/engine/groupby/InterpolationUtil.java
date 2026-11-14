@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,24 +24,48 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.std.Unsafe;
 
 public class InterpolationUtil {
-    static final StoreYFunction STORE_Y_DOUBLE = InterpolationUtil::storeYDouble;
-    static final StoreYFunction STORE_Y_FLOAT = InterpolationUtil::storeYFloat;
-    static final StoreYFunction STORE_Y_BYTE = InterpolationUtil::storeYByte;
-    static final StoreYFunction STORE_Y_SHORT = InterpolationUtil::storeYShort;
-    static final StoreYFunction STORE_Y_INT = InterpolationUtil::storeYInt;
-    static final StoreYFunction STORE_Y_LONG = InterpolationUtil::storeYLong;
-
+    static final InterpolatorFunction INTERPOLATE_BYTE = InterpolationUtil::interpolateByte;
     static final InterpolatorFunction INTERPOLATE_DOUBLE = InterpolationUtil::interpolateDouble;
     static final InterpolatorFunction INTERPOLATE_FLOAT = InterpolationUtil::interpolateFloat;
-    static final InterpolatorFunction INTERPOLATE_BYTE = InterpolationUtil::interpolateByte;
-    static final InterpolatorFunction INTERPOLATE_SHORT = InterpolationUtil::interpolateShort;
     static final InterpolatorFunction INTERPOLATE_INT = InterpolationUtil::interpolateInt;
     static final InterpolatorFunction INTERPOLATE_LONG = InterpolationUtil::interpolateLong;
+    static final InterpolatorFunction INTERPOLATE_SHORT = InterpolationUtil::interpolateShort;
+    static final StoreYFunction STORE_Y_BYTE = InterpolationUtil::storeYByte;
+    static final StoreYFunction STORE_Y_DOUBLE = InterpolationUtil::storeYDouble;
+    static final StoreYFunction STORE_Y_FLOAT = InterpolationUtil::storeYFloat;
+    static final StoreYFunction STORE_Y_INT = InterpolationUtil::storeYInt;
+    static final StoreYFunction STORE_Y_LONG = InterpolationUtil::storeYLong;
+    static final StoreYFunction STORE_Y_SHORT = InterpolationUtil::storeYShort;
+
+    /**
+     * Returns y at x on the line through the points (x1, y1) and (x2, y2).
+     * SampleByInterpolateRecordCursorFactory also passes an x outside [x1, x2], to extrapolate
+     * the leading and trailing gaps of a key.
+     * <p>
+     * x is a timestamp in micros or nanos, so for a large y the product {@code y1 * (x2 - x)}
+     * overflows to infinity before the division can bring it back, and the bucket would read as
+     * NULL. An overflow never yields a wrong finite value, only infinity or NaN, so this method
+     * keeps the direct form for its rounding and recomputes the value from the weights
+     * {@code (x2 - x) / (x2 - x1)} and {@code (x - x1) / (x2 - x1)} only when the direct form
+     * is not finite. For x within [x1, x2] both weights lie in [0, 1], and the recomputed value
+     * overflows only when it lies within rounding error of the double range limit. Outside
+     * [x1, x2] one weight exceeds 1, and a y above Double.MAX_VALUE divided by that weight still
+     * overflows, so the bucket reads as NULL.
+     */
+    public static double interpolate(long x, long x1, double y1, long x2, double y2) {
+        final double y = (y1 * (x2 - x) + y2 * (x - x1)) / (x2 - x1);
+        if (Double.isFinite(y)) {
+            return y;
+        }
+        final double span = x2 - x1;
+        return y1 * ((x2 - x) / span) + y2 * ((x - x1) / span);
+    }
 
     public static void interpolateByte(
             GroupByFunction function,
@@ -57,9 +81,9 @@ public class InterpolationUtil {
                 (byte) interpolate(
                         x,
                         x1,
-                        Unsafe.getUnsafe().getByte(y1Address),
+                        Unsafe.getByte(y1Address),
                         x2,
-                        Unsafe.getUnsafe().getByte(y2Address)
+                        Unsafe.getByte(y2Address)
                 )
         );
     }
@@ -78,9 +102,9 @@ public class InterpolationUtil {
                 (float) interpolate(
                         x,
                         x1,
-                        Unsafe.getUnsafe().getFloat(y1Address),
+                        Unsafe.getFloat(y1Address),
                         x2,
-                        Unsafe.getUnsafe().getFloat(y2Address)
+                        Unsafe.getFloat(y2Address)
                 )
         );
     }
@@ -99,9 +123,9 @@ public class InterpolationUtil {
                 (int) interpolate(
                         x,
                         x1,
-                        Unsafe.getUnsafe().getInt(y1Address),
+                        Unsafe.getInt(y1Address),
                         x2,
-                        Unsafe.getUnsafe().getInt(y2Address)
+                        Unsafe.getInt(y2Address)
                 )
         );
     }
@@ -120,9 +144,9 @@ public class InterpolationUtil {
                 (long) interpolate(
                         x,
                         x1,
-                        Unsafe.getUnsafe().getLong(y1Address),
+                        Unsafe.getLong(y1Address),
                         x2,
-                        Unsafe.getUnsafe().getLong(y2Address)
+                        Unsafe.getLong(y2Address)
                 )
         );
     }
@@ -141,15 +165,30 @@ public class InterpolationUtil {
                 (short) interpolate(
                         x,
                         x1,
-                        Unsafe.getUnsafe().getShort(y1Address),
+                        Unsafe.getShort(y1Address),
                         x2,
-                        Unsafe.getUnsafe().getShort(y2Address)
+                        Unsafe.getShort(y2Address)
                 )
         );
     }
 
-    public static double interpolate(long x, long x1, double y1, long x2, double y2) {
-        return (y1 * (x2 - x) + y2 * (x - x1)) / (x2 - x1);
+    static void interpolateBoundary(
+            GroupByFunction function,
+            long boundaryTimestamp,
+            MapValue mapValue1,
+            MapValue mapValue2,
+            boolean isEndOfBoundary
+    ) {
+        try {
+            function.interpolateBoundary(
+                    mapValue1,
+                    mapValue2,
+                    boundaryTimestamp,
+                    isEndOfBoundary
+            );
+        } catch (UnsupportedOperationException e) {
+            throw CairoException.nonCritical().put("interpolation is not supported for function: ").put(function.getClass().getName());
+        }
     }
 
     static void interpolateDouble(
@@ -166,9 +205,9 @@ public class InterpolationUtil {
                 interpolate(
                         x,
                         x1,
-                        Unsafe.getUnsafe().getDouble(y1Address),
+                        Unsafe.getDouble(y1Address),
                         x2,
-                        Unsafe.getUnsafe().getDouble(y2Address)
+                        Unsafe.getDouble(y2Address)
                 )
         );
     }
@@ -180,56 +219,48 @@ public class InterpolationUtil {
             MapValue mapValue1,
             MapValue mapValue2
     ) {
-        function.interpolateGap(
-                mapValue,
-                mapValue1, mapValue2,
-                x);
-    }
-
-    static void interpolateBoundary(
-            GroupByFunction function,
-            long boundaryTimestamp,
-            MapValue mapValue1,
-            MapValue mapValue2,
-            boolean isEndOfBoundary
-    ) {
-        function.interpolateBoundary(
-                mapValue1,
-                mapValue2,
-                boundaryTimestamp,
-                isEndOfBoundary);
-    }
-
-    static void storeYDouble(GroupByFunction function, MapValue mapValue, long targetAddress) {
-        Unsafe.getUnsafe().putDouble(targetAddress, function.getDouble(mapValue));
-    }
-
-    static void storeYFloat(GroupByFunction function, MapValue mapValue, long targetAddress) {
-        Unsafe.getUnsafe().putFloat(targetAddress, function.getFloat(mapValue));
+        try {
+            function.interpolateGap(
+                    mapValue,
+                    mapValue1,
+                    mapValue2,
+                    x
+            );
+        } catch (UnsupportedOperationException e) {
+            throw CairoException.nonCritical().put("interpolation is not supported for function: ").put(function.getClass().getName());
+        }
     }
 
     static void storeYByte(GroupByFunction function, MapValue mapValue, long targetAddress) {
-        Unsafe.getUnsafe().putByte(targetAddress, function.getByte(mapValue));
+        Unsafe.putByte(targetAddress, function.getByte(mapValue));
     }
 
-    static void storeYShort(GroupByFunction function, MapValue mapValue, long targetAddress) {
-        Unsafe.getUnsafe().putShort(targetAddress, function.getShort(mapValue));
+    static void storeYDouble(GroupByFunction function, MapValue mapValue, long targetAddress) {
+        Unsafe.putDouble(targetAddress, function.getDouble(mapValue));
+    }
+
+    static void storeYFloat(GroupByFunction function, MapValue mapValue, long targetAddress) {
+        Unsafe.putFloat(targetAddress, function.getFloat(mapValue));
     }
 
     static void storeYInt(GroupByFunction function, MapValue mapValue, long targetAddress) {
-        Unsafe.getUnsafe().putInt(targetAddress, function.getInt(mapValue));
+        Unsafe.putInt(targetAddress, function.getInt(mapValue));
     }
 
     static void storeYLong(GroupByFunction function, MapValue mapValue, long targetAddress) {
-        Unsafe.getUnsafe().putLong(targetAddress, function.getLong(mapValue));
+        Unsafe.putLong(targetAddress, function.getLong(mapValue));
+    }
+
+    static void storeYShort(GroupByFunction function, MapValue mapValue, long targetAddress) {
+        Unsafe.putShort(targetAddress, function.getShort(mapValue));
+    }
+
+    interface InterpolatorFunction {
+        void interpolateAndStore(GroupByFunction function, MapValue mapValue, long x, long x1, long x2, long y1Address, long y2Address);
     }
 
     @FunctionalInterface
     interface StoreYFunction {
         void store(GroupByFunction function, MapValue mapValue, long targetAddress);
-    }
-
-    interface InterpolatorFunction {
-        void interpolateAndStore(GroupByFunction function, MapValue mapValue, long x, long x1, long x2, long y1Address, long y2Address);
     }
 }

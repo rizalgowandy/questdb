@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.IntFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
@@ -52,7 +52,7 @@ public class BitwiseAndIntFunctionFactory implements FunctionFactory {
         return new BitAndIntFunction(args.getQuick(0), args.getQuick(1));
     }
 
-    public static final class BitAndIntFunction extends IntFunction implements BinaryFunction {
+    public static final class BitAndIntFunction extends IntFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 
@@ -65,7 +65,7 @@ public class BitwiseAndIntFunctionFactory implements FunctionFactory {
         public int getInt(Record rec) {
             final int l = left.getInt(rec);
             final int r = right.getInt(rec);
-            return l != Numbers.INT_NaN && r != Numbers.INT_NaN ? l & r : Numbers.INT_NaN;
+            return l != Numbers.INT_NULL && r != Numbers.INT_NULL ? l & r : Numbers.INT_NULL;
         }
 
         @Override
@@ -76,6 +76,11 @@ public class BitwiseAndIntFunctionFactory implements FunctionFactory {
         @Override
         public Function getRight() {
             return right;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left).val('&').val(right);
         }
     }
 }

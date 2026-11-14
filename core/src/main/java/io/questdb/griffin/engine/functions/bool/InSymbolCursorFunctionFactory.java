@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,51 +26,201 @@ package io.questdb.griffin.engine.functions.bool;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.BooleanFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
-import io.questdb.std.*;
+import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.griffin.engine.functions.constants.BooleanConstant;
+import io.questdb.griffin.engine.functions.constants.NullConstant;
+import io.questdb.std.CharSequenceHashSet;
+import io.questdb.std.Chars;
+import io.questdb.std.IntHashSet;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
+import io.questdb.std.str.StringSink;
 
 public class InSymbolCursorFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "in(KC)";
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
-        SymbolFunction symbolFunction = (SymbolFunction) args.getQuick(0);
-        Function cursorFunction = args.getQuick(1);
+    public Function newInstance(
+            int position,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) throws SqlException {
+        final Function valueFunction = args.getQuick(0);
+        final Function cursorFunction = args.getQuick(1);
+
+        final int zeroColumnType = !cursorFunction.isNullConstant()
+                ? cursorFunction.getRecordCursorFactory().getMetadata().getColumnType(0)
+                : ColumnType.NULL;
+        if (ColumnType.isNull(zeroColumnType)) {
+            if (valueFunction.isNullConstant()) {
+                return BooleanConstant.TRUE;
+            }
+            final SymbolFunction symbolFunction = (SymbolFunction) args.getQuick(0);
+            if (symbolFunction.isSymbolTableStatic()) {
+                return new SymbolInNullCursorFunc(symbolFunction);
+            }
+            return new StrInNullCursorFunc(symbolFunction);
+        }
 
         // use first column to create list of values (over multiple records)
-        // supported column types are STRING and SYMBOL
+        // supported column types are VARCHAR, STRING and SYMBOL
+        final Record.CharSequenceFunction func = switch (zeroColumnType) {
+            case ColumnType.STRING -> Record.GET_STR;
+            case ColumnType.SYMBOL -> Record.GET_SYM;
+            case ColumnType.VARCHAR -> Record.GET_VARCHAR;
+            default ->
+                    throw SqlException.position(position).put("supported column types are VARCHAR, SYMBOL and STRING, found: ").put(ColumnType.nameOf(zeroColumnType));
+        };
 
-        final int zeroColumnType = cursorFunction.getRecordCursorFactory().getMetadata().getColumnType(0);
-        if (!ColumnType.isSymbolOrString(zeroColumnType)) {
-            throw SqlException.position(position).put("supported column types are STRING and SYMBOL, found: ").put(ColumnType.nameOf(zeroColumnType));
+        if (valueFunction.isNullConstant()) {
+            return new StrInCursorFunc(NullConstant.NULL, cursorFunction, func);
         }
 
-        final Record.CharSequenceFunction func = ColumnType.isString(zeroColumnType) ? Record.GET_STR : Record.GET_SYM;
-
+        final SymbolFunction symbolFunction = (SymbolFunction) args.getQuick(0);
         if (symbolFunction.isSymbolTableStatic()) {
-            return new SymbolInCursorFunction(symbolFunction, cursorFunction, func);
+            return new SymbolInCursorFunc(symbolFunction, cursorFunction, func);
         }
-        return new StrInCursorFunction(symbolFunction, cursorFunction, func);
+        return new StrInCursorFunc(symbolFunction, cursorFunction, func);
     }
 
-    private static class SymbolInCursorFunction extends BooleanFunction implements BinaryFunction {
-
-        private final SymbolFunction valueArg;
+    private static class StrInCursorFunc extends BooleanFunction implements BinaryFunction {
         private final Function cursorArg;
-        private final IntHashSet symbolKeys = new IntHashSet();
         private final Record.CharSequenceFunction func;
+        private final StringSink sink = new StringSink();
+        private final Function valueArg;
+        private final CharSequenceHashSet valueSet = new CharSequenceHashSet();
+        private boolean stateInherited = false;
+        private boolean stateShared = false;
 
-        public SymbolInCursorFunction(SymbolFunction valueArg, Function cursorArg, Record.CharSequenceFunction func) {
+        public StrInCursorFunc(Function valueArg, Function cursorArg, Record.CharSequenceFunction func) {
+            this.valueArg = valueArg;
+            this.cursorArg = cursorArg;
+            this.func = func;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return valueSet.contains(valueArg.getSymbol(rec));
+        }
+
+        @Override
+        public Function getLeft() {
+            return valueArg;
+        }
+
+        @Override
+        public Function getRight() {
+            return cursorArg;
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            valueArg.init(symbolTableSource, executionContext);
+            cursorArg.init(symbolTableSource, executionContext);
+
+            if (stateInherited) {
+                return;
+            }
+
+            stateShared = false;
+            valueSet.clear();
+
+            RecordCursorFactory factory = cursorArg.getRecordCursorFactory();
+            try (RecordCursor cursor = factory.getCursor(executionContext)) {
+                final Record record = cursor.getRecord();
+                sink.clear();
+                while (cursor.hasNext()) {
+                    CharSequence value = func.get(record, 0, sink);
+                    if (value == null) {
+                        this.valueSet.addNull();
+                    } else {
+                        int toIndex = this.valueSet.keyIndex(value);
+                        if (toIndex > -1) {
+                            this.valueSet.addAt(toIndex, Chars.toString(value));
+                        }
+                    }
+                }
+            }
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return valueArg.isThreadSafe();
+        }
+
+        @Override
+        public void offerStateTo(Function that) {
+            if (that instanceof StrInCursorFunc thatF) {
+                thatF.valueSet.clear();
+                thatF.valueSet.addAll(valueSet);
+                thatF.stateInherited = this.stateShared = true;
+            }
+            BinaryFunction.super.offerStateTo(that);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(valueArg).val(" in ").val(cursorArg);
+            if (stateShared) {
+                sink.val(" [state-shared]");
+            }
+        }
+    }
+
+    private static class StrInNullCursorFunc extends BooleanFunction implements UnaryFunction {
+        private final Function valueArg;
+
+        public StrInNullCursorFunc(Function valueArg) {
+            this.valueArg = valueArg;
+        }
+
+        @Override
+        public Function getArg() {
+            return valueArg;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return valueArg.getSymbol(rec) == null;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(valueArg).val(" in null");
+        }
+    }
+
+    private static class SymbolInCursorFunc extends BooleanFunction implements BinaryFunction {
+        private final Function cursorArg;
+        private final Record.CharSequenceFunction func;
+        private final IntHashSet symbolKeys = new IntHashSet();
+        private final SymbolFunction valueArg;
+        private boolean stateInherited = false;
+        private boolean stateShared = false;
+
+        public SymbolInCursorFunc(SymbolFunction valueArg, Function cursorArg, Record.CharSequenceFunction func) {
             this.valueArg = valueArg;
             this.cursorArg = cursorArg;
             this.func = func;
@@ -95,90 +245,75 @@ public class InSymbolCursorFunctionFactory implements FunctionFactory {
         public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
             valueArg.init(symbolTableSource, executionContext);
             cursorArg.init(symbolTableSource, executionContext);
+            if (stateInherited) {
+                return;
+            }
+            stateShared = false;
             symbolKeys.clear();
-
-            final StaticSymbolTable symbolTable = valueArg.getStaticSymbolTable();
-            assert symbolTable != null;
-
             RecordCursorFactory factory = cursorArg.getRecordCursorFactory();
             try (RecordCursor cursor = factory.getCursor(executionContext)) {
+                final StaticSymbolTable symbolTable = valueArg.getStaticSymbolTable();
+                assert symbolTable != null;
                 final Record record = cursor.getRecord();
+                StringSink sink = Misc.getThreadLocalSink();
                 while (cursor.hasNext()) {
-                    int key = symbolTable.keyOf(func.get(record, 0));
+                    int key = symbolTable.keyOf(func.get(record, 0, sink));
                     if (key != SymbolTable.VALUE_NOT_FOUND) {
                         symbolKeys.add(key + 1);
                     }
                 }
             }
         }
+
+        @Override
+        public boolean isThreadSafe() {
+            return valueArg.isThreadSafe();
+        }
+
+        @Override
+        public void offerStateTo(Function that) {
+            if (that instanceof SymbolInCursorFunc thatF) {
+                thatF.symbolKeys.clear();
+                thatF.symbolKeys.addAll(symbolKeys);
+                thatF.stateInherited = this.stateShared = true;
+            }
+            BinaryFunction.super.offerStateTo(that);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(valueArg).val(" in ").val(cursorArg);
+            if (stateShared) {
+                sink.val(" [state-shared]");
+            }
+        }
     }
 
-    private static class StrInCursorFunction extends BooleanFunction implements BinaryFunction {
-
+    private static class SymbolInNullCursorFunc extends BooleanFunction implements UnaryFunction {
         private final Function valueArg;
-        private final Function cursorArg;
-        private final CharSequenceHashSet valueSetA = new CharSequenceHashSet();
-        private final CharSequenceHashSet valueSetB = new CharSequenceHashSet();
-        private final Record.CharSequenceFunction func;
-        private CharSequenceHashSet valueSet;
 
-        public StrInCursorFunction(Function valueArg, Function cursorArg, Record.CharSequenceFunction func) {
+        public SymbolInNullCursorFunc(Function valueArg) {
             this.valueArg = valueArg;
-            this.cursorArg = cursorArg;
-            this.valueSet = valueSetA;
-            this.func = func;
         }
 
         @Override
-        public boolean getBool(Record rec) {
-            return valueSet.contains(valueArg.getSymbol(rec));
-        }
-
-        @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
-            valueArg.init(symbolTableSource, executionContext);
-            cursorArg.init(symbolTableSource, executionContext);
-
-            CharSequenceHashSet valueSet;
-            if (this.valueSet == this.valueSetA) {
-                valueSet = this.valueSetB;
-            } else {
-                valueSet = this.valueSetA;
-            }
-
-            valueSet.clear();
-
-            RecordCursorFactory factory = cursorArg.getRecordCursorFactory();
-            try (RecordCursor cursor = factory.getCursor(executionContext)) {
-                final Record record = cursor.getRecord();
-                while (cursor.hasNext()) {
-                    CharSequence value = func.get(record, 0);
-                    if (value == null) {
-                        valueSet.addNull();
-                    } else {
-                        int toIndex = valueSet.keyIndex(value);
-                        if (toIndex > -1) {
-                            int index = this.valueSet.keyIndex(value);
-                            if (index < 0) {
-                                valueSet.addAt(toIndex, this.valueSet.keyAt(index));
-                            } else {
-                                valueSet.addAt(toIndex, Chars.toString(value));
-                            }
-                        }
-                    }
-                }
-            }
-            this.valueSet = valueSet;
-        }
-
-        @Override
-        public Function getLeft() {
+        public Function getArg() {
             return valueArg;
         }
 
         @Override
-        public Function getRight() {
-            return cursorArg;
+        public boolean getBool(Record rec) {
+            return valueArg.getInt(rec) == SymbolTable.VALUE_IS_NULL;
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return valueArg.isThreadSafe();
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(valueArg).val(" in null");
         }
     }
 }

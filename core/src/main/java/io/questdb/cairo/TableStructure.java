@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,20 +24,45 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.lv.LiveViewDefinition;
+import io.questdb.cairo.mv.MatViewDefinition;
+import io.questdb.std.IntList;
+import io.questdb.cairo.view.ViewDefinition;
+import org.jetbrains.annotations.NotNull;
+
 public interface TableStructure {
+
     int getColumnCount();
 
     CharSequence getColumnName(int columnIndex);
 
     int getColumnType(int columnIndex);
 
-    long getColumnHash(int columnIndex);
+    /**
+     * Returns the dedup mode of the table, {@link TableUtils#DEDUP_MODE_UPSERT} (default) or
+     * {@link TableUtils#DEDUP_MODE_SKIP}. It applies only when the table has dedup keys.
+     */
+    default int getDedupMode() {
+        return TableUtils.DEDUP_MODE_UPSERT;
+    }
 
     int getIndexBlockCapacity(int columnIndex);
 
-    boolean isIndexed(int columnIndex);
+    default int getParquetEncodingConfig(int columnIndex) {
+        return 0;
+    }
 
-    boolean isSequential(int columnIndex);
+    default LiveViewDefinition getLiveViewDefinition() {
+        return null;
+    }
+
+    default MatViewDefinition getMatViewDefinition() {
+        return null;
+    }
+
+    int getMaxUncommittedRows();
+
+    long getO3MaxLag();
 
     int getPartitionBy();
 
@@ -45,11 +70,92 @@ public interface TableStructure {
 
     int getSymbolCapacity(int columnIndex);
 
+    /**
+     * Returns the default storage format for new partitions.
+     * {@link TableUtils#TABLE_FORMAT_NATIVE} (default) or
+     * {@link TableUtils#TABLE_FORMAT_PARQUET}.
+     */
+    default int getTableFormat() {
+        return TableUtils.TABLE_FORMAT_NATIVE;
+    }
+
     CharSequence getTableName();
 
     int getTimestampIndex();
 
-    int getMaxUncommittedRows();
+    /**
+     * Returns the time-to-live (TTL) of the data in this table:
+     * if positive, it's in hours;
+     * if negative, it's in months (and the actual value is positive);
+     * zero means "no TTL".
+     */
+    default int getTtlHoursOrMonths() {
+        return 0; // TTL disabled by default
+    }
 
-    long getCommitLag();
+    /**
+     * Returns the row-expiry predicate (raw SQL text) for this table, or {@code null} when no
+     * row-expiry policy is configured.
+     */
+    default String getExpiryPredicate() {
+        return null;
+    }
+
+    /**
+     * Returns the row-expiry cleanup interval in microseconds, or {@code 0} when unset.
+     */
+    default long getExpiryCleanupIntervalMicros() {
+        return 0;
+    }
+
+    default ViewDefinition getViewDefinition() {
+        return null;
+    }
+
+    default boolean hasParquetPartitions() {
+        return false;
+    }
+
+    default void init(TableToken tableToken) {
+    }
+
+    /**
+     * Returns the index type for the column.
+     *
+     * @param columnIndex the column index
+     * @return the index type (see {@link IndexType})
+     */
+    byte getIndexType(int columnIndex);
+
+    default IntList getCoveringColumnIndices(int columnIndex) {
+        return null;
+    }
+
+    default boolean isCovering(int columnIndex) {
+        IntList indices = getCoveringColumnIndices(columnIndex);
+        return indices != null && indices.size() > 0;
+    }
+
+    boolean isDedupKey(int columnIndex);
+
+    default boolean isIndexed(int columnIndex) {
+        return IndexType.isIndexed(getIndexType(columnIndex));
+    }
+
+    default boolean isLiveView() {
+        return false;
+    }
+
+    default boolean isMatView() {
+        return false;
+    }
+
+    default boolean isView() {
+        return false;
+    }
+
+    boolean isWalEnabled();
+
+    default void onCreated(@NotNull CairoEngine engine, @NotNull TableToken tableToken) {
+    }
 }

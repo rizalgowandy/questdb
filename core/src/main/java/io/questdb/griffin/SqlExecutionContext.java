@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,80 +26,701 @@ package io.questdb.griffin;
 
 import io.questdb.MessageBus;
 import io.questdb.cairo.CairoEngine;
-import io.questdb.cairo.CairoSecurityContext;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.pool.ResourcePoolSupervisor;
 import io.questdb.cairo.sql.BindVariableService;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.cairo.sql.VirtualRecord;
-import io.questdb.griffin.engine.analytic.AnalyticContext;
+import io.questdb.cairo.sql.async.PageFrameSequence;
+import io.questdb.cairo.view.ViewDefinition;
 import io.questdb.griffin.engine.functions.rnd.SharedRandom;
+import io.questdb.griffin.engine.window.WindowContext;
+import io.questdb.griffin.model.IntrinsicModel;
+import io.questdb.griffin.model.RuntimeIntrinsicIntervalModel;
+import io.questdb.mp.continuation.CancellationBinding;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Decimal64;
+import io.questdb.std.MemoryTracker;
 import io.questdb.std.Rnd;
 import io.questdb.std.Transient;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Path;
+import io.questdb.std.str.Sinkable;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-public interface SqlExecutionContext extends Closeable {
+public interface SqlExecutionContext extends Sinkable, Closeable {
 
-    QueryFutureUpdateListener getQueryFutureUpdateListener();
-
-    BindVariableService getBindVariableService();
-
-    CairoSecurityContext getCairoSecurityContext();
-
-    default @NotNull MessageBus getMessageBus() {
-        return getCairoEngine().getMessageBus();
+    // Returns true when a bare name in a top-level select list that matches no column reads as a call to the
+    // zero-argument function of that name, so `SELECT version FROM t` calls version(). A passthrough materialized
+    // view's refresh turns this off: its stored query spells each function call with parentheses, so a bare
+    // name that stops resolving means the base table lost that column.
+    default boolean allowBareNoArgFunctionCalls() {
+        return true;
     }
 
-    boolean isTimestampRequired();
+    // Returns true when the context doesn't require all SQL functions to be deterministic.
+    // Deterministic-only functions are enforced e.g. when compiling a mat view.
+    boolean allowNonDeterministicFunctions();
 
-    void popTimestampRequiredFlag();
+    default void awaitPageFrameSequences() {
+    }
 
-    void pushTimestampRequiredFlag(boolean flag);
+    void changePageFrameSizes(int minRows, int maxRows);
 
-    int getWorkerCount();
+    default void clearCancelledFlag(AtomicBoolean expected) {
+        getCircuitBreaker().clearCancelledFlag(expected);
+        getSimpleCircuitBreaker().clearCancelledFlag(expected);
+    }
 
-    Rnd getRandom();
+    default void clearCancelledFlag(AtomicBoolean expected, long expectedGeneration) {
+        getCircuitBreaker().clearCancelledFlag(expected, expectedGeneration);
+        getSimpleCircuitBreaker().clearCancelledFlag(expected, expectedGeneration);
+    }
+
+    void clearWindowContext();
+
+    @Override
+    default void close() {
+    }
+
+    void configureWindowContext(
+            @Nullable VirtualRecord partitionByRecord,
+            @Nullable RecordSink partitionBySink,
+            @Transient @Nullable ColumnTypes keyTypes,
+            boolean isOrdered,
+            int scanDirection,
+            int orderByDirection,
+            boolean baseSupportsRandomAccess,
+            int framingMode,
+            long rowsLo,
+            char rowsLoUnit,
+            int rowsLoExprPos,
+            int rowsLoKindPos,
+            long rowsHi,
+            char rowsHiUnit,
+            int rowsHiExprPos,
+            int rowsHiKindPos,
+            int exclusionKind,
+            int exclusionKindPos,
+            int timestampIndex,
+            int timestampType,
+            boolean ignoreNulls,
+            int nullsDescPos
+    ) throws SqlException;
+
+    default void containsSecret(boolean b) {
+    }
+
+    default boolean containsSecret() {
+        return false;
+    }
+
+    default void copyCancelledFlagsTo(CancellationBinding circuitBreakerTarget, CancellationBinding simpleCircuitBreakerTarget) {
+        getCircuitBreaker().copyCancelledFlagTo(circuitBreakerTarget);
+        getSimpleCircuitBreaker().copyCancelledFlagTo(simpleCircuitBreakerTarget);
+    }
 
     default Rnd getAsyncRandom() {
         return SharedRandom.getAsyncRandom(getCairoEngine().getConfiguration());
     }
 
-    void setRandom(Rnd rnd);
+    BindVariableService getBindVariableService();
 
+    @NotNull
     CairoEngine getCairoEngine();
 
-    long getRequestFd();
-
+    @NotNull
     SqlExecutionCircuitBreaker getCircuitBreaker();
 
-    void storeTelemetry(short event, short origin);
+    boolean getCloneSymbolTables();
 
-    AnalyticContext getAnalyticContext();
+    Decimal128 getDecimal128();
 
-    void configureAnalyticContext(
-            @Nullable VirtualRecord partitionByRecord,
-            @Nullable RecordSink partitionBySink,
-            @Transient @Nullable ColumnTypes keyTypes,
-            boolean isOrdered,
-            boolean baseSupportsRandomAccess
-    );
+    Decimal256 getDecimal256();
 
-    void initNow();
+    Decimal64 getDecimal64();
 
-    long getNow();
+    default @Nullable ExecutionState getExecutionState() {
+        return null;
+    }
+
+    int getIntervalFunctionType();
+
+    /**
+     * Returns the dynamic-interval plan handoff generation: zero outside EXPLAIN, negative while
+     * EXPLAIN prepares its base cursor, and positive while it renders the successfully prepared plan.
+     */
+    default long getIntervalPlanGeneration() {
+        return 0;
+    }
 
     int getJitMode();
 
-    void setJitMode(int jitMode);
+    /**
+     * Returns the tracker bound to the currently active workload, or
+     * {@code null} between workloads. The workload entry point sets it via
+     * {@link #setMemoryTracker(MemoryTracker)} on acquisition and clears it
+     * on workload end.
+     */
+    @Nullable
+    default MemoryTracker getMemoryTracker() {
+        return null;
+    }
 
-    @Override
-    default void close(){
+    default @NotNull MessageBus getMessageBus() {
+        return getCairoEngine().getMessageBus();
+    }
+
+    default TableRecordMetadata getMetadataForWrite(TableToken tableToken, long desiredVersion) {
+        return getCairoEngine().getLegacyMetadata(tableToken, desiredVersion);
+    }
+
+    default TableRecordMetadata getMetadataForWrite(TableToken tableToken) {
+        return getMetadataForWrite(tableToken, TableUtils.ANY_TABLE_VERSION);
+    }
+
+    long getMicrosecondTimestamp();
+
+    long getNanosecondTimestamp();
+
+    /**
+     * Gets the current timestamp with specified precision.
+     *
+     * @param timestampType the timestamp precision type (micros or nanos)
+     * @return current timestamp value in the specified precision
+     */
+    long getNow(int timestampType);
+
+    int getNowTimestampType();
+
+    int getPageFrameMaxRows();
+
+    int getPageFrameMinRows();
+
+    QueryFutureUpdateListener getQueryFutureUpdateListener();
+
+    /**
+     * Returns the protocol execution owner currently mounted on this context, or {@code -1}.
+     */
+    default long getQueryRegistryOwnerId() {
+        return -1;
+    }
+
+    Rnd getRandom();
+
+    default TableReader getReader(TableToken tableToken, long version) {
+        return getCairoEngine().getReader(tableToken, version, this.getReaderPoolSupervisor());
+    }
+
+    default TableReader getReader(TableToken tableToken) {
+        return getCairoEngine().getReader(tableToken, this.getReaderPoolSupervisor());
+    }
+
+    /**
+     * The reader-pool supervisor that table-reader borrows made through this context are
+     * attributed to (for query-scoped reader-leak detection). Carried on the execution
+     * context rather than a carrier/thread local so it survives a continuation that parks
+     * and resumes on a different worker. Returns {@code null} when no supervisor is active.
+     */
+    default ResourcePoolSupervisor<TableReader> getReaderPoolSupervisor() {
+        return null;
+    }
+
+    long getRequestFd();
+
+    @NotNull
+    SecurityContext getSecurityContext();
+
+    int getSharedQueryWorkerCount();
+
+    @NotNull
+    SqlExecutionCircuitBreaker getSimpleCircuitBreaker();
+
+    /**
+     * The view whose definition is currently being compiled, which the table-name functions and SHOW
+     * statements written in it read the objects they name through, see
+     * {@link #isTableFunctionVisible(TableToken, TableFunctionView)}.
+     */
+    default TableFunctionView getTableFunctionView() {
+        return null;
+    }
+
+    default int getTableStatus(Path path, CharSequence tableName) {
+        return getCairoEngine().getTableStatus(path, tableName);
+    }
+
+    default int getTableStatus(Path path, TableToken tableToken) {
+        return getCairoEngine().getTableStatus(path, tableToken);
+    }
+
+    default TableToken getTableToken(CharSequence tableName) {
+        return getCairoEngine().verifyTableName(tableName);
+    }
+
+    default TableToken getTableToken(CharSequence tableName, int lo, int hi) {
+        return getCairoEngine().verifyTableName(tableName, lo, hi);
+    }
+
+    default TableToken getTableTokenIfExists(CharSequence tableName) {
+        return getCairoEngine().getTableTokenIfExists(tableName);
+    }
+
+    default TableToken getTableTokenIfExists(CharSequence tableName, int lo, int hi) {
+        return getCairoEngine().getTableTokenIfExists(tableName, lo, hi);
+    }
+
+    /**
+     * Returns the token of the table, view, materialized view or live view of the given name, or null
+     * when there is no such object or the principal may not see it, see
+     * {@link SecurityContext#isTableVisible(TableToken)}. Statements that act on an existing object
+     * resolve its name through this method, so that an object the principal may not see behaves
+     * exactly like a missing one, IF EXISTS included. Statements that create an object must not:
+     * the namespace is shared, so a name taken by an invisible object is still taken.
+     */
+    default TableToken getVisibleTableTokenIfExists(CharSequence tableName) {
+        final TableToken tableToken = getTableTokenIfExists(tableName);
+        return tableToken != null && getSecurityContext().isTableVisible(tableToken) ? tableToken : null;
+    }
+
+    WindowContext getWindowContext();
+
+    int hasInterval();
+
+    void initNow();
+
+    /**
+     * Returns true for the contexts the engine's own jobs run SQL under: a materialized view
+     * refresh, a live view refresh, WAL apply and view compilation, where the view compiler job and
+     * {@code COMPILE VIEW} each run under their own {@code ViewCompilerExecutionContext}. No
+     * principal is reading data through such a context. The job runs the query on the engine's
+     * behalf, under a security context that names no real user, so view auditing records nothing
+     * for it: a row would credit the read to nobody, once per refresh, once per node that replays
+     * the WAL, or once per compile of a view.
+     * <p>
+     * Unlike {@link #isMetadataProbe()}, which a caller raises around a single cursor open, this
+     * is a fixed property of the context's type.
+     */
+    default boolean isBackgroundJob() {
+        return false;
+    }
+
+    boolean isCacheHit();
+
+    // Returns false only for materialized view refresh contexts when the
+    // cairo.mat.view.covering.index.enabled property is set to false.
+    // All other contexts always return true.
+    default boolean isCoveringIndexEnabled() {
+        return true;
+    }
+
+    default CharSequence getExpiryMaterializingViewName() {
+        return null;
+    }
+
+    // The one table this compilation reads without its EXPIRE ROWS policy, while every other table follows
+    // getExpiryReadPolicy(). ALTER ... SET EXPIRE ROWS names the view while its compile probe runs, so the
+    // probe reads the view the way a read sees it once the new policy replaces the current one.
+    default @Nullable TableToken getExpiryRawReadTable() {
+        return null;
+    }
+
+    default ExpiryReadPolicy getExpiryReadPolicy() {
+        return isExpiryReadFilterEnabled() ? ExpiryReadPolicy.FILTER : ExpiryReadPolicy.RAW;
+    }
+
+    default ExpiryReadPolicy getExpiryReadPolicy(TableToken tableToken) {
+        return isExpiryReadFilterEnabled(tableToken) ? ExpiryReadPolicy.FILTER : ExpiryReadPolicy.RAW;
+    }
+
+    // Compatibility accessors for contexts that only distinguish filtered and raw reads. Materializing
+    // compilation must use getExpiryReadPolicy(TableToken), where REJECT is distinct from RAW.
+    boolean isExpiryReadFilterEnabled();
+
+    // Per-table refinement of {@link #isExpiryReadFilterEnabled()}: whether the read-time row-expiry
+    // filter applies to reads of THIS table in the current compilation. Follows the global flag by
+    // default; the mat-view refresh context overrides it to keep the filter on every table except the
+    // base, so a policied view referenced as a JOIN table is read filtered during refresh, exactly as
+    // any query reads it.
+    default boolean isExpiryReadFilterEnabled(TableToken tableToken) {
+        return isExpiryReadFilterEnabled();
+    }
+
+    // Returns true when the current compile is the CREATE-time or refresh-time
+    // compile of a live view's SELECT. Compile-time switch that lets window
+    // function factories opt into live-view-only machinery (e.g. the
+    // tombstone value-layout slot that drives anchor-driven compaction)
+    // and lets WhereClauseParser suppress indexed-symbol key
+    // extraction so the planner falls back to a plain FilteredRecordCursorFactory
+    // shape that the incremental refresh path can handle.
+    default boolean isLiveViewCompile() {
+        return false;
+    }
+
+    // The refresh of a live view compiles the SQL that CREATE accepted, with no caller to authorize:
+    // a catalogue function written in that SQL needs no SYSTEM ADMIN here, see
+    // SqlExecutionRequirements.DISCLOSES_OBJECTS.
+    default boolean isLiveViewRefresh() {
+        return false;
+    }
+
+    // The refresh of a materialized view compiles the SQL that CREATE accepted, with no caller to
+    // authorize: a catalogue function written in that SQL needs no SYSTEM ADMIN here, see
+    // SqlExecutionRequirements.DISCLOSES_OBJECTS. Readers with SELECT on the view read what it lists.
+    default boolean isMatViewRefresh() {
+        return false;
+    }
+
+    // Returns true when where intrinsics are overridden, i.e. by a materialized view refresh
+    default boolean isOverriddenIntrinsics(TableToken tableToken) {
+        return false;
+    }
+
+    /**
+     * Returns true while a statement opens a cursor only to check a SELECT, not to hand anyone its
+     * rows: {@code CREATE VIEW} derives the view's column types from it, and
+     * {@code CREATE MATERIALIZED VIEW} and {@code ALTER VIEW} validate their SELECT with it. No
+     * principal is reading data through such a cursor, so view auditing skips it: an audit row for
+     * it would assert an access to rows that nobody asked for.
+     */
+    default boolean isMetadataProbe() {
+        return false;
+    }
+
+    boolean isParallelFilterEnabled();
+
+    boolean isParallelGroupByEnabled();
+
+    boolean isParallelHashJoinGroupByEnabled();
+
+    boolean isParallelHorizonJoinEnabled();
+
+    boolean isParallelReadParquetEnabled();
+
+    boolean isParallelTopKEnabled();
+
+    boolean isParallelWindowJoinEnabled();
+
+    boolean isParquetRowGroupPruningEnabled();
+
+    /**
+     * Returns whether cached table scans may retain their compiled optimization state across
+     * partition-format changes. A tolerant context accepts that Parquet row-group pruning may no
+     * longer match the current table format; the ordinary row filter still preserves SQL semantics.
+     */
+    default boolean isPartitionFormatChangeTolerated() {
+        return false;
+    }
+
+    /**
+     * A table-name function or a SHOW statement in a view reads the object it names through that
+     * view, not as the caller, when the view's definition names the object, see
+     * {@link TableFunctionView#isDependency(TableToken)}. Any other object, such as one a caller
+     * substitutes through an OVERRIDABLE variable of the view, is read as the caller. Recheck the
+     * view's identity, definition and SELECT grant when the cursor opens: a cached cursor may outlive
+     * a revoke, a replacement or a drop and recreation under the same name. A view that changed since
+     * the compile makes the plan stale, so it throws {@link TableReferenceOutOfDateException} for the
+     * caller to recompile, rather than run a function the current definition may not name or report a
+     * visible object as missing.
+     */
+    default boolean isTableFunctionVisible(TableToken tableToken, TableFunctionView view) {
+        if (view != null) {
+            final ViewDefinition viewDefinition = view.definition();
+            final TableToken viewToken = viewDefinition.getViewToken();
+            final ViewDefinition currentDefinition = viewToken.equals(getTableTokenIfExists(viewToken.getTableName()))
+                    ? getCairoEngine().getViewGraph().getViewDefinition(viewToken)
+                    : null;
+            if (currentDefinition == null || currentDefinition.getSeqTxn() != viewDefinition.getSeqTxn()) {
+                throw TableReferenceOutOfDateException.ofOutdatedView(
+                        viewToken,
+                        viewDefinition.getSeqTxn(),
+                        currentDefinition != null ? currentDefinition.getSeqTxn() : -1
+                );
+            }
+        }
+        return isTableFunctionVisibleAtCompile(tableToken, view);
+    }
+
+    /**
+     * Like {@link #isTableFunctionVisible(TableToken, TableFunctionView)}, for the compile that
+     * captured the view: it checks the view's visibility and SELECT grant against the definition the
+     * compile captured, without rereading it. A view change that another session commits during the
+     * compile makes the plan stale, which StaleViewCheckFactory and the recheck at cursor open report
+     * as {@link TableReferenceOutOfDateException}; failing the compile instead would report the object
+     * missing, or fail a PostgreSQL Parse, which does not recompile.
+     */
+    default boolean isTableFunctionVisibleAtCompile(TableToken tableToken, TableFunctionView view) {
+        if (view == null || !view.isDependency(tableToken)) {
+            return getSecurityContext().isTableVisible(tableToken);
+        }
+        final ViewDefinition viewDefinition = view.definition();
+        if (!getSecurityContext().isTableVisible(viewDefinition.getViewToken())) {
+            return false;
+        }
+        getSecurityContext().authorizeSelect(viewDefinition);
+        return true;
+    }
+
+    /**
+     * Returns whether a factory may keep the plan choices that its compile took from the tables'
+     * row counts after the tables change size. A context that runs a factory which no holder
+     * compiles again, such as a queued export, tolerates the change: a fused GROUP BY over a hash
+     * join then keeps its compile-time build side and key table presizing, which cost memory and
+     * never change the rows, instead of throwing {@link TableReferenceOutOfDateException} to ask
+     * for a recompile. A RIGHT join that took the fused plan while the table before it held no
+     * more rows than the table after it therefore keeps building the table before it, however
+     * large that table grows.
+     */
+    default boolean isTableRowCountChangeTolerated() {
+        return false;
+    }
+
+    boolean isTimestampRequired();
+
+    default boolean isUninterruptible() {
+        return false;
+    }
+
+    boolean isValidationOnly();
+
+    /**
+     * Whether the current compile derives an ordinary view's metadata, at CREATE, ALTER or
+     * recompilation. PIVOT IN subqueries execute now and must also work without the caller later.
+     */
+    default boolean isViewCompile() {
+        return false;
+    }
+
+    /**
+     * Whether this compile is inside a PIVOT IN subquery that derives an ordinary view's metadata.
+     * Unlike the rest of the view's SELECT, its functions execute during detached recompilation.
+     */
+    default boolean isViewMetadataSubquery() {
+        return false;
+    }
+
+    boolean isWalApplication();
+
+    /**
+     * Starts a new dynamic-interval plan preparation and returns its negative generation.
+     */
+    default long nextIntervalPlanGeneration() {
+        return 0;
+    }
+
+    // This method is used to override intrinsic values in the query execution context
+    // Its initial usage is in the materialized view refresh
+    // where the queried timestamp of the base table is limited to the range affected since last refresh
+    default void overrideWhereIntrinsics(TableToken tableToken, IntrinsicModel intrinsicModel, int timestampType) {
+    }
+
+    RuntimeIntrinsicIntervalModel peekIntervalModel();
+
+    void popHasInterval();
+
+    void popIntervalModel();
+
+    void popTimestampRequiredFlag();
+
+    /**
+     * Restores the caller's window specification without closing any of its functions.
+     */
+    void popWindowContext();
+
+    void pushHasInterval(int hasInterval);
+
+    void pushIntervalModel(RuntimeIntrinsicIntervalModel intervalModel);
+
+    void pushTimestampRequiredFlag(boolean flag);
+
+    /**
+     * Starts a nested query with an empty window context; the caller must pop it in finally.
+     */
+    void pushWindowContext();
+
+    default void registerPageFrameSequence(PageFrameSequence<?> frameSequence) {
+    }
+
+    void reset();
+
+    default void restoreCancelledFlag(
+            AtomicBoolean expected,
+            CancellationBinding circuitBreakerPrevious,
+            CancellationBinding simpleCircuitBreakerPrevious
+    ) {
+        final SqlExecutionCircuitBreaker circuitBreaker = getCircuitBreaker();
+        final SqlExecutionCircuitBreaker simpleCircuitBreaker = getSimpleCircuitBreaker();
+        if (circuitBreaker.getCancelledFlag() == expected) {
+            circuitBreaker.setCancelledFlag(circuitBreakerPrevious);
+        }
+        if (simpleCircuitBreaker != circuitBreaker && simpleCircuitBreaker.getCancelledFlag() == expected) {
+            simpleCircuitBreaker.setCancelledFlag(simpleCircuitBreakerPrevious);
+        }
+    }
+
+    void restoreToDefaultPageFrameSizes();
+
+    default void setAllowBareNoArgFunctionCalls(boolean value) {
+    }
+
+    void setAllowNonDeterministicFunction(boolean value);
+
+    void setCacheHit(boolean value);
+
+    void setCancelledFlag(AtomicBoolean cancelled);
+
+    default void setCancelledFlag(CancellationBinding source) {
+        getCircuitBreaker().setCancelledFlag(source);
+        getSimpleCircuitBreaker().setCancelledFlag(source);
+    }
+
+    default void setCancelledFlag(AtomicBoolean cancelled, long generation) {
+        getCircuitBreaker().setCancelledFlag(cancelled, generation);
+        getSimpleCircuitBreaker().setCancelledFlag(cancelled, generation);
     }
 
     void setCloneSymbolTables(boolean cloneSymbolTables);
 
-    boolean getCloneSymbolTables();
+    // A context without per-table read policies ignores this and reads every table under
+    // getExpiryReadPolicy().
+    default void setExpiryRawReadTable(@Nullable TableToken tableToken) {
+    }
+
+    void setExpiryReadFilterEnabled(boolean enabled);
+
+    default void setExpiryReadPolicy(ExpiryReadPolicy policy, @Nullable CharSequence materializingViewName) {
+        if (policy == ExpiryReadPolicy.REJECT) {
+            throw new UnsupportedOperationException("this SQL execution context cannot enter expiry REJECT mode");
+        }
+        setExpiryReadFilterEnabled(policy == ExpiryReadPolicy.FILTER);
+    }
+
+    void setIntervalFunctionType(int intervalType);
+
+    default void setIntervalPlanGeneration(long generation) {
+    }
+
+    void setJitMode(int jitMode);
+
+    default void setLiveViewCompile(boolean value) {
+    }
+
+    /**
+     * Stashes the active per-workload memory tracker on this context. Set at
+     * workload start by the entry point that called
+     * {@code MemoryTrackerProvider.acquire(...)}; cleared (with {@code null})
+     * at workload end so the context is ready for the next workload.
+     */
+    default void setMemoryTracker(@Nullable MemoryTracker tracker) {
+    }
+
+    default void setMetadataProbe(boolean value) {
+    }
+
+    void setNowAndFixClock(long now, int nowTimestampType);
+
+    void setParallelFilterEnabled(boolean parallelFilterEnabled);
+
+    void setParallelGroupByEnabled(boolean parallelGroupByEnabled);
+
+    void setParallelHashJoinGroupByEnabled(boolean isEnabled);
+
+    void setParallelHorizonJoinEnabled(boolean parallelHorizonJoinEnabled);
+
+    void setParallelReadParquetEnabled(boolean parallelReadParquetEnabled);
+
+    void setParallelTopKEnabled(boolean parallelTopKEnabled);
+
+    void setParallelWindowJoinEnabled(boolean parallelWindowJoinEnabled);
+
+    void setParquetRowGroupPruningEnabled(boolean parquetRowGroupPruningEnabled);
+
+    /**
+     * Binds the protocol execution owner for nested QueryRegistry registrations on this context.
+     */
+    default void setQueryRegistryOwnerId(long queryRegistryOwnerId) {
+    }
+
+    void setRandom(Rnd rnd);
+
+    /**
+     * Sets the reader-pool supervisor for table-reader borrows made through this context.
+     * {@link io.questdb.griffin.engine.QueryProgress} installs itself here for the duration
+     * of cursor open so that readers borrowed while building the cursor are attributed to
+     * the query, then restores the previous value. Default is a no-op for contexts that do
+     * not track reader leaks.
+     */
+    default void setReaderPoolSupervisor(@Nullable ResourcePoolSupervisor<TableReader> supervisor) {
+    }
+
+    /**
+     * Tells the context which name the statement being compiled uses for the table it targets - the
+     * table named by {@code UPDATE <name>} or {@code ALTER TABLE <name>}. Called before that name,
+     * or any other table in the statement, is resolved.
+     * <p>
+     * Only contexts that resolve a target differently from the name in the SQL need this; for
+     * everything else it is a no-op. See {@code WalApplySqlExecutionContext}, where the stored SQL
+     * may name a table that has since been renamed, or whose name now belongs to a different table.
+     */
+    default void setStatementTargetTableName(CharSequence tableName) {
+    }
+
+    default void setTableFunctionView(TableFunctionView view) {
+        if (view != null) {
+            throw new UnsupportedOperationException("table-valued functions in views require a view-aware execution context");
+        }
+    }
+
+    // For a materialized view refresh, the compiler reports whether the SELECT it has just parsed has a wildcard
+    // in its top-level select list, before the optimiser expands it. The refresh compares the query's column
+    // names with the view's only then: without a wildcard the query text fixes what every column computes, and
+    // the names can differ only in how the alias rules in effect name unaliased columns.
+    default void setTopLevelProjectionWildcard(boolean hasTopLevelProjectionWildcard) {
+    }
+
+    void setUseSimpleCircuitBreaker(boolean value);
+
+    default void setViewCompile(boolean value) {
+    }
+
+    default void setViewMetadataSubquery(boolean value) {
+    }
+
+    default boolean shouldLogSql() {
+        return true;
+    }
+
+    default void storeTelemetry(short event, short origin) {
+    }
+
+    default void toSink(@NotNull CharSink<?> sink) {
+    }
+
+    default void unregisterPageFrameSequence(PageFrameSequence<?> frameSequence) {
+    }
+
+    // the view definition, as of the compile, that a table-name function or SHOW statement reads through
+    record TableFunctionView(ViewDefinition definition) {
+
+        /**
+         * Returns whether the view's definition names the object, i.e. whether CREATE VIEW or ALTER
+         * VIEW recorded it among the dependencies of the view, the tables it reads and the arguments of
+         * its table-name functions. The view lends its authority to those objects only: an object a
+         * caller substitutes into the view, e.g. through an OVERRIDABLE variable, is read as the caller.
+         */
+        public boolean isDependency(TableToken tableToken) {
+            return definition.getDependencies().contains(tableToken.getTableName());
+        }
+    }
 }

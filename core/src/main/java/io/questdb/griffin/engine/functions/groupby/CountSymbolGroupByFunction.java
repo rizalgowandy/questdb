@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,106 +24,95 @@
 
 package io.questdb.griffin.engine.functions.groupby;
 
-import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.Record;
-import io.questdb.griffin.engine.functions.GroupByFunction;
-import io.questdb.griffin.engine.functions.LongFunction;
-import io.questdb.std.IntList;
-import io.questdb.std.Numbers;
-import io.questdb.std.ObjList;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.engine.functions.SymbolFunction;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
+import io.questdb.griffin.engine.groupby.GroupByUtils;
+import io.questdb.std.Unsafe;
+import org.jetbrains.annotations.NotNull;
 
-import static io.questdb.cairo.sql.SymbolTable.VALUE_IS_NULL;
+public class CountSymbolGroupByFunction extends AbstractCountGroupByFunction {
+    private final int argColumnIndex;
+    private final boolean symbolTableStatic;
 
-public class CountSymbolGroupByFunction extends LongFunction implements GroupByFunction {
-    private final Function arg;
-    private final ObjList<IntList> lists = new ObjList<>();
-    private int valueIndex;
-    private int setIndex;
-
-    public CountSymbolGroupByFunction(Function arg) {
-        this.arg = arg;
+    public CountSymbolGroupByFunction(@NotNull Function arg) {
+        super(arg);
+        this.argColumnIndex = GroupByUtils.directArgColumnIndex(arg, ColumnType.SYMBOL);
+        // FunctionParser guarantees a SymbolFunction for count(K). Keep the fallback for
+        // synthetic test functions and preserve the integer fast path for static tables.
+        this.symbolTableStatic = !(arg instanceof SymbolFunction sf) || sf.isSymbolTableStatic();
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
-        final IntList list;
-        if (lists.size() <= setIndex) {
-            lists.extendAndSet(setIndex, list = new IntList());
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
+        if (isNotNull(record)) {
+            mapValue.putLong(valueIndex, 1);
         } else {
-            list = lists.getQuick(setIndex);
-        }
-        list.clear(0);
-        mapValue.putInt(valueIndex + 1, setIndex);
-        setIndex++;
-
-        int val = arg.getInt(record);
-        if (val != VALUE_IS_NULL) {
-            list.extendAndSet(val, 1);
-            mapValue.putLong(valueIndex, 1L);
-        } else {
-            mapValue.putLong(valueIndex, 0L);
+            mapValue.putLong(valueIndex, 0);
         }
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
-        final IntList set = lists.getQuick(mapValue.getInt(valueIndex + 1));
-        final int val = arg.getInt(record);
-        if (val != VALUE_IS_NULL) {
-            if (val < set.size()) {
-                if (set.getQuick(val) == 1) {
-                    return;
+    public void computeKeyedBatch(
+            PageFrameMemoryRecord record,
+            FlyweightPackedMapValue mapValue,
+            long baseValueAddr,
+            long batchAddr,
+            long rowCount,
+            long baseRowId
+    ) {
+        // setEmpty stores 0, so the etalon seed matches the identity element for count
+        // and new entries need no branching. Each non-null row adds 1.
+        final long valueColumnOffset = mapValue.getOffset(valueIndex);
+        // Fast path: arg is a direct symbol column with data on the current frame.
+        // Symbols are stored as 4-byte ids; null = SymbolTable.VALUE_IS_NULL.
+        // Zero page address means a column top; fall through to the record-based path.
+        final long argAddr = argColumnIndex >= 0 ? record.getPageAddress(argColumnIndex) : 0;
+        if (argAddr != 0) {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                final long rowIndex = Map.decodeBatchRowIndex(encoded);
+                final int value = Unsafe.getInt(argAddr + (rowIndex << 2));
+                if (value != SymbolTable.VALUE_IS_NULL) {
+                    final long addr = baseValueAddr + Map.decodeBatchOffset(encoded) + valueColumnOffset;
+                    Unsafe.putLong(addr, Unsafe.getLong(addr) + 1);
                 }
-                set.setQuick(val, 1);
-            } else {
-                set.extendAndSet(val, 1);
             }
+        } else {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                record.setRowIndex(Map.decodeBatchRowIndex(encoded));
+                if (isNotNull(record)) {
+                    final long addr = baseValueAddr + Map.decodeBatchOffset(encoded) + valueColumnOffset;
+                    Unsafe.putLong(addr, Unsafe.getLong(addr) + 1);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
+        if (isNotNull(record)) {
             mapValue.addLong(valueIndex, 1);
         }
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
-        this.valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.LONG);
-        columnTypes.add(ColumnType.INT);
+    public int getComputeBatchArgType() {
+        return ColumnType.SYMBOL;
     }
 
-    @Override
-    public void setEmpty(MapValue mapValue) {
-        mapValue.putLong(valueIndex, 0L);
-    }
-
-    @Override
-    public void setLong(MapValue mapValue, long value) {
-        mapValue.putLong(valueIndex, value);
-    }
-
-    @Override
-    public void setNull(MapValue mapValue) {
-        mapValue.putLong(valueIndex, Numbers.LONG_NaN);
-    }
-
-    @Override
-    public long getLong(Record rec) {
-        return rec.getLong(valueIndex);
-    }
-
-    @Override
-    public boolean isConstant() {
-        return false;
-    }
-
-    @Override
-    public boolean isReadThreadSafe() {
-        return true;
-    }
-
-    @Override
-    public void toTop() {
-        setIndex = 0;
+    private boolean isNotNull(Record record) {
+        // Dynamic symbol functions may allocate keys lazily in getInt(). count() only
+        // needs nullness, so keep those functions on their string pass-through path.
+        return symbolTableStatic
+                ? arg.getInt(record) != SymbolTable.VALUE_IS_NULL
+                : arg.getSymbol(record) != null;
     }
 }

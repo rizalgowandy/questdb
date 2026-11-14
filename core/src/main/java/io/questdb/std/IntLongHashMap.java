@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ package io.questdb.std;
 import java.util.Arrays;
 
 public class IntLongHashMap extends AbstractIntHashSet {
-    private static final int noEntryValue = -1;
+    private static final long noEntryValue = -1;
     private long[] values;
 
     public IntLongHashMap() {
@@ -35,11 +35,7 @@ public class IntLongHashMap extends AbstractIntHashSet {
     }
 
     public IntLongHashMap(int initialCapacity) {
-        this(initialCapacity, 0.5f);
-    }
-
-    private IntLongHashMap(int initialCapacity, double loadFactor) {
-        super(initialCapacity, loadFactor);
+        super(initialCapacity, 0.5f);
         values = new long[keys.length];
         clear();
     }
@@ -68,18 +64,6 @@ public class IntLongHashMap extends AbstractIntHashSet {
         return index < 0 ? values[-index - 1] : noEntryValue;
     }
 
-    @Override
-    protected void erase(int index) {
-        keys[index] = this.noEntryKeyValue;
-    }
-
-    @Override
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        values[to] = values[from];
-        erase(from);
-    }
-
     private void rehash() {
         int size = size();
         int newCapacity = capacity * 2;
@@ -102,5 +86,17 @@ public class IntLongHashMap extends AbstractIntHashSet {
                 values[index] = oldValues[i];
             }
         }
+    }
+
+    @Override
+    protected void erase(int index) {
+        keys[index] = this.noEntryKeyValue;
+    }
+
+    @Override
+    protected void move(int from, int to) {
+        keys[to] = keys[from];
+        values[to] = values[from];
+        erase(from);
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,28 +24,27 @@
 
 package io.questdb.griffin.engine.functions.catalogue;
 
+import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.SingleValueRecordCursor;
 
-public class ShowTransactionIsolationLevelCursorFactory implements RecordCursorFactory {
+public class ShowTransactionIsolationLevelCursorFactory extends AbstractRecordCursorFactory {
     private final static GenericRecordMetadata METADATA = new GenericRecordMetadata();
     private final static StringValueRecord RECORD = new StringValueRecord("read committed");
     private final SingleValueRecordCursor cursor = new SingleValueRecordCursor(RECORD);
 
-    @Override
-    public RecordCursor getCursor(SqlExecutionContext executionContext) {
-        cursor.toTop();
-        return cursor;
+    public ShowTransactionIsolationLevelCursorFactory() {
+        super(METADATA);
     }
 
     @Override
-    public RecordMetadata getMetadata() {
-        return METADATA;
+    public RecordCursor getCursor(SqlExecutionContext executionContext) {
+        return cursor.of(executionContext.getCircuitBreaker());
     }
 
     @Override
@@ -53,7 +52,12 @@ public class ShowTransactionIsolationLevelCursorFactory implements RecordCursorF
         return false;
     }
 
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("transaction_isolation");
+    }
+
     static {
-        METADATA.add(new TableColumnMetadata("transaction_isolation", 1, ColumnType.STRING));
+        METADATA.add(new TableColumnMetadata("transaction_isolation", ColumnType.STRING));
     }
 }

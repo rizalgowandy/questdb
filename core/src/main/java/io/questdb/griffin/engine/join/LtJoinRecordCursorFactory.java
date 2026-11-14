@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,29 +24,42 @@
 
 package io.questdb.griffin.engine.join;
 
-import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnFilter;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
-import io.questdb.cairo.map.*;
+import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.MapFactory;
+import io.questdb.cairo.map.MapKey;
+import io.questdb.cairo.map.MapRecord;
+import io.questdb.cairo.map.MapRecordCursor;
+import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.map.RecordValueSink;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.model.JoinContext;
 import io.questdb.std.IntList;
 import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
 import io.questdb.std.Transient;
 
-public class LtJoinRecordCursorFactory extends AbstractRecordCursorFactory {
-    private final Map joinKeyMap;
-    private final RecordCursorFactory masterFactory;
-    private final RecordCursorFactory slaveFactory;
+import static io.questdb.griffin.engine.join.AbstractAsOfJoinFastRecordCursor.scaleTimestamp;
+
+public class LtJoinRecordCursorFactory extends AbstractJoinRecordCursorFactory {
+    private final int mapEvacuationThreshold;
     private final RecordSink masterKeySink;
+    private final IntList slaveColumnIndex; // maps columns after the split to columns in the slave cursor
     private final RecordSink slaveKeySink;
-    private final LtJoinRecordCursor cursor;
-    private final IntList columnIndex;
+    private final int slaveValueTimestampIndex;
+    private final long toleranceInterval;
+    private LtJoinRecordCursor cursor;
 
     public LtJoinRecordCursorFactory(
             CairoConfiguration configuration,
@@ -60,31 +73,59 @@ public class LtJoinRecordCursorFactory extends AbstractRecordCursorFactory {
             RecordSink slaveKeySink,
             int columnSplit,
             RecordValueSink slaveValueSink,
-            IntList columnIndex // this column index will be used to retrieve symbol tables from underlying slave
+            IntList columnIndex, // this column index will be used to retrieve symbol tables from underlying slave
+            JoinContext joinContext,
+            ColumnFilter masterTableKeyColumns,
+            long toleranceInterval,
+            int slaveValueTimestampIndex
     ) {
-        super(metadata);
-        this.masterFactory = masterFactory;
-        this.slaveFactory = slaveFactory;
-        joinKeyMap = MapFactory.createMap(configuration, mapKeyTypes, mapValueTypes);
-        this.masterKeySink = masterKeySink;
-        this.slaveKeySink = slaveKeySink;
-        this.cursor = new LtJoinRecordCursor(
-                columnSplit,
-                joinKeyMap,
-                NullRecordFactory.getInstance(slaveColumnTypes),
-                masterFactory.getMetadata().getTimestampIndex(),
-                slaveFactory.getMetadata().getTimestampIndex(),
-                slaveValueSink
-        );
-        this.columnIndex = columnIndex;
+        super(metadata, joinContext, masterFactory, slaveFactory);
+        Map joinKeyMapA = null;
+        Map joinKeyMapB = null;
+        boolean isCursorOwningMaps = false;
+        try {
+            this.masterKeySink = masterKeySink;
+            this.slaveKeySink = slaveKeySink;
+            joinKeyMapA = MapFactory.createUnorderedMap(configuration, mapKeyTypes, mapValueTypes, false, false);
+            // if toleranceInterval is not set, we do not need a second map for evacuation. since evacuations are only
+            // executed when TOLERANCE_INTERVAL is set
+            joinKeyMapB = toleranceInterval != Numbers.LONG_NULL ? MapFactory.createUnorderedMap(configuration, mapKeyTypes, mapValueTypes, false, false) : null;
+            int slaveWrappedOverMaster = slaveColumnTypes.getColumnCount() - masterTableKeyColumns.getColumnCount();
+            this.cursor = new LtJoinRecordCursor(
+                    columnSplit,
+                    joinKeyMapA,
+                    joinKeyMapB,
+                    NullRecordFactory.getInstance(slaveColumnTypes),
+                    masterFactory.getMetadata().getTimestampIndex(),
+                    slaveFactory.getMetadata().getTimestampIndex(),
+                    masterFactory.getMetadata().getTimestampType(),
+                    slaveFactory.getMetadata().getTimestampType(),
+                    slaveValueSink,
+                    masterTableKeyColumns,
+                    slaveWrappedOverMaster,
+                    columnIndex
+            );
+            // From here on the cursor owns the maps and its close() frees them.
+            isCursorOwningMaps = true;
+            this.slaveColumnIndex = columnIndex;
+            this.toleranceInterval = toleranceInterval;
+            this.slaveValueTimestampIndex = slaveValueTimestampIndex;
+            this.mapEvacuationThreshold = configuration.getSqlAsOfJoinMapEvacuationThreshold();
+        } catch (Throwable th) {
+            // If a map allocation or the cursor constructor throws before the cursor takes ownership,
+            // close() cannot reach the maps, so free them here.
+            if (!isCursorOwningMaps) {
+                Misc.free(joinKeyMapA);
+                Misc.free(joinKeyMapB);
+            }
+            close();
+            throw th;
+        }
     }
 
     @Override
-    public void close() {
-        joinKeyMap.close();
-        ((JoinRecordMetadata) getMetadata()).close();
-        masterFactory.close();
-        slaveFactory.close();
+    public boolean followedOrderByAdvice() {
+        return masterFactory.followedOrderByAdvice();
     }
 
     @Override
@@ -93,13 +134,20 @@ public class LtJoinRecordCursorFactory extends AbstractRecordCursorFactory {
         RecordCursor slaveCursor = null;
         try {
             slaveCursor = slaveFactory.getCursor(executionContext);
-            cursor.of(masterCursor, slaveCursor);
+            cursor.of(masterCursor, slaveCursor, executionContext);
             return cursor;
         } catch (Throwable e) {
             Misc.free(slaveCursor);
             Misc.free(masterCursor);
+            // of() may breach after reopening tracker-charged join key map(s); close() frees them and resets isOpen for reuse
+            Misc.free(cursor);
             throw e;
         }
+    }
+
+    @Override
+    public int getScanDirection() {
+        return masterFactory.getScanDirection();
     }
 
     @Override
@@ -108,35 +156,80 @@ public class LtJoinRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
-    public boolean hasDescendingOrder() {
-        return masterFactory.hasDescendingOrder();
+    public void toPlan(PlanSink sink) {
+        sink.type("Lt Join");
+        sink.attr("condition").val(joinContext);
+        sink.child(masterFactory);
+        sink.child(slaveFactory);
     }
 
-    private class LtJoinRecordCursor extends AbstractJoinCursor {
-        private final OuterJoinRecord record;
-        private final Map joinKeyMap;
+    @Override
+    protected void _close() {
+        final LtJoinRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        Throwable failure = closeJoinOwnersBestEffort();
+        failure = Misc.freeBestEffort(failure, cursor);
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    private class LtJoinRecordCursor extends AbstractSymbolWrapOverCursor {
+        private final Map joinKeyMapA;
+        private final Map joinKeyMapB;
         private final int masterTimestampIndex;
+        private final SymbolWrapOverJoinRecord record;
         private final int slaveTimestampIndex;
         private final RecordValueSink valueSink;
+        private SqlExecutionCircuitBreaker circuitBreaker;
+        private Map currentJoinKeyMap;
+        private boolean danglingSlaveRecord = false;
+        private boolean isOpen;
         private Record masterRecord;
         private Record slaveRecord;
         private long slaveTimestamp = Long.MIN_VALUE;
-        private boolean danglingSlaveRecord = false;
 
         public LtJoinRecordCursor(
                 int columnSplit,
-                Map joinKeyMap,
+                Map joinKeyMapA,
+                Map joinKeyMapB,
                 Record nullRecord,
                 int masterTimestampIndex,
                 int slaveTimestampIndex,
-                RecordValueSink valueSink
+                int masterTimestampType,
+                int slaveTimestampType,
+                RecordValueSink valueSink,
+                ColumnFilter masterTableKeyColumns,
+                int slaveWrappedOverMaster,
+                IntList slaveColumnIndex
         ) {
-            super(columnSplit);
-            this.record = new OuterJoinRecord(columnSplit, nullRecord);
-            this.joinKeyMap = joinKeyMap;
+            super(columnSplit, slaveWrappedOverMaster, masterTableKeyColumns, slaveColumnIndex, masterTimestampType, slaveTimestampType);
+            this.record = new SymbolWrapOverJoinRecord(columnSplit, nullRecord, slaveWrappedOverMaster, masterTableKeyColumns);
+            this.joinKeyMapA = joinKeyMapA;
+            this.joinKeyMapB = joinKeyMapB;
+            this.currentJoinKeyMap = joinKeyMapA;
             this.masterTimestampIndex = masterTimestampIndex;
             this.slaveTimestampIndex = slaveTimestampIndex;
             this.valueSink = valueSink;
+            this.isOpen = false;
+        }
+
+        @Override
+        public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
+            masterCursor.calculateSize(circuitBreaker, counter);
+        }
+
+        @Override
+        public void close() {
+            // Free the maps regardless of isOpen. Map.close() is idempotent, so this costs nothing when
+            // of() never ran, and it keeps the factory leak-free no matter which openOnInit the maps use.
+            // The factory can be closed without ever handing out a cursor - EXPLAIN does exactly that.
+            joinKeyMapA.close();
+            if (joinKeyMapB != null) {
+                joinKeyMapB.close();
+            }
+            if (isOpen) {
+                isOpen = false;
+                super.close();
+            }
         }
 
         @Override
@@ -145,35 +238,36 @@ public class LtJoinRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public long size() {
-            return masterCursor.size();
-        }
-
-        @Override
         public boolean hasNext() {
-
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
             if (masterCursor.hasNext()) {
-                final long masterTimestamp = masterRecord.getTimestamp(masterTimestampIndex);
+                final long masterTimestamp = scaleTimestamp(masterRecord.getTimestamp(masterTimestampIndex), masterTimestampScale);
+                final long minSlaveTimestamp = toleranceInterval == Numbers.LONG_NULL ? Long.MIN_VALUE : masterTimestamp - toleranceInterval;
                 MapKey key;
                 MapValue value;
                 long slaveTimestamp = this.slaveTimestamp;
                 if (slaveTimestamp < masterTimestamp) {
-
                     if (danglingSlaveRecord) {
-                        key = joinKeyMap.withKey();
-                        key.put(slaveRecord, slaveKeySink);
-                        value = key.createValue();
-                        valueSink.copy(slaveRecord, value);
-                        danglingSlaveRecord = false;
-                    }
-
-                    while (slaveCursor.hasNext()) {
-                        slaveTimestamp = slaveRecord.getTimestamp(slaveTimestampIndex);
-                        if (slaveTimestamp < masterTimestamp) {
-                            key = joinKeyMap.withKey();
+                        if (slaveTimestamp >= minSlaveTimestamp) {
+                            key = currentJoinKeyMap.withKey();
                             key.put(slaveRecord, slaveKeySink);
                             value = key.createValue();
                             valueSink.copy(slaveRecord, value);
+                        }
+                        danglingSlaveRecord = false;
+                    }
+
+                    evacuateJoinKeyMap(masterTimestamp);
+
+                    while (slaveCursor.hasNext()) {
+                        slaveTimestamp = scaleTimestamp(slaveRecord.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
+                        if (slaveTimestamp < masterTimestamp) {
+                            if (slaveTimestamp >= minSlaveTimestamp) {
+                                key = currentJoinKeyMap.withKey();
+                                key.put(slaveRecord, slaveKeySink);
+                                value = key.createValue();
+                                valueSink.copy(slaveRecord, value);
+                            }
                         } else {
                             danglingSlaveRecord = true;
                             break;
@@ -182,12 +276,18 @@ public class LtJoinRecordCursorFactory extends AbstractRecordCursorFactory {
 
                     this.slaveTimestamp = slaveTimestamp;
                 }
-                key = joinKeyMap.withKey();
+                key = currentJoinKeyMap.withKey();
                 key.put(masterRecord, masterKeySink);
                 value = key.findValue();
                 if (value != null) {
-                    value.setMapRecordHere();
-                    record.hasSlave(true);
+                    currentJoinKeyMap.getRecord().of(value.getStartAddress());
+                    if (toleranceInterval == Numbers.LONG_NULL) {
+                        record.hasSlave(true);
+                    } else {
+                        long slaveRecordTimestamp = scaleTimestamp(value.getTimestamp(slaveValueTimestampIndex), slaveTimestampScale);
+                        long minTimestamp = masterTimestamp - toleranceInterval;
+                        record.hasSlave(slaveRecordTimestamp >= minTimestamp);
+                    }
                 } else {
                     record.hasSlave(false);
                 }
@@ -198,25 +298,93 @@ public class LtJoinRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
+        public long preComputedStateSize() {
+            return 0;
+        }
+
+        @Override
+        public long size() {
+            return masterCursor.size();
+        }
+
+        @Override
         public void toTop() {
-            joinKeyMap.clear();
+            currentJoinKeyMap.clear();
+            currentJoinKeyMap = joinKeyMapA;
+            assert currentJoinKeyMap.size() == 0;
             slaveTimestamp = Long.MIN_VALUE;
             danglingSlaveRecord = false;
             masterCursor.toTop();
             slaveCursor.toTop();
         }
 
-        private void of(RecordCursor masterCursor, RecordCursor slaveCursor) {
-            joinKeyMap.clear();
-            slaveTimestamp = Long.MIN_VALUE;
-            danglingSlaveRecord = false;
+        /**
+         * Evacuates the join key map by copying records that are not older than `masterTimestamp - toleranceInterval`
+         * This is useful when some of the join keys are unique and the map is ever-growing.
+         *
+         * @param masterTimestamp the timestamp of the current master record
+         */
+        private void evacuateJoinKeyMap(long masterTimestamp) {
+            if (toleranceInterval == Numbers.LONG_NULL || currentJoinKeyMap.size() < mapEvacuationThreshold) {
+                return; // no need to evacuate small maps
+            }
+            assert joinKeyMapB != null : "Join key map B must not be null";
+            Map dstMap = currentJoinKeyMap == joinKeyMapA ? joinKeyMapB : joinKeyMapA;
+            assert dstMap.size() == 0 : "Evacuating non-empty map: " + dstMap.size();
+
+            MapRecordCursor srcMapCursor = currentJoinKeyMap.getCursor();
+            MapRecord srcRecord = currentJoinKeyMap.getRecord();
+            long minTimestamp = masterTimestamp - toleranceInterval;
+            while (srcMapCursor.hasNext()) {
+                MapValue srcValue = srcRecord.getValue();
+                long srcTimestamp = scaleTimestamp(srcValue.getTimestamp(slaveValueTimestampIndex), slaveTimestampScale);
+                if (srcTimestamp < minTimestamp) {
+                    continue; // skip records that are too old
+                }
+                long srcKeyHash = srcRecord.keyHashCode();
+                MapKey dstKey = dstMap.withKey();
+                srcRecord.copyToKey(dstKey);
+                MapValue dstValue = dstKey.createValue(srcKeyHash);
+                srcRecord.copyValue(dstValue);
+            }
+            currentJoinKeyMap.clear();
+            currentJoinKeyMap = dstMap;
+
+            // we need to update the record to point to the new map
+            // and we have to preserve the slave record state too since of() implicitly set hasSlave() to true
+            boolean hasSlave = record.hasSlave();
+            record.of(masterRecord, currentJoinKeyMap.getRecord());
+            record.hasSlave(hasSlave);
+        }
+
+        private void of(RecordCursor masterCursor, RecordCursor slaveCursor, SqlExecutionContext executionContext) {
+            if (!isOpen) {
+                isOpen = true;
+                joinKeyMapA.setMemoryTracker(executionContext.getMemoryTracker());
+                joinKeyMapA.reopen();
+                if (joinKeyMapB != null) {
+                    // reopen joinKeyMapB only if it was created
+                    joinKeyMapB.setMemoryTracker(executionContext.getMemoryTracker());
+                    joinKeyMapB.reopen();
+                }
+            }
+            this.circuitBreaker = executionContext.getCircuitBreaker();
+            currentJoinKeyMap = joinKeyMapA;
             this.masterCursor = masterCursor;
             this.slaveCursor = slaveCursor;
-            this.masterRecord = masterCursor.getRecord();
-            this.slaveRecord = slaveCursor.getRecord();
-            MapRecord mapRecord = joinKeyMap.getRecord();
-            mapRecord.setSymbolTableResolver(slaveCursor, columnIndex);
-            record.of(masterRecord, mapRecord);
+            slaveTimestamp = Long.MIN_VALUE;
+            danglingSlaveRecord = false;
+            masterRecord = masterCursor.getRecord();
+            slaveRecord = slaveCursor.getRecord();
+
+            MapRecord mapRecordA = joinKeyMapA.getRecord();
+            mapRecordA.setSymbolTableResolver(slaveCursor, slaveColumnIndex);
+            record.of(masterRecord, mapRecordA);
+
+            if (joinKeyMapB != null) {
+                MapRecord mapRecordB = joinKeyMapB.getRecord();
+                mapRecordB.setSymbolTableResolver(slaveCursor, slaveColumnIndex);
+            }
         }
     }
 }

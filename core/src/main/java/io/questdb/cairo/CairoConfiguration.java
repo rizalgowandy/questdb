@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,99 +25,292 @@
 package io.questdb.cairo;
 
 import io.questdb.BuildInformation;
+import io.questdb.ConfigPropertyKey;
+import io.questdb.ConfigPropertyValue;
+import io.questdb.FactoryProvider;
+import io.questdb.Metrics;
 import io.questdb.TelemetryConfiguration;
+import io.questdb.VolumeDefinitions;
+import io.questdb.cairo.idx.PostingIndexUtils;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
+import io.questdb.cutlass.qwp.codec.DefaultQwpServerInfoProvider;
+import io.questdb.cutlass.qwp.codec.QwpServerInfoProvider;
 import io.questdb.cutlass.text.TextConfiguration;
+import io.questdb.griffin.engine.table.parquet.ParquetPartitionDecoder;
+import io.questdb.mp.continuation.DelayedFireable;
+import io.questdb.mp.continuation.TimerShards;
 import io.questdb.std.FilesFacade;
-import io.questdb.std.NanosecondClock;
-import io.questdb.std.NanosecondClockImpl;
+import io.questdb.std.IOURingFacade;
+import io.questdb.std.IOURingFacadeImpl;
+import io.questdb.std.ObjHashSet;
+import io.questdb.std.ObjObjHashMap;
 import io.questdb.std.Rnd;
+import io.questdb.std.RostiAllocFacade;
+import io.questdb.std.RostiAllocFacadeImpl;
 import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.DateLocale;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.datetime.MicrosecondClock;
+import io.questdb.std.datetime.NanosecondClock;
+import io.questdb.std.datetime.TimeZoneRules;
+import io.questdb.std.datetime.microtime.MicrosecondClockImpl;
 import io.questdb.std.datetime.millitime.MillisecondClock;
+import io.questdb.std.datetime.millitime.MillisecondClockImpl;
+import io.questdb.std.datetime.nanotime.NanosecondClockImpl;
+import io.questdb.std.str.CharSink;
+import io.questdb.tasks.ColumnPurgeTask;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.Map;
+import java.util.function.LongSupplier;
+import java.util.function.ObjIntConsumer;
 
 public interface CairoConfiguration {
 
-    long O_NONE = 0;
-    long O_ASYNC = 0x40;
-    long O_SYNC = 0x80;
-    long O_DIRECT = 0x4000;
-
+    int O_ASYNC = 0x40;
+    int O_DIRECT = 0x4000;
+    int O_NONE = 0;
+    int O_SYNC = 0x80;
     ThreadLocal<Rnd> RANDOM = new ThreadLocal<>();
+
+    boolean attachPartitionCopy();
+
+    /**
+     * Flag to enable or disable symbol capacity auto-scaling. Auto-scaling means resizing
+     * symbol table data structures as the number of symbols in the table grows. Optimal sizing of
+     * these data structures ensures optimal ingres performance.
+     * <p>
+     * By default, the auto-scaling is enabled. This is optimal. You may want to disable auto-scaling in case
+     * something goes wrong.
+     *
+     * @return true - auto-scaling is enabled and false - otherwise.
+     */
+    boolean autoScaleSymbolCapacity();
+
+    /**
+     * No-zero positive value. It is used as percentage of symbol counts in
+     * the symbol table relative to the table capacity, after which table is resized. For example 0.8 would indicate
+     * that as soon as symbol count goes over 80% of the capacity, the symbol table is resized.
+     *
+     * @return resize threshold
+     */
+    double autoScaleSymbolCapacityThreshold();
+
+    boolean cairoResourcePoolTracingEnabled();
+
+    default boolean disableColumnPurgeJob() {
+        return false;
+    }
 
     boolean enableTestFactories();
 
-    int getAnalyticColumnPoolCapacity();
+    /**
+     * Exports subset of configuration parameters into a sink. Configuration
+     * parameters are exported in JSON format.
+     *
+     * @return true if anything was exported
+     */
+    default boolean exportConfiguration(CharSink<?> sink) {
+        return false;
+    }
 
-    DateFormat getBackupDirTimestampFormat();
+    default boolean freeLeakedReaders() {
+        return true;
+    }
 
-    int getBackupMkDirMode();
+    /**
+     * All effective configuration values are seen by the server instance.
+     *
+     * @return key value pairs of the configuration
+     */
+    default @Nullable ObjObjHashMap<ConfigPropertyKey, ConfigPropertyValue> getAllPairs() {
+        return null;
+    }
 
-    // null disables backups
-    CharSequence getBackupRoot();
+    boolean getAllowTableRegistrySharedWrite();
 
-    CharSequence getBackupTempDirName();
+    // the '+' is used to prevent overlap with table names
+    @NotNull
+    default String getArchivedCrashFilePrefix() {
+        return "crash+";
+    }
+
+    boolean getAsyncMunmapEnabled();
+
+    @NotNull
+    String getAttachPartitionSuffix();
 
     int getBinaryEncodingMaxLength();
 
     int getBindVariablePoolSize();
 
+    @NotNull
     BuildInformation getBuildInformation();
 
-    int getColumnCastModelPoolCapacity();
+    default boolean getBypassWalFdCache() {
+        // If wal fd re-usage is not allowed it means fd cache should not be used for wal and sequencer files.
+        // This typically means that those files be renamed/replaced outside QuestDB java code.
+        return getWalMaxSegmentFileDescriptorsCache() < 1;
+    }
+
+    boolean getCairoSqlLegacyOperatorPrecedence();
+
+    @NotNull
+    default CheckpointListener getCheckpointListener() {
+        return DefaultCheckpointListener.INSTANCE;
+    }
+
+    /**
+     * Enable/disable full rebuild of bitmap indexes for symbol columns in partitions
+     */
+    boolean getCheckpointRecoveryRebuildColumnIndexes();
+
+    /**
+     * Maximum thread pool size for checkpoint recovery operations.
+     * The actual size is determined by clamping the available processor count between min and max.
+     */
+    int getCheckpointRecoveryThreadpoolMax();
+
+    /**
+     * Minimum thread pool size for checkpoint recovery operations.
+     * The actual size is determined by clamping the available processor count between min and max.
+     */
+    int getCheckpointRecoveryThreadpoolMin();
+
+    @NotNull
+    CharSequence getCheckpointRoot(); // same as root/../.checkpoint
+
+    @NotNull
+    SqlExecutionCircuitBreakerConfiguration getCircuitBreakerConfiguration();
+
+    /**
+     * Maximum size for a generated alias, the column will be truncated if it's longer than that. Note
+     * that this flag only works if isColumnAliasExpressionEnabled is enabled.
+     *
+     * @return the maximum size of a generated alias.
+     */
+    int getColumnAliasGeneratedMaxSize();
 
     int getColumnIndexerQueueCapacity();
 
     int getColumnPurgeQueueCapacity();
 
-    int getColumnPurgeTaskPoolCapacity();
-
-    int getColumnPurgeRetryLimitDays();
-
-    double getColumnPurgeRetryDelayMultiplier();
-
-    /**
-     * Default commit lag in microseconds for new tables. This value
-     * can be overridden with 'create table' statement.
-     *
-     * @return commit lag in microseconds
-     */
-    long getCommitLag();
-
-    int getCommitMode();
-
-    CharSequence getConfRoot(); // same as root/../conf
+    long getColumnPurgeRetryDelay();
 
     long getColumnPurgeRetryDelayLimit();
 
-    long getColumnPurgeRetryDelay();
+    double getColumnPurgeRetryDelayMultiplier();
 
-    CharSequence getSnapshotRoot(); // same as root/../snapshot
-
-    /**
-     * Returns database instance id. The instance id is used by the snapshot recovery mechanism:
-     * on database start the id is compared with the id stored in a snapshot, if any. If the ids
-     * are different, snapshot recovery is being triggered.
-     *
-     * @return instance id.
-     */
-    CharSequence getSnapshotInstanceId();
-
-    CharSequence getSystemTableNamePrefix();
+    int getColumnPurgeTaskPoolCapacity();
 
     /**
-     * A flag to enable/disable snapshot recovery mechanism. Defaults to {@code true}.
+     * Receives the task and the offset in {@link ColumnPurgeTask#getUpdatedColumnInfo()} of each entry
+     * whose files the column purge job leaves in place because DROP PARTITION, ATTACH, DETACH or
+     * TRUNCATE changed the truncate version of the table after the purge was queued. The purge log
+     * marks such an entry completed, as it marks a purged one, so tests read the refusals here.
      *
-     * @return enable/disable snapshot recovery flag
+     * @return the listener, or null when nothing listens
      */
-    boolean isSnapshotRecoveryEnabled();
+    @Nullable
+    default ObjIntConsumer<ColumnPurgeTask> getColumnPurgeTruncateRefusalListener() {
+        return null;
+    }
+
+    long getCommitLatency();
+
+    int getCommitMode();
+
+    /**
+     * Minimum interval, in milliseconds, between durable epochs of one table under {@link CommitMode#ADAPTIVE}.
+     * {@code 0} advances the epoch on every apply batch; a negative value disables adaptive epochs, including
+     * the {@link #getAdaptiveEpochMaxRows()} cap, which is a deliberate opt-out: the WAL is then never purged
+     * and recovery replays all of it.
+     * <p>This default (1000 ms) serves embedded configurations and tests; the server default is 60000 ms since
+     * {@link #getAdaptiveEpochMaxRows()} already bounds the backlog under load.
+     *
+     * @return the minimum per-table durable-epoch interval in milliseconds; negative disables epochs
+     */
+    default long getAdaptiveEpochIntervalMs() {
+        return 1000;
+    }
+
+    /**
+     * The maximum rows applied to a table since its last durable epoch before the apply worker advances the
+     * epoch, independent of {@link #getAdaptiveEpochIntervalMs()}. Bounds post-epoch WAL retention and
+     * post-crash recovery-replay lag so the interval can stay long. {@code <= 0} disables the cap.
+     *
+     * @return the per-table un-epoched applied-row cap; {@code <= 0} disables it
+     */
+    default long getAdaptiveEpochMaxRows() {
+        return 5_000_000;
+    }
+
+    /**
+     * The adaptive group-commit window in microseconds ({@code cairo.adaptive.commit.group.window}). Under
+     * {@link CommitMode#ADAPTIVE}, {@code commit0} makes the writer's own segment files durable, then returns
+     * once the shared sequencer record is in the page cache; the sequencer fdatasync is batched across the
+     * commits within the window. {@code localDurableSeqTxn}, the durable-ack frontier, advances only when
+     * that fdatasync completes, so a crash loses only commits whose batch fdatasync had not completed.
+     * <p>{@code 0} fdatasyncs each commit before {@code commit0} returns, at {@code sync} latency; a negative
+     * value counts as {@code 0}. Other modes ignore the setting; the mat-view refresh WAL always fdatasyncs.
+     *
+     * @return the group-commit window in microseconds; {@code 0} commits synchronously
+     */
+    default long getAdaptiveCommitGroupWindowUs() {
+        return 50_000;
+    }
+
+    /**
+     * Whether startup recovery ({@link RecoveryCoordinator}) restores each WAL table that has a save point
+     * from it, before WAL apply replays the transactions after it. When {@code false}, startup refuses a
+     * table that has a save point rather than expose applied state that may be torn; no effect otherwise.
+     * Not a server property: only tests turn it off, to drive the refusal path.
+     *
+     * @return {@code true} to run the adaptive epoch roll-forward on startup
+     */
+    default boolean isAdaptiveRecoveryRollForwardEnabled() {
+        return true;
+    }
+
+    /**
+     * Whether a clean {@link io.questdb.cairo.TableWriter} close flushes a final durable epoch over any
+     * committed tail the last epoch does not cover (ADAPTIVE only). When {@code true} (default), a graceful
+     * close advances the durable epoch to the committed frontier, leaving nothing to roll forward; when
+     * {@code false}, the tail is left for the next boot's idempotent WAL replay. No effect otherwise.
+     *
+     * @return {@code true} to flush a durable epoch on a clean writer close
+     */
+    default boolean isAdaptiveEpochFlushOnClose() {
+        return true;
+    }
+
+    int getCompileViewModelPoolCapacity();
+
+    @NotNull
+    CharSequence getConfRoot(); // same as root/../conf
+
+    /**
+     * Returns the forced copier type for testing, or COPIER_TYPE_DEFAULT for auto-selection.
+     * See RecordToRowCopierUtils.COPIER_TYPE_* constants.
+     */
+    default int getCopierType() {
+        return 0; // COPIER_TYPE_DEFAULT
+    }
+
+    @NotNull
+    LongSupplier getCopyIDSupplier();
 
     int getCopyPoolCapacity();
 
+    int getCountDistinctCapacity();
+
+    double getCountDistinctLoadFactor();
+
     int getCreateAsSelectRetryCount();
 
-    int getCreateTableModelPoolCapacity();
+    int getCreateTableColumnModelPoolCapacity();
+
+    long getCreateTableModelBatchSize();
 
     long getDataAppendPageSize();
 
@@ -129,42 +322,361 @@ public interface CairoConfiguration {
 
     long getDatabaseIdLo();
 
+    @NotNull
     CharSequence getDbDirectory(); // env['cairo.root'], defaults to db
 
+    @Nullable
+    String getDbLogName();
+
+    @NotNull
+    String getDbRoot(); // some folder with suffix env['cairo.root'] e.g. /.../db
+
+    boolean getDebugWalApplyBlockFailureNoRetry();
+
+    /**
+     * Upper bound on how many WAL transactions {@code WalTxnDetails.calculateInsertTransactionBlock}
+     * may fold into a single commit. Unlimited by default; a small value makes each transaction land
+     * on its own, which is what a test needs when it wants a later transaction to merge INTO data an
+     * earlier one already put on disk rather than be sorted alongside it into a partition the same
+     * commit creates.
+     */
+    int getDebugWalApplyMaxTxnBlockSize();
+
+    @NotNull
     DateLocale getDefaultDateLocale();
 
-    CharSequence getDefaultMapType();
+    int getDefaultSeqPartTxnCount();
 
     boolean getDefaultSymbolCacheFlag();
 
     int getDefaultSymbolCapacity();
 
-    int getDoubleToStrCastScale();
+    byte getDefaultSymbolIndexType();
+
+    int getDetachedMkDirMode();
+
+    default Map<String, String> getEnv() {
+        return System.getenv();
+    }
+
+    int getExplainPoolCapacity();
+
+    @NotNull
+    FactoryProvider getFactoryProvider();
+
+    boolean getFileDescriptorCacheEnabled();
 
     int getFileOperationRetryCount();
 
+    @NotNull
     FilesFacade getFilesFacade();
 
-    int getFloatToStrCastScale();
+    long getGroupByAllocatorDefaultChunkSize();
+
+    long getGroupByAllocatorMaxChunkSize();
+
+    int getGroupByBatchSize();
 
     int getGroupByMapCapacity();
 
+    int getGroupByMergeShardQueueCapacity();
+
+    long getGroupByParallelTopKThreshold();
+
     int getGroupByPoolCapacity();
+
+    long getGroupByPresizeMaxCapacity();
+
+    long getGroupByPresizeMaxHeapSize();
+
+    int getGroupByShardingThreshold();
+
+    int getGroupByTopKQueueCapacity();
+
+    @NotNull
+    default IOURingFacade getIOURingFacade() {
+        return IOURingFacadeImpl.INSTANCE;
+    }
+
+    int getIdGenerateBatchStep();
 
     long getIdleCheckInterval();
 
+    int getInactiveReaderMaxOpenPartitions();
+
     long getInactiveReaderTTL();
+
+    long getInactiveViewWalWriterTTL();
+
+    long getInactiveWalWriterTTL();
 
     long getInactiveWriterTTL();
 
     int getIndexValueBlockSize();
 
-    // null input root disables "copy" sql
-    CharSequence getInputRoot();
+    long getInsertModelBatchSize();
 
-    int getInsertPoolCapacity();
+    int getInsertModelPoolCapacity();
+
+    /**
+     * Installation root, i.e., the directory that usually contains the "conf", "db", etc. directories.
+     */
+    @NotNull
+    String getInstallRoot();
+
+    int getJsonUnnestMaxValueSize();
 
     int getLatestByQueueCapacity();
+
+    @NotNull
+    CharSequence getLegacyCheckpointRoot(); // same as root/../snapshot
+
+    /**
+     * Cadence, in live-view checkpoint seals, at which the refresh worker attempts
+     * one physical compaction pass over the live view's checkpoint timeline.
+     * Compaction repacks the still-live state pages of sparse data segments into a
+     * fresh segment and redirects the roots onto it, so the drained segments retire
+     * and the purge job reclaims their dead bytes. Zero (the default) disables it,
+     * leaving superseded pages to be reclaimed only when their whole segment
+     * becomes unreferenced.
+     */
+    long getLiveViewCheckpointCompactionInterval();
+
+    /**
+     * Wall-clock ceiling between consecutive head-checkpoint writes for a
+     * live view. The refresh worker writes a fresh head once this duration
+     * has elapsed since the prior write, even when
+     * {@link #getLiveViewCheckpointRows()} has not been reached. Caps the
+     * worst-case O3 / restart replay window for low-rate views.
+     */
+    long getLiveViewCheckpointMaxDurationMicros();
+
+    /**
+     * Cadence, in live-view checkpoint seals, at which the refresh worker sweeps
+     * the view's checkpoint directory for segments no generation references any
+     * more, unlinking them and staging their catalogue entries for the next seal
+     * to remove. Without it a sweep runs only when a worker reconciles the
+     * directory - once per process - so every segment a seal, a repair or a
+     * compaction supersedes waits for a restart before its bytes come back. Zero
+     * disables the cadence, leaving that reconciliation the only sweep.
+     */
+    long getLiveViewCheckpointPurgeInterval();
+
+    /**
+     * Per-turn budget on the base rows one localized out-of-order repair may
+     * replay. The repair's convergence boundary makes its work finite, but a
+     * dense interval can still hold more rows than one refresh turn should
+     * carry, so a replay that crosses this budget stops at the end of the
+     * current timestamp group and continues in a later turn. It publishes
+     * nothing while suspended: the replacement stays uncommitted in the
+     * live-view writer the repair holds, and no generation names its staged
+     * roots. The turn also ends on
+     * {@link #getLiveViewRefreshTurnMaxDurationMicros()}, whichever comes
+     * first. A value {@code <= 0} disables the row budget, leaving the
+     * wall-clock one alone to bound the turn.
+     */
+    long getLiveViewCheckpointRepairReplayMaxRows();
+
+    /**
+     * Budget on the partition keys one localized out-of-order repair may plan
+     * to re-emit. A timestamp-global replacement re-emits every key with a
+     * qualifying row in the replacement interval, and the repair holds a
+     * counter per such key while it discovers its bounds, so the key domain
+     * sizes both the planning memory and, for an indexed predecessor search,
+     * the number of index seeks. A discovery that crosses this budget reports
+     * an explicit budget status and hands the repair back to the unlocalized
+     * rebuild instead of planning a replacement of that width. A value
+     * {@code <= 0} disables the budget.
+     */
+    long getLiveViewCheckpointRepairScanMaxKeys();
+
+    /**
+     * Budget on the base rows one localized out-of-order repair may read while
+     * discovering its bounds. Counts rows pulled from the base table across
+     * every scan of one discovery - forward convergence search, backward
+     * predecessor walk, and per-key indexed seeks alike - including rows the
+     * view's {@code WHERE} filter then discards, since those cost the same read.
+     * A {@code ROWS N PRECEDING} dependency is discovered rather than derived,
+     * and a sparse partition key can spread its {@code N} rows over an
+     * arbitrary span, so this is the bound that keeps discovery from costing
+     * the view's whole history. Crossing it reports an explicit budget status
+     * and leaves the conservative bound in place rather than continuing the
+     * scan. A value {@code <= 0} disables the budget.
+     */
+    long getLiveViewCheckpointRepairScanMaxRows();
+
+    /**
+     * Row-count cadence trigger for head-checkpoint writes. The refresh
+     * worker writes a fresh head once this many live-view rows have been
+     * applied since the prior head. The natural sizing knob for high-rate
+     * views: raising it spaces checkpoints further apart at the cost of a
+     * larger O3 / restart replay window.
+     */
+    long getLiveViewCheckpointRows();
+
+    int getLiveViewFlushRetryMax();
+
+    long getLiveViewFlushRetryMaxDurationMicros();
+
+    /**
+     * Fast-path growth budget. When the published in-memory slot's footprint
+     * already meets or exceeds this size, the refresh worker falls
+     * back to a slow-path swap (which evicts rows older than {@code IN MEMORY}
+     * and may shrink the slot) instead of appending in place. Acts as a
+     * safety backstop against unbounded slot growth between slow-path edges.
+     * Operators with an {@code IN MEMORY} window large enough to exceed the
+     * default should raise this proportionally to keep the fast-path engaged.
+     */
+    long getLiveViewInMemoryBufferGrowthBytes();
+
+    long getLiveViewInMemoryBufferInitialBytes();
+
+    long getLiveViewInMemoryMaxMicros();
+
+    /**
+     * Reclaimable-partition threshold for the frontier sweep in {@code LiveViewWindow}. The
+     * sweep drops the anchor-map partitions that have fallen behind the previous anchor
+     * bucket, and it runs only once the anchor has advanced past a bucket boundary since the
+     * last sweep and all three of these hold together: the anchor map holds more partitions
+     * than this threshold, at least this many of them are reclaimable, and the reclaimable
+     * ones are at least half the map. A higher value leaves the anchor map larger between
+     * sweeps; a lower one sweeps more often. Neither matters for a view whose anchor is not
+     * provably monotone, or is NULL - such a view never compacts, at any value of this key.
+     */
+    int getLiveViewPartitionCompactThreshold();
+
+    /**
+     * @return the byte limit applied to one live view's refresh, measured as the PEAK of a
+     * refresh cycle. {@code 0} means unlimited; only the global RSS limit applies.
+     * <p>
+     * The tracker is per-view and its lifetime matches the view's cached state, not one
+     * refresh attempt, because the persistent part of that state - the anchor map plus each
+     * anchored window function's partition map and ring buffers - outlives the cycle that
+     * built it. Unlike a query or a materialized-view refresh, this state is what the limit
+     * exists to bound: it is the only backstop for a view whose ANCHOR cannot drive frontier
+     * compaction (a LONG/INT anchor, or any anchor not provably monotone with the base scan
+     * order), since such a view retains every partition key it has ever seen.
+     * <p>
+     * The tracker also charges the transient per-cycle buffers of the view's compiled SELECT:
+     * LiveViewRefreshSqlExecutionContext hands it to AbstractPageFrameRecordCursor, which binds
+     * it into the frame memory pool and so into RowGroupBuffers. Parquet decode buffers are
+     * therefore charged alongside the persistent state, and freed at cursor close, so the
+     * accounting stays symmetric across cycles but the limit bounds the cycle's peak rather
+     * than its residue. Size the limit to include those transients: a peak that crosses it
+     * invalidates the view (LiveViewRefreshJob.handleRefreshFailure invalidates immediately on
+     * a limit breach rather than spending the retry budget), and invalidation is durable and
+     * sticky - recovery is an operator DROP + CREATE.
+     * <p>
+     * Two floors dominate that sizing. A view reading parquet partitions decodes a whole row
+     * group at a time. And a view whose SELECT binds a ring buffer - any RANGE frame, or a
+     * {@code PARTITION BY} ROWS / lag() / lead() ring - charges a whole
+     * {@link #getSqlWindowStorePageSize()} (1 MiB by default) on its first allocation (its
+     * first partition, where the frame is partitioned), however small the frame: the ring is
+     * created at page granularity. A NON-partitioned ROWS or
+     * lag()/lead() ring is fixed by the query text and stays on global accounting, so it
+     * imposes no floor here (see {@code WindowFunction.setMemoryTracker}).
+     */
+    long getLiveViewRefreshMemoryLimitBytes();
+
+    int getLiveViewRefreshTurnMaxCommits();
+
+    long getLiveViewRefreshTurnMaxDurationMicros();
+
+    /**
+     * Worker count of the dedicated live-view refresh pool
+     * ({@code live.view.refresh.worker.count}). A positive value is what makes
+     * {@code ServerMain} start {@code LiveViewRefreshJob}s at all, so it is also the
+     * signal {@link #isLiveViewRefreshEnabled()} reads. Lives on the cairo
+     * configuration rather than only on the pool configuration because the engine and
+     * {@code WalPurgeJob} have to answer "will anything ever refresh a live view?"
+     * without reaching into the server configuration.
+     */
+    int getLiveViewRefreshWorkerCount();
+
+    boolean getLogLevelVerbose();
+
+    boolean getLogSqlQueryProgressExe();
+
+    DateFormat getLogTimestampFormat();
+
+    String getLogTimestampTimezone();
+
+    DateLocale getLogTimestampTimezoneLocale();
+
+    TimeZoneRules getLogTimestampTimezoneRules();
+
+    long getMatViewInsertAsSelectBatchSize();
+
+    int getMatViewMaxRefreshIntervals();
+
+    int getMatViewMaxRefreshRetries();
+
+    long getMatViewMaxRefreshStepUs();
+
+    int getMatViewRefreshBusyRetryLimit();
+
+    long getMatViewRefreshBusyRetryTimeout();
+
+    long getMatViewRefreshIntervalsUpdatePeriod();
+
+    int getMatViewRefreshMaxClusters();
+
+    /**
+     * @return the per-event byte limit applied to one materialized view refresh
+     * attempt. {@code 0} means unlimited; only the global RSS limit applies.
+     */
+    long getMatViewRefreshMemoryLimitBytes();
+
+    /**
+     * The number of materialized view partitions, across all views, for which the EXPIRE ROWS cleanup job
+     * remembers that the partition is unchanged and holds no expired row, so that its next run skips the
+     * partition instead of counting its rows again.
+     * <p>
+     * The job remembers partitions for a policy that decides each row from that row's own data. The
+     * exception is a policy that is a single comparison putting the designated timestamp below a
+     * TIMESTAMP-typed constant ({@code ts < T}, {@code ts <= T}, {@code T > ts}, {@code T >= ts}); the job
+     * decides those partitions from their bounds instead. A string or numeric threshold such as
+     * {@code ts < '2024-01-03'} binds as STRING or LONG, so it uses the cache.
+     * <p>
+     * Once the job remembers this many partitions, it keeps those and adds no more, so each run counts the
+     * rows of every other unchanged partition again. The job keeps this information in memory only, so its
+     * first run after a restart counts the rows of every partition once. Set 0 to make every run count every
+     * partition.
+     */
+    int getMatViewRowExpiryCleanupMaxCachedPartitions();
+
+    /**
+     * The fraction of a materialized view partition's rows that must be expired before the EXPIRE ROWS
+     * cleanup job compacts that partition. To compact a partition, the job rewrites all of the rows that
+     * are not expired.
+     * <p>
+     * This value doesn't apply to a fully expired partition because deleting it wholesale is a cheap
+     * operation. It concerns a partition that's only partially expired, specifically when the expiration
+     * policy is based on wall clock time, such as {@code ts < now() - 7d}. When the job checks this
+     * partition, it will find more rows that are newly expired due to the passage of time. It will want
+     * to copy all the surviving rows to a new partition file, and this will repeat on every cleanup run.
+     * <p>
+     * To prevent copying the partition data over and over, there's a threshold configured by this value:
+     * what fraction of the partition must be expired to warrant the copying of still-live data.
+     * A value of 0 makes the job compact a partition whenever any row expires. A value of 1 stops
+     * all compaction, and the job then frees the disk only when it reclaims a full partition.
+     * <p>
+     * This value applies to clock-based policies only. A clock-free predicate, such as {@code v < 2.0},
+     * decides each row from that row's own data, so the expired fraction of a partition changes only when
+     * the partition's rows change. One compaction pass clears the partition, and the job leaves it alone
+     * until a later refresh back-fills rows into it. The job therefore copies such a partition once per
+     * back-fill rather than once per cleanup run, and copies nothing at all while nothing writes to the
+     * view.
+     */
+    double getMatViewRowExpiryCleanupMinExpiredFraction();
+
+    long getMatViewRowsPerQueryEstimate();
+
+    int getMaxCrashFiles();
+
+    int getMaxFileNameLength();
+
+    int getMaxSqlRecompileAttempts();
 
     int getMaxSwapFileCount();
 
@@ -172,9 +684,19 @@ public interface CairoConfiguration {
 
     int getMaxUncommittedRows();
 
-    MicrosecondClock getMicrosecondClock();
+    int getMetadataPoolCapacity();
 
-    MillisecondClock getMillisecondClock();
+    Metrics getMetrics();
+
+    @NotNull
+    default MicrosecondClock getMicrosecondClock() {
+        return MicrosecondClockImpl.INSTANCE;
+    }
+
+    @NotNull
+    default MillisecondClock getMillisecondClock() {
+        return MillisecondClockImpl.INSTANCE;
+    }
 
     long getMiscAppendPageSize();
 
@@ -190,36 +712,300 @@ public interface CairoConfiguration {
 
     int getO3CopyQueueCapacity();
 
+    int getO3LagCalculationWindowsSize();
+
+    default double getO3LagDecreaseFactor() {
+        return 0.5;
+    }
+
+    default double getO3LagIncreaseFactor() {
+        return 1.5;
+    }
+
+    /**
+     * @deprecated Use {@link #getO3PartitionMaxSplits()}.
+     */
+    @Deprecated
+    int getO3LastPartitionMaxSplits();
+
+    /**
+     * How many partitions a writer keeps merge-append frames open for across commits - see
+     * {@link io.questdb.cairo.frm.file.CompositeFrameCache}. 0 disables the cache.
+     */
+    int getO3PartitionMergeAppendFrameCacheSize();
+
+    /**
+     * Default commit lag in microseconds for new tables. This value
+     * can be overridden with 'create table' statement.
+     *
+     * @return upper bound of "commit lag" in micros
+     */
+    long getO3MaxLag();
+
+    int getO3MemMaxPages();
+
+    /**
+     * Split cap for a logical partition behind the last one of a non-WAL table, applied by the commit. The
+     * compaction sweep does not serve non-WAL tables. WAL tables use {@link #getO3PartitionMaxSplits()} for
+     * every logical partition and leave folding older days to the sweep.
+     */
+    int getO3MidPartitionMaxSplits();
+
+    long getO3PartitionClusterBinWidth();
+
+    int getO3PartitionClusterMaxBins();
+
+    default int getO3PartitionMaxSplits() {
+        return getO3LastPartitionMaxSplits();
+    }
+
+    long getO3MinLag();
+
+    int getO3PartitionPreSplitMaxCuts();
+
     int getO3OpenColumnQueueCapacity();
+
+    int getO3PartitionPreSplitMinPieceMultiple();
 
     int getO3PartitionQueueCapacity();
 
-    int getO3PartitionUpdateQueueCapacity();
-
     int getO3PurgeDiscoveryQueueCapacity();
 
-    boolean isSqlParallelFilterEnabled();
-
-    int getPageFrameReduceQueueCapacity();
-
-    int getPageFrameReduceShardCount();
-
-    int getPageFrameReduceRowIdListCapacity();
+    // the '+' is used to prevent overlap with table names
+    @NotNull
+    default String getOGCrashFilePrefix() {
+        return "hs_err_pid+";
+    }
 
     int getPageFrameReduceColumnListCapacity();
 
-    int getPageFrameReduceTaskPoolCapacity();
+    int getPageFrameReduceQueueCapacity();
+
+    int getPageFrameReduceRowIdListCapacity();
+
+    int getPageFrameReduceShardCount();
 
     int getParallelIndexThreshold();
 
+    long getParquetExportBatchSize();
+
+    double getParquetExportBloomFilterFpp();
+
+    int getParquetExportCompressionCodec();
+
+    int getParquetExportCompressionLevel();
+
+    int getParquetExportCopyReportFrequencyLines();
+
+    int getParquetExportDataPageSize();
+
+    int getParquetExportRowGroupSize();
+
+    CharSequence getParquetExportTableNamePrefix();
+
+    int getParquetExportVersion();
+
+    long getPartitionCompactionAvgRowsPieceLim();
+
+    long getPartitionCompactionCheckInterval();
+
+    long getPartitionCompactionDeadMinSize();
+
+    double getPartitionCompactionDeadRowsRatio();
+
+    long getPartitionCompactionDeclineBackoffMax();
+
+    long getPartitionCompactionDeclineBackoffMin();
+
+    int getPartitionCompactionDeclineBackoffMultiplier();
+
+    int getPartitionCompactionHotCommits();
+
+    long getPartitionCompactionIdleTimeout();
+
+    long getPartitionCompactionIoBudget();
+
+    int getPartitionCompactionIoCostMultiplier();
+
+    int getPartitionCompactionMoveTailDeadRowsPercent();
+
+    int getPartitionCompactionMoveTailPieceThreshold();
+
+    int getPartitionCompactionMoveTailPrefixMultiple();
+
+    int getPartitionCompactionPieceThreshold();
+
+    /**
+     * How long every folder of a logical partition - the main directory and all its MOVE-TAIL splits - has to
+     * have been idle before the background sweep merges the whole logical partition into a single folder. Always
+     * at or below {@link #getPartitionCompactionIdleTimeout()}, which is the threshold for compacting one
+     * composite folder on its own.
+     */
+    long getPartitionCompactionSquashIdleTimeout();
+
+    int getPartitionCompactionSquashTargetSizeMultiple();
+
+    long getPartitionCompactionSwapTimeout();
+
+    int getPartitionCompactionTableDeadStopPercent();
+
+    int getPartitionCompactionTableDeadStopTriggerPercent();
+
+    long getPartitionCompactionTableDeadThreshold();
+
+    int getPartitionCompactionTableDeadThresholdPercent();
+
+    long getPartitionCompactionTableDeadTrigger();
+
+    default double getPartitionCompactionTablePressureDeadRatio() {
+        return 0.5;
+    }
+
+    long getPartitionCompactionTimeBudgetMs();
+
+    double getPartitionEncoderParquetBloomFilterFpp();
+
+    int getPartitionEncoderParquetCompressionCodec();
+
+    int getPartitionEncoderParquetCompressionLevel();
+
+    int getPartitionEncoderParquetDataPageSize();
+
+    double getPartitionEncoderParquetMinCompressionRatio();
+
+    long getPartitionEncoderParquetO3RewriteUnusedMaxBytes();
+
+    double getPartitionEncoderParquetO3RewriteUnusedRatio();
+
+    int getPartitionEncoderParquetRowGroupSize();
+
+    int getPartitionEncoderParquetVersion();
+
+    long getPartitionO3SplitMinSize();
+
     int getPartitionPurgeListCapacity();
 
+    int getPivotColumnPoolCapacity();
+
+    int getPoolSegmentSize();
+
+    /**
+     * Threshold at which the adaptive posting-index row-id encoder forces
+     * DELTA instead of running the size-only EF-vs-DELTA race. When a key has
+     * {@code >= getPostingIndexAdaptiveDeltaAtOrAbove()} row IDs the writer
+     * skips EF and emits DELTA directly. Default 2000.
+     * <p>
+     * The size-only adaptive pick is essentially a coin-flip at large counts
+     * because both encodings produce similar byte sizes, but DELTA reads
+     * markedly faster (per-block unpack, cache-line-friendly) than EF for
+     * dense keys that span a long high-bits bitmap. For Zipfian-skewed
+     * workloads with hot keys at 100k+ row IDs the threshold lifts point /
+     * scan / range queries by 15-60% with no measurable regression on
+     * uniform-distribution scenarios where keys stay below the threshold.
+     * <p>
+     * Set to {@link Integer#MAX_VALUE} to restore pure size comparison.
+     */
+    default int getPostingIndexAdaptiveDeltaAtOrAbove() {
+        return 2000;
+    }
+
+    default double getPostingIndexAlignedBitWidthThreshold() {
+        return 0.0;
+    }
+
+    default byte getPostingIndexRowIdEncoding() {
+        return PostingIndexUtils.ENCODING_ADAPTIVE;
+    }
+
+    /**
+     * Maximum bytes the posting index writer's per-key spill buffers may hold
+     * before it triggers a mid-stream {@code flushAllPending} + free cycle to
+     * bound peak RSS during long indexing runs (ALTER ADD INDEX TYPE POSTING,
+     * IndexBuilder, the per-O3-seal rebuild loop). Returning {@code 0} or a
+     * negative value disables the back-pressure entirely (legacy behaviour:
+     * accumulate until {@code seal()}). Default is 256 MiB.
+     */
+    default long getPostingIndexerSpillBytesMax() {
+        return 256L << 20;
+    }
+
+    int getPostingSealGenThreshold();
+
+    /**
+     * Hard cap on the per-writer in-memory outbox of superseded posting-seal
+     * generations awaiting publish to the global purge queue. When the cap
+     * is reached the writer evicts the oldest entry and emits a critical
+     * log message -- the file the entry pointed at is then left on disk (a
+     * bounded leak); no writer-open scan reclaims it.
+     * <p>
+     * Sized for steady-state operation where the purge queue is healthy. If
+     * the queue is saturated for an extended period (e.g. background job
+     * disabled) the outbox saturates and oldest entries are dropped, leaking
+     * their files until the partition is rewritten -- keep the purge job
+     * running to avoid this.
+     */
+    default int getPostingSealPurgeOutboxMax() {
+        return 8192;
+    }
+
+    int getPreferencesStringPoolCapacity();
+
+    int getQueryCacheEventQueueCapacity();
+
+    long getQueryContinuationWakeIntervalMillis();
+
+    /**
+     * @return the per-query byte limit applied to user SQL execution. {@code 0}
+     * means unlimited; only the global RSS limit applies.
+     */
+    long getQueryMemoryLimitBytes();
+
+    int getQueryRegistryPoolSize();
+
+    /**
+     * Operator override for the zstd compression level used on QWP egress
+     * {@code RESULT_BATCH} frames. Default {@code 0} means "honor the
+     * client-negotiated level" -- the server uses whatever the client
+     * advertised via {@code X-QWP-Accept-Encoding}, clamped to the wire
+     * range {@code [COMPRESSION_ZSTD_MIN_LEVEL, COMPRESSION_ZSTD_MAX_LEVEL]}.
+     * <p>
+     * A value in {@code [1, 9]} forces every ZSTD-negotiated connection on
+     * this server to use that level regardless of what the client asked
+     * for; out-of-range values are clamped at the override site. A misbehaving
+     * client cannot raise the server's CPU spend above the operator's chosen
+     * ceiling. The {@code X-QWP-Content-Encoding} response header echoes
+     * the effective (post-override) level so the client can observe what was
+     * actually used.
+     * <p>
+     * Read from the configuration object on every handshake (not cached at
+     * processor construction), so a live config reload takes effect on the
+     * next new connection. Connections already established keep their
+     * already-built ZSTD contexts -- runtime mutation of an in-flight cctx
+     * level is not safe.
+     */
+    default int getQwpEgressForcedZstdLevel() {
+        return 0;
+    }
+
+    /**
+     * Source of the role / cluster / node identity emitted in the QWP egress
+     * {@code SERVER_INFO} frame. Default is the standalone OSS provider; the
+     * Enterprise configuration overrides this with a provider backed by the
+     * live replication role so clients can route reads to primary vs replica.
+     */
+    @NotNull
+    default QwpServerInfoProvider getQwpServerInfoProvider() {
+        return DefaultQwpServerInfoProvider.INSTANCE;
+    }
+
+    @NotNull
     default Rnd getRandom() {
         Rnd rnd = RANDOM.get();
         if (rnd == null) {
             RANDOM.set(rnd = new Rnd(
-                    getNanosecondClock().getTicks(),
-                    getMicrosecondClock().getTicks())
+                            getNanosecondClock().getTicks(),
+                            getMicrosecondClock().getTicks()
+                    )
             );
         }
         return rnd;
@@ -227,29 +1013,55 @@ public interface CairoConfiguration {
 
     int getReaderPoolMaxSegments();
 
+    int getRecentWriteTrackerCapacity();
+
     int getRenameTableModelPoolCapacity();
 
-    CharSequence getRoot(); // some folder with suffix env['cairo.root'] e.g. /.../db
+    int getRepeatMigrationsFromVersion();
 
-    int getSampleByIndexSearchPageSize();
-
-    int getRndFunctionMemoryPageSize();
+    int getRmdirMaxDepth();
 
     int getRndFunctionMemoryMaxPages();
 
-    long getSpinLockTimeoutUs();
+    int getRndFunctionMemoryPageSize();
 
-    int getSqlAnalyticRowIdMaxPages();
+    @NotNull
+    default RostiAllocFacade getRostiAllocFacade() {
+        return RostiAllocFacadeImpl.INSTANCE;
+    }
 
-    int getSqlAnalyticRowIdPageSize();
+    boolean getSampleByDefaultAlignmentCalendar();
 
-    int getSqlAnalyticStoreMaxPages();
+    /**
+     * Selects the sort backend the SAMPLE BY FILL fast path stacks above
+     * the GROUP BY output. Returns one of {@link SampleBySortStrategy}'s int
+     * constants. The default is {@link SampleBySortStrategy#LIGHT_ENCODED}.
+     */
+    int getSampleByFillSortStrategy();
 
-    int getSqlAnalyticStorePageSize();
+    int getSampleByIndexSearchPageSize();
 
-    int getSqlAnalyticTreeKeyMaxPages();
+    long getSequencerCheckInterval();
 
-    int getSqlAnalyticTreeKeyPageSize();
+    long getSequencerCheckMinInterval();
+
+    /**
+     * Returns database instance id. The instance id is used by the snapshot recovery mechanism:
+     * on database start the id is compared with the ID stored in the checkpoint, if any. If the ids
+     * are different, snapshot recovery is being triggered.
+     *
+     * @return instance id.
+     */
+    @NotNull
+    CharSequence getSnapshotInstanceId();
+
+    long getSpinLockTimeout();
+
+    int getSqlAsOfJoinLookAhead();
+
+    int getSqlAsOfJoinMapEvacuationThreshold();
+
+    int getSqlAsOfJoinShortCircuitCacheCapacity();
 
     int getSqlCharacterStoreCapacity();
 
@@ -257,9 +1069,23 @@ public interface CairoConfiguration {
 
     int getSqlColumnPoolCapacity();
 
-    double getSqlCompactMapLoadFactor();
+    int getSqlCompilerPoolCapacity();
 
     int getSqlCopyBufferSize();
+
+    int getSqlCopyExportQueueCapacity();
+
+    @Nullable CharSequence getSqlCopyExportRoot();
+
+    @Nullable CharSequence getSqlCopyInputRoot();
+
+    @Nullable CharSequence getSqlCopyInputWorkRoot();
+
+    int getSqlCopyLogRetentionDays();
+
+    long getSqlCopyMaxIndexChunkSize();
+
+    int getSqlCopyQueueCapacity();
 
     int getSqlDistinctTimestampKeyCapacity();
 
@@ -277,6 +1103,31 @@ public interface CairoConfiguration {
 
     int getSqlHashJoinValuePageSize();
 
+    long getSqlHorizonJoinBwdScanAbsoluteThreshold();
+
+    long getSqlHorizonJoinBwdScanMinGap();
+
+    long getSqlHorizonJoinBwdScanSwitchFactor();
+
+    int getSqlHorizonJoinMaxOffsets();
+
+    /**
+     * When the number of intervals exceeds this threshold during bracket expansion,
+     * intervals are merged to prevent unbounded memory growth.
+     */
+    int getSqlIntervalIncrementalMergeThreshold();
+
+    /**
+     * Maximum recursion depth for bracket expansion in interval parsing (one level per bracket group).
+     */
+    int getSqlIntervalMaxBracketDepth();
+
+    /**
+     * Maximum number of intervals allowed after bracket expansion and merging.
+     * This limit prevents memory exhaustion from large non-adjacent interval sets.
+     */
+    int getSqlIntervalMaxIntervalsAfterMerge();
+
     int getSqlJitBindVarsMemoryMaxPages();
 
     int getSqlJitBindVarsMemoryPageSize();
@@ -285,11 +1136,9 @@ public interface CairoConfiguration {
 
     int getSqlJitIRMemoryPageSize();
 
+    int getSqlJitMaxInListSizeThreshold();
+
     int getSqlJitMode();
-
-    int getSqlJitPageAddressCacheThreshold();
-
-    int getSqlJitRowsThreshold();
 
     int getSqlJoinContextPoolCapacity();
 
@@ -302,49 +1151,333 @@ public interface CairoConfiguration {
      */
     int getSqlJoinMetadataPageSize();
 
+    /**
+     * Number of entries at which each master-to-slave symbol key translation cache stops
+     * allocating memory. Hash, LT, HORIZON and multi-key ASOF joins on SYMBOL keys build these
+     * caches when the two sides have different symbol tables. Past the limit, a cache still
+     * stores the symbol keys that fall into its allocated pages, and the join translates the
+     * other symbol keys via their string values on every lookup.
+     * <p>
+     * ASOF joins on a single SYMBOL key, and multi-key ASOF joins where no SYMBOL key can
+     * use this cache (e.g. because the master SYMBOL key columns are computed by a function),
+     * cache the translations under {@link #getSqlAsOfJoinShortCircuitCacheCapacity()} instead.
+     *
+     * @return number of symbol key translations per join key column at which the cache stops allocating
+     */
+    int getSqlJoinSymbolTranslationCacheCapacity();
+
     long getSqlLatestByRowCount();
 
     int getSqlLexerPoolCapacity();
-
-    int getSqlMapKeyCapacity();
 
     int getSqlMapMaxPages();
 
     int getSqlMapMaxResizes();
 
-    int getSqlMapPageSize();
-
-    int getSqlModelPoolCapacity();
+    int getSqlMaxGroupingSets();
 
     int getSqlMaxNegativeLimit();
 
-    int getSqlPageFrameMinRows();
+    int getSqlModelPoolCapacity();
 
     int getSqlPageFrameMaxRows();
 
-    int getSqlSortKeyMaxPages();
+    int getSqlPageFrameMinRows();
+
+    int getSqlParallelFilterDispatchLimit();
+
+    double getSqlParallelFilterPreTouchThreshold();
+
+    /**
+     * Build input rows from which a fused hash join GROUP BY builds on the workers: the build scan's
+     * frame rows, before any row filter. Smaller builds run on the query's own thread. Zero builds
+     * every fused join on the workers.
+     */
+    long getSqlParallelHashJoinGroupByBuildParallelMinRows();
+
+    /**
+     * Build rows per hash partition of a fused hash join GROUP BY's parallel build, which sets how
+     * many partitions the build splits its rows into, up to 256. Each partition gets its own key
+     * table, which a worker fills alone.
+     */
+    long getSqlParallelHashJoinGroupByBuildRowsPerPartition();
+
+    /**
+     * Bytes above which a fused hash join GROUP BY keeps reading build payload columns at their
+     * build rows instead of copying them: the build's row count times the copied row size. Zero
+     * never copies.
+     */
+    long getSqlParallelHashJoinGroupByPayloadCopyMaxSize();
+
+    /**
+     * Probe to build row ratio from which a fused hash join GROUP BY copies its build payload
+     * columns after a build on the query's own thread, which then copies them alone: the probe
+     * input's frame rows, before any row filter, divided by the build's rows. Zero copies every
+     * such build that fits the size bound.
+     */
+    double getSqlParallelHashJoinGroupByPayloadCopyMinProbeRatio();
+
+    /**
+     * Probe to build row ratio from which a fused hash join GROUP BY copies its build payload
+     * columns after a build on the query workers, which then copy them in parallel. The ratio is
+     * the one {@link #getSqlParallelHashJoinGroupByPayloadCopyMinProbeRatio()} describes.
+     */
+    double getSqlParallelHashJoinGroupByPayloadCopyParallelMinProbeRatio();
+
+    long getSqlParallelWorkStealingSpinTimeout();
+
+    int getSqlParallelWorkStealingThreshold();
+
+    long getSqlParquetCacheMemorySize();
+
+    int getSqlPivotMaxProducedColumns();
+
+    int getSqlSmallMapKeyCapacity();
+
+    long getSqlSmallMapPageSize();
+
+    int getSqlSmallPageFrameMaxRows();
+
+    int getSqlSmallPageFrameMinRows();
+
+    long getSqlSortEncodedParallelThreshold();
+
+    int getSqlSortKeyMaterializationThreshold();
+
+    long getSqlSortKeyMaxBytes();
 
     long getSqlSortKeyPageSize();
 
-    int getSqlSortLightValueMaxPages();
+    long getSqlSortLightValueMaxBytes();
 
     long getSqlSortLightValuePageSize();
 
-    int getSqlSortValueMaxPages();
+    long getSqlSortValueMaxBytes();
 
     int getSqlSortValuePageSize();
 
+    int getSqlUnorderedMapMaxEntrySize();
+
+    long getSqlWindowCacheMaxBytes();
+
+    /**
+     * Resolves which config key the CachedWindow record-store cap was sourced from. Returned as a
+     * property path string (e.g. "cairo.sql.window.cache.max.bytes") so error messages can name the
+     * actual binding constraint when growth fails. The new bytes key wins when explicitly set; the
+     * legacy pages key wins when only it is explicit; the new bytes default wins otherwise.
+     */
+    String getSqlWindowCacheMaxPagesConfigKey();
+
+    /**
+     * Effective cap (in pages of {@link #getSqlWindowStorePageSize()}) on the CachedWindow record
+     * store, after reconciling cairo.sql.window.cache.max.bytes and the legacy
+     * cairo.sql.window.store.max.pages. Paired with {@link #getSqlWindowCacheMaxPagesConfigKey()}.
+     */
+    int getSqlWindowCacheMaxPagesResolved();
+
+    int getSqlWindowInitialRangeBufferSize();
+
+    int getSqlWindowMaxRecursion();
+
+    long getSqlWindowRowIdMaxBytes();
+
+    int getSqlWindowRowIdPageSize();
+
+    int getSqlWindowStoreMaxPages();
+
+    int getSqlWindowStorePageSize();
+
+    long getSqlWindowTreeKeyMaxBytes();
+
+    int getSqlWindowTreeKeyPageSize();
+
+    int getStrFunctionMaxBufferLength();
+
+    default long getSubsampleMaxRows() {
+        return 100_000_000L;
+    }
+
+    int getSymbolPatternIndexThreshold();
+
+    long getSymbolTableMaxAllocationPageSize();
+
+    long getSymbolTableMinAllocationPageSize();
+
+    long getSystemDataAppendPageSize();
+
+    int getSystemO3ColumnMemorySize();
+
+    @NotNull
+    CharSequence getSystemTableNamePrefix();
+
+    long getSystemWalDataAppendPageSize();
+
+    long getSystemWalEventAppendPageSize();
+
+    long getTableRegistryAutoReloadFrequency();
+
+    int getTableRegistryCompactionThreshold();
+
+    @NotNull
     TelemetryConfiguration getTelemetryConfiguration();
 
+    CharSequence getTempRenamePendingTablePrefix();
+
+    @NotNull
     TextConfiguration getTextConfiguration();
+
+    /**
+     * Number of {@link TimerShards} shards (one daemon thread each) used
+     * to fire timer-based wakeups for parked SQL continuations and other
+     * {@link DelayedFireable} entries. Higher values reduce
+     * {@code DelayQueue} lock contention but cost one always-on thread per shard.
+     */
+    int getTimerShardCount();
 
     int getTxnScoreboardEntryCount();
 
+    int getUnorderedPageFrameReduceQueueCapacity();
+
     int getVectorAggregateQueueCapacity();
+
+    int getViewLexerPoolCapacity();
+
+    int getViewWalWriterPoolMaxSegments();
+
+    @NotNull
+    VolumeDefinitions getVolumeDefinitions();
+
+    /**
+     * Hard cap, in rows, of one WAL apply transaction block while {@code cairo.wal.apply.block.size} is positive:
+     * caps both the starting row limit and its growth. At most 2 billion, which keeps block row counts and the
+     * look-ahead txn estimates derived from them within int range. Has no effect while
+     * {@code cairo.wal.apply.block.size} is 0.
+     */
+    long getWalApplyBlockMaxRows();
+
+    /**
+     * Memory budget of WAL apply transaction blocks above {@link #getWalApplyBlockSize()}, as a percentage of
+     * the RSS limit, shared by the {@link #getWalApplyWorkerCount()} workers: one block gets the percentage
+     * divided by the worker count. A block grows past the block size only while both of its memory uses fit: anonymous memory
+     * (sort index, a copy of the block's rows, and the O3 merge index over them and the existing rows the merge
+     * copies again) and page cache (the block's staging plus the existing rows copied again, read and written).
+     * The existing rows copied again are estimated from the partitions the block's transactions reach, times a
+     * copy ratio learned per table for merge-append partitions and for classic O3 merges. No RSS limit: no growth. Has
+     * no effect while {@code cairo.wal.apply.block.size} is 0.
+     */
+    int getWalApplyBlockMemoryPercent();
+
+    /**
+     * Starting size, in bytes, of one WAL apply transaction block, 75 MiB by default. The writer divides it by the
+     * table's average record size to get the block's starting row limit. {@code 0} disables adaptive blocks: the
+     * block row limit then comes from {@code cairo.wal.max.lag.size} and
+     * {@code cairo.wal.squash.uncommitted.rows.multiplier} x the table's max uncommitted rows. When positive, it
+     * replaces both for the block row limit (the lag row count still bounds the look-ahead and the in-memory lag).
+     * Rows up to the starting size are always applied without a memory check; past it, a block ends early when it
+     * no longer fits {@link #getWalApplyBlockMemoryPercent()}. The row limit doubles after every block that the
+     * row limit itself cut short, while there is a memory budget; without an RSS limit or at a memory percent of
+     * 0 it stays at the starting size. The grown limit is per table writer and resets when the writer reopens.
+     * Blocks can still be smaller: they end at the last pending transaction and at transactions that
+     * force a full commit. The look-ahead txn count starts at {@code cairo.wal.apply.look.ahead.txn.count} and
+     * adapts to one block's worth of transactions, and the table time quota does not stop the look-ahead
+     * before it has loaded one block of the transactions visible when it started.
+     */
+    long getWalApplyBlockSize();
+
+    int getWalApplyLookAheadTransactionCount();
+
+    /**
+     * @return the per-event byte limit applied to one WAL apply batch.
+     * {@code 0} means unlimited; only the global RSS limit applies.
+     */
+    long getWalApplyMemoryLimitBytes();
+
+    /**
+     * Set of table directory names (e.g. {@code my_table~3}) whose WAL transactions must not be
+     * applied by the ApplyWal2Table job ("hard suspended" tables). Directory names are matched, not
+     * logical names, so the suspension binds to the physical table across a rename and a fresh table
+     * reusing the name is unaffected. Configured via {@code cairo.wal.apply.suspended.tables}
+     * (comma-separated) and reloadable. The runtime set extended through
+     * {@code ALTER TABLE ... SUSPEND WAL} is held separately on the engine.
+     *
+     * @return the configured set, or null when none are configured (treated as empty).
+     */
+    @Nullable
+    default ObjHashSet<String> getWalApplySuspendedTables() {
+        return null;
+    }
+
+    long getWalApplyTableTimeQuota();
+
+    /**
+     * Number of threads that run WAL apply: the dedicated WAL apply pool's ({@code wal.apply.worker.count}), or the
+     * shared write pool's when there is no dedicated pool. They can apply as many tables at once, so a WAL apply
+     * block gets this share of {@link #getWalApplyBlockMemoryPercent()}.
+     */
+    int getWalApplyWorkerCount();
+
+    /**
+     * Whether WAL-apply-suspended tables (see {@link #getWalApplySuspendedTables()} and
+     * {@code ALTER TABLE ... SUSPEND WAL}) also deny WAL writes, rejecting commits like a dropped
+     * table but with a distinct exception. When false, suspension only excludes the table from WAL
+     * apply while writes keep buffering for later. Configured via
+     * {@code cairo.wal.apply.suspended.write.denied} and reloadable.
+     */
+    default boolean isWalApplySuspendedWriteDenied() {
+        return false;
+    }
+
+    long getWalDataAppendPageSize();
+
+    boolean getWalEnabledDefault();
+
+    long getWalEventAppendPageSize();
+
+    double getWalLagRowsMultiplier();
+
+    long getWalMaxLagSize();
+
+    int getWalMaxLagTxnCount();
+
+    int getWalMaxSegmentFileDescriptorsCache();
+
+    long getWalPurgeInterval();
+
+    default int getWalPurgeWaitBeforeDelete() {
+        return 0;
+    }
+
+    int getWalRecreateDistressedSequencerAttempts();
+
+    /**
+     * If after a commit a WAL segment has more than this number of rows, roll the next transaction onto a new segment.
+     * <p>
+     *
+     * @see #getWalSegmentRolloverSize()
+     */
+    long getWalSegmentRolloverRowCount();
+
+    /**
+     * If after a commit a WAL segment is larger than this size, roll the next transaction onto a new segment.
+     * <p>
+     *
+     * @see #getWalSegmentRolloverRowCount()
+     */
+    long getWalSegmentRolloverSize();
+
+    int getWalTxnNotificationQueueCapacity();
+
+    int getWalWriterMadviseMode();
+
+    int getWalWriterPoolMaxSegments();
+
+    int getWindowColumnPoolCapacity();
 
     int getWithClauseModelPoolCapacity();
 
     long getWorkStealTimeoutNanos();
+
+    long getWriteBackOffTimeoutOnMemPressureMs();
 
     long getWriterAsyncCommandBusyWaitTimeout();
 
@@ -354,17 +1487,283 @@ public interface CairoConfiguration {
 
     long getWriterCommandQueueSlotSize();
 
-    long getWriterFileOpenOpts();
+    int getWriterFileOpenOpts();
 
     int getWriterTickRowsCountMod();
+
+    /**
+     * Whether the adaptive durable epoch batches its column flushes (start writeback of every column, wait for
+     * it, then one {@code syncfs}) instead of flushing each file with {@code msync(MS_SYNC)}, which is slower
+     * but durable on every filesystem.
+     *
+     * @return {@code true} if the batched adaptive durable-epoch column flush should be used
+     */
+    default boolean isAdaptiveEpochColumnSyncBatched() {
+        return true;
+    }
+
+    /**
+     * When true, SQL compilation does not reject UPDATE, ALTER COLUMN TYPE and ADD INDEX on
+     * tables whose partition layout (parquet, read-only or cold storage partitions) cannot
+     * support them. Such statements then fail when applied, which suspends a WAL table.
+     */
+    boolean isAllPartitionOperationsAllowed();
+
+    /**
+     * Whether an ADAPTIVE WAL commit drains writeback across its whole segment before taking barriers: starts
+     * every column and {@code _event} file's writeback first ({@code sync_file_range(WRITE)}), then waits on
+     * each ({@code WRITE|WAIT_AFTER}), so the device writes files back concurrently instead of serially inside
+     * each file's own fdatasync.
+     * <p>The pass is advisory and never the barrier: every file still gets its own {@code fdatasync}. Where
+     * the call does nothing (ZFS, see {@link io.questdb.std.FilesFacade#isSyncFileRangeEffective(io.questdb.std.str.Utf8Sequence)})
+     * the commit only loses the speedup.
+     *
+     * @return {@code true} if the drain pass should run
+     */
+    default boolean isWalCommitWritebackDrainEnabled() {
+        return true;
+    }
+
+    boolean isCairoMetadataCacheSnapshotOrdered();
+
+    /**
+     * Rollback flag for the by-name column emit to UNION siblings in the SQL optimizer's top-down
+     * column propagation. The optimizer matches UNION columns by position; the legacy by-name emit
+     * could prune one branch inconsistently and crash code generation when branch aliases differed.
+     * When {@code true}, restores the legacy by-name behavior. Defaults to {@code false}.
+     *
+     * @return whether to restore the legacy by-name UNION column propagation
+     */
+    default boolean isCairoSqlLegacyUnionColumnPropagation() {
+        return false;
+    }
+
+    /**
+     * A flag to enable/disable checkpoint recovery mechanism. Defaults to {@code true}.
+     *
+     * @return enable/disable flag for recovering from the checkpoint
+     */
+    boolean isCheckpointRecoveryEnabled();
+
+    /**
+     * This is a flag to enable/disable the generation of column alias based on the expression passed as a query.
+     *
+     * @return true if SqlParser should return the expression normalized instead of the default behavior.
+     */
+    boolean isColumnAliasExpressionEnabled();
+
+    boolean isCopierChunkedEnabled();
+
+    /**
+     * Debug-only: when true, {@link TableWriter} verifies its column-mapping and truncation invariants after
+     * every commit, structural change and close, and reports violations to {@link WriterInvariantChecker}.
+     * Index writers are not checked. Enabled by the test harness, never in production.
+     */
+    boolean isDebugWriterInvariantCheckEnabled();
+
+    boolean isDevModeEnabled();
+
+    boolean isGroupByPresizeEnabled();
+
+    boolean isIOURingEnabled();
+
+    boolean isLiveViewEnabled();
+
+    /**
+     * True when a {@code LiveViewRefreshJob} will actually run for this configuration:
+     * the feature flag is on AND the dedicated refresh pool has at least one worker.
+     * <p>
+     * Every decision that only makes sense while something advances a live view's
+     * watermarks must read THIS, not {@link #isLiveViewEnabled()} alone. Registering an
+     * unattended instance pins the base WAL at its genesis watermark forever, because
+     * {@code WalPurgeJob} clamps the purge floor to every registered view's
+     * {@code lvConsumedSeqTxn} and nothing would ever advance it. The predicate is
+     * config-derived and evaluated on the boot thread before the pools start, so the
+     * registration guard and the purge gate cannot disagree.
+     * <p>
+     * Deliberately excludes {@code isReadOnlyInstance()}: a read-only replica runs no
+     * refresh job either, but it still needs registered instances for the read path and
+     * for a later promote, and it creates no {@code WalPurgeJob} at all, so there is no
+     * floor to release there.
+     */
+    default boolean isLiveViewRefreshEnabled() {
+        return isLiveViewEnabled() && getLiveViewRefreshWorkerCount() > 0;
+    }
+
+    boolean isMatViewCoveringIndexEnabled();
+
+    boolean isMatViewEnabled();
+
+    boolean isMatViewParallelSqlEnabled();
+
+    /**
+     * Returns true if the materialized view with the given name is in the configured refresh block
+     * list ({@code cairo.mat.view.refresh.block.list}). Blocked views are skipped by every refresh
+     * path; they may still be invalidated by a base-table/parent cascade or an explicit INVALIDATE.
+     * Invalidation is safe for a blocked view: it runs no view SQL (so it can't trigger the crash
+     * the block list guards against) and it releases the base table's WAL retention. This is an
+     * operator escape hatch for a view whose refresh keeps crashing the database: blocking it lets
+     * the database start and stay up. Because a blocked view that is never invalidated never advances
+     * its last refreshed base txn, it can pin the base table's WAL retention until it is dropped or
+     * removed from the block list. This applies equally to all
+     * refresh types: the block skip in the refresh job short-circuits before the refresh-intervals
+     * caching bump, so blocked timer and manual views stop caching intervals just like immediate
+     * views, and the base WAL is pinned just as hard.
+     */
+    default boolean isMatViewRefreshBlocked(CharSequence viewName) {
+        return false;
+    }
+
+    boolean isMatViewRefreshMissingWalFilesFatal();
+
+    /**
+     * When this is false, queries against a materialized view that has an EXPIRE ROWS policy stay correct,
+     * because the read-time EXPIRE filter continues to hide the expired rows. But the server does not
+     * schedule the background row-expiry cleanup job, so the job never removes an expired row from disk.
+     * EXPIRE ROWS applies to materialized views only, so this value schedules no work for an ordinary table.
+     */
+    boolean isMatViewRowExpiryCleanupEnabled();
+
+    boolean isMultiKeyDedupEnabled();
+
+    boolean isO3PartitionMergeAppendEnabled();
 
     boolean isO3QuickSortEnabled();
 
     boolean isParallelIndexingEnabled();
 
+    boolean isParquetExportRawArrayEncoding();
+
+    boolean isParquetExportStatisticsEnabled();
+
+    boolean isPartitionEncoderParquetRawArrayEncoding();
+
+    boolean isPartitionEncoderParquetStatisticsEnabled();
+
+    boolean isPartitionO3OverwriteControlEnabled();
+
+    boolean isPostingIndexAutoIncludeTimestamp();
+
+    boolean isQueryTracingEnabled();
+
+    boolean isReadOnlyInstance();
+
+    // Test-only seam, with no backing production property: always true in a running server, so
+    // the optimiser always rewrites SELECT DISTINCT to GROUP BY. Tests override it to false in a
+    // CairoConfiguration subclass to keep DISTINCT as a Distinct factory and reach
+    // DistinctTimeSeriesRecordCursorFactory.
+    boolean isSqlDistinctGroupByRewriteEnabled();
+
+    // Test-only seam, with no backing production property: always true in a running server, so the
+    // optimiser always rewrites a LATEST ON over a plain sub-query into a direct table read. Tests
+    // override it to false in a CairoConfiguration subclass to obtain the un-rewritten plan, which
+    // LatestByHoistEquivalenceTest compares against, shape by shape.
+    default boolean isSqlLatestOnHoistEnabled() {
+        return true;
+    }
+
     boolean isSqlJitDebugEnabled();
 
-    SqlExecutionCircuitBreakerConfiguration getCircuitBreakerConfiguration();
+    boolean isSqlLatestByJitEnabled();
 
-    int getQueryCacheEventQueueCapacity();
+    boolean isSqlOrderBySortEnabled();
+
+    boolean isSqlParallelFilterEnabled();
+
+    boolean isSqlParallelGroupByEnabled();
+
+    boolean isSqlParallelHashJoinGroupByEnabled();
+
+    boolean isSqlParallelHorizonJoinEnabled();
+
+    boolean isSqlParallelReadParquetEnabled();
+
+    boolean isSqlParallelTopKEnabled();
+
+    boolean isSqlParallelWindowJoinEnabled();
+
+    boolean isSqlParquetRowGroupPruningEnabled();
+
+    boolean isSqlWindowCachedLightEnabled();
+
+    /**
+     * When true (the default), several window functions over one identical window may share a
+     * single partition Map: the group keeps one key domain and makes one lookup per row where
+     * each function would otherwise keep and probe a Map of its own.
+     * <p>
+     * The switch changes no answer - a group co-locates state that stays each member's own - so
+     * it is an operational escape hatch for a shape whose Map implementation or key distribution
+     * regresses in the field, and the control the differential tests compare against. It gates
+     * the runtime binding only; the group is compiled either way, and nothing user-visible,
+     * {@code EXPLAIN} included, differs between the two settings.
+     */
+    boolean isSqlWindowMapFusionEnabled();
+
+    boolean isSymbolPatternIndexEnabled();
+
+    boolean isTableTypeConversionEnabled();
+
+    /**
+     * When true (the default), TTL enforcement uses the minimum of the max timestamp in the table
+     * and the current wall clock time. This prevents accidental data loss when future timestamps
+     * are inserted into a table with TTL enabled.
+     * <p>
+     * When false, TTL enforcement uses only the max timestamp in the table, which can cause
+     * unexpected partition eviction if future timestamps are inserted.
+     *
+     * @return true if wall clock should be used for TTL enforcement (default), false otherwise
+     */
+    default boolean isTtlWallClockEnabled() {
+        return true;
+    }
+
+    /**
+     * A compatibility switch that controls validation of sample-by fill type.
+     * <p>
+     * This temporary switch maintains backward compatibility following changes introduced in
+     * <a href="https://github.com/questdb/questdb/pull/5324">this PR</a>.
+     * The pull request implemented stricter validation of sample validity, where:
+     * <p>
+     * 1. LINEAR interpolation is disabled by default
+     * 2. Group-by functions must explicitly declare support for interpolation
+     * <p>
+     * Currently, LINEAR interpolation is enabled only for functions with verified test coverage.
+     * However, there may be other functions that support interpolation but lack proper testing.
+     * The introduction of strict validation could break these untested functions.
+     * <p>
+     * This switch allows users to disable the validation check and maintain the previous behavior.
+     * Note: This configuration option is temporary and will be removed in a future release, at
+     * which point sample-by-fill type validation will become mandatory.
+     *
+     * @return true if sample-by-fill type validation is enabled (default), false otherwise
+     */
+    default boolean isValidateSampleByFillType() {
+        return true;
+    }
+
+    boolean isWalApplyEnabled();
+
+    boolean isWalApplyParallelSqlEnabled();
+
+    boolean isWalSupported();
+
+    boolean isWriterMixedIOEnabled();
+
+    /**
+     * This is a flag to enable/disable making table directory names different to table names for non-WAL tables.
+     * When it is enabled directory name of table TRADE becomes TRADE~, so that ~ sign is added at the end.
+     * The flag is enabled in tests and disabled in released code for backward compatibility. Tests verify that
+     * we do not rely on the fact that table directory name is the same as table name.
+     *
+     * @return true if mangling of directory names for non-WAL tables is enabled, false otherwise.
+     */
+    boolean mangleTableDirNames();
+
+    int maxArrayElementCount();
+
+    default ParquetPartitionDecoder newParquetPartitionDecoder() {
+        return new ParquetPartitionDecoder();
+    }
+
+    boolean useWithinLatestByOptimisation();
 }

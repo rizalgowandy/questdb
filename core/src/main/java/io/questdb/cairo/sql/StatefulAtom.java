@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,8 +26,27 @@ package io.questdb.cairo.sql;
 
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.std.Mutable;
+import io.questdb.std.QuietCloseable;
 
-public interface StatefulAtom {
+public interface StatefulAtom extends QuietCloseable, Mutable {
+
+    @Override
+    default void clear() {
+    }
+
+    @Override
+    default void close() {
+    }
+
+    /**
+     * Initializes state required for filtering, such as child atoms, symbol table sources,
+     * bind variable values, circuit breakers, etc.
+     *
+     * @param symbolTableSource symbol table source
+     * @param executionContext  execution context
+     * @throws SqlException when bind variable validation or any other kind of validation fails
+     */
     default void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.GeoByteFunction;
@@ -48,13 +49,15 @@ public class RndGeoHashFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position,
-                                ObjList<Function> args,
-                                IntList argPositions,
-                                CairoConfiguration configuration,
-                                SqlExecutionContext sqlExecutionContext) throws SqlException {
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) throws SqlException {
         int bits = args.getQuick(0).getInt(null);
-        if (bits < 1 || bits > ColumnType.GEO_HASH_MAX_BITS_LENGTH) {
+        if (bits < 1 || bits > ColumnType.GEOLONG_MAX_BITS) {
             throw SqlException.$(argPositions.getQuick(0), "precision must be in [1..60] range");
         }
         final int type = ColumnType.getGeoHashTypeWithBits(bits);
@@ -64,7 +67,7 @@ public class RndGeoHashFunctionFactory implements FunctionFactory {
             case ColumnType.GEOSHORT:
                 return new RndShortFunction(type);
             case ColumnType.GEOINT:
-                return new RndIntFunction(type);
+                return new RndGeoIntFunction(type);
             default:
                 return new RndLongFunction(type);
         }
@@ -86,48 +89,32 @@ public class RndGeoHashFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
-            return false;
-        }
-
-        @Override
         public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
             this.rnd = executionContext.getRandom();
         }
+
+        @Override
+        public boolean isNonDeterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean isRandom() {
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("rnd_geohash(").val(bits).val(')');
+        }
     }
 
-    private static class RndShortFunction extends GeoShortFunction implements Function {
+    private static class RndGeoIntFunction extends GeoIntFunction implements Function {
 
         private final int bits;
         private Rnd rnd;
 
-        public RndShortFunction(int type) {
-            super(type);
-            this.bits = ColumnType.getGeoHashBits(type);
-        }
-
-        @Override
-        public short getGeoShort(Record rec) {
-            return (short) rnd.nextGeoHash(bits);
-        }
-
-        @Override
-        public boolean isReadThreadSafe() {
-            return false;
-        }
-
-        @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
-            this.rnd = executionContext.getRandom();
-        }
-    }
-
-    private static class RndIntFunction extends GeoIntFunction implements Function {
-
-        private final int bits;
-        private Rnd rnd;
-
-        public RndIntFunction(int type) {
+        public RndGeoIntFunction(int type) {
             super(type);
             this.bits = ColumnType.getGeoHashBits(type);
         }
@@ -138,11 +125,6 @@ public class RndGeoHashFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
-            return false;
-        }
-
-        @Override
         public short getGeoShort(Record rec) {
             return (byte) rnd.nextGeoHash(bits);
         }
@@ -150,6 +132,21 @@ public class RndGeoHashFunctionFactory implements FunctionFactory {
         @Override
         public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
             this.rnd = executionContext.getRandom();
+        }
+
+        @Override
+        public boolean isNonDeterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean isRandom() {
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("rnd_geohash(").val(bits).val(')');
         }
     }
 
@@ -169,11 +166,6 @@ public class RndGeoHashFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
-            return false;
-        }
-
-        @Override
         public short getGeoShort(Record rec) {
             return (byte) rnd.nextGeoHash(bits);
         }
@@ -181,6 +173,57 @@ public class RndGeoHashFunctionFactory implements FunctionFactory {
         @Override
         public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
             this.rnd = executionContext.getRandom();
+        }
+
+        @Override
+        public boolean isNonDeterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean isRandom() {
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("rnd_geohash(").val(bits).val(')');
+        }
+    }
+
+    private static class RndShortFunction extends GeoShortFunction implements Function {
+
+        private final int bits;
+        private Rnd rnd;
+
+        public RndShortFunction(int type) {
+            super(type);
+            this.bits = ColumnType.getGeoHashBits(type);
+        }
+
+        @Override
+        public short getGeoShort(Record rec) {
+            return (short) rnd.nextGeoHash(bits);
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
+            this.rnd = executionContext.getRandom();
+        }
+
+        @Override
+        public boolean isNonDeterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean isRandom() {
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("rnd_geohash(").val(bits).val(')');
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,13 @@
 package io.questdb.cairo.vm.api;
 
 import io.questdb.std.FilesFacade;
+import io.questdb.std.str.LPSZ;
 import org.jetbrains.annotations.Nullable;
 
-//mapped appendable readable writable
-public interface MemoryMARW extends MemoryMW, MemoryARW, MemoryMA, MemoryMR {
+// mapped appendable readable writable
+public interface MemoryMARW extends MemoryMW, MemoryARW, MemoryMA, MemoryMR, MemoryMAR {
 
-    void of(FilesFacade ff, long fd, @Nullable CharSequence name, long size, int memoryTag);
+    void of(FilesFacade ff, long fd, @Nullable LPSZ fileName, long size, int memoryTag);
 
-    void of(FilesFacade ff, long fd, @Nullable CharSequence name, long extendSegmentSize, long size, int memoryTag);
+    void of(FilesFacade ff, long fd, boolean keepFdOpen, @Nullable LPSZ fileName, long extendSegmentSize, long size, int memoryTag);
 }

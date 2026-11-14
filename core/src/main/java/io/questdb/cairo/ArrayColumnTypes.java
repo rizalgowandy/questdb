@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import io.questdb.std.IntList;
 import io.questdb.std.Mutable;
 
 public class ArrayColumnTypes implements ColumnTypes, Mutable {
+    public static final ArrayColumnTypes EMPTY = new ArrayColumnTypes();
     private final IntList types = new IntList();
 
     public ArrayColumnTypes add(int type) {
@@ -40,6 +41,16 @@ public class ArrayColumnTypes implements ColumnTypes, Mutable {
         return this;
     }
 
+    public ArrayColumnTypes addAll(ArrayColumnTypes that) {
+        types.addAll(that.types);
+        return this;
+    }
+
+    @Override
+    public void clear() {
+        types.clear();
+    }
+
     @Override
     public int getColumnCount() {
         return types.size();
@@ -50,7 +61,7 @@ public class ArrayColumnTypes implements ColumnTypes, Mutable {
         return types.getQuick(columnIndex);
     }
 
-    public void clear() {
-        types.clear();
+    public void set(int index, int type) {
+        types.setQuick(index, type);
     }
 }

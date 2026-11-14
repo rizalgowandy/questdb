@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.std.Chars;
@@ -37,6 +37,7 @@ import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
 public class EqStrFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "=(SS)";
@@ -48,14 +49,20 @@ public class EqStrFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
         // there are optimisation opportunities
         // 1. when one of args is constant null comparison can boil down to checking
         //    length of non-constant (must be -1)
         // 2. when one of arguments is constant, save method call and use a field
 
-        Function a = args.getQuick(0);
-        Function b = args.getQuick(1);
+        final Function a = args.getQuick(0);
+        final Function b = args.getQuick(1);
 
         if (a.isConstant() && !b.isConstant()) {
             return createHalfConstantFunc(a, b);
@@ -69,34 +76,14 @@ public class EqStrFunctionFactory implements FunctionFactory {
     }
 
     private Function createHalfConstantFunc(Function constFunc, Function varFunc) {
-        CharSequence constValue = constFunc.getStr(null);
-
+        CharSequence constValue = constFunc.getStrA(null);
         if (constValue == null) {
             return new NullCheckFunc(varFunc);
         }
-
         return new ConstCheckFunc(varFunc, constValue);
     }
 
-    private static class NullCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
-        private final Function arg;
-
-        public NullCheckFunc(Function arg) {
-            this.arg = arg;
-        }
-
-        @Override
-        public Function getArg() {
-            return arg;
-        }
-
-        @Override
-        public boolean getBool(Record rec) {
-            return negated != (arg.getStrLen(rec) == -1L);
-        }
-    }
-
-    private static class ConstCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
+    public static class ConstCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
         private final Function arg;
         private final CharSequence constant;
 
@@ -112,27 +99,22 @@ public class EqStrFunctionFactory implements FunctionFactory {
 
         @Override
         public boolean getBool(Record rec) {
-            return negated != Chars.equalsNc(constant, arg.getStr(rec));
+            return negated != Chars.equalsNc(constant, arg.getStrA(rec));
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(arg);
+            if (negated) {
+                sink.val('!');
+            }
+            sink.val("='").val(constant).val('\'');
         }
     }
 
-    private static class Func extends NegatableBooleanFunction implements BinaryFunction {
-        private final Function left;
-        private final Function right;
-
+    private static class Func extends AbstractEqBinaryFunction {
         public Func(Function left, Function right) {
-            this.left = left;
-            this.right = right;
-        }
-
-        @Override
-        public Function getLeft() {
-            return left;
-        }
-
-        @Override
-        public Function getRight() {
-            return right;
+            super(left, right);
         }
 
         @Override
@@ -140,7 +122,7 @@ public class EqStrFunctionFactory implements FunctionFactory {
             // important to compare A and B strings in case
             // these are columns of the same record
             // records have re-usable character sequences
-            final CharSequence a = left.getStr(rec);
+            final CharSequence a = left.getStrA(rec);
             final CharSequence b = right.getStrB(rec);
 
             if (a == null) {
@@ -148,6 +130,43 @@ public class EqStrFunctionFactory implements FunctionFactory {
             }
 
             return negated != Chars.equalsNc(a, b);
+        }
+
+        @Override
+        public String getName() {
+            if (negated) {
+                return "!=";
+            } else {
+                return "=";
+            }
+        }
+    }
+
+    public static class NullCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
+        private final Function arg;
+
+        public NullCheckFunc(Function arg) {
+            this.arg = arg;
+        }
+
+        @Override
+        public Function getArg() {
+            return arg;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return negated != (arg.getStrLen(rec) == -1L);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(arg);
+            if (negated) {
+                sink.val(" is not null");
+            } else {
+                sink.val(" is null");
+            }
         }
     }
 }

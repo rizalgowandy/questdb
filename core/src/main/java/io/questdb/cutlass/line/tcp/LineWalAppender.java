@@ -1,0 +1,610 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cutlass.line.tcp;
+
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.CommitFailedException;
+import io.questdb.cairo.GeoHashes;
+import io.questdb.cairo.MicrosTimestampDriver;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TableWriterAPI;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.griffin.DecimalUtil;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.QuietCloseable;
+import io.questdb.std.Uuid;
+import io.questdb.std.datetime.CommonUtils;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.DirectUtf8Sink;
+import io.questdb.std.str.Utf8s;
+
+import static io.questdb.cutlass.line.LineUtils.from;
+import static io.questdb.cutlass.line.LineUtils.fromDesignatedTimestamp;
+import static io.questdb.cutlass.line.tcp.LineProtocolException.*;
+import static io.questdb.cutlass.line.tcp.TableUpdateDetails.ThreadLocalDetails.COLUMN_NOT_FOUND;
+import static io.questdb.cutlass.line.tcp.TableUpdateDetails.ThreadLocalDetails.DUPLICATED_COLUMN;
+
+/**
+ * Appends parsed line protocol measurements to WAL tables.
+ * <p>
+ * Instances hold mutable scratch buffers and are not thread-safe: each thread
+ * of execution must use its own appender. {@link LineTcpMeasurementScheduler}
+ * keeps one appender per network IO worker and LineHttpProcessorState owns one
+ * per connection.
+ */
+public class LineWalAppender implements QuietCloseable {
+    private static final Log LOG = LogFactory.getLog(LineWalAppender.class);
+    private final boolean autoCreateNewColumns;
+    private final Decimal256 decimal256 = new Decimal256();
+    private final Long256Impl long256 = new Long256Impl();
+    private final int maxFileNameLength;
+    private final int maxMetadataChangeRetries;
+    private final boolean stringToCharCastAllowed;
+    private final DirectUtf8Sink utf8Sink = new DirectUtf8Sink(16);
+    private byte timestampUnit;
+
+    public LineWalAppender(boolean autoCreateNewColumns, boolean stringToCharCastAllowed, byte timestampUnit, int maxFileNameLength, int maxMetadataChangeRetries) {
+        this.autoCreateNewColumns = autoCreateNewColumns;
+        this.stringToCharCastAllowed = stringToCharCastAllowed;
+        this.maxFileNameLength = maxFileNameLength;
+        this.maxMetadataChangeRetries = maxMetadataChangeRetries;
+        this.timestampUnit = timestampUnit;
+    }
+
+    public void appendToWal(SecurityContext securityContext, LineTcpParser parser, TableUpdateDetails tud) throws CommitFailedException {
+        for (int retryCount = 0; !tud.isDropped(); retryCount++) {
+            try {
+                appendToWal0(securityContext, parser, tud);
+                return;
+            } catch (MetadataChangedException e) {
+                if (retryCount == maxMetadataChangeRetries) {
+                    throw CairoException.nonCritical().put("metadata changed too many times during WAL append");
+                }
+            } catch (CairoException e) {
+                if (e.isMalformedUtf8()) {
+                    throw LineProtocolException.malformedUtf8(tud.getTableNameUtf16(), e.getFlyweightMessage());
+                }
+                throw e;
+            }
+        }
+    }
+
+    @Override
+    public void close() {
+        utf8Sink.close();
+    }
+
+    public void setTimestampAdapter(byte precision) {
+        this.timestampUnit = precision;
+    }
+
+    private void appendToWal0(SecurityContext securityContext, LineTcpParser parser, TableUpdateDetails tud) throws CommitFailedException, MetadataChangedException {
+
+        // pass 1: create all columns that do not exist
+        final TableUpdateDetails.ThreadLocalDetails ld = tud.getThreadLocalDetails(0); // IO thread id is irrelevant
+        ld.resetStateIfNecessary();
+        ld.clearColumnTypes();
+
+        final TableWriterAPI writer = tud.getWriter();
+        assert writer.supportsMultipleWriters();
+        TableRecordMetadata metadata = writer.getMetadata();
+
+        long timestamp = parser.getTimestamp();
+        if (timestamp != LineTcpParser.NULL_TIMESTAMP) {
+            timestamp = fromDesignatedTimestamp(
+                    tud.getTimestampDriver(),
+                    timestamp,
+                    getOverloadTimestampUnit(parser.getTimestampUnit()),
+                    tud.getTableNameUtf16()
+            );
+        } else {
+            timestamp = tud.getTimestampDriver().getTicks();
+        }
+
+        final int entCount = parser.getEntityCount();
+        for (int i = 0; i < entCount; i++) {
+            final LineTcpParser.ProtoEntity ent = parser.getEntity(i);
+            int columnWriterIndex = ld.getColumnWriterIndex(ent.getName(), metadata);
+
+            switch (columnWriterIndex) {
+                default:
+                    final int columnType = metadata.getColumnType(columnWriterIndex);
+                    if (columnType > -1) {
+                        if (columnWriterIndex == tud.getTimestampIndex()) {
+                            // the designated timestamp arrives as a named field, overriding the line timestamp
+                            timestamp = fromDesignatedTimestamp(
+                                    tud.getTimestampDriver(),
+                                    ent.getLongValue(),
+                                    ent.getUnit(),
+                                    tud.getTableNameUtf16()
+                            );
+                            ld.addColumnType(DUPLICATED_COLUMN, ColumnType.UNDEFINED);
+                        } else {
+                            ld.addColumnType(columnWriterIndex, metadata.getColumnType(columnWriterIndex));
+                        }
+                        break;
+                    } else {
+                        // column has been deleted from the metadata, but it is in our utf8 cache
+                        ld.removeFromCaches(ent.getName());
+                        // act as if we did not find this column and fall through
+                    }
+                case COLUMN_NOT_FOUND:
+                    final String columnNameUtf16 = ld.getColNameUtf16();
+                    if (autoCreateNewColumns && TableUtils.isValidColumnName(columnNameUtf16, maxFileNameLength)) {
+                        columnWriterIndex = metadata.getColumnIndexQuiet(columnNameUtf16);
+                        if (columnWriterIndex < 0) {
+                            securityContext.authorizeAlterTableAddColumn(writer.getTableToken());
+                            try {
+                                int newColumnType = ld.getColumnType(ld.getColNameUtf8(), ent);
+                                if (newColumnType == ColumnType.DECIMAL) {
+                                    // the surrogate DECIMAL carries no precision or scale, so it cannot back a column
+                                    throw CairoException.nonCritical()
+                                            .put("decimal columns cannot be created automatically [table=")
+                                            .put(tud.getTableNameUtf16())
+                                            .put(", columnName=")
+                                            .put(columnNameUtf16)
+                                            .put(']');
+                                }
+                                writer.addColumn(columnNameUtf16, newColumnType, securityContext);
+                                columnWriterIndex = metadata.getWriterIndex(metadata.getColumnIndexQuiet(columnNameUtf16));
+                                // Add the column to metadata cache too
+                                ld.addColumn(columnNameUtf16, columnWriterIndex, newColumnType);
+                            } catch (CairoException e) {
+                                columnWriterIndex = metadata.getColumnIndexQuiet(columnNameUtf16);
+                                if (columnWriterIndex < 0) {
+                                    // the column is still not there, something must be wrong
+                                    throw e;
+                                }
+                                // all good, someone added the column concurrently
+                            }
+                        }
+                        if (ld.getMetadataVersion() != writer.getMetadataVersion()) {
+                            throw MetadataChangedException.INSTANCE;
+                        }
+                        ld.addColumnType(columnWriterIndex, metadata.getColumnType(columnWriterIndex));
+                    } else if (!autoCreateNewColumns) {
+                        throw newColumnsNotAllowed(columnNameUtf16, tud.getTableNameUtf16());
+                    } else {
+                        throw invalidColNameError(columnNameUtf16, tud.getTableNameUtf16());
+                    }
+                    break;
+                case DUPLICATED_COLUMN:
+                    // indicate to the second loop that writer index does not exist
+                    ld.addColumnType(DUPLICATED_COLUMN, ColumnType.UNDEFINED);
+                    break;
+            }
+        }
+
+        TableWriter.Row r = writer.newRow(timestamp);
+        try {
+            for (int i = 0; i < entCount; i++) {
+                final int colType = ld.getColumnType(i);
+                final int columnIndex = ld.getColumnIndex(i);
+
+                if (columnIndex < 0) {
+                    continue;
+                }
+
+                final LineTcpParser.ProtoEntity ent = parser.getEntity(i);
+                switch (ent.getType()) {
+                    case LineTcpParser.ENTITY_TYPE_TAG:
+                    case LineTcpParser.ENTITY_TYPE_SYMBOL: {
+                        switch (colType) {
+                            case ColumnType.STRING:
+                                r.putStrUtf8(columnIndex, ent.getValue());
+                                break;
+                            case ColumnType.SYMBOL:
+                                r.putSymUtf8(columnIndex, ent.getValue());
+                                break;
+                            case ColumnType.VARCHAR:
+                                r.putVarchar(columnIndex, ent.getValue());
+                                break;
+                            default:
+                                throw castError(tud.getTableNameUtf16(), "TAG", colType, ent.getName());
+                        }
+                        break;
+                    }
+                    case LineTcpParser.ENTITY_TYPE_INTEGER: {
+                        switch (ColumnType.tagOf(colType)) {
+                            case ColumnType.DECIMAL8:
+                            case ColumnType.DECIMAL16:
+                            case ColumnType.DECIMAL32:
+                            case ColumnType.DECIMAL64:
+                            case ColumnType.DECIMAL128:
+                            case ColumnType.DECIMAL256:
+                                final int scale = ColumnType.getDecimalScale(colType);
+                                decimal256.ofLong(ent.getLongValue(), 0);
+                                if (scale != 0) {
+                                    try {
+                                        decimal256.rescale(scale);
+                                    } catch (NumericException ignored) {
+                                        throw boundsError(ent.getLongValue(), colType, tud.getTableNameUtf16(), writer.getMetadata().getColumnName(columnIndex));
+                                    }
+                                }
+                                if (!decimal256.comparePrecision(ColumnType.getDecimalPrecision(colType))) {
+                                    throw boundsError(ent.getLongValue(), colType, tud.getTableNameUtf16(), writer.getMetadata().getColumnName(columnIndex));
+                                }
+                                DecimalUtil.storeNonNull(decimal256, r, columnIndex, colType);
+                                break;
+                            case ColumnType.LONG:
+                                r.putLong(columnIndex, ent.getLongValue());
+                                break;
+                            case ColumnType.INT: {
+                                final long entityValue = ent.getLongValue();
+                                if (entityValue >= Integer.MIN_VALUE && entityValue <= Integer.MAX_VALUE) {
+                                    r.putInt(columnIndex, (int) entityValue);
+                                } else if (entityValue == Numbers.LONG_NULL) {
+                                    r.putInt(columnIndex, Numbers.INT_NULL);
+                                } else {
+                                    throw boundsError(entityValue, ColumnType.INT, tud.getTableNameUtf16(), writer.getMetadata().getColumnName(columnIndex));
+                                }
+                                break;
+                            }
+                            case ColumnType.SHORT: {
+                                final long entityValue = ent.getLongValue();
+                                if (entityValue >= Short.MIN_VALUE && entityValue <= Short.MAX_VALUE) {
+                                    r.putShort(columnIndex, (short) entityValue);
+                                } else if (entityValue == Numbers.LONG_NULL) {
+                                    r.putShort(columnIndex, (short) 0);
+                                } else {
+                                    throw boundsError(entityValue, ColumnType.SHORT, tud.getTableNameUtf16(), writer.getMetadata().getColumnName(columnIndex));
+                                }
+                                break;
+                            }
+                            case ColumnType.BYTE: {
+                                final long entityValue = ent.getLongValue();
+                                if (entityValue >= Byte.MIN_VALUE && entityValue <= Byte.MAX_VALUE) {
+                                    r.putByte(columnIndex, (byte) entityValue);
+                                } else if (entityValue == Numbers.LONG_NULL) {
+                                    r.putByte(columnIndex, (byte) 0);
+                                } else {
+                                    throw boundsError(entityValue, ColumnType.BYTE, tud.getTableNameUtf16(), writer.getMetadata().getColumnName(columnIndex));
+                                }
+                                break;
+                            }
+                            case ColumnType.TIMESTAMP:
+                                r.putTimestamp(columnIndex, ent.getLongValue());
+                                break;
+                            case ColumnType.DATE:
+                                r.putDate(columnIndex, ent.getLongValue());
+                                break;
+                            case ColumnType.DOUBLE:
+                                r.putDouble(columnIndex, ent.getLongValue());
+                                break;
+                            case ColumnType.FLOAT:
+                                r.putFloat(columnIndex, ent.getLongValue());
+                                break;
+                            case ColumnType.SYMBOL:
+                                if (ent.isBinaryFormat()) {
+                                    utf8Sink.clear();
+                                    Numbers.append(utf8Sink, ent.getLongValue());
+                                    r.putSymUtf8(columnIndex, utf8Sink);
+                                } else {
+                                    r.putSymUtf8(columnIndex, ent.getValue());
+                                }
+                                break;
+                            default:
+                                throw castError(tud.getTableNameUtf16(), "INTEGER", colType, ent.getName());
+                        }
+                        break;
+                    }
+                    case LineTcpParser.ENTITY_TYPE_FLOAT: {
+                        switch (ColumnType.tagOf(colType)) {
+                            case ColumnType.DOUBLE:
+                                r.putDouble(columnIndex, ent.getFloatValue());
+                                break;
+                            case ColumnType.FLOAT:
+                                r.putFloat(columnIndex, (float) ent.getFloatValue());
+                                break;
+                            case ColumnType.DECIMAL8:
+                            case ColumnType.DECIMAL16:
+                            case ColumnType.DECIMAL32:
+                            case ColumnType.DECIMAL64:
+                            case ColumnType.DECIMAL128:
+                            case ColumnType.DECIMAL256:
+                                final int precision = ColumnType.getDecimalPrecision(colType);
+                                final int scale = ColumnType.getDecimalScale(colType);
+                                if (ent.isBinaryFormat()) {
+                                    double d = ent.getFloatValue();
+                                    if (Numbers.isNull(d)) {
+                                        DecimalUtil.storeNull(r, columnIndex, colType);
+                                        break;
+                                    } else {
+                                        utf8Sink.clear();
+                                        Numbers.append(utf8Sink, ent.getFloatValue());
+                                        try {
+                                            decimal256.ofString(utf8Sink.asAsciiCharSequence(), precision, scale);
+                                        } catch (NumericException ignored) {
+                                            throw precisionLossError(tud.getTableNameUtf16(), ent.getName(), utf8Sink, colType);
+                                        }
+                                        DecimalUtil.storeNonNull(decimal256, r, columnIndex, colType);
+                                    }
+                                } else {
+                                    try {
+                                        decimal256.ofString(ent.getValue().asAsciiCharSequence(), precision, scale);
+                                    } catch (NumericException ignored) {
+                                        throw precisionLossError(tud.getTableNameUtf16(), ent.getName(), ent.getValue(), colType);
+                                    }
+                                    DecimalUtil.store(decimal256, r, columnIndex, colType);
+                                }
+                                break;
+                            case ColumnType.SYMBOL:
+                                if (ent.isBinaryFormat()) {
+                                    utf8Sink.clear();
+                                    Numbers.append(utf8Sink, ent.getFloatValue());
+                                    r.putSymUtf8(columnIndex, utf8Sink);
+                                } else {
+                                    r.putSymUtf8(columnIndex, ent.getValue());
+                                }
+                                break;
+                            default:
+                                throw castError(tud.getTableNameUtf16(), "FLOAT", colType, ent.getName());
+                        }
+                        break;
+                    }
+                    case LineTcpParser.ENTITY_TYPE_STRING: {
+                        final DirectUtf8Sequence entityValue = ent.getValue();
+                        if (!ColumnType.isGeoHash(colType)) { // not geohash
+                            switch (ColumnType.tagOf(colType)) {
+                                case ColumnType.IPv4:
+                                    try {
+                                        int value = Numbers.parseIPv4Nl(entityValue);
+                                        r.putInt(columnIndex, value);
+                                    } catch (NumericException e) {
+                                        throw castError(tud.getTableNameUtf16(), "STRING", colType, ent.getName());
+                                    }
+                                    break;
+                                case ColumnType.VARCHAR:
+                                    r.putVarchar(columnIndex, entityValue);
+                                    break;
+                                case ColumnType.STRING:
+                                    r.putStrUtf8(columnIndex, entityValue);
+                                    break;
+                                case ColumnType.CHAR:
+                                    if (entityValue.size() == 1 && entityValue.byteAt(0) > -1) {
+                                        r.putChar(columnIndex, (char) entityValue.byteAt(0));
+                                    } else if (stringToCharCastAllowed) {
+                                        int encodedResult = Utf8s.utf8CharDecode(entityValue);
+                                        if (Numbers.decodeLowShort(encodedResult) > 0) {
+                                            r.putChar(columnIndex, (char) Numbers.decodeHighShort(encodedResult));
+                                        } else {
+                                            throw castError(tud.getTableNameUtf16(), "STRING", colType, ent.getName());
+                                        }
+                                    } else {
+                                        throw castError(tud.getTableNameUtf16(), "STRING", colType, ent.getName());
+                                    }
+                                    break;
+                                case ColumnType.SYMBOL:
+                                    r.putSymUtf8(columnIndex, entityValue);
+                                    break;
+                                case ColumnType.UUID:
+                                    CharSequence asciiCharSequence = entityValue.asAsciiCharSequence();
+                                    try {
+                                        Uuid.checkDashesAndLength(asciiCharSequence);
+                                        long uuidLo = Uuid.parseLo(asciiCharSequence);
+                                        long uuidHi = Uuid.parseHi(asciiCharSequence);
+                                        r.putLong128(columnIndex, uuidLo, uuidHi);
+                                    } catch (NumericException e) {
+                                        throw castError(tud.getTableNameUtf16(), "STRING", colType, ent.getName());
+                                    }
+                                    break;
+                                case ColumnType.LONG256:
+                                    CharSequence cs = entityValue.asAsciiCharSequence();
+                                    if (Numbers.extractLong256(cs, long256)) {
+                                        r.putLong256(columnIndex, long256);
+                                        break;
+                                    }
+                                    throw castError(tud.getTableNameUtf16(), "STRING", colType, ent.getName());
+                                case ColumnType.DECIMAL8:
+                                case ColumnType.DECIMAL16:
+                                case ColumnType.DECIMAL32:
+                                case ColumnType.DECIMAL64:
+                                case ColumnType.DECIMAL128:
+                                case ColumnType.DECIMAL256:
+                                    final int precision = ColumnType.getDecimalPrecision(colType);
+                                    final int scale = ColumnType.getDecimalScale(colType);
+                                    try {
+                                        decimal256.ofString(entityValue.asAsciiCharSequence(), precision, scale);
+                                    } catch (NumericException ignored) {
+                                        throw valueError(tud.getTableNameUtf16(), colType, entityValue, ent.getName());
+                                    }
+                                    DecimalUtil.store(decimal256, r, columnIndex, colType);
+                                    break;
+                                default:
+                                    throw castError(tud.getTableNameUtf16(), "STRING", colType, ent.getName());
+                            }
+                        } else {
+                            long geoHash;
+                            try {
+                                DirectUtf8Sequence value = ent.getValue();
+                                geoHash = GeoHashes.fromAsciiTruncatingNl(value.lo(), value.hi(), ColumnType.getGeoHashBits(colType));
+                            } catch (NumericException e) {
+                                geoHash = GeoHashes.NULL;
+                            }
+                            r.putGeoHash(columnIndex, geoHash);
+                        }
+                        break;
+                    }
+                    case LineTcpParser.ENTITY_TYPE_LONG256: {
+                        switch (colType) {
+                            case ColumnType.LONG256:
+                                r.putLong256Utf8(columnIndex, ent.getValue());
+                                break;
+                            case ColumnType.SYMBOL:
+                                r.putSymUtf8(columnIndex, ent.getValue());
+                                break;
+                            default:
+                                throw castError(tud.getTableNameUtf16(), "LONG256", colType, ent.getName());
+                        }
+                        break;
+                    }
+                    case LineTcpParser.ENTITY_TYPE_BOOLEAN: {
+                        switch (colType) {
+                            case ColumnType.BOOLEAN:
+                                r.putBool(columnIndex, ent.getBooleanValue());
+                                break;
+                            case ColumnType.BYTE:
+                                r.putByte(columnIndex, (byte) (ent.getBooleanValue() ? 1 : 0));
+                                break;
+                            case ColumnType.SHORT:
+                                r.putShort(columnIndex, (short) (ent.getBooleanValue() ? 1 : 0));
+                                break;
+                            case ColumnType.INT:
+                                r.putInt(columnIndex, ent.getBooleanValue() ? 1 : 0);
+                                break;
+                            case ColumnType.LONG:
+                                r.putLong(columnIndex, ent.getBooleanValue() ? 1 : 0);
+                                break;
+                            case ColumnType.FLOAT:
+                                r.putFloat(columnIndex, ent.getBooleanValue() ? 1 : 0);
+                                break;
+                            case ColumnType.DOUBLE:
+                                r.putDouble(columnIndex, ent.getBooleanValue() ? 1 : 0);
+                                break;
+                            case ColumnType.SYMBOL:
+                                if (ent.isBinaryFormat()) {
+                                    utf8Sink.clear();
+                                    utf8Sink.put(ent.getBooleanValue() ? 't' : 'f');
+                                    r.putSymUtf8(columnIndex, utf8Sink);
+                                } else {
+                                    r.putSymUtf8(columnIndex, ent.getValue());
+                                }
+                                break;
+                            default:
+                                throw castError(tud.getTableNameUtf16(), "BOOLEAN", colType, ent.getName());
+                        }
+                        break;
+                    }
+                    case LineTcpParser.ENTITY_TYPE_TIMESTAMP: {
+                        switch (ColumnType.tagOf(colType)) {
+                            case ColumnType.TIMESTAMP:
+                                long timestampValue = from(ColumnType.getTimestampDriver(colType), ent.getLongValue(), ent.getUnit());
+                                r.putTimestamp(columnIndex, timestampValue);
+                                break;
+                            case ColumnType.DATE:
+                                TimestampDriver driver = MicrosTimestampDriver.INSTANCE;
+                                long dateValue = driver.toDate(from(driver, ent.getLongValue(), ent.getUnit()));
+                                r.putTimestamp(columnIndex, dateValue);
+                                break;
+                            case ColumnType.SYMBOL:
+                                if (ent.isBinaryFormat()) {
+                                    utf8Sink.clear();
+                                    Numbers.append(utf8Sink, ent.getLongValue());
+                                    r.putSymUtf8(columnIndex, utf8Sink);
+                                } else {
+                                    r.putSymUtf8(columnIndex, ent.getValue());
+                                }
+                                break;
+                            default:
+                                throw castError(tud.getTableNameUtf16(), "TIMESTAMP", colType, ent.getName());
+                        }
+                        break;
+                    }
+                    case LineTcpParser.ENTITY_TYPE_ARRAY:
+                        if (ColumnType.isArray(colType)) {
+                            ArrayView array = ent.getArray();
+                            if (array.getType() != colType && !array.isNull()) {
+                                throw castError(tud.getTableNameUtf16(), ColumnType.nameOf(array.getType()), colType, ent.getName());
+                            }
+                            r.putArray(columnIndex, array);
+                        } else {
+                            throw castError(tud.getTableNameUtf16(), "ARRAY", colType, ent.getName());
+                        }
+                        break;
+                    case LineTcpParser.ENTITY_TYPE_DECIMAL:
+                        if (!ColumnType.isDecimalType(ColumnType.tagOf(colType))) {
+                            throw castError(tud.getTableNameUtf16(), "DECIMAL", colType, ent.getName());
+                        }
+                        Decimal256 decimal = ent.getDecimalValue();
+                        if (decimal.isNull()) {
+                            DecimalUtil.storeNull(r, columnIndex, colType);
+                        } else {
+                            final int scale = ColumnType.getDecimalScale(colType);
+                            if (decimal.getScale() != scale) {
+                                try {
+                                    decimal.rescale(scale);
+                                } catch (NumericException ignored) {
+                                    if (decimal.getScale() > scale) {
+                                        throw precisionLossError(tud.getTableNameUtf16(), ent.getName(), ent.getDecimalValue(), colType);
+                                    } else {
+                                        throw boundsError(ent.getDecimalValue(), colType, tud.getTableNameUtf16(), ent.getName().asAsciiCharSequence());
+                                    }
+                                }
+                            }
+                            if (!decimal.comparePrecision(ColumnType.getDecimalPrecision(colType))) {
+                                throw boundsError(ent.getDecimalValue(), colType, tud.getTableNameUtf16(), ent.getName().asAsciiCharSequence());
+                            }
+                            DecimalUtil.storeNonNull(decimal, r, columnIndex, colType);
+                        }
+                        break;
+                    default:
+                        break; // unsupported types are ignored
+                }
+            }
+            r.append();
+            tud.commitIfMaxUncommittedRowsCountReached();
+        } catch (CommitFailedException commitFailedException) {
+            throw commitFailedException;
+        } catch (CairoException th) {
+            LOG.error().$("could not write line protocol measurement [tableName=").$(tud.getTableNameUtf16()).$(", message=").$safe(th.getFlyweightMessage()).$(", trace: ").$((Throwable) th).I$();
+            if (r != null) {
+                r.cancel();
+            }
+            if (th.isMalformedUtf8()) {
+                // Bad input, not a broken writer. As a bare CairoException this hits the
+                // scheduler's catch-all, which drops the writer -- one bad byte would churn the
+                // writer per line. LineProtocolException skips the line instead, as castError()
+                // already does. Other CairoExceptions still propagate, so real faults surface.
+                throw LineProtocolException.malformedUtf8(tud.getTableNameUtf16(), th.getFlyweightMessage());
+            }
+            throw th;
+        } catch (Throwable th) {
+            LOG.error().$("could not write line protocol measurement [tableName=").$(tud.getTableNameUtf16()).$(", message=").$safe(th.getMessage()).$(", trace: ").$(th).I$();
+            if (r != null) {
+                r.cancel();
+            }
+            throw th;
+        }
+    }
+
+    private byte getOverloadTimestampUnit(byte unit) {
+        return switch (unit) {
+            case CommonUtils.TIMESTAMP_UNIT_NANOS,
+                 CommonUtils.TIMESTAMP_UNIT_MILLIS,
+                 CommonUtils.TIMESTAMP_UNIT_MICROS -> unit;
+            default -> timestampUnit;
+        };
+    }
+}

@@ -1,0 +1,70 @@
+package io.questdb.test.cairo;
+
+import io.questdb.TelemetryConfigLogger;
+import io.questdb.cairo.TableFlagResolver;
+import io.questdb.cairo.TableFlagResolverImpl;
+import io.questdb.metrics.MetricsPersistenceJob;
+import io.questdb.metrics.QueryTracingJob;
+import io.questdb.tasks.TelemetryMatViewTask;
+import io.questdb.tasks.TelemetryTask;
+import io.questdb.tasks.TelemetryWalTask;
+import org.junit.Test;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+public class TableFlagsResolverTest {
+    final TableFlagResolver flags = new TableFlagResolverImpl("sys.");
+
+    @Test
+    public void testPublicTables() {
+        assertTrue(flags.isPublic(TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME));
+        assertTrue(flags.isPublic(TelemetryTask.TABLE_NAME));
+        assertTrue(flags.isPublic("sys." + TelemetryWalTask.TABLE_NAME));
+        assertTrue(flags.isPublic("sys." + TelemetryMatViewTask.TABLE_NAME));
+
+        assertTrue(flags.isPublic(TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME.toLowerCase()));
+        assertTrue(flags.isPublic(TelemetryTask.TABLE_NAME.toUpperCase()));
+        assertTrue(flags.isPublic("SYS." + TelemetryWalTask.TABLE_NAME));
+        assertTrue(flags.isPublic("SYS." + TelemetryMatViewTask.TABLE_NAME));
+
+        assertFalse(flags.isPublic("anything"));
+        assertFalse(flags.isPublic("sys.anything"));
+    }
+
+    @Test
+    public void testSysTables() {
+        assertTrue(flags.isSystem(TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME));
+        assertTrue(flags.isSystem(TelemetryTask.TABLE_NAME));
+        assertTrue(flags.isSystem("sys." + TelemetryWalTask.TABLE_NAME));
+        assertTrue(flags.isSystem("sys." + TelemetryMatViewTask.TABLE_NAME));
+
+        assertTrue(flags.isSystem(TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME.toUpperCase()));
+        assertTrue(flags.isSystem(TelemetryTask.TABLE_NAME.toLowerCase()));
+
+        assertTrue(flags.isSystem("sys.anything"));
+        assertTrue(flags.isSystem("sYs.anything"));
+        assertTrue(flags.isSystem("sYS.AnyThing"));
+        assertTrue(flags.isSystem("sys."));
+        assertTrue(flags.isSystem("SYS."));
+
+        assertFalse(flags.isSystem("anything"));
+    }
+
+    @Test
+    public void testSysTablesWithCustomPrefix() {
+        final TableFlagResolver customFlags = new TableFlagResolverImpl("__sys.");
+        // The metrics table name is prefix-derived, so it is a system table via the prefix.
+        assertTrue(customFlags.isSystem("__sys." + MetricsPersistenceJob.TABLE_NAME));
+        assertTrue(customFlags.isSystem(("__sys." + MetricsPersistenceJob.TABLE_NAME).toUpperCase()));
+        // Fixed-name internal tables stay system tables regardless of the configured prefix.
+        assertTrue(customFlags.isSystem(QueryTracingJob.TABLE_NAME));
+        assertTrue(customFlags.isSystem("__sys.anything"));
+
+        // A user table that merely shares the metrics table's unprefixed name is not a system table.
+        assertFalse(customFlags.isSystem(MetricsPersistenceJob.TABLE_NAME));
+        assertFalse(customFlags.isSystem("sys." + MetricsPersistenceJob.TABLE_NAME));
+        assertFalse(customFlags.isSystem("sys.anything"));
+        assertFalse(customFlags.isSystem("anything"));
+    }
+}

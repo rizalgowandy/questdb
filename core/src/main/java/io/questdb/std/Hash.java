@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,17 @@
 
 package io.questdb.std;
 
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.Utf8String;
+
 public final class Hash {
-    static final int HASH_BITS = 0x7fffffff;
+    // Polynomial hash multiplier (from Rust compiler's FxHasher).
+    private static final long M2 = 0x517cc1b727220a95L;
+    private static final int MURMUR3_SEED = 95967;
+    private static final long MURMUR3_X64_128_C1 = 0x87c37b91114253d5L;
+    private static final long MURMUR3_X64_128_C2 = 0x4cf5ad432745937fL;
+    private static final int SPREAD_HASH_BITS = 0x7fffffff;
+    private static final long XXH3_PRIME_MX1 = 0x165667919E3779F9L;
 
     private Hash() {
     }
@@ -33,56 +42,120 @@ public final class Hash {
     /**
      * Restricts hashCode() of the underlying char sequence to be no greater than max.
      *
-     * @param s   char sequence
+     * @param seq char sequence
      * @param max max value of hashCode()
      * @return power of 2 integer
      */
-    public static int boundedHash(CharSequence s, int max) {
-        return s == null ? -1 : (Chars.hashCode(s) & 0xFFFFFFF) & max;
+    public static int boundedHash(CharSequence seq, int max) {
+        return seq == null ? -1 : boundedHash(Chars.hashCode(seq), max);
     }
 
     /**
-     * Calculates positive integer hash of memory pointer using Java hashcode() algorithm using Ints
+     * Restricts an already computed {@link Chars#hashCode(CharSequence)} to be no greater than
+     * max. A caller that hashed the sequence for a map of its own passes that hash here rather
+     * than hashing the same characters a second time.
+     *
+     * @param hashCode {@link Chars#hashCode(CharSequence)} of the char sequence
+     * @param max      max value of the returned hash
+     * @return power of 2 integer
+     */
+    public static int boundedHash(int hashCode, int max) {
+        return (hashCode & 0xFFFFFFF) & max;
+    }
+
+    public static long hashInt64(int k) {
+        return xxh3Avalanche64(Integer.toUnsignedLong(k));
+    }
+
+    public static int hashLong128_32(long key1, long key2) {
+        return (int) hashLong128_64(key1, key2);
+    }
+
+    public static long hashLong128_64(long key1, long key2) {
+        return xxh3Avalanche64(key1 * M2 + key2);
+    }
+
+    public static long hashLong256_64(long key1, long key2, long key3, long key4) {
+        return xxh3Avalanche64(key1 * M2 * M2 * M2 + key2 * M2 * M2 + key3 * M2 + key4);
+    }
+
+    public static int hashLong32(long k) {
+        return (int) hashLong64(k);
+    }
+
+    public static long hashLong64(long k) {
+        return xxh3Avalanche64(k);
+    }
+
+    /**
+     * Calculates integer hash for the given chunk of native memory using a polynomial hash function.
+     * Suitable for potentially large sequences of bytes.
+     * <p>
+     * The function is a modified version of the function from
+     * <a href="https://vanilla-java.github.io/2018/08/15/Looking-at-randomness-and-performance-for-hash-codes.html">this article</a>
+     * by Peter Lawrey.
      *
      * @param p   memory pointer
      * @param len memory length in bytes
      * @return hash code
      */
-    public static int hashMem(long p, int len) {
-        long hash = 0;
-        final long hi = p + len;
-        while (hi - p > 3) {
-            hash = (hash << 5) - hash + Unsafe.getUnsafe().getInt(p);
-            p += Integer.BYTES;
+    public static long hashMem64(long p, long len) {
+        long h = 0;
+        long i = 0;
+        for (; i + 7 < len; i += 8) {
+            h = h * M2 + Unsafe.getLong(p + i);
         }
-
-        while (p < hi) {
-            hash = (hash << 5) - hash + Unsafe.getUnsafe().getByte(p++);
+        if (i + 3 < len) {
+            h = h * M2 + Unsafe.getInt(p + i);
+            i += 4;
         }
-
-        return spread((int) hash);
+        for (; i < len; i++) {
+            h = h * M2 + Unsafe.getByte(p + i);
+        }
+        return xxh3Avalanche64(h);
     }
 
     /**
-     * Calculates positive integer hash of memory pointer using Java hashcode() algorithm using Longs
-     *
-     * @param p   memory pointer
-     * @param len memory length in bytes
-     * @return hash code
+     * Same as {@link #hashMem64(long, long)}, but with direct UTF8 string
+     * instead of direct unsafe access.
      */
-    public static int hashMemAlternative(long p, int len) {
-        long hash = 0;
-        final long hi = p + len;
-        while (hi - p > 7) {
-            hash = (hash << 5) - hash + Unsafe.getUnsafe().getLong(p);
-            p += Long.BYTES;
-        }
+    public static int hashUtf8(DirectUtf8Sequence seq) {
+        return (int) hashMem64(seq.lo(), seq.size());
+    }
 
-        while (p < hi) {
-            hash = (hash << 5) - hash + Unsafe.getUnsafe().getByte(p++);
+    /**
+     * Same as {@link #hashMem64(long, long)}, but with on-heap char sequence
+     * instead of direct unsafe access.
+     */
+    public static int hashUtf8(Utf8String us) {
+        final int len = us.size();
+        long h = 0;
+        int i = 0;
+        for (; i + 7 < len; i += 8) {
+            h = h * M2 + us.longAt(i);
         }
+        if (i + 3 < len) {
+            h = h * M2 + us.intAt(i);
+            i += 4;
+        }
+        for (; i < len; i++) {
+            h = h * M2 + us.byteAt(i);
+        }
+        return (int) xxh3Avalanche64(h);
+    }
 
-        return spread((int) hash);
+    /**
+     * The Murmur3 128-bit variant. Returns the 8 most significant bytes of the hash.
+     */
+    public static long murmur3ToLong(long key) {
+        return murmur3ToLong(key, Long.BYTES);
+    }
+
+    /**
+     * The Murmur3 128-bit variant. Returns the 8 most significant bytes of the hash.
+     */
+    public static long murmur3ToLong(int key) {
+        return murmur3ToLong(key & 0xffffffffL, Integer.BYTES);
     }
 
     /**
@@ -93,7 +166,7 @@ public final class Hash {
      * always collide. (Among known examples are sets of Float keys
      * holding consecutive whole numbers in small tables.)  So we
      * apply a transform that spreads the impact of higher bits
-     * downward. There is a trade off between speed, utility, and
+     * downward. There is a trade-off between speed, utility, and
      * quality of bit-spreading. Because many common sets of hashes
      * are already reasonably distributed (so don't benefit from
      * spreading), and because we use trees to handle large sets of
@@ -106,6 +179,54 @@ public final class Hash {
      * @return adjusted hash code
      */
     public static int spread(int h) {
-        return (h ^ (h >>> 16)) & HASH_BITS;
+        return (h ^ (h >>> 16)) & SPREAD_HASH_BITS;
+    }
+
+    /**
+     * Murmur3 finalizer. Kept as a private helper exclusively for
+     * {@link #murmur3ToLong(long, int)} to preserve the bit-identical
+     * Murmur3 128-bit algorithm; other hash paths use
+     * {@link #xxh3Avalanche64(long)}.
+     */
+    private static long fmix64(long h) {
+        h = (h ^ (h >>> 33)) * 0xff51afd7ed558ccdL;
+        h = (h ^ (h >>> 33)) * 0xc4ceb9fe1a85ec53L;
+        return h ^ (h >>> 33);
+    }
+
+    /**
+     * This is an implementation of the Murmur3 128-bit variant, based on the MurmurHash3_x64_128
+     * function from the original MurmurHash3 C++ code
+     * (<a href="https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp">SMHasher</a>).
+     * <p>
+     * Returns the 8 most significant bytes of the hash.
+     */
+    private static long murmur3ToLong(long key, int keySizeInBytes) {
+        long k1 = key;
+        long h1 = MURMUR3_SEED;
+        long h2 = MURMUR3_SEED;
+        k1 *= MURMUR3_X64_128_C1;
+        k1 = Long.rotateLeft(k1, 31);
+        k1 *= MURMUR3_X64_128_C2;
+        h1 ^= k1;
+
+        // finalization
+        h1 ^= keySizeInBytes;
+        h2 ^= keySizeInBytes;
+        h1 += h2;
+        h2 += h1;
+        h1 = fmix64(h1);
+        h2 = fmix64(h2);
+        h1 += h2;
+        return h1;
+    }
+
+    /**
+     * xxh3 64-bit avalanche: 1 multiply + 2 shift-XORs on the critical path.
+     */
+    private static long xxh3Avalanche64(long h) {
+        h ^= h >>> 37;
+        h *= XXH3_PRIME_MX1;
+        return h ^ (h >>> 32);
     }
 }

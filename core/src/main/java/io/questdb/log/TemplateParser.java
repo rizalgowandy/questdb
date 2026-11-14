@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,17 +24,33 @@
 
 package io.questdb.log;
 
-import io.questdb.std.*;
+import io.questdb.cairo.CairoException;
+import io.questdb.std.CharSequenceIntHashMap;
+import io.questdb.std.CharSequenceObjHashMap;
+import io.questdb.std.Chars;
+import io.questdb.std.ObjList;
 import io.questdb.std.datetime.DateFormat;
-import io.questdb.std.datetime.microtime.TimestampFormatCompiler;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
+import io.questdb.std.datetime.DateLocaleFactory;
+import io.questdb.std.datetime.microtime.MicrosFormatCompiler;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.Utf8StringSink;
+import org.jetbrains.annotations.NotNull;
 
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class TemplateParser implements Sinkable {
+
+    private static final String DATE_FORMAT_KEY = "date:";
+    private static final int NIL = -1;
+    private final MicrosFormatCompiler dateCompiler = new MicrosFormatCompiler();
+    private final AtomicLong dateValue = new AtomicLong();
+    private final CharSequenceIntHashMap envStartIdxs = new CharSequenceIntHashMap();
+    private final Utf8StringSink resolveSink = new Utf8StringSink();
+    private final ObjList<TemplateNode> templateNodes = new ObjList<>();
+    private CharSequence originalTxt;
+    private CharSequenceObjHashMap<CharSequence> props;
 
     public static CharSequenceObjHashMap<CharSequence> adaptMap(Map<String, String> props) {
         CharSequenceObjHashMap<CharSequence> properties = new CharSequenceObjHashMap<>(props.size());
@@ -44,19 +60,12 @@ public class TemplateParser implements Sinkable {
         return properties;
     }
 
-    private static final String DATE_FORMAT_KEY = "date:";
-    private static final int NIL = -1;
+    public int getKeyOffset(CharSequence key) {
+        return envStartIdxs.get(key); // relative to originalTxt
+    }
 
-    private final TimestampFormatCompiler dateCompiler = new TimestampFormatCompiler();
-    private final StringSink resolveSink = new StringSink();
-    private final ObjList<TemplateNode> templateNodes = new ObjList<>();
-    private final CharSequenceIntHashMap envStartIdxs = new CharSequenceIntHashMap();
-    private final AtomicLong dateValue = new AtomicLong();
-    private CharSequenceObjHashMap<CharSequence> props;
-    private CharSequence originalTxt;
-
-    public TemplateParser parseEnv(CharSequence txt, long dateValue) {
-        return parse(txt, dateValue, adaptMap(System.getenv()), true);
+    public ObjList<TemplateNode> getTemplateNodes() {
+        return templateNodes;
     }
 
     public TemplateParser parse(CharSequence txt, long dateValue, CharSequenceObjHashMap<CharSequence> props) {
@@ -67,8 +76,90 @@ public class TemplateParser implements Sinkable {
         return parse(txt, dateValue, adaptMap(props), true);
     }
 
+    public TemplateParser parseEnv(CharSequence txt, long dateValue) {
+        return parse(txt, dateValue, adaptMap(System.getenv()), true);
+    }
+
     public TemplateParser parseUtf8(CharSequence txt, long dateValue, CharSequenceObjHashMap<CharSequence> props) {
         return parse(txt, dateValue, props, false);
+    }
+
+    public void setDateValue(long dateValue) {
+        this.dateValue.set(dateValue);
+    }
+
+    @Override
+    public void toSink(@NotNull CharSink<?> sink) {
+        for (int i = 0, n = templateNodes.size(); i < n; i++) {
+            sink.put(templateNodes.getQuick(i));
+        }
+    }
+
+    @Override
+    public String toString() {
+        resolveSink.clear();
+        toSink(resolveSink);
+        return resolveSink.toString();
+    }
+
+    private void addDateTemplateNode(int start, int end) {
+        if (end - start < 1) {
+            throw new LogError("Missing expression at position " + start);
+        }
+        int actualStart = start;
+        int actualEnd = end;
+        while (originalTxt.charAt(actualStart) == ' ' && actualStart < actualEnd) {
+            actualStart++;
+        }
+        while (originalTxt.charAt(actualEnd - 1) == ' ' && actualEnd > actualStart) {
+            actualEnd--;
+        }
+        if (actualEnd - actualStart < 1) {
+            throw new LogError("Missing expression at position " + actualStart);
+        }
+        final DateFormat dateFormat = dateCompiler.compile(originalTxt, actualStart, actualEnd, false);
+        templateNodes.add(new TemplateNode(TemplateNode.TYPE_DATE, DATE_FORMAT_KEY) {
+            @Override
+            public void toSink(@NotNull CharSink<?> sink) {
+                dateFormat.format(dateValue.get(), DateLocaleFactory.EN_LOCALE, null, sink);
+            }
+        });
+    }
+
+    private void addEnvTemplateNode(int dollarOffset, int envStart, int envEnd) {
+        final String envKey = originalTxt.subSequence(envStart, envEnd).toString();
+        CharSequence envVal = props.get(envKey);
+        if (envVal == null) {
+            if (Chars.equals(envKey, "log.dir")) {
+                envVal = props.get("QDB_LOG_LOG_DIR");
+                if (envVal == null) {
+                    throw CairoException.nonCritical().put("could not find property `log.dir`. Did you pass `QDB_LOG_LOG_DIR` as an environment variable?");
+                }
+            } else {
+                throw new LogError("Undefined property: " + envKey);
+            }
+        }
+        envStartIdxs.put(envKey, dollarOffset);
+        CharSequence finalEnvVal = envVal;
+        templateNodes.add(new TemplateNode(TemplateNode.TYPE_ENV, envKey) {
+            @Override
+            public void toSink(@NotNull CharSink<?> sink) {
+                sink.put(finalEnvVal);
+            }
+        });
+    }
+
+    private void addStaticTemplateNode(int start, int end, boolean needsUtf8Encoding) {
+        templateNodes.add(new TemplateNode(TemplateNode.TYPE_STATIC, null) {
+            @Override
+            public void toSink(@NotNull CharSink<?> sink) {
+                if (needsUtf8Encoding) {
+                    sink.put(originalTxt, start, end);
+                } else {
+                    sink.putAscii(originalTxt, start, end);
+                }
+            }
+        });
     }
 
     private TemplateParser parse(
@@ -158,39 +249,12 @@ public class TemplateParser implements Sinkable {
         return this;
     }
 
-    public void setDateValue(long dateValue) {
-        this.dateValue.set(dateValue);
-    }
-
-    public int getKeyOffset(CharSequence key) {
-        return envStartIdxs.get(key); // relative to originalTxt
-    }
-
-    public ObjList<TemplateNode> getTemplateNodes() {
-        return templateNodes;
-    }
-
-    @Override
-    public void toSink(CharSink sink) {
-        for (int i = 0, n = templateNodes.size(); i < n; i++) {
-            sink.put(templateNodes.getQuick(i));
-        }
-    }
-
-    @Override
-    public String toString() {
-        resolveSink.clear();
-        toSink(resolveSink);
-        return resolveSink.toString();
-    }
-
     public static abstract class TemplateNode implements Sinkable {
-        private final static int TYPE_STATIC = 0;
-        private final static int TYPE_ENV = 1;
         private final static int TYPE_DATE = 2;
-
-        private final int type;
+        private final static int TYPE_ENV = 1;
+        private final static int TYPE_STATIC = 0;
         private final CharSequence key;
+        private final int type;
 
         private TemplateNode(int type, CharSequence key) {
             this.type = type;
@@ -200,57 +264,5 @@ public class TemplateParser implements Sinkable {
         public boolean isEnv(CharSequence key) {
             return type == TYPE_ENV && Chars.equals(this.key, key);
         }
-    }
-
-    private void addEnvTemplateNode(int dollarOffset, int envStart, int envEnd) {
-        final String envKey = originalTxt.subSequence(envStart, envEnd).toString();
-        final CharSequence envVal = props.get(envKey);
-        if (envVal == null) {
-            throw new LogError("Undefined property: " + envKey);
-        }
-        envStartIdxs.put(envKey, dollarOffset);
-        templateNodes.add(new TemplateNode(TemplateNode.TYPE_ENV, envKey) {
-            @Override
-            public void toSink(CharSink sink) {
-                sink.encodeUtf8(envVal);
-            }
-        });
-    }
-
-    private void addDateTemplateNode(int start, int end) {
-        if (end - start < 1) {
-            throw new LogError("Missing expression at position " + start);
-        }
-        int actualStart = start;
-        int actualEnd = end;
-        while (originalTxt.charAt(actualStart) == ' ' && actualStart < actualEnd) {
-            actualStart++;
-        }
-        while (originalTxt.charAt(actualEnd - 1) == ' ' && actualEnd > actualStart) {
-            actualEnd--;
-        }
-        if (actualEnd - actualStart < 1) {
-            throw new LogError("Missing expression at position " + actualStart);
-        }
-        final DateFormat dateFormat = dateCompiler.compile(originalTxt, actualStart, actualEnd, false);
-        templateNodes.add(new TemplateNode(TemplateNode.TYPE_DATE, DATE_FORMAT_KEY) {
-            @Override
-            public void toSink(CharSink sink) {
-                dateFormat.format(dateValue.get(), TimestampFormatUtils.enLocale, null, sink);
-            }
-        });
-    }
-
-    private void addStaticTemplateNode(int start, int end, boolean needsUtf8Encoding) {
-        templateNodes.add(new TemplateNode(TemplateNode.TYPE_STATIC, null) {
-            @Override
-            public void toSink(CharSink sink) {
-                if (needsUtf8Encoding) {
-                    sink.encodeUtf8(originalTxt, start, end);
-                } else {
-                    sink.put(originalTxt, start, end);
-                }
-            }
-        });
     }
 }

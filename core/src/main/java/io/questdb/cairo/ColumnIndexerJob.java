@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ public class ColumnIndexerJob extends AbstractQueueConsumerJob<ColumnIndexerTask
         super(messageBus.getIndexerQueue(), messageBus.getIndexerSubSequence());
     }
 
-    protected boolean doRun(int workerId, long cursor) {
+    protected boolean doRun(long cursor, WorkerContext workerContext) {
         final ColumnIndexerTask queueItem = queue.get(cursor);
         // copy values and release queue item
         final ColumnIndexer indexer = queueItem.indexer;
@@ -46,7 +46,7 @@ public class ColumnIndexerJob extends AbstractQueueConsumerJob<ColumnIndexerTask
         subSeq.done(cursor);
 
         // On the face of it main thread could have consumed same sequence as
-        // child workers. The reason it is undesirable is because all writers
+        // child workers. The reason it is undesirable is that all writers
         // share the same queue and main thread end up indexing content for other writers.
         // Using CAS allows main thread to steal only parts of its own job.
         if (indexer.tryLock(indexSequence)) {

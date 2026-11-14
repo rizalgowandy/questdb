@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,11 +24,11 @@
 
 #include <processthreadsapi.h>
 #include <errhandlingapi.h>
+#include <psapi.h>
 
 #define SECURITY_WIN32
 
 #include <sspi.h>
-#include <issper16.h>
 #include <rpc.h>
 #include <sys/timeb.h>
 #include "../share/os.h"
@@ -37,12 +37,28 @@
 
 JNIEXPORT jint JNICALL Java_io_questdb_std_Os_getPid
         (JNIEnv *e, jclass cl) {
-    return GetCurrentProcessId();
+    return (jint) GetCurrentProcessId();
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_std_Os_getRss
+        (JNIEnv *e, jclass cl) {
+    PROCESS_MEMORY_COUNTERS procInfo;
+    BOOL status = GetProcessMemoryInfo(GetCurrentProcess(), &procInfo, sizeof(procInfo));
+    if ( status != 0 ) {
+        return (jlong) procInfo.WorkingSetSize;
+    } else {
+        return (jlong)0L;
+    }
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_std_Os_errno
         (JNIEnv *e, jclass cl) {
     return (jint) (intptr_t) TlsGetValue(dwTlsIndexLastError);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Os_getEnvironmentType
+        (JNIEnv *e, jclass cl) {
+    return 0; // no-op
 }
 
 typedef struct {
@@ -125,14 +141,13 @@ jlong JNICALL Java_io_questdb_std_Os_generateKrbToken
 
 JNIEXPORT jint JNICALL Java_io_questdb_std_Os_setCurrentThreadAffinity0
         (JNIEnv *e, jclass fd, jint cpu) {
-    DWORD_PTR mask = (DWORD_PTR) (1L << cpu);
+    DWORD_PTR mask = (1L << cpu);
     if (SetThreadAffinityMask(GetCurrentThread(), mask) == 0) {
         SaveLastError();
         return -1;
     }
     return 0;
 }
-
 
 #define exp7           10000000LL     //1E+7     //C-file part
 #define exp9         1000000000LL     //1E+9

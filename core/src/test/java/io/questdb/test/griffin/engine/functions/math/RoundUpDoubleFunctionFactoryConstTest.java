@@ -1,0 +1,131 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin.engine.functions.math;
+
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Test;
+
+public class RoundUpDoubleFunctionFactoryConstTest extends AbstractCairoTest {
+
+    @Test
+    public void testLargeNegScale() throws Exception {
+        assertQuery("select round_up(14.7778, -18) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        null
+                        """);
+    }
+
+    @Test
+    public void testLargePosScale() throws Exception {
+        assertQuery("select round_up(14.7778, 18) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        null
+                        """);
+    }
+
+    @Test
+    public void testNegScaleHigherThanNumber() throws Exception {
+        assertQuery("select round_up(-14.778, -5) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        -100000.0
+                        """);
+    }
+
+    @Test
+    public void testNegScaleNegValue() throws Exception {
+        assertQuery("select round_up(-14.778, -1) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        -20.0
+                        """);
+    }
+
+    @Test
+    public void testNegScalePosValue() throws Exception {
+        assertQuery("select round_up(14.778, -1) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        20.0
+                        """);
+    }
+
+    @Test
+    public void testOKNegScale() throws Exception {
+        assertQuery("select round_up(14.7778, -17) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        0.0
+                        """);
+    }
+
+    @Test
+    public void testOKPosScale() throws Exception {
+        assertQuery("select round_up(14.7778, 17) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        14.777800000000001
+                        """);
+    }
+
+    @Test
+    public void testPosScaleHigherThanNumber() throws Exception {
+        assertQuery("select round_up(-14.778, 7) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        -14.7780001
+                        """);
+    }
+
+    @Test
+    public void testPosScaleNegValue() throws Exception {
+        assertQuery("select round_up(-100.9999, 1) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        -101.0
+                        """);
+    }
+
+    @Test
+    public void testPosScalePosValue() throws Exception {
+        assertQuery("select round_up(100.01, 1) from long_sequence(1)")
+                .expectSize()
+                .returns("""
+                        round_up
+                        100.10000000000001
+                        """);
+    }
+}

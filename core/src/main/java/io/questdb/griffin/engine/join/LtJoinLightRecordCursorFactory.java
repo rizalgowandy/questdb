@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,31 +24,40 @@
 
 package io.questdb.griffin.engine.join;
 
-import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.table.SymbolTranslatingRecord;
+import io.questdb.griffin.model.JoinContext;
 import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.Transient;
+import org.jetbrains.annotations.Nullable;
 
-public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory {
-    private final Map joinKeyMap;
-    private final RecordCursorFactory masterFactory;
-    private final RecordCursorFactory slaveFactory;
+import static io.questdb.griffin.engine.join.AbstractAsOfJoinFastRecordCursor.scaleTimestamp;
+
+// merge join of two cursors ordered by timestamp plus additional conditions
+public class LtJoinLightRecordCursorFactory extends AbstractJoinRecordCursorFactory {
     private final RecordSink masterKeySink;
     private final RecordSink slaveKeySink;
-    private final LtJoinLightRecordCursor cursor;
+    private final long toleranceInterval;
+    private LtJoinLightRecordCursor cursor;
+    private @Nullable SymbolTranslatingRecord symbolTranslatingRecord;
 
     public LtJoinLightRecordCursorFactory(
             CairoConfiguration configuration,
@@ -56,31 +65,45 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
             RecordCursorFactory masterFactory,
             RecordCursorFactory slaveFactory,
             @Transient ColumnTypes joinColumnTypes,
-            @Transient ColumnTypes valueTypes, // this expected to be just LONG, we store chain references in map
+            @Transient ColumnTypes valueTypes, // this expected to be just LONG, we store row ids in map
             RecordSink masterKeySink,
             RecordSink slaveKeySink,
-            int columnSplit) {
-        super(metadata);
-        this.masterFactory = masterFactory;
-        this.slaveFactory = slaveFactory;
-        joinKeyMap = MapFactory.createMap(configuration, joinColumnTypes, valueTypes);
-        this.masterKeySink = masterKeySink;
-        this.slaveKeySink = slaveKeySink;
-        this.cursor = new LtJoinLightRecordCursor(
-                columnSplit,
-                joinKeyMap,
-                NullRecordFactory.getInstance(slaveFactory.getMetadata()),
-                masterFactory.getMetadata().getTimestampIndex(),
-                slaveFactory.getMetadata().getTimestampIndex()
-        );
+            int columnSplit,
+            JoinContext joinContext,
+            long toleranceInterval,
+            int @Nullable [] masterSymbolKeyColumnIndices,
+            int @Nullable [] slaveSymbolKeyColumnIndices
+    ) {
+        super(metadata, joinContext, masterFactory, slaveFactory);
+        this.symbolTranslatingRecord = masterSymbolKeyColumnIndices != null
+                ? new SymbolTranslatingRecord(configuration, masterFactory.getMetadata().getColumnCount(), masterSymbolKeyColumnIndices, slaveSymbolKeyColumnIndices)
+                : null;
+        Map joinKeyMap = null;
+        try {
+            this.masterKeySink = masterKeySink;
+            this.slaveKeySink = slaveKeySink;
+            this.toleranceInterval = toleranceInterval;
+
+            joinKeyMap = MapFactory.createUnorderedMap(configuration, joinColumnTypes, valueTypes, false, false);
+            this.cursor = new LtJoinLightRecordCursor(
+                    columnSplit,
+                    joinKeyMap,
+                    NullRecordFactory.getInstance(slaveFactory.getMetadata()),
+                    masterFactory.getMetadata().getTimestampIndex(),
+                    slaveFactory.getMetadata().getTimestampIndex(),
+                    masterFactory.getMetadata().getTimestampType(),
+                    slaveFactory.getMetadata().getTimestampType()
+            );
+        } catch (Throwable th) {
+            Misc.free(joinKeyMap);
+            close();
+            throw th;
+        }
     }
 
     @Override
-    public void close() {
-        joinKeyMap.close();
-        ((JoinRecordMetadata) getMetadata()).close();
-        masterFactory.close();
-        slaveFactory.close();
+    public boolean followedOrderByAdvice() {
+        return masterFactory.followedOrderByAdvice();
     }
 
     @Override
@@ -89,13 +112,20 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
         RecordCursor slaveCursor = null;
         try {
             slaveCursor = slaveFactory.getCursor(executionContext);
-            cursor.of(masterCursor, slaveCursor);
+            slaveCursor.setParquetDecodeHint(ParquetDecodeHint.MONOTONIC);
+            cursor.of(masterCursor, slaveCursor, executionContext);
             return cursor;
         } catch (Throwable e) {
             Misc.free(slaveCursor);
             Misc.free(masterCursor);
+            Misc.free(cursor);
             throw e;
         }
+    }
+
+    @Override
+    public int getScanDirection() {
+        return masterFactory.getScanDirection();
     }
 
     @Override
@@ -104,32 +134,78 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
     }
 
     @Override
-    public boolean hasDescendingOrder() {
-        return masterFactory.hasDescendingOrder();
+    public void toPlan(PlanSink sink) {
+        sink.type("Lt Join Light");
+        sink.attr("condition").val(joinContext);
+        if (symbolTranslatingRecord != null) {
+            sink.attr("symbolKeyJoin").val(true);
+        }
+        sink.child(masterFactory);
+        sink.child(slaveFactory);
+    }
+
+    @Override
+    protected void _close() {
+        final LtJoinLightRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final SymbolTranslatingRecord symbolTranslatingRecord = this.symbolTranslatingRecord;
+        this.symbolTranslatingRecord = null;
+        Throwable failure = closeJoinOwnersBestEffort();
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeBestEffort(failure, symbolTranslatingRecord);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private class LtJoinLightRecordCursor extends AbstractJoinCursor {
-        private final OuterJoinRecord record;
         private final Map joinKeyMap;
         private final int masterTimestampIndex;
+        private final long masterTimestampScale;
+        private final OuterJoinRecord record;
         private final int slaveTimestampIndex;
-        private Record slaveRecord;
-        private Record masterRecord;
-        private long slaveTimestamp = Long.MIN_VALUE;
+        private final long slaveTimestampScale;
+        private SqlExecutionCircuitBreaker circuitBreaker;
+        private boolean isOpen;
         private long lastSlaveRowID = Long.MIN_VALUE;
+        private Record masterRecord;
+        private Record slaveRecord;
+        private long slaveTimestamp = Long.MIN_VALUE;
 
         public LtJoinLightRecordCursor(
                 int columnSplit,
                 Map joinKeyMap,
                 Record nullRecord,
                 int masterTimestampIndex,
-                int slaveTimestampIndex
+                int slaveTimestampIndex,
+                int masterTimestampType,
+                int slaveTimestampType
         ) {
             super(columnSplit);
             this.record = new OuterJoinRecord(columnSplit, nullRecord);
             this.joinKeyMap = joinKeyMap;
             this.masterTimestampIndex = masterTimestampIndex;
             this.slaveTimestampIndex = slaveTimestampIndex;
+            this.isOpen = false;
+            if (masterTimestampType == slaveTimestampType) {
+                masterTimestampScale = slaveTimestampScale = 1L;
+            } else {
+                masterTimestampScale = ColumnType.getTimestampDriver(masterTimestampType).toNanosScale();
+                slaveTimestampScale = ColumnType.getTimestampDriver(slaveTimestampType).toNanosScale();
+            }
+        }
+
+        @Override
+        public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
+            masterCursor.calculateSize(circuitBreaker, counter);
+        }
+
+        @Override
+        public void close() {
+            if (isOpen) {
+                joinKeyMap.close();
+                Misc.free(symbolTranslatingRecord);
+                super.close();
+                isOpen = false;
+            }
         }
 
         @Override
@@ -138,21 +214,16 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
         }
 
         @Override
-        public long size() {
-            return masterCursor.size();
-        }
-
-        @Override
         public boolean hasNext() {
-
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
             if (masterCursor.hasNext()) {
-                final long masterTimestamp = masterRecord.getTimestamp(masterTimestampIndex);
+                final long masterTimestamp = scaleTimestamp(masterRecord.getTimestamp(masterTimestampIndex), masterTimestampScale);
                 MapKey key;
                 MapValue value;
                 long slaveTimestamp = this.slaveTimestamp;
+                long slaveRowID = this.lastSlaveRowID;
                 if (slaveTimestamp < masterTimestamp) {
-
-                    if (lastSlaveRowID != Numbers.LONG_NaN) {
+                    if (lastSlaveRowID != Numbers.LONG_NULL) {
                         slaveCursor.recordAt(slaveRecord, lastSlaveRowID);
                         key = joinKeyMap.withKey();
                         key.put(slaveRecord, slaveKeySink);
@@ -160,9 +231,16 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
                         value.putLong(0, lastSlaveRowID);
                     }
 
+                    // NOTE: unlike full fat LT JOIN, we don't evacuate joinKeyMap here.
+                    // Reasoning: The joinKeyMap here contains only row ID, so evacuation would
+                    // require to dereference row ID to record to get a timestamp to decide
+                    // whether to keep the record or not. This could be expensive. Given map
+                    // values are just row IDs, we don't evacuate maps in Light LT JOINs.
+
                     final Record rec = slaveCursor.getRecord();
                     while (slaveCursor.hasNext()) {
-                        slaveTimestamp = rec.getTimestamp(slaveTimestampIndex);
+                        slaveTimestamp = scaleTimestamp(rec.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
+                        slaveRowID = rec.getRowId();
                         if (slaveTimestamp < masterTimestamp) {
                             key = joinKeyMap.withKey();
                             key.put(rec, slaveKeySink);
@@ -175,14 +253,29 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
 
                     // now we have dangling slave record, which we need to hold on to
                     this.slaveTimestamp = slaveTimestamp;
-                    this.lastSlaveRowID = rec.getRowId();
+                    this.lastSlaveRowID = slaveRowID;
                 }
+
                 key = joinKeyMap.withKey();
-                key.put(masterRecord, masterKeySink);
+                // Use the translating record (if available) so that getInt() on symbol
+                // key columns returns slave symbol IDs for integer-based map lookup.
+                if (symbolTranslatingRecord != null) {
+                    symbolTranslatingRecord.resetNonExistentKeyFlag();
+                    key.put(symbolTranslatingRecord, masterKeySink);
+                    // Skip map probe when master symbol keys don't exist in slave.
+                    if (symbolTranslatingRecord.hadNonExistentKey()) {
+                        record.hasSlave(false);
+                        return true;
+                    }
+                } else {
+                    key.put(masterRecord, masterKeySink);
+                }
+
                 value = key.findValue();
                 if (value != null) {
                     slaveCursor.recordAt(slaveRecord, value.getLong(0));
-                    record.hasSlave(true);
+                    slaveTimestamp = scaleTimestamp(slaveRecord.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
+                    record.hasSlave(toleranceInterval == Numbers.LONG_NULL || slaveTimestamp >= masterTimestamp - toleranceInterval);
                 } else {
                     record.hasSlave(false);
                 }
@@ -190,6 +283,16 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
                 return true;
             }
             return false;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return masterCursor.preComputedStateSize() + slaveCursor.preComputedStateSize();
+        }
+
+        @Override
+        public long size() {
+            return masterCursor.size();
         }
 
         @Override
@@ -201,14 +304,26 @@ public class LtJoinLightRecordCursorFactory extends AbstractRecordCursorFactory 
             slaveCursor.toTop();
         }
 
-        void of(RecordCursor masterCursor, RecordCursor slaveCursor) {
-            joinKeyMap.clear();
+        void of(RecordCursor masterCursor, RecordCursor slaveCursor, SqlExecutionContext executionContext) {
+            if (!isOpen) {
+                isOpen = true;
+                joinKeyMap.setMemoryTracker(executionContext.getMemoryTracker());
+                joinKeyMap.reopen();
+            }
+            this.circuitBreaker = executionContext.getCircuitBreaker();
+            if (symbolTranslatingRecord != null) {
+                symbolTranslatingRecord.setMemoryTracker(executionContext.getMemoryTracker());
+                symbolTranslatingRecord.initSources(masterCursor, slaveCursor);
+            }
             slaveTimestamp = Long.MIN_VALUE;
             lastSlaveRowID = Long.MIN_VALUE;
             this.masterCursor = masterCursor;
             this.slaveCursor = slaveCursor;
-            this.masterRecord = masterCursor.getRecord();
-            this.slaveRecord = slaveCursor.getRecordB();
+            masterRecord = masterCursor.getRecord();
+            slaveRecord = slaveCursor.getRecordB();
+            if (symbolTranslatingRecord != null) {
+                symbolTranslatingRecord.of(masterRecord);
+            }
             record.of(masterRecord, slaveRecord);
         }
     }

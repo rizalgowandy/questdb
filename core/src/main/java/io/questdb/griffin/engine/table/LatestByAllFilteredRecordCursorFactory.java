@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,47 +25,84 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
-import io.questdb.cairo.sql.DataFrameCursorFactory;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class LatestByAllFilteredRecordCursorFactory extends AbstractTreeSetRecordCursorFactory {
-    private final Map map;
+    private Function filter;
 
     public LatestByAllFilteredRecordCursorFactory(
-            @NotNull RecordMetadata metadata,
             @NotNull CairoConfiguration configuration,
-            @NotNull DataFrameCursorFactory dataFrameCursorFactory,
+            @NotNull RecordMetadata metadata,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
             @NotNull RecordSink recordSink,
             @Transient @NotNull ColumnTypes columnTypes,
             @Nullable Function filter,
-            @NotNull IntList columnIndexes
+            @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts
     ) {
-        super(metadata, dataFrameCursorFactory, configuration);
-        this.map = MapFactory.createMap(configuration, columnTypes);
-        if (filter == null) {
-            this.cursor = new LatestByAllRecordCursor(map, rows, recordSink, columnIndexes);
-        } else {
-            this.cursor = new LatestByAllFilteredRecordCursor(map, rows, recordSink, filter, columnIndexes);
-        }
-    }
+        super(configuration, metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
 
-    @Override
-    public void close() {
-        super.close();
-        map.close();
+        try {
+            this.filter = filter;
+            // openOnInit=false: the cursor binds the per-query tracker and reopens the map in of(),
+            // so the first allocation is charged to the per-query counter.
+            Map map = MapFactory.createOrderedMap(configuration, columnTypes, null, false);
+            if (filter == null) {
+                cursor = new LatestByAllRecordCursor(configuration, metadata, map, rows, recordSink);
+            } else {
+                cursor = new LatestByAllFilteredRecordCursor(configuration, metadata, map, rows, recordSink, filter);
+            }
+        } catch (Throwable th) {
+            close();
+            throw th;
+        }
     }
 
     @Override
     public boolean recordCursorSupportsRandomAccess() {
         return true;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("LatestByAllFiltered");
+        LatestByCompiledFilter.addJitAttr(sink, filter);
+        sink.child(cursor);
+        sink.child(partitionFrameCursorFactory);
+    }
+
+    @Override
+    public boolean usesCompiledFilter() {
+        return filter instanceof LatestByCompiledFilter;
+    }
+
+    @Override
+    protected void _close() {
+        final PageFrameRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final Function filter = this.filter;
+        this.filter = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
+        }
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeBestEffort(failure, filter);
+        CairoException.rethrowCleanupFailure(failure);
     }
 }

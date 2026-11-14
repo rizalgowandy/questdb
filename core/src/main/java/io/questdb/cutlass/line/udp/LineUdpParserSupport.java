@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,15 +27,85 @@ package io.questdb.cutlass.line.udp;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GeoHashes;
+import io.questdb.cairo.ImplicitCastException;
 import io.questdb.cairo.TableWriter;
 import io.questdb.griffin.SqlKeywords;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
+import io.questdb.std.str.Utf8StringSink;
 
 public class LineUdpParserSupport {
     private final static Log LOG = LogFactory.getLog(LineUdpParserSupport.class);
+
+    public static int getValueType(CharSequence value) {
+        return getValueType(value, ColumnType.DOUBLE, ColumnType.LONG, true);
+    }
+
+    public static int getValueType(CharSequence value, boolean useLegacyStringDefault) {
+        return getValueType(value, ColumnType.DOUBLE, ColumnType.LONG, useLegacyStringDefault);
+    }
+
+    public static int getValueType(CharSequence value, short defaultFloatColumnType, short defaultIntegerColumnType, boolean useLegacyStringDefault) {
+        // method called for inbound ilp messages on each value.
+        // returning UNDEFINED makes the whole line be skipped.
+        // 0 len values, return null type.
+        // the goal of this method is to guess the potential type,
+        // and then it will be parsed accordingly by 'putValue'.
+        int valueLen = value.length();
+        if (valueLen > 0) {
+            char first = value.charAt(0);
+            char last = value.charAt(valueLen - 1); // see AbstractLineSender.field methods
+            switch (last) {
+                case 'i':
+                    if (valueLen > 3 && value.charAt(0) == '0' && value.charAt(1) == 'x') {
+                        return ColumnType.LONG256;
+                    }
+                    return valueLen == 1 ? ColumnType.SYMBOL : defaultIntegerColumnType;
+                case 't':
+                    if (valueLen > 1 && ((first >= '0' && first <= '9') || first == '-')) {
+                        return ColumnType.TIMESTAMP_MICRO;
+                    }
+                    // fall through
+                case 'T':
+                    // t
+                    // T
+                case 'e':
+                case 'E':
+                    // tru(e)
+                    // fals(e)
+                case 'f':
+                case 'F':
+                    // f
+                    // F
+                    if (valueLen == 1) {
+                        return last != 'e' ? ColumnType.BOOLEAN : ColumnType.SYMBOL;
+                    }
+                    return SqlKeywords.isTrueKeyword(value) || SqlKeywords.isFalseKeyword(value) ?
+                            ColumnType.BOOLEAN : ColumnType.SYMBOL;
+                case '"':
+                    if (valueLen < 2 || value.charAt(0) != '\"') {
+                        LOG.error().$("incorrectly quoted string: ").$(value).$();
+                        return ColumnType.UNDEFINED;
+                    }
+                    return useLegacyStringDefault ? ColumnType.STRING : ColumnType.VARCHAR;
+                default:
+                    if (last >= '0' && last <= '9' && ((first >= '0' && first <= '9') || first == '-' || first == '.')) {
+                        return defaultFloatColumnType;
+                    }
+                    if (SqlKeywords.isNanKeyword(value)) {
+                        return defaultFloatColumnType;
+                    }
+                    if (value.charAt(0) == '"') {
+                        return ColumnType.UNDEFINED;
+                    }
+                    return ColumnType.SYMBOL;
+            }
+        }
+        return ColumnType.NULL;
+    }
 
     /**
      * Writes column value to table row. CharSequence value is interpreted depending on
@@ -48,7 +118,6 @@ public class LineUdpParserSupport {
      *                       and tag size (high short negative), otherwise -1
      * @param columnIndex    index of column to write value to
      * @param value          value characters
-     * @throws BadCastException when value cannot be cast to the give type
      */
     public static void putValue(
             TableWriter.Row row,
@@ -56,8 +125,8 @@ public class LineUdpParserSupport {
             int columnTypeMeta,
             int columnIndex,
             CharSequence value
-    ) throws BadCastException {
-        if (value.length() > 0) {
+    ) {
+        if (!value.isEmpty()) {
             try {
                 switch (ColumnType.tagOf(columnType)) {
                     case ColumnType.LONG:
@@ -68,6 +137,11 @@ public class LineUdpParserSupport {
                         break;
                     case ColumnType.STRING:
                         row.putStr(columnIndex, value, 1, value.length() - 2);
+                        break;
+                    case ColumnType.VARCHAR:
+                        Utf8StringSink utf8Sink = Misc.getThreadLocalUtf8Sink();
+                        utf8Sink.put(value, 1, value.length() - 1);
+                        row.putVarchar(columnIndex, utf8Sink);
                         break;
                     case ColumnType.SYMBOL:
                         row.putSym(columnIndex, value);
@@ -81,13 +155,16 @@ public class LineUdpParserSupport {
                     case ColumnType.INT:
                         row.putInt(columnIndex, Numbers.parseInt(value, 0, value.length() - 1));
                         break;
+                    case ColumnType.IPv4:
+                        row.putIPv4(columnIndex, Numbers.parseIPv4UDP(value));
+                        break;
                     case ColumnType.SHORT:
                         row.putShort(columnIndex, Numbers.parseShort(value, 0, value.length() - 1));
                         break;
                     case ColumnType.BYTE:
                         long v = Numbers.parseLong(value, 0, value.length() - 1);
                         if (v < Byte.MIN_VALUE || v > Byte.MAX_VALUE) {
-                            throw CairoException.instance(0)
+                            throw CairoException.nonCritical()
                                     .put("line protocol integer is out of byte bounds [columnIndex=")
                                     .put(columnIndex)
                                     .put(", v=")
@@ -161,7 +238,7 @@ public class LineUdpParserSupport {
                         // unsupported types and null are ignored
                         break;
                 }
-            } catch (NumericException e) {
+            } catch (NumericException | ImplicitCastException e) {
                 LOG.info()
                         .$("cast error [value=")
                         .$(value).$(", toType=")
@@ -172,73 +249,6 @@ public class LineUdpParserSupport {
         } else {
             putNullValue(row, columnIndex, columnType);
         }
-    }
-
-    public static class BadCastException extends Exception {
-        public static final BadCastException INSTANCE = new BadCastException();
-    }
-
-    public static int getValueType(CharSequence value) {
-        return getValueType(value, ColumnType.DOUBLE, ColumnType.LONG);
-    }
-
-    public static int getValueType(CharSequence value, short defaultFloatColumnType, short defaultIntegerColumnType) {
-        // method called for inbound ilp messages on each value.
-        // returning UNDEFINED makes the whole line be skipped.
-        // 0 len values, return null type.
-        // the goal of this method is to guess the potential type
-        // and then it will be parsed accordingly by 'putValue'.
-        int valueLen = value.length();
-        if (valueLen > 0) {
-            char first = value.charAt(0);
-            char last = value.charAt(valueLen - 1); // see AbstractLineSender.field methods
-            switch (last) {
-                case 'i':
-                    if (valueLen > 3 && value.charAt(0) == '0' && value.charAt(1) == 'x') {
-                        return ColumnType.LONG256;
-                    }
-                    return valueLen == 1 ? ColumnType.SYMBOL : defaultIntegerColumnType;
-                case 't':
-                    if (valueLen > 1 && ((first >= '0' && first <= '9') || first == '-')) {
-                        return ColumnType.TIMESTAMP;
-                    }
-                    // fall through
-                case 'T':
-                    // t
-                    // T
-                case 'e':
-                case 'E':
-                    // tru(e)
-                    // fals(e)
-                case 'f':
-                case 'F':
-                    // f
-                    // F
-                    if (valueLen == 1) {
-                        return last != 'e' ? ColumnType.BOOLEAN : ColumnType.SYMBOL;
-                    }
-                    return SqlKeywords.isTrueKeyword(value) || SqlKeywords.isFalseKeyword(value) ?
-                            ColumnType.BOOLEAN : ColumnType.SYMBOL;
-                case '"':
-                    if (valueLen < 2 || value.charAt(0) != '\"') {
-                        LOG.error().$("incorrectly quoted string: ").$(value).$();
-                        return ColumnType.UNDEFINED;
-                    }
-                    return ColumnType.STRING;
-                default:
-                    if (last >= '0' && last <= '9' && ((first >= '0' && first <= '9') || first == '-' || first == '.')) {
-                        return defaultFloatColumnType;
-                    }
-                    if (SqlKeywords.isNanKeyword(value)) {
-                        return defaultFloatColumnType;
-                    }
-                    if (value.charAt(0) == '"') {
-                        return ColumnType.UNDEFINED;
-                    }
-                    return ColumnType.SYMBOL;
-            }
-        }
-        return ColumnType.NULL;
     }
 
     private static boolean isTrue(CharSequence value) {
@@ -253,6 +263,9 @@ public class LineUdpParserSupport {
             case ColumnType.STRING:
                 row.putStr(columnIndex, null);
                 break;
+            case ColumnType.VARCHAR:
+                row.putVarchar(columnIndex, null);
+                break;
             case ColumnType.SYMBOL:
                 row.putSym(columnIndex, null);
                 break;
@@ -263,10 +276,13 @@ public class LineUdpParserSupport {
                 row.putFloat(columnIndex, Float.NaN);
                 break;
             case ColumnType.LONG:
-                row.putLong(columnIndex, Numbers.LONG_NaN);
+                row.putLong(columnIndex, Numbers.LONG_NULL);
                 break;
             case ColumnType.INT:
-                row.putInt(columnIndex, Numbers.INT_NaN);
+                row.putInt(columnIndex, Numbers.INT_NULL);
+                break;
+            case ColumnType.IPv4:
+                row.putIPv4(columnIndex, Numbers.IPv4_NULL);
                 break;
             case ColumnType.SHORT:
                 row.putShort(columnIndex, (short) 0);
@@ -278,10 +294,10 @@ public class LineUdpParserSupport {
                 row.putChar(columnIndex, (char) 0);
                 break;
             case ColumnType.DATE:
-                row.putDate(columnIndex, Numbers.LONG_NaN);
+                row.putDate(columnIndex, Numbers.LONG_NULL);
                 break;
             case ColumnType.TIMESTAMP:
-                row.putTimestamp(columnIndex, Numbers.LONG_NaN);
+                row.putTimestamp(columnIndex, Numbers.LONG_NULL);
                 break;
             case ColumnType.LONG256:
                 row.putLong256(columnIndex, "");
@@ -302,5 +318,9 @@ public class LineUdpParserSupport {
                 // unsupported types are ignored
                 break;
         }
+    }
+
+    public static class BadCastException extends Exception {
+        public static final BadCastException INSTANCE = new BadCastException();
     }
 }

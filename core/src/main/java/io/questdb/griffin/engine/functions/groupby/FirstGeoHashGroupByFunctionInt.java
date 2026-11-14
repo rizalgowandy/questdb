@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,43 +30,108 @@ import io.questdb.cairo.GeoHashes;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
-import io.questdb.griffin.engine.functions.GeoByteFunction;
+import io.questdb.griffin.engine.functions.GeoIntFunction;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
 
-class FirstGeoHashGroupByFunctionInt extends GeoByteFunction implements GroupByFunction, UnaryFunction {
-    protected final Function function;
+class FirstGeoHashGroupByFunctionInt extends GeoIntFunction implements GroupByFunction, UnaryFunction {
+    protected final Function arg;
     protected int valueIndex;
 
-    public FirstGeoHashGroupByFunctionInt(int type, Function function) {
+    public FirstGeoHashGroupByFunctionInt(int type, Function arg) {
         super(type);
-        this.function = function;
+        this.arg = arg;
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
-        mapValue.putInt(valueIndex, function.getGeoInt(record));
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        if (rowCount > 0) {
+            long existingRowId = mapValue.getLong(valueIndex);
+            if (startRowId < existingRowId || existingRowId == Numbers.LONG_NULL) {
+                mapValue.putLong(valueIndex, startRowId);
+                mapValue.putInt(valueIndex + 1, Unsafe.getInt(dataAddr));
+            }
+        }
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
-        // empty
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
+        mapValue.putLong(valueIndex, rowId);
+        mapValue.putInt(valueIndex + 1, arg.getGeoInt(record));
+    }
+
+    @Override
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
+        if (rowId < mapValue.getLong(valueIndex)) {
+            computeFirst(mapValue, record, rowId);
+        }
     }
 
     @Override
     public Function getArg() {
-        return function;
+        return arg;
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
+    public int getGeoInt(Record rec) {
+        return rec.getGeoInt(valueIndex + 1);
+    }
+
+    @Override
+    public String getName() {
+        return "first";
+    }
+
+    @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
+    }
+
+    @Override
+    public int getValueIndex() {
+        return valueIndex;
+    }
+
+    @Override
+    public void initValueIndex(int valueIndex) {
+        this.valueIndex = valueIndex;
+    }
+
+    @Override
+    public void initValueTypes(ArrayColumnTypes columnTypes) {
         this.valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.INT);
+        columnTypes.add(ColumnType.LONG); // row id
+        columnTypes.add(ColumnType.INT);  // value
+    }
+
+    @Override
+    public boolean isConstant() {
+        return false;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
+    }
+
+    @Override
+    public void merge(MapValue destValue, MapValue srcValue) {
+        long srcRowId = srcValue.getLong(valueIndex);
+        long destRowId = destValue.getLong(valueIndex);
+        if (srcRowId != Numbers.LONG_NULL && (srcRowId < destRowId || destRowId == Numbers.LONG_NULL)) {
+            destValue.putLong(valueIndex, srcRowId);
+            destValue.putInt(valueIndex + 1, srcValue.getGeoInt(valueIndex + 1));
+        }
     }
 
     @Override
     public void setInt(MapValue mapValue, int value) {
-        mapValue.putInt(this.valueIndex, value);
+        // This method is used to define interpolated points and to init
+        // an empty value, so it's ok to reset the row id field here.
+        mapValue.putLong(valueIndex, Numbers.LONG_NULL);
+        mapValue.putInt(valueIndex + 1, value);
     }
 
     @Override
@@ -75,22 +140,12 @@ class FirstGeoHashGroupByFunctionInt extends GeoByteFunction implements GroupByF
     }
 
     @Override
-    public byte getGeoByte(Record rec) {
-        throw new UnsupportedOperationException();
+    public boolean supportsBatchComputation() {
+        return true;
     }
 
     @Override
-    public short getGeoShort(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public int getGeoInt(Record rec) {
-        return rec.getGeoInt(this.valueIndex);
-    }
-
-    @Override
-    public long getGeoLong(Record rec) {
-        throw new UnsupportedOperationException();
+    public boolean supportsParallelism() {
+        return UnaryFunction.super.supportsParallelism();
     }
 }

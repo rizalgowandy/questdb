@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,16 +26,51 @@ package io.questdb.std.datetime;
 
 import io.questdb.std.NumericException;
 import io.questdb.std.str.CharSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * Instances of DateFormat do not have state. They are thread-safe. In that multiple threads can use
- * same DateFormat instance without disk of data corruption.
+ * same DateFormat instance without risk of data corruption.
  */
 public interface DateFormat {
 
-    void format(long datetime, DateLocale locale, CharSequence timeZoneName, CharSink sink);
+    /**
+     * Formats a datetime value to the sink.
+     *
+     * @param datetime     the datetime value
+     * @param locale       the date locale
+     * @param timeZoneName the timezone name, may be null
+     * @param sink         the sink to write to
+     */
+    void format(long datetime, @NotNull DateLocale locale, @Nullable CharSequence timeZoneName, @NotNull CharSink<?> sink);
 
-    long parse(CharSequence in, DateLocale locale) throws NumericException;
+    /**
+     * Returns the column type for this date format.
+     *
+     * @return the column type
+     */
+    int getColumnType();
 
-    long parse(CharSequence in, int lo, int hi, DateLocale locale) throws NumericException;
+    /**
+     * Parses a date string to a timestamp.
+     *
+     * @param in     the input string
+     * @param lo     the start index
+     * @param hi     the end index
+     * @param locale the date locale
+     * @return the parsed timestamp
+     * @throws NumericException if parsing fails
+     */
+    long parse(@NotNull CharSequence in, int lo, int hi, @NotNull DateLocale locale) throws NumericException;
+
+    /**
+     * Parses a date string to a timestamp.
+     *
+     * @param in     the input string
+     * @param locale the date locale
+     * @return the parsed timestamp
+     * @throws NumericException if parsing fails
+     */
+    long parse(@NotNull CharSequence in, @NotNull DateLocale locale) throws NumericException;
 }

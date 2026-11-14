@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 package io.questdb.std;
 
 public class LowerCaseCharSequenceHashSet extends AbstractLowerCaseCharSequenceHashSet {
-
     private static final int MIN_INITIAL_CAPACITY = 16;
 
     public LowerCaseCharSequenceHashSet() {
@@ -64,23 +63,18 @@ public class LowerCaseCharSequenceHashSet extends AbstractLowerCaseCharSequenceH
         }
     }
 
-    public boolean contains(CharSequence key) {
-        return keyIndex(key) < 0;
+    // returns the first non-null key, in arbitrary order
+    public CharSequence getAny() {
+        for (int i = 0, n = keys.length; i < n; i++) {
+            if (keys[i] != noEntryKey) {
+                return keys[i];
+            }
+        }
+        return null;
     }
 
     public CharSequence keyAt(int index) {
         return keys[-index - 1];
-    }
-
-    @Override
-    protected void erase(int index) {
-        keys[index] = noEntryKey;
-    }
-
-    @Override
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        erase(from);
     }
 
     private void rehash() {
@@ -99,5 +93,16 @@ public class LowerCaseCharSequenceHashSet extends AbstractLowerCaseCharSequenceH
                 keys[keyIndex(key)] = key;
             }
         }
+    }
+
+    @Override
+    protected void erase(int index) {
+        keys[index] = noEntryKey;
+    }
+
+    @Override
+    protected void move(int from, int to) {
+        keys[to] = keys[from];
+        erase(from);
     }
 }

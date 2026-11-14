@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,65 +29,66 @@ import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
-import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
-import io.questdb.griffin.SqlException;
-import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
+import org.jetbrains.annotations.NotNull;
 
-public class IntersectRecordCursorFactory implements RecordCursorFactory {
-    private final RecordMetadata metadata;
-    private final RecordCursorFactory masterFactory;
-    private final RecordCursorFactory slaveFactory;
-    private final IntersectRecordCursor cursor;
-    private final Map map;
+public class IntersectRecordCursorFactory extends AbstractSetRecordCursorFactory {
 
     public IntersectRecordCursorFactory(
             CairoConfiguration configuration,
             RecordMetadata metadata,
-            RecordCursorFactory masterFactory,
-            RecordCursorFactory slaveFactory,
+            RecordCursorFactory factoryA,
+            RecordCursorFactory factoryB,
+            ObjList<Function> castFunctionsA,
+            ObjList<Function> castFunctionsB,
             RecordSink recordSink,
-            ColumnTypes valueTypes
+            @Transient @NotNull ColumnTypes mapKeyTypes,
+            @Transient @NotNull ColumnTypes mapValueTypes
     ) {
-        this.metadata = metadata;
-        this.masterFactory = masterFactory;
-        this.slaveFactory = slaveFactory;
-        this.map = MapFactory.createMap(configuration, metadata, valueTypes);
-        this.cursor = new IntersectRecordCursor(map, recordSink);
-    }
-
-    @Override
-    public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        RecordCursor masterCursor = null;
-        RecordCursor slaveCursor = null;
+        super(metadata, factoryA, factoryB, castFunctionsA, castFunctionsB);
+        Map mapA = null;
+        Map mapB = null;
         try {
-            masterCursor = masterFactory.getCursor(executionContext);
-            slaveCursor = slaveFactory.getCursor(executionContext);
-            cursor.of(masterCursor, slaveCursor, executionContext);
-            return cursor;
-        } catch (Throwable ex) {
-            Misc.free(masterCursor);
-            Misc.free(slaveCursor);
-            throw ex;
+            mapA = MapFactory.createOrderedMap(configuration, mapKeyTypes, mapValueTypes, false);
+            mapB = MapFactory.createOrderedMap(configuration, mapKeyTypes, mapValueTypes, false);
+            if (castFunctionsA == null && castFunctionsB == null) {
+                cursor = new IntersectRecordCursor(mapA, mapB, recordSink);
+            } else {
+                assert castFunctionsA != null && castFunctionsB != null;
+                cursor = new IntersectCastRecordCursor(mapA, mapB, recordSink, castFunctionsA, castFunctionsB);
+            }
+        } catch (Throwable t) {
+            Misc.free(mapA);
+            Misc.free(mapB);
+            close();
+            throw t;
         }
     }
 
     @Override
-    public RecordMetadata getMetadata() {
-        return metadata;
+    public int getScanDirection() {
+        return factoryA.getScanDirection();
     }
 
     @Override
-    public boolean recordCursorSupportsRandomAccess() {
-        return masterFactory.recordCursorSupportsRandomAccess();
+    protected void _close() {
+        final AbstractSetRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        closeSetOwnersBestEffort(cursor);
     }
 
     @Override
-    public void close() {
-        Misc.free(masterFactory);
-        Misc.free(slaveFactory);
-        Misc.free(map);
+    protected CharSequence getOperation() {
+        return "Intersect";
+    }
+
+    @Override
+    protected boolean isSecondFactoryHashed() {
+        return true;
     }
 }

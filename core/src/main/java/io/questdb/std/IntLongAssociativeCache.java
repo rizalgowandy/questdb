@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,15 +28,15 @@ public class IntLongAssociativeCache {
 
     public static final long NO_VALUE = -1L;
     public static final int UNUSED_KEY = 0;
-    private static final int NOT_FOUND = -1;
     private static final int MIN_BLOCKS = 1;
     private static final int MIN_ROWS = 1;
-    private final int[] keys;
-    private final long[] values;
-    private final int rmask;
-    private final int bmask;
+    private static final int NOT_FOUND = -1;
     private final int blocks;
+    private final int bmask;
     private final int bshift;
+    private final int[] keys;
+    private final int rmask;
+    private final long[] values;
 
     public IntLongAssociativeCache(int blocks, int rows) {
         this.blocks = Math.max(MIN_BLOCKS, Numbers.ceilPow2(blocks));
@@ -67,7 +67,6 @@ public class IntLongAssociativeCache {
             return NO_VALUE;
         }
         long value = values[index];
-//        Unsafe.arrayPut(values, index, 0);
         keys[index] = UNUSED_KEY;
         return value;
     }

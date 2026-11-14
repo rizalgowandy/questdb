@@ -1,0 +1,256 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cairo.mv;
+
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.security.ReadOnlySecurityContext;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
+import io.questdb.griffin.ExpiryReadPolicy;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl;
+import io.questdb.griffin.engine.functions.bind.IndexedParameterLinkFunction;
+import io.questdb.griffin.model.IntrinsicModel;
+import io.questdb.std.Numbers;
+import io.questdb.std.str.CharSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.TestOnly;
+
+public class MatViewRefreshSqlExecutionContext extends SqlExecutionContextImpl {
+    private final boolean coveringIndexEnabled;
+    private TableReader baseTableReader;
+    // Whether the view query compiled last through this context has a wildcard in its top-level select list.
+    // It starts out true, and resetTopLevelProjectionWildcard() sets it back before each compile, so a compile
+    // that does not report its select list keeps the refresh's column-name check.
+    private boolean hasTopLevelProjectionWildcard = true;
+    private boolean isPassthrough;
+    private TableToken viewTableToken;
+
+    public MatViewRefreshSqlExecutionContext(CairoEngine engine, int sharedQueryWorkerCount) {
+        super(engine, sharedQueryWorkerCount);
+        if (!engine.getConfiguration().isMatViewParallelSqlEnabled()) {
+            setParallelFilterEnabled(false);
+            setParallelGroupByEnabled(false);
+            setParallelTopKEnabled(false);
+            setParallelWindowJoinEnabled(false);
+            setParallelReadParquetEnabled(false);
+        }
+        this.coveringIndexEnabled = engine.getConfiguration().isMatViewCoveringIndexEnabled();
+        this.securityContext = new ReadOnlySecurityContext() {
+            @Override
+            public void authorizeInsert(TableToken tableToken) {
+                if (!tableToken.equals(viewTableToken)) {
+                    throw CairoException.authorization().put("Write permission denied").setCacheable(true);
+                }
+            }
+
+            @Override
+            protected SecurityContext newPrincipalContext(CharSequence principal) {
+                // this refresh context is never re-derived per principal; return this so forPrincipal keeps
+                // the view-scoped authorizeInsert override instead of downgrading to plain read-only
+                return this;
+            }
+        };
+        this.bindVariableService = new BindVariableServiceImpl(engine.getConfiguration());
+    }
+
+    // A passthrough view's stored query spells each function call with parentheses, so a bare name in it is
+    // always a column, and one that stops resolving fails the refresh. Every passthrough view comes from a
+    // binary that stores queries this way. An aggregating view's stored query can come from a binary that
+    // stored it as written, where a bare name such as count or pi calls the zero-argument function, so its
+    // refresh keeps reading a bare name that matches no column as that call.
+    @Override
+    public boolean allowBareNoArgFunctionCalls() {
+        return !isPassthrough;
+    }
+
+    @Override
+    public boolean allowNonDeterministicFunctions() {
+        return false;
+    }
+
+    @Override
+    public boolean isExpiryReadFilterEnabled() {
+        return false;
+    }
+
+    @Override
+    public ExpiryReadPolicy getExpiryReadPolicy() {
+        return ExpiryReadPolicy.REJECT;
+    }
+
+    @Override
+    public ExpiryReadPolicy getExpiryReadPolicy(TableToken tableToken) {
+        return ExpiryReadPolicy.REJECT;
+    }
+
+    @Override
+    public CharSequence getExpiryMaterializingViewName() {
+        return viewTableToken != null ? viewTableToken.getTableName() : null;
+    }
+
+    public void clearReader() {
+        this.viewTableToken = null;
+        this.baseTableReader = null;
+        this.isPassthrough = false;
+    }
+
+    @Override
+    public @NotNull SqlExecutionCircuitBreaker getCircuitBreaker() {
+        return getSimpleCircuitBreaker(); // mat view refresh should use cancellable circuit breaker instead of no-op
+    }
+
+    // Only the declared base uses the fixed refresh snapshot. Other referenced
+    // tables use current readers and may change while the refresh runs.
+    @Override
+    public TableReader getReader(TableToken tableToken, long version) {
+        if (tableToken.equals(baseTableReader.getTableToken())) {
+            // Base table reader txn is fixed throughout the mat view refresh.
+            if (version > -1 && baseTableReader.getMetadataVersion() != version) {
+                final int tableId = tableToken.getTableId();
+                throw TableReferenceOutOfDateException.of(
+                        tableToken,
+                        tableId,
+                        tableId,
+                        version,
+                        baseTableReader.getMetadataVersion()
+                );
+            }
+            return getCairoEngine().getReaderAtTxn(baseTableReader, this);
+        }
+        return getCairoEngine().getReader(tableToken, version, this.getReaderPoolSupervisor());
+    }
+
+    // As in the versioned overload, this does not fix snapshots across all sources.
+    @Override
+    public TableReader getReader(TableToken tableToken) {
+        if (tableToken.equals(baseTableReader.getTableToken())) {
+            // Base table reader txn is fixed throughout the mat view refresh.
+            return getCairoEngine().getReaderAtTxn(baseTableReader, this);
+        }
+        return getCairoEngine().getReader(tableToken, this.getReaderPoolSupervisor());
+    }
+
+    public boolean hasTopLevelProjectionWildcard() {
+        return hasTopLevelProjectionWildcard;
+    }
+
+    @Override
+    public boolean isBackgroundJob() {
+        return true;
+    }
+
+    @Override
+    public boolean isCoveringIndexEnabled() {
+        return coveringIndexEnabled;
+    }
+
+    @Override
+    public boolean isMatViewRefresh() {
+        return true;
+    }
+
+    @Override
+    public boolean isOverriddenIntrinsics(TableToken tableToken) {
+        return tableToken == baseTableReader.getTableToken();
+    }
+
+    public void of(TableReader baseTableReader, TableToken viewTableToken, boolean isPassthrough) {
+        this.viewTableToken = viewTableToken;
+        this.baseTableReader = baseTableReader;
+        this.isPassthrough = isPassthrough;
+    }
+
+    @TestOnly
+    public void of(TableReader baseTableReader) {
+        of(baseTableReader, baseTableReader.getTableToken(), false);
+    }
+
+    @Override
+    public void overrideWhereIntrinsics(TableToken tableToken, IntrinsicModel intrinsicModel, int timestampType) {
+        if (tableToken != baseTableReader.getTableToken()) {
+            return;
+        }
+        // The refresh range always narrows the base table scan, so its boundaries go in as a
+        // positive BETWEEN. A NOT BETWEEN on the designated timestamp in the view query leaves
+        // the model's BETWEEN polarity negated, which would subtract the range instead.
+        intrinsicModel.setBetweenNegated(false);
+        // Cannot re-use function instances, they will be cached in the query plan
+        // and then can be re-used in another execution context.
+        intrinsicModel.setBetweenBoundary(new IndexedParameterLinkFunction(1, timestampType, 0), 0);
+        intrinsicModel.setBetweenBoundary(new IndexedParameterLinkFunction(2, timestampType, 0), 0);
+    }
+
+    public void resetTopLevelProjectionWildcard() {
+        hasTopLevelProjectionWildcard = true;
+    }
+
+    @Override
+    public void setAllowBareNoArgFunctionCalls(boolean value) {
+        // no-op
+    }
+
+    @Override
+    public void setAllowNonDeterministicFunction(boolean value) {
+        // no-op
+    }
+
+    // timestampLo is inclusive, timestampHi is exclusive
+    public void setRange(long timestampLo, long timestampHi, int timestampType) throws SqlException {
+        getBindVariableService().setTimestampWithType(1, timestampType, timestampLo);
+        getBindVariableService().setTimestampWithType(2, timestampType, timestampHi - 1);
+    }
+
+    @Override
+    public void setTopLevelProjectionWildcard(boolean hasTopLevelProjectionWildcard) {
+        this.hasTopLevelProjectionWildcard = hasTopLevelProjectionWildcard;
+    }
+
+    @Override
+    public void toSink(@NotNull CharSink<?> sink) {
+        super.toSink(sink);
+        if (baseTableReader != null) {
+            final TimestampDriver driver = ColumnType.getTimestampDriver(baseTableReader.getMetadata().getTimestampType());
+            sink.putAscii(", refreshMinTs=").putISODate(driver, getTimestamp(1));
+            sink.putAscii(", refreshMaxTs=").putISODate(driver, getTimestamp(2));
+        }
+    }
+
+    private long getTimestamp(int index) {
+        final Function func = getBindVariableService().getFunction(index);
+        if (func == null || !ColumnType.isTimestamp(func.getType())) {
+            return Numbers.LONG_NULL;
+        }
+        return func.getTimestamp(null);
+    }
+}

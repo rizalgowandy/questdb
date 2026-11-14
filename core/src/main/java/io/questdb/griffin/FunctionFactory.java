@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 package io.questdb.griffin;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.std.IntList;
@@ -32,6 +33,10 @@ import io.questdb.std.ObjList;
 import io.questdb.std.Transient;
 
 public interface FunctionFactory {
+    default int getExecutionRequirements() {
+        return SqlExecutionRequirements.NONE;
+    }
+
     /**
      * Function signature in a form of "name(type...)". Name is a literal that does not
      * start with number and contains no control characters, which can be confused with
@@ -40,51 +45,107 @@ public interface FunctionFactory {
      * <p>
      * Argument types are represented by single character from this table:
      * <ul>
-     * <li>B = byte</li>
-     * <li>E = short</li>
-     * <li>I = int</li>
-     * <li>L = long</li>
-     * <li>F = float</li>
-     * <li>D = double</li>
-     * <li>S = string</li>
      * <li>A = char</li>
+     * <li>B = byte</li>
+     * <li>C = cursor</li>
+     * <li>D = double</li>
+     * <li>E = short</li>
+     * <li>F = float</li>
+     * <li>G = GeoHash</li>
+     * <li>H = long256</li>
+     * <li>I = int</li>
+     * <li>J = long128</li>
      * <li>K = symbol</li>
-     * <li>T = boolean</li>
+     * <li>L = long</li>
      * <li>M = date</li>
      * <li>N = timestamp</li>
+     * <li>o = NULL - this type is used in cast()</li>
+     * <li>p = REGCLASS - this type is used in cast()</li>
+     * <li>q = REGPROCEDURE - this type is used in cast()</li>
+     * <li>R = record</li>
+     * <li>S = string</li>
+     * <li>T = boolean</li>
      * <li>U = binary</li>
      * <li>V = variable argument list</li>
-     * <li>R = record</li>
-     * <li>H = long256</li>
-     * <li>G = GeoHash</li>
+     * <li>W = string array</li>
+     * <li>X = ipv4</li>
+     * <li>Z = uuid</li>
+     * <li>Ø(ø) = varchar</li>
+     * <li>Δ(δ) = interval</li>
+     * <li>Ξ(ξ) = decimal</li>
      * </ul>
-     *
+     * <p>
      * Lower-case letters will require arguments to be constant expressions. Upper-case letters allow both constant and
-     * variable expressions.
+     * non-constant expressions.
      *
      * @return signature, for example "substr(SII)"
+     * @see Function#isConstant()
      */
     String getSignature();
 
-    default boolean isGroupBy() {
-        return false;
-    }
-
-    default boolean isCursor() {
-        return false;
-    }
-
+    /**
+     * Returns true if the function returns a boolean type.
+     *
+     * @return true if the function returns a boolean type
+     */
     default boolean isBoolean() {
         return false;
     }
 
     /**
-     * @return true if the {@link Function} produced by the factory is guaranteed to be constant for a query such that its result does not depend on any {@link Record} in the result set (i.e. now())
+     * Returns true if the function returns a cursor.
+     *
+     * @return true if the function returns a cursor
+     */
+    default boolean isCursor() {
+        return false;
+    }
+
+    /**
+     * Returns true if the function is a group by function.
+     *
+     * @return true if the function is a group by function
+     */
+    default boolean isGroupBy() {
+        return false;
+    }
+
+    /**
+     * @return true if the {@link Function} produced by the factory is guaranteed to be constant for
+     * a query such that its result does not depend on any {@link Record} in the result set, i.e. now().
      */
     default boolean isRuntimeConstant() {
         return false;
     }
 
+    /**
+     * Returns true if the first argument of the function names a table, view, materialized view or
+     * live view, whose metadata the function reads, e.g. table_columns(). In a view, such a function
+     * reads the object through the view only when the view's definition names it, which is why
+     * CREATE VIEW and ALTER VIEW record a constant argument among the dependencies of the view, see
+     * {@link SqlExecutionContext.TableFunctionView#isDependency(io.questdb.cairo.TableToken)}.
+     *
+     * @return true if the first argument of the function names a table
+     */
+    default boolean isTableNameFunction() {
+        return false;
+    }
+
+    default boolean isWindow() {
+        return false;
+    }
+
+    /**
+     * Creates a new instance of the function.
+     *
+     * @param position            the position in the SQL statement
+     * @param args                the list of function arguments
+     * @param argPositions        the positions of the arguments in the SQL statement
+     * @param configuration       the Cairo configuration
+     * @param sqlExecutionContext the SQL execution context
+     * @return a new function instance
+     * @throws SqlException if the function cannot be created
+     */
     Function newInstance(
             int position,
             @Transient ObjList<Function> args,
@@ -92,4 +153,44 @@ public interface FunctionFactory {
             CairoConfiguration configuration,
             SqlExecutionContext sqlExecutionContext
     ) throws SqlException;
+
+    /**
+     * If function has variable number of arguments, this method should return preferred type
+     * for a variadic argument at given index.
+     * <p>
+     * SQL Compiler will use this as a hint to determine type of variadic arguments when they have the
+     * UNDEFINED type at compile time.
+     *
+     * @param sqlPos sql position of the argument being resolved
+     * @param argPos index of the argument being resolved
+     * @param args   list of arguments, function type can be undefined
+     * @return preferred type for variadic arguments
+     * @throws SqlException if a function cannot resolve preferred type
+     */
+    default int resolvePreferredVariadicType(int sqlPos, int argPos, ObjList<Function> args) throws SqlException {
+        return ColumnType.STRING;
+    }
+
+    /**
+     * This method should return true when the function signature specifies two parameters
+     * of different types, but we want to accept them in the opposite order as well.
+     * <p>
+     * Example: {@code array + scalar}, where we also want to support {@code scalar + array}.
+     * <p>
+     * When this returns true, a function signature with the opposite parameter order will
+     * be automatically generated.
+     *
+     * @return true if arguments should be swapped, false otherwise
+     */
+    default boolean shouldSwapArgs() {
+        return false;
+    }
+
+    default boolean supportImplicitCastCharToStr() {
+        return true;
+    }
+
+    default boolean variadicTypeSupportUndefinedBindVariables(ObjList<Function> args) {
+        return true;
+    }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,34 +36,17 @@ abstract class AbstractSSequence extends AbstractSequence implements Sequence {
     }
 
     @Override
+    public Barrier getBarrier() {
+        return barrier;
+    }
+
+    @Override
     public long nextBully() {
         long cursor;
-
         while ((cursor = next()) < 0) {
             bully();
         }
-
         return cursor;
-    }
-
-    @Override
-    public long waitForNext() {
-        long r;
-        WaitStrategy waitStrategy = getWaitStrategy();
-        while ((r = next()) < 0) {
-            if (r == -2) {
-                continue;
-            }
-            waitStrategy.await();
-        }
-        return r;
-    }
-
-    @Override
-    public void clear() {
-        setBarrier(OpenBarrier.INSTANCE);
-        value = -1;
-        cache = -1;
     }
 
     @Override
@@ -80,6 +63,19 @@ abstract class AbstractSSequence extends AbstractSequence implements Sequence {
     public Barrier then(Barrier barrier) {
         barrier.setBarrier(this);
         return barrier;
+    }
+
+    @Override
+    public long waitForNext() {
+        long r;
+        WaitStrategy waitStrategy = getWaitStrategy();
+        while ((r = next()) < 0) {
+            if (r == -2) {
+                continue;
+            }
+            waitStrategy.await();
+        }
+        return r;
     }
 
     private void bully() {

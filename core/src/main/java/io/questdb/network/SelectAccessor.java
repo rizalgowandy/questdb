@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,19 +25,19 @@
 package io.questdb.network;
 
 public class SelectAccessor {
-    public static final int COUNT_OFFSET;
     public static final int ARRAY_OFFSET;
+    public static final int COUNT_OFFSET;
     static final int FD_READ = 1;
     static final int FD_WRITE = 2;
+
+    public static native int select(long readfds, long writefds, long exceptfds, int timeout);
+
+    private static native int arrayOffset();
+
+    private static native int countOffset();
 
     static {
         ARRAY_OFFSET = SelectAccessor.arrayOffset();
         COUNT_OFFSET = SelectAccessor.countOffset();
     }
-
-    public static native int select(long readfds, long writefds, long exceptfds);
-
-    private static native int countOffset();
-
-    private static native int arrayOffset();
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,161 +25,294 @@
 package io.questdb;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.sql.async.PageFrameReduceDispatcher;
 import io.questdb.cairo.sql.async.PageFrameReduceTask;
-import io.questdb.mp.*;
+import io.questdb.cairo.sql.async.QueryParallelFiberDispatcher;
+import io.questdb.cairo.sql.async.UnorderedPageFrameReduceTask;
+import io.questdb.cutlass.parquet.CopyExportRequestTask;
+import io.questdb.cutlass.text.CopyImportRequestTask;
+import io.questdb.cutlass.text.CopyImportTask;
+import io.questdb.metrics.QueryTrace;
+import io.questdb.mp.ConcurrentQueue;
+import io.questdb.mp.FanOut;
+import io.questdb.mp.MCSequence;
+import io.questdb.mp.MPSequence;
+import io.questdb.mp.RingQueue;
+import io.questdb.mp.SCSequence;
+import io.questdb.mp.SPSequence;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
-import io.questdb.tasks.*;
+import io.questdb.tasks.ColumnIndexerTask;
+import io.questdb.tasks.ColumnPurgeTask;
+import io.questdb.tasks.ColumnTask;
+import io.questdb.tasks.GroupByLongTopKTask;
+import io.questdb.tasks.GroupByMergeShardTask;
+import io.questdb.tasks.LatestByTask;
+import io.questdb.tasks.O3CopyTask;
+import io.questdb.tasks.O3OpenColumnTask;
+import io.questdb.tasks.O3PartitionPurgeTask;
+import io.questdb.tasks.O3PartitionTask;
+import io.questdb.tasks.PostingSealPurgeTask;
+import io.questdb.tasks.TableWriterTask;
+import io.questdb.tasks.VectorAggregateTask;
+import io.questdb.tasks.WalTxnNotificationTask;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
 public class MessageBusImpl implements MessageBus {
-    private final CairoConfiguration configuration;
-
-    private final RingQueue<ColumnIndexerTask> indexerQueue;
-    private final MPSequence indexerPubSeq;
-    private final MCSequence indexerSubSeq;
-
-    private final RingQueue<VectorAggregateTask> vectorAggregateQueue;
-    private final MPSequence vectorAggregatePubSeq;
-    private final MCSequence vectorAggregateSubSeq;
-
-    private final RingQueue<O3CallbackTask> o3CallbackQueue;
-    private final MPSequence o3CallbackPubSeq;
-    private final MCSequence o3CallbackSubSeq;
-
-    private final RingQueue<O3PartitionPurgeTask> o3PurgeDiscoveryQueue;
-    private final MPSequence o3PurgeDiscoveryPubSeq;
-    private final MCSequence o3PurgeDiscoverySubSeq;
-
-    private final RingQueue<O3PartitionTask> o3PartitionQueue;
-    private final MPSequence o3PartitionPubSeq;
-    private final MCSequence o3PartitionSubSeq;
-
-    private final RingQueue<O3OpenColumnTask> o3OpenColumnQueue;
-    private final MPSequence o3OpenColumnPubSeq;
-    private final MCSequence o3OpenColumnSubSeq;
-
-    private final RingQueue<O3CopyTask> o3CopyQueue;
-    private final MPSequence o3CopyPubSeq;
-    private final MCSequence o3CopySubSeq;
-
-    private final RingQueue<LatestByTask> latestByQueue;
-    private final MPSequence latestByPubSeq;
-    private final MCSequence latestBySubSeq;
-
-    private final RingQueue<TableWriterTask> tableWriterEventQueue;
-    private final MPSequence tableWriterEventPubSeq;
-    private final FanOut tableWriterEventSubSeq;
-
-    private final MPSequence queryCacheEventPubSeq;
-    private final FanOut queryCacheEventSubSeq;
-
-    private final int pageFrameReduceShardCount;
-    private final MPSequence[] pageFrameReducePubSeq;
-    private final MCSequence[] pageFrameReduceSubSeq;
-    private final RingQueue<PageFrameReduceTask>[] pageFrameReduceQueue;
-    private final FanOut[] pageFrameCollectFanOut;
+    private final MPSequence columnPurgePubSeq;
     private final RingQueue<ColumnPurgeTask> columnPurgeQueue;
     private final SCSequence columnPurgeSubSeq;
-    private final MPSequence columnPurgePubSeq;
+    private final MPSequence columnTaskPubSeq;
+    private final RingQueue<ColumnTask> columnTaskQueue;
+    private final MCSequence columnTaskSubSeq;
+    private final CairoConfiguration configuration;
+    private final MPSequence copyExportRequestPubSeq;
+    private final RingQueue<CopyExportRequestTask> copyExportRequestQueue;
+    private final MCSequence copyExportRequestSubSeq;
+    private final SCSequence copyImportColSeq;
+    private final SPSequence copyImportPubSeq;
+    private final RingQueue<CopyImportTask> copyImportQueue;
+    private final SPSequence copyImportRequestPubSeq;
+    private final RingQueue<CopyImportRequestTask> copyImportRequestQueue;
+    private final SCSequence copyImportRequestSubSeq;
+    private final MCSequence copyImportSubSeq;
+    private final MPSequence groupByLongTopKPubSeq;
+    private final RingQueue<GroupByLongTopKTask> groupByLongTopKQueue;
+    private final MCSequence groupByLongTopKSubSeq;
+    private final MPSequence groupByMergeShardPubSeq;
+    private final RingQueue<GroupByMergeShardTask> groupByMergeShardQueue;
+    private final MCSequence groupByMergeShardSubSeq;
+    private final MPSequence indexerPubSeq;
+    private final RingQueue<ColumnIndexerTask> indexerQueue;
+    private final MCSequence indexerSubSeq;
+    private final MPSequence latestByPubSeq;
+    private final RingQueue<LatestByTask> latestByQueue;
+    private final MCSequence latestBySubSeq;
+    private final MPSequence o3CopyPubSeq;
+    private final RingQueue<O3CopyTask> o3CopyQueue;
+    private final MCSequence o3CopySubSeq;
+    private final MPSequence o3OpenColumnPubSeq;
+    private final RingQueue<O3OpenColumnTask> o3OpenColumnQueue;
+    private final MCSequence o3OpenColumnSubSeq;
+    private final MPSequence o3PartitionPubSeq;
+    private final RingQueue<O3PartitionTask> o3PartitionQueue;
+    private final MCSequence o3PartitionSubSeq;
+    private final MPSequence o3PurgeDiscoveryPubSeq;
+    private final RingQueue<O3PartitionPurgeTask> o3PurgeDiscoveryQueue;
+    private final MCSequence o3PurgeDiscoverySubSeq;
+    private final FanOut[] pageFrameCollectFanOut;
+    private volatile PageFrameReduceDispatcher pageFrameReduceDispatcher;
+    private final MPSequence[] pageFrameReducePubSeq;
+    private final RingQueue<PageFrameReduceTask>[] pageFrameReduceQueue;
+    private final int pageFrameReduceShardCount;
+    private final MCSequence[] pageFrameReduceSubSeq;
+    private final MPSequence postingSealPurgePubSeq;
+    private final RingQueue<PostingSealPurgeTask> postingSealPurgeQueue;
+    private final SCSequence postingSealPurgeSubSeq;
+    private final MPSequence queryCacheEventPubSeq;
+    private final MCSequence queryCacheEventSubSeq;
+    private final ConcurrentQueue<QueryTrace> queryTraceQueue;
+    private volatile QueryParallelFiberDispatcher queryParallelFiberDispatcher;
+    private final MPSequence tableWriterEventPubSeq;
+    private final RingQueue<TableWriterTask> tableWriterEventQueue;
+    private final FanOut tableWriterEventSubSeq;
+    private final MPSequence unorderedPageFrameReducePubSeq;
+    private final RingQueue<UnorderedPageFrameReduceTask> unorderedPageFrameReduceQueue;
+    private final MCSequence unorderedPageFrameReduceSubSeq;
+    private final MPSequence vectorAggregatePubSeq;
+    private final RingQueue<VectorAggregateTask> vectorAggregateQueue;
+    private final MCSequence vectorAggregateSubSeq;
+    private final MPSequence walTxnNotificationPubSequence;
+    private final RingQueue<WalTxnNotificationTask> walTxnNotificationQueue;
+    private final MCSequence walTxnNotificationSubSequence;
 
     public MessageBusImpl(@NotNull CairoConfiguration configuration) {
-        this.configuration = configuration;
-        this.indexerQueue = new RingQueue<>(ColumnIndexerTask::new, configuration.getColumnIndexerQueueCapacity());
-        this.indexerPubSeq = new MPSequence(indexerQueue.getCycle());
-        this.indexerSubSeq = new MCSequence(indexerQueue.getCycle());
-        indexerPubSeq.then(indexerSubSeq).then(indexerPubSeq);
+        try {
+            this.configuration = configuration;
+            this.indexerQueue = new RingQueue<>(ColumnIndexerTask::new, configuration.getColumnIndexerQueueCapacity());
+            this.indexerPubSeq = new MPSequence(indexerQueue.getCycle());
+            this.indexerSubSeq = new MCSequence(indexerQueue.getCycle());
+            indexerPubSeq.then(indexerSubSeq).then(indexerPubSeq);
 
-        this.vectorAggregateQueue = new RingQueue<>(VectorAggregateTask::new, configuration.getVectorAggregateQueueCapacity());
-        this.vectorAggregatePubSeq = new MPSequence(vectorAggregateQueue.getCycle());
-        this.vectorAggregateSubSeq = new MCSequence(vectorAggregateQueue.getCycle());
-        vectorAggregatePubSeq.then(vectorAggregateSubSeq).then(vectorAggregatePubSeq);
+            this.vectorAggregateQueue = new RingQueue<>(VectorAggregateTask::new, configuration.getVectorAggregateQueueCapacity());
+            this.vectorAggregatePubSeq = new MPSequence(vectorAggregateQueue.getCycle());
+            this.vectorAggregateSubSeq = new MCSequence(vectorAggregateQueue.getCycle());
+            vectorAggregatePubSeq.then(vectorAggregateSubSeq).then(vectorAggregatePubSeq);
 
-        this.o3CallbackQueue = new RingQueue<>(O3CallbackTask::new, configuration.getO3CallbackQueueCapacity());
-        this.o3CallbackPubSeq = new MPSequence(this.o3CallbackQueue.getCycle());
-        this.o3CallbackSubSeq = new MCSequence(this.o3CallbackQueue.getCycle());
-        o3CallbackPubSeq.then(o3CallbackSubSeq).then(o3CallbackPubSeq);
+            this.columnTaskQueue = new RingQueue<>(ColumnTask::new, configuration.getO3CallbackQueueCapacity());
+            this.columnTaskPubSeq = new MPSequence(this.columnTaskQueue.getCycle());
+            this.columnTaskSubSeq = new MCSequence(this.columnTaskQueue.getCycle());
+            columnTaskPubSeq.then(columnTaskSubSeq).then(columnTaskPubSeq);
 
-        this.o3PartitionQueue = new RingQueue<>(O3PartitionTask::new, configuration.getO3PartitionQueueCapacity());
-        this.o3PartitionPubSeq = new MPSequence(this.o3PartitionQueue.getCycle());
-        this.o3PartitionSubSeq = new MCSequence(this.o3PartitionQueue.getCycle());
-        o3PartitionPubSeq.then(o3PartitionSubSeq).then(o3PartitionPubSeq);
+            this.o3PartitionQueue = new RingQueue<>(O3PartitionTask::new, configuration.getO3PartitionQueueCapacity());
+            this.o3PartitionPubSeq = new MPSequence(this.o3PartitionQueue.getCycle());
+            this.o3PartitionSubSeq = new MCSequence(this.o3PartitionQueue.getCycle());
+            o3PartitionPubSeq.then(o3PartitionSubSeq).then(o3PartitionPubSeq);
 
-        this.o3OpenColumnQueue = new RingQueue<>(O3OpenColumnTask::new, configuration.getO3OpenColumnQueueCapacity());
-        this.o3OpenColumnPubSeq = new MPSequence(this.o3OpenColumnQueue.getCycle());
-        this.o3OpenColumnSubSeq = new MCSequence(this.o3OpenColumnQueue.getCycle());
-        o3OpenColumnPubSeq.then(o3OpenColumnSubSeq).then(o3OpenColumnPubSeq);
+            this.o3OpenColumnQueue = new RingQueue<>(O3OpenColumnTask::new, configuration.getO3OpenColumnQueueCapacity());
+            this.o3OpenColumnPubSeq = new MPSequence(this.o3OpenColumnQueue.getCycle());
+            this.o3OpenColumnSubSeq = new MCSequence(this.o3OpenColumnQueue.getCycle());
+            o3OpenColumnPubSeq.then(o3OpenColumnSubSeq).then(o3OpenColumnPubSeq);
 
-        this.o3CopyQueue = new RingQueue<>(O3CopyTask::new, configuration.getO3CopyQueueCapacity());
-        this.o3CopyPubSeq = new MPSequence(this.o3CopyQueue.getCycle());
-        this.o3CopySubSeq = new MCSequence(this.o3CopyQueue.getCycle());
-        o3CopyPubSeq.then(o3CopySubSeq).then(o3CopyPubSeq);
+            this.o3CopyQueue = new RingQueue<>(O3CopyTask::new, configuration.getO3CopyQueueCapacity());
+            this.o3CopyPubSeq = new MPSequence(this.o3CopyQueue.getCycle());
+            this.o3CopySubSeq = new MCSequence(this.o3CopyQueue.getCycle());
+            o3CopyPubSeq.then(o3CopySubSeq).then(o3CopyPubSeq);
 
-        this.o3PurgeDiscoveryQueue = new RingQueue<>(O3PartitionPurgeTask::new, configuration.getO3PurgeDiscoveryQueueCapacity());
-        this.o3PurgeDiscoveryPubSeq = new MPSequence(this.o3PurgeDiscoveryQueue.getCycle());
-        this.o3PurgeDiscoverySubSeq = new MCSequence(this.o3PurgeDiscoveryQueue.getCycle());
-        this.o3PurgeDiscoveryPubSeq.then(this.o3PurgeDiscoverySubSeq).then(o3PurgeDiscoveryPubSeq);
+            this.o3PurgeDiscoveryQueue = new RingQueue<>(O3PartitionPurgeTask::new, configuration.getO3PurgeDiscoveryQueueCapacity());
+            this.o3PurgeDiscoveryPubSeq = new MPSequence(this.o3PurgeDiscoveryQueue.getCycle());
+            this.o3PurgeDiscoverySubSeq = new MCSequence(this.o3PurgeDiscoveryQueue.getCycle());
+            this.o3PurgeDiscoveryPubSeq.then(this.o3PurgeDiscoverySubSeq).then(o3PurgeDiscoveryPubSeq);
 
-        this.latestByQueue = new RingQueue<>(LatestByTask::new, configuration.getLatestByQueueCapacity());
-        this.latestByPubSeq = new MPSequence(latestByQueue.getCycle());
-        this.latestBySubSeq = new MCSequence(latestByQueue.getCycle());
-        latestByPubSeq.then(latestBySubSeq).then(latestByPubSeq);
+            this.latestByQueue = new RingQueue<>(() -> new LatestByTask(configuration), configuration.getLatestByQueueCapacity());
+            this.latestByPubSeq = new MPSequence(latestByQueue.getCycle());
+            this.latestBySubSeq = new MCSequence(latestByQueue.getCycle());
+            latestByPubSeq.then(latestBySubSeq).then(latestByPubSeq);
 
-        this.tableWriterEventQueue = new RingQueue<>(
-                TableWriterTask::new,
-                configuration.getWriterCommandQueueSlotSize(),
-                configuration.getWriterCommandQueueCapacity(),
-                MemoryTag.NATIVE_REPL
-        );
-        this.tableWriterEventPubSeq = new MPSequence(this.tableWriterEventQueue.getCycle());
-        this.tableWriterEventSubSeq = new FanOut();
-        this.tableWriterEventPubSeq.then(this.tableWriterEventSubSeq).then(this.tableWriterEventPubSeq);
-
-        this.queryCacheEventPubSeq = new MPSequence(configuration.getQueryCacheEventQueueCapacity());
-        this.queryCacheEventSubSeq = new FanOut();
-        this.queryCacheEventPubSeq.then(this.queryCacheEventSubSeq).then(this.queryCacheEventPubSeq);
-
-        this.columnPurgeQueue = new RingQueue<>(ColumnPurgeTask::new, configuration.getColumnPurgeQueueCapacity());
-        this.columnPurgeSubSeq = new SCSequence();
-        this.columnPurgePubSeq = new MPSequence(this.columnPurgeQueue.getCycle());
-        this.columnPurgePubSeq.then(this.columnPurgeSubSeq).then(this.columnPurgePubSeq);
-
-        this.pageFrameReduceShardCount = configuration.getPageFrameReduceShardCount();
-
-        //noinspection unchecked
-        pageFrameReduceQueue = new RingQueue[pageFrameReduceShardCount];
-        pageFrameReducePubSeq = new MPSequence[pageFrameReduceShardCount];
-        pageFrameReduceSubSeq = new MCSequence[pageFrameReduceShardCount];
-        pageFrameCollectFanOut = new FanOut[pageFrameReduceShardCount];
-
-        int reduceQueueCapacity = configuration.getPageFrameReduceQueueCapacity();
-        for (int i = 0; i < pageFrameReduceShardCount; i++) {
-            final RingQueue<PageFrameReduceTask> queue = new RingQueue<PageFrameReduceTask>(
-                    () -> new PageFrameReduceTask(configuration),
-                    reduceQueueCapacity
+            this.tableWriterEventQueue = new RingQueue<>(
+                    TableWriterTask::new,
+                    configuration.getWriterCommandQueueSlotSize(),
+                    configuration.getWriterCommandQueueCapacity(),
+                    MemoryTag.NATIVE_REPL
             );
+            this.tableWriterEventPubSeq = new MPSequence(this.tableWriterEventQueue.getCycle());
+            this.tableWriterEventSubSeq = new FanOut();
+            this.tableWriterEventPubSeq.then(this.tableWriterEventSubSeq).then(this.tableWriterEventPubSeq);
 
-            final MPSequence reducePubSeq = new MPSequence(reduceQueueCapacity);
-            final MCSequence reduceSubSeq = new MCSequence(reduceQueueCapacity);
-            final FanOut collectFanOut = new FanOut();
-            reducePubSeq.then(reduceSubSeq).then(collectFanOut).then(reducePubSeq);
+            this.columnPurgeQueue = new RingQueue<>(ColumnPurgeTask::new, configuration.getColumnPurgeQueueCapacity());
+            this.columnPurgeSubSeq = new SCSequence();
+            this.columnPurgePubSeq = new MPSequence(this.columnPurgeQueue.getCycle());
+            this.columnPurgePubSeq.then(this.columnPurgeSubSeq).then(this.columnPurgePubSeq);
 
-            pageFrameReduceQueue[i] = queue;
-            pageFrameReducePubSeq[i] = reducePubSeq;
-            pageFrameReduceSubSeq[i] = reduceSubSeq;
-            pageFrameCollectFanOut[i] = collectFanOut;
+            // POSTING-seal purge queue. Multi-producer (every TableWriter
+            // commit thread can publish) → single-consumer (PostingSealPurgeJob).
+            // Reuses the column-purge capacity knob — publish rate is bounded
+            // by seal frequency (one per ~MAX_GEN_COUNT commits per column).
+            this.postingSealPurgeQueue = new RingQueue<>(PostingSealPurgeTask::new, configuration.getColumnPurgeQueueCapacity());
+            this.postingSealPurgeSubSeq = new SCSequence();
+            this.postingSealPurgePubSeq = new MPSequence(this.postingSealPurgeQueue.getCycle());
+            this.postingSealPurgePubSeq.then(this.postingSealPurgeSubSeq).then(this.postingSealPurgePubSeq);
+
+            this.pageFrameReduceShardCount = configuration.getPageFrameReduceShardCount();
+
+            //noinspection unchecked
+            pageFrameReduceQueue = new RingQueue[pageFrameReduceShardCount];
+            pageFrameReducePubSeq = new MPSequence[pageFrameReduceShardCount];
+            pageFrameReduceSubSeq = new MCSequence[pageFrameReduceShardCount];
+            pageFrameCollectFanOut = new FanOut[pageFrameReduceShardCount];
+
+            int reduceQueueCapacity = configuration.getPageFrameReduceQueueCapacity();
+            for (int i = 0; i < pageFrameReduceShardCount; i++) {
+                pageFrameReduceQueue[i] = new RingQueue<>(
+                        () -> new PageFrameReduceTask(configuration, MemoryTag.NATIVE_OFFLOAD),
+                        reduceQueueCapacity
+                );
+                final MPSequence reducePubSeq = new MPSequence(reduceQueueCapacity);
+                pageFrameReducePubSeq[i] = reducePubSeq;
+                final MCSequence reduceSubSeq = new MCSequence(reduceQueueCapacity);
+                pageFrameReduceSubSeq[i] = reduceSubSeq;
+                final FanOut collectFanOut = new FanOut();
+                pageFrameCollectFanOut[i] = collectFanOut;
+                reducePubSeq.then(reduceSubSeq).then(collectFanOut).then(reducePubSeq);
+            }
+
+            int unorderedReduceQueueCapacity = configuration.getUnorderedPageFrameReduceQueueCapacity();
+            this.unorderedPageFrameReduceQueue = new RingQueue<>(UnorderedPageFrameReduceTask::new, unorderedReduceQueueCapacity);
+            this.unorderedPageFrameReducePubSeq = new MPSequence(unorderedReduceQueueCapacity);
+            this.unorderedPageFrameReduceSubSeq = new MCSequence(unorderedReduceQueueCapacity);
+            unorderedPageFrameReducePubSeq.then(unorderedPageFrameReduceSubSeq).then(unorderedPageFrameReducePubSeq);
+
+            this.copyImportQueue = new RingQueue<>(CopyImportTask::new, configuration.getSqlCopyQueueCapacity());
+            this.copyImportPubSeq = new SPSequence(copyImportQueue.getCycle());
+            this.copyImportSubSeq = new MCSequence(copyImportQueue.getCycle());
+            this.copyImportColSeq = new SCSequence();
+            copyImportPubSeq.then(copyImportSubSeq).then(copyImportColSeq).then(copyImportPubSeq);
+
+            // We allow only a single parallel import to be in-flight, hence queue size of 1.
+            this.copyImportRequestQueue = new RingQueue<>(CopyImportRequestTask::new, 1);
+            this.copyImportRequestPubSeq = new SPSequence(copyImportRequestQueue.getCycle());
+            this.copyImportRequestSubSeq = new SCSequence();
+            copyImportRequestPubSeq.then(copyImportRequestSubSeq).then(copyImportRequestPubSeq);
+
+            this.copyExportRequestQueue = new RingQueue<>(CopyExportRequestTask::new, configuration.getSqlCopyExportQueueCapacity());
+            this.copyExportRequestPubSeq = new MPSequence(copyExportRequestQueue.getCycle());
+            this.copyExportRequestSubSeq = new MCSequence(copyExportRequestQueue.getCycle());
+            copyExportRequestPubSeq.then(copyExportRequestSubSeq).then(copyExportRequestPubSeq);
+
+            this.walTxnNotificationQueue = new RingQueue<>(WalTxnNotificationTask::new, configuration.getWalTxnNotificationQueueCapacity());
+            this.walTxnNotificationPubSequence = new MPSequence(walTxnNotificationQueue.getCycle());
+            this.walTxnNotificationSubSequence = new MCSequence(walTxnNotificationQueue.getCycle());
+            walTxnNotificationPubSequence.then(walTxnNotificationSubSequence).then(walTxnNotificationPubSequence);
+
+            this.groupByMergeShardQueue = new RingQueue<>(GroupByMergeShardTask::new, configuration.getGroupByMergeShardQueueCapacity());
+            this.groupByMergeShardPubSeq = new MPSequence(groupByMergeShardQueue.getCycle());
+            this.groupByMergeShardSubSeq = new MCSequence(groupByMergeShardQueue.getCycle());
+            groupByMergeShardPubSeq.then(groupByMergeShardSubSeq).then(groupByMergeShardPubSeq);
+
+            this.groupByLongTopKQueue = new RingQueue<>(GroupByLongTopKTask::new, configuration.getGroupByTopKQueueCapacity());
+            this.groupByLongTopKPubSeq = new MPSequence(groupByLongTopKQueue.getCycle());
+            this.groupByLongTopKSubSeq = new MCSequence(groupByLongTopKQueue.getCycle());
+            groupByLongTopKPubSeq.then(groupByLongTopKSubSeq).then(groupByLongTopKPubSeq);
+
+            this.queryCacheEventPubSeq = new MPSequence(configuration.getQueryCacheEventQueueCapacity());
+            this.queryCacheEventSubSeq = new MCSequence(configuration.getQueryCacheEventQueueCapacity());
+            queryCacheEventPubSeq.then(queryCacheEventSubSeq).then(queryCacheEventPubSeq);
+
+            this.queryTraceQueue = ConcurrentQueue.createConcurrentQueue(QueryTrace.ITEM_FACTORY);
+        } catch (Throwable th) {
+            close();
+            throw th;
+        }
+    }
+
+    @TestOnly
+    public void clear() {
+        columnPurgeSubSeq.clear();
+        postingSealPurgeSubSeq.clear();
+        groupByLongTopKSubSeq.clear();
+        groupByMergeShardSubSeq.clear();
+        indexerSubSeq.clear();
+        latestBySubSeq.clear();
+        columnTaskSubSeq.clear();
+        o3CopySubSeq.clear();
+        o3OpenColumnSubSeq.clear();
+        o3PartitionSubSeq.clear();
+        o3PurgeDiscoverySubSeq.clear();
+        copyImportColSeq.clear();
+        copyImportRequestSubSeq.clear();
+        copyImportSubSeq.clear();
+        copyExportRequestSubSeq.clear();
+        vectorAggregateSubSeq.clear();
+        walTxnNotificationSubSequence.clear();
+        queryCacheEventSubSeq.clear();
+        unorderedPageFrameReduceSubSeq.clear();
+        for (int i = 0, n = pageFrameReduceSubSeq.length; i < n; i++) {
+            pageFrameReduceSubSeq[i].clear();
+        }
+        // Reset tasks with native backing memory to the original state.
+        for (int i = 0; i < pageFrameReduceShardCount; i++) {
+            for (int j = 0, n = pageFrameReduceQueue[i].getCycle(); j < n; j++) {
+                pageFrameReduceQueue[i].get(j).clear();
+            }
+        }
+        for (int i = 0, n = latestByQueue.getCycle(); i < n; i++) {
+            latestByQueue.get(i).clear();
         }
     }
 
     @Override
     public void close() {
         // We need to close only queues with native backing memory.
-        Misc.free(getTableWriterEventQueue());
+        Misc.free(copyExportRequestQueue);
+        Misc.free(tableWriterEventQueue);
         Misc.free(pageFrameReduceQueue);
+        Misc.free(latestByQueue);
     }
 
     @Override
-    public Sequence getColumnPurgePubSeq() {
+    public MPSequence getColumnPurgePubSeq() {
         return columnPurgePubSeq;
     }
 
@@ -194,12 +327,107 @@ public class MessageBusImpl implements MessageBus {
     }
 
     @Override
+    public MPSequence getColumnTaskPubSeq() {
+        return columnTaskPubSeq;
+    }
+
+    @Override
+    public RingQueue<ColumnTask> getColumnTaskQueue() {
+        return columnTaskQueue;
+    }
+
+    @Override
+    public MCSequence getColumnTaskSubSeq() {
+        return columnTaskSubSeq;
+    }
+
+    @Override
     public CairoConfiguration getConfiguration() {
         return configuration;
     }
 
     @Override
-    public Sequence getIndexerPubSequence() {
+    public MPSequence getCopyExportRequestPubSeq() {
+        return copyExportRequestPubSeq;
+    }
+
+    @Override
+    public RingQueue<CopyExportRequestTask> getCopyExportRequestQueue() {
+        return copyExportRequestQueue;
+    }
+
+    @Override
+    public MCSequence getCopyExportRequestSubSeq() {
+        return copyExportRequestSubSeq;
+    }
+
+    @Override
+    public SCSequence getCopyImportColSeq() {
+        return copyImportColSeq;
+    }
+
+    @Override
+    public SPSequence getCopyImportPubSeq() {
+        return copyImportPubSeq;
+    }
+
+    @Override
+    public RingQueue<CopyImportTask> getCopyImportQueue() {
+        return copyImportQueue;
+    }
+
+    @Override
+    public SPSequence getCopyImportRequestPubSeq() {
+        return copyImportRequestPubSeq;
+    }
+
+    @Override
+    public RingQueue<CopyImportRequestTask> getCopyImportRequestQueue() {
+        return copyImportRequestQueue;
+    }
+
+    @Override
+    public SCSequence getCopyImportRequestSubSeq() {
+        return copyImportRequestSubSeq;
+    }
+
+    @Override
+    public MCSequence getCopyImportSubSeq() {
+        return copyImportSubSeq;
+    }
+
+    @Override
+    public MPSequence getGroupByLongTopKPubSeq() {
+        return groupByLongTopKPubSeq;
+    }
+
+    @Override
+    public RingQueue<GroupByLongTopKTask> getGroupByLongTopKQueue() {
+        return groupByLongTopKQueue;
+    }
+
+    @Override
+    public MCSequence getGroupByLongTopKSubSeq() {
+        return groupByLongTopKSubSeq;
+    }
+
+    @Override
+    public MPSequence getGroupByMergeShardPubSeq() {
+        return groupByMergeShardPubSeq;
+    }
+
+    @Override
+    public RingQueue<GroupByMergeShardTask> getGroupByMergeShardQueue() {
+        return groupByMergeShardQueue;
+    }
+
+    @Override
+    public MCSequence getGroupByMergeShardSubSeq() {
+        return groupByMergeShardSubSeq;
+    }
+
+    @Override
+    public MPSequence getIndexerPubSequence() {
         return indexerPubSeq;
     }
 
@@ -209,12 +437,12 @@ public class MessageBusImpl implements MessageBus {
     }
 
     @Override
-    public Sequence getIndexerSubSequence() {
+    public MCSequence getIndexerSubSequence() {
         return indexerSubSeq;
     }
 
     @Override
-    public Sequence getLatestByPubSeq() {
+    public MPSequence getLatestByPubSeq() {
         return latestByPubSeq;
     }
 
@@ -224,23 +452,8 @@ public class MessageBusImpl implements MessageBus {
     }
 
     @Override
-    public Sequence getLatestBySubSeq() {
+    public MCSequence getLatestBySubSeq() {
         return latestBySubSeq;
-    }
-
-    @Override
-    public MPSequence getO3CallbackPubSeq() {
-        return o3CallbackPubSeq;
-    }
-
-    @Override
-    public RingQueue<O3CallbackTask> getO3CallbackQueue() {
-        return o3CallbackQueue;
-    }
-
-    @Override
-    public MCSequence getO3CallbackSubSeq() {
-        return o3CallbackSubSeq;
     }
 
     @Override
@@ -309,6 +522,11 @@ public class MessageBusImpl implements MessageBus {
     }
 
     @Override
+    public @Nullable PageFrameReduceDispatcher getPageFrameReduceDispatcher() {
+        return pageFrameReduceDispatcher;
+    }
+
+    @Override
     public MPSequence getPageFrameReducePubSeq(int shard) {
         return pageFrameReducePubSeq[shard];
     }
@@ -329,6 +547,41 @@ public class MessageBusImpl implements MessageBus {
     }
 
     @Override
+    public MPSequence getPostingSealPurgePubSeq() {
+        return postingSealPurgePubSeq;
+    }
+
+    @Override
+    public RingQueue<PostingSealPurgeTask> getPostingSealPurgeQueue() {
+        return postingSealPurgeQueue;
+    }
+
+    @Override
+    public SCSequence getPostingSealPurgeSubSeq() {
+        return postingSealPurgeSubSeq;
+    }
+
+    @Override
+    public MPSequence getQueryCacheEventPubSeq() {
+        return queryCacheEventPubSeq;
+    }
+
+    @Override
+    public MCSequence getQueryCacheEventSubSeq() {
+        return queryCacheEventSubSeq;
+    }
+
+    @Override
+    public ConcurrentQueue<QueryTrace> getQueryTraceQueue() {
+        return queryTraceQueue;
+    }
+
+    @Override
+    public @Nullable QueryParallelFiberDispatcher getQueryParallelFiberDispatcher() {
+        return queryParallelFiberDispatcher;
+    }
+
+    @Override
     public FanOut getTableWriterEventFanOut() {
         return tableWriterEventSubSeq;
     }
@@ -344,7 +597,22 @@ public class MessageBusImpl implements MessageBus {
     }
 
     @Override
-    public Sequence getVectorAggregatePubSeq() {
+    public MPSequence getUnorderedPageFrameReducePubSeq() {
+        return unorderedPageFrameReducePubSeq;
+    }
+
+    @Override
+    public RingQueue<UnorderedPageFrameReduceTask> getUnorderedPageFrameReduceQueue() {
+        return unorderedPageFrameReduceQueue;
+    }
+
+    @Override
+    public MCSequence getUnorderedPageFrameReduceSubSeq() {
+        return unorderedPageFrameReduceSubSeq;
+    }
+
+    @Override
+    public MPSequence getVectorAggregatePubSeq() {
         return vectorAggregatePubSeq;
     }
 
@@ -354,17 +622,40 @@ public class MessageBusImpl implements MessageBus {
     }
 
     @Override
-    public Sequence getVectorAggregateSubSeq() {
+    public MCSequence getVectorAggregateSubSeq() {
         return vectorAggregateSubSeq;
     }
 
     @Override
-    public MPSequence getQueryCacheEventPubSeq() {
-        return queryCacheEventPubSeq;
+    public MPSequence getWalTxnNotificationPubSequence() {
+        return walTxnNotificationPubSequence;
     }
 
     @Override
-    public FanOut getQueryCacheEventFanOut() {
-        return queryCacheEventSubSeq;
+    public RingQueue<WalTxnNotificationTask> getWalTxnNotificationQueue() {
+        return walTxnNotificationQueue;
+    }
+
+    @Override
+    public MCSequence getWalTxnNotificationSubSequence() {
+        return walTxnNotificationSubSequence;
+    }
+
+    @Override
+    public synchronized void setPageFrameReduceDispatcher(@Nullable PageFrameReduceDispatcher dispatcher) {
+        if (dispatcher != null && pageFrameReduceDispatcher != null && pageFrameReduceDispatcher != dispatcher) {
+            throw new IllegalStateException("page frame reduce dispatcher is already configured");
+        }
+        pageFrameReduceDispatcher = dispatcher;
+    }
+
+    @Override
+    public synchronized void setQueryParallelFiberDispatcher(@Nullable QueryParallelFiberDispatcher dispatcher) {
+        if (dispatcher != null
+                && queryParallelFiberDispatcher != null
+                && queryParallelFiberDispatcher != dispatcher) {
+            throw new IllegalStateException("query parallel fiber dispatcher is already configured");
+        }
+        queryParallelFiberDispatcher = dispatcher;
     }
 }

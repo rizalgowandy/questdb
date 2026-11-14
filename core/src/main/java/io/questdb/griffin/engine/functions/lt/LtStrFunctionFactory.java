@@ -1,0 +1,269 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.functions.lt;
+
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.Record;
+import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.functions.BinaryFunction;
+import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
+import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.std.Chars;
+import io.questdb.std.IntList;
+import io.questdb.std.ObjList;
+
+public class LtStrFunctionFactory implements FunctionFactory {
+
+    @Override
+    public String getSignature() {
+        return "<(SS)";
+    }
+
+    @Override
+    public boolean isBoolean() {
+        return true;
+    }
+
+    @Override
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
+        final Function a = args.getQuick(0);
+        final Function b = args.getQuick(1);
+        if (a.isConstant() && !b.isConstant()) {
+            CharSequence constValue = a.getStrA(null);
+            if (constValue == null) {
+                return new StrNullSideFunc(b, true);
+            }
+            return new ConstOnLeftFunc(constValue, b);
+        }
+        if (!a.isConstant() && b.isConstant()) {
+            CharSequence constValue = b.getStrA(null);
+            if (constValue == null) {
+                return new StrNullSideFunc(a, false);
+            }
+            return new ConstOnRightFunc(a, constValue);
+        }
+        return new Func(a, b);
+    }
+
+    static class ConstOnLeftFunc extends NegatableBooleanFunction implements UnaryFunction {
+        private final CharSequence constant;
+        private final Function right;
+
+        public ConstOnLeftFunc(CharSequence constant, Function right) {
+            this.constant = constant;
+            this.right = right;
+        }
+
+        @Override
+        public Function getArg() {
+            return right;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return Chars.lessThan(
+                    constant,
+                    right.getStrB(rec),
+                    negated
+            );
+        }
+
+        @Override
+        public String getName() {
+            if (negated) {
+                return ">=";
+            } else {
+                return "<";
+            }
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val('\'').val(constant).val('\'');
+            if (negated) {
+                sink.val(">=");
+            } else {
+                sink.val("<");
+            }
+            sink.val(right);
+        }
+    }
+
+    static class ConstOnRightFunc extends NegatableBooleanFunction implements UnaryFunction {
+        private final CharSequence constant;
+        private final Function left;
+
+        public ConstOnRightFunc(Function left, CharSequence constant) {
+            this.left = left;
+            this.constant = constant;
+        }
+
+        @Override
+        public Function getArg() {
+            return left;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return Chars.lessThan(
+                    left.getStrB(rec),
+                    constant,
+                    negated
+            );
+        }
+
+        @Override
+        public String getName() {
+            if (negated) {
+                return ">=";
+            } else {
+                return "<";
+            }
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val(">=");
+            } else {
+                sink.val("<");
+            }
+            sink.val('\'').val(constant).val('\'');
+        }
+    }
+
+    static class Func extends NegatableBooleanFunction implements BinaryFunction {
+        private final Function left;
+        private final Function right;
+
+        public Func(Function left, Function right) {
+            this.left = left;
+            this.right = right;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            // important to compare A and B strings in case
+            // these are columns of the same record
+            // records have re-usable character sequences
+            return Chars.lessThan(
+                    left.getStrA(rec),
+                    right.getStrB(rec),
+                    negated
+            );
+        }
+
+        @Override
+        public Function getLeft() {
+            return left;
+        }
+
+        @Override
+        public String getName() {
+            if (negated) {
+                return ">=";
+            } else {
+                return "<";
+            }
+        }
+
+        @Override
+        public Function getRight() {
+            return right;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val(">=");
+            } else {
+                sink.val('<');
+            }
+            sink.val(right);
+        }
+    }
+
+    /**
+     * Short-circuit used when one operand is a constant NULL and the other side is a
+     * STRING-typed Function. Returning {@link io.questdb.griffin.engine.functions.constants.BooleanConstant#FALSE}
+     * directly would let the wrapping {@code NegatingFunctionFactory} (which builds
+     * {@code <=} and {@code >=} from {@code <} and {@code >}) flip the result; as a
+     * {@link NegatableBooleanFunction}, this class consumes the negation flag itself.
+     * <p>
+     * The semantics mirror the runtime {@link Chars#lessThan(CharSequence, CharSequence, boolean)} path:
+     * {@code <} / {@code >} (negated=false) always return false because at least one
+     * operand is null, and {@code <=} / {@code >=} (negated=true) return true only
+     * when the runtime side is also null (QuestDB's {@code NULL = NULL -> true}
+     * convention).
+     */
+    static final class StrNullSideFunc extends NegatableBooleanFunction implements UnaryFunction {
+        private final Function arg;
+        private final boolean nullOnLeft;
+
+        StrNullSideFunc(Function arg, boolean nullOnLeft) {
+            this.arg = arg;
+            this.nullOnLeft = nullOnLeft;
+        }
+
+        @Override
+        public Function getArg() {
+            return arg;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return negated && arg.getStrA(rec) == null;
+        }
+
+        @Override
+        public String getName() {
+            return negated ? ">=" : "<";
+        }
+
+        // The printed form reflects the post-Swap orientation, not the user's
+        // original SQL: `s <= null` lands here as Negating(Swapping(<)), which
+        // sets nullOnLeft=true and negated=true, so EXPLAIN reads `null >= s`.
+        // The expression is mathematically equivalent.
+        @Override
+        public void toPlan(PlanSink sink) {
+            if (nullOnLeft) {
+                sink.val("null").val(getName()).val(arg);
+            } else {
+                sink.val(arg).val(getName()).val("null");
+            }
+        }
+    }
+}

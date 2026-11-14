@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,22 +31,21 @@ public class FlyweightCharSequence extends AbstractCharSequence implements Mutab
     public static final ObjectFactory<FlyweightCharSequence> FACTORY = FlyweightCharSequence::new;
 
     private CharSequence delegate;
-    private int lo;
     private int len = -1;
+    private int lo;
+
+    @Override
+    public char charAt(int index) {
+        return delegate.charAt(index + lo);
+    }
 
     @Override
     public void clear() {
-
     }
 
     @Override
     public int length() {
         return len;
-    }
-
-    @Override
-    public char charAt(int index) {
-        return delegate.charAt(index + lo);
     }
 
     public FlyweightCharSequence of(CharSequence delegate) {

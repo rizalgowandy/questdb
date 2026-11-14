@@ -1,0 +1,246 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cairo.idx;
+
+import io.questdb.cairo.vm.api.MemoryR;
+
+/**
+ * Picks the chain entry that a reader pinned at {@code pinnedTableTxn}
+ * should use. The rule is: select the entry with the largest
+ * {@code txnAtSeal} that is {@code <= pinnedTableTxn}.
+ * <p>
+ * Entries with {@code txnAtSeal > pinnedTableTxn} are either:
+ * <ul>
+ *   <li>uncommitted publishes whose corresponding {@code txWriter.commit()}
+ *       has not yet landed (transient state during a healthy commit), or
+ *   <li>abandoned publishes from a writer that distressed before commit
+ *       (will be reclaimed by the next writer-open recovery pass).
+ * </ul>
+ * In both cases the reader skips them. The strict-pin invariant guarantees
+ * no reader will ever be pinned at a {@code _txn} value that hasn't
+ * actually committed, so an entry with {@code txnAtSeal > pinnedTableTxn}
+ * cannot be the right one for this reader.
+ */
+public final class PostingIndexChainPicker {
+
+    public static final int RESULT_EMPTY_CHAIN = 1;
+    public static final int RESULT_HEADER_UNREADABLE = 3;
+    public static final int RESULT_NO_VISIBLE_ENTRY = 2;
+    public static final int RESULT_OK = 0;
+
+    private PostingIndexChainPicker() {
+    }
+
+    /**
+     * Walks the chain backwards from head to the entry that names {@code sealTxn}, and populates {@code into} with
+     * it. {@link #pick} returns that entry for a pinned txn from its txnAtSeal up to, not including, the lowest
+     * txnAtSeal of the entries after it, which the walk visits first. Every entry takes a sealTxn above those of the
+     * entries before it, so the walk stops at the first entry below {@code sealTxn}. The bound checks are those of
+     * {@link #pick}.
+     *
+     * @return one of the RESULT_* codes:
+     * <ul>
+     *   <li>{@code RESULT_OK} — {@link #pick} returns the entry that names {@code sealTxn} for a pinned txn at or
+     *       above {@code minPinnedTableTxn}, and {@code into} holds it;</li>
+     *   <li>{@code RESULT_EMPTY_CHAIN} — the chain has no entries at all;</li>
+     *   <li>{@code RESULT_NO_VISIBLE_ENTRY} — no entry names {@code sealTxn}, or {@link #pick} returns another entry
+     *       for every pinned txn at or above {@code minPinnedTableTxn};</li>
+     *   <li>{@code RESULT_HEADER_UNREADABLE} — the header or an entry cannot be read, as for {@link #pick}.</li>
+     * </ul>
+     */
+    public static int findVisibleBySealTxn(
+            MemoryR keyMem,
+            long sealTxn,
+            long minPinnedTableTxn,
+            PostingIndexChainHeader.Snapshot headerScratch,
+            PostingIndexChainEntry.Snapshot into
+    ) {
+        if (!PostingIndexChainHeader.readUnderSeqlock(keyMem, headerScratch)) {
+            return RESULT_HEADER_UNREADABLE;
+        }
+        return findVisibleBySealTxn(keyMem, headerScratch, sealTxn, minPinnedTableTxn, into);
+    }
+
+    /**
+     * {@link #findVisibleBySealTxn(MemoryR, long, long, PostingIndexChainHeader.Snapshot, PostingIndexChainEntry.Snapshot)}
+     * from a header that the caller read with {@link PostingIndexChainHeader#readUnderSeqlock}, for a caller that
+     * needs the header before the walk, as {@link PostingIndexKeyFileView} does.
+     */
+    public static int findVisibleBySealTxn(
+            MemoryR keyMem,
+            PostingIndexChainHeader.Snapshot header,
+            long sealTxn,
+            long minPinnedTableTxn,
+            PostingIndexChainEntry.Snapshot into
+    ) {
+        if (header.isEmpty()) {
+            return RESULT_EMPTY_CHAIN;
+        }
+
+        long entryOffset = header.headEntryOffset;
+        final long regionBase = header.regionBase;
+        final long regionLimit = header.regionLimit;
+        final long entryCount = header.entryCount;
+        final long mappedLimit = keyMem.size();
+        long visited = 0;
+        // The first pinned txn at which pick() returns an entry the walk has visited
+        long supersedingTxnAtSeal = Long.MAX_VALUE;
+        while (entryOffset != PostingIndexUtils.V2_NO_HEAD) {
+            if (entryOffset < regionBase || entryOffset >= regionLimit) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            if (entryOffset + PostingIndexUtils.V2_ENTRY_HEADER_SIZE > mappedLimit) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            final long peekedLen = keyMem.getLong(entryOffset + PostingIndexUtils.V2_ENTRY_OFFSET_LEN);
+            if (peekedLen <= 0 || peekedLen > mappedLimit - entryOffset) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            if (visited++ > entryCount) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            // No cover footer is needed: read() takes the sealTxn and the txnAtSeal from the header and the gen dir.
+            PostingIndexChainEntry.read(keyMem, entryOffset, 0, into);
+            if (into.len != peekedLen) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            if (into.sealTxn == sealTxn) {
+                return Math.max(into.txnAtSeal, minPinnedTableTxn) < supersedingTxnAtSeal ? RESULT_OK : RESULT_NO_VISIBLE_ENTRY;
+            }
+            if (into.sealTxn < sealTxn) {
+                return RESULT_NO_VISIBLE_ENTRY;
+            }
+            supersedingTxnAtSeal = Math.min(supersedingTxnAtSeal, into.txnAtSeal);
+            entryOffset = into.prevEntryOffset;
+        }
+        return RESULT_NO_VISIBLE_ENTRY;
+    }
+
+    /**
+     * Convenience overload for callers that don't read covering. Equivalent
+     * to {@code pick(keyMem, pinnedTableTxn, 0, headerScratch, into)}.
+     */
+    public static int pick(
+            MemoryR keyMem,
+            long pinnedTableTxn,
+            PostingIndexChainHeader.Snapshot headerScratch,
+            PostingIndexChainEntry.Snapshot into
+    ) {
+        return pick(keyMem, pinnedTableTxn, 0, headerScratch, into);
+    }
+
+    /**
+     * Walk the chain backwards from head and pick the first entry where
+     * {@code txnAtSeal <= pinnedTableTxn}. Populates {@code into} with the
+     * picked entry on success.
+     *
+     * @param coverCount number of cover columns published in {@code .pci};
+     *                   the entry's per-cover end-offset footer is read in
+     *                   full when {@code coverCount > 0}.
+     * @return one of the RESULT_* codes:
+     * <ul>
+     *   <li>{@code RESULT_OK} — entry was found and {@code into} is populated;</li>
+     *   <li>{@code RESULT_EMPTY_CHAIN} — chain has no entries at all;</li>
+     *   <li>{@code RESULT_NO_VISIBLE_ENTRY} — chain is non-empty but every
+     *       entry has {@code txnAtSeal > pinnedTableTxn} (only happens
+     *       immediately after a snapshot restore or pre-first-seal);</li>
+     *   <li>{@code RESULT_HEADER_UNREADABLE} — header seqlock retries
+     *       exhausted; caller should treat as I/O error.</li>
+     * </ul>
+     */
+    public static int pick(
+            MemoryR keyMem,
+            long pinnedTableTxn,
+            int coverCount,
+            PostingIndexChainHeader.Snapshot headerScratch,
+            PostingIndexChainEntry.Snapshot into
+    ) {
+        if (!PostingIndexChainHeader.readUnderSeqlock(keyMem, headerScratch)) {
+            return RESULT_HEADER_UNREADABLE;
+        }
+        if (headerScratch.isEmpty()) {
+            return RESULT_EMPTY_CHAIN;
+        }
+
+        long entryOffset = headerScratch.headEntryOffset;
+        long regionBase = headerScratch.regionBase;
+        long regionLimit = headerScratch.regionLimit;
+        long entryCount = headerScratch.entryCount;
+        long visited = 0;
+        // Mapped size is the upper bound for any read. The header reflects
+        // the writer's current published state, but the reader's mmap may
+        // be smaller if a publish raced with the reader's open or
+        // extend. Returning RESULT_HEADER_UNREADABLE on overshoot lets the
+        // caller extend the mapping and retry.
+        long mappedLimit = keyMem.size();
+
+        while (entryOffset != PostingIndexUtils.V2_NO_HEAD) {
+            // Sanity-check: the offset must lie inside the live region.
+            // A corrupted PREV_ENTRY_OFFSET would otherwise drive the walk
+            // off into garbage memory.
+            if (entryOffset < regionBase || entryOffset >= regionLimit) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            // Bound against the reader's mapped size: the entry header
+            // must fit inside the mmap, otherwise getLong/getInt would
+            // assert under -ea (or SIGBUS without). Return HEADER_UNREADABLE
+            // so the caller can extend the mapping.
+            if (entryOffset + PostingIndexUtils.V2_ENTRY_HEADER_SIZE > mappedLimit) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            // Peek the entry's declared LEN before invoking read(), so the
+            // full-entry bound check happens BEFORE any cover-footer or
+            // gen-dir read. The post-read variant of this check used to fire
+            // too late: a corrupted or truncated entry whose footer landed
+            // past the mmap would already have SIGSEGV'd inside read().
+            // Compare against (mappedLimit - entryOffset) so a stomped
+            // peekedLen near Long.MAX_VALUE cannot overflow the addition
+            // and silently pass the bound check.
+            long peekedLen = keyMem.getLong(entryOffset + PostingIndexUtils.V2_ENTRY_OFFSET_LEN);
+            if (peekedLen <= 0 || peekedLen > mappedLimit - entryOffset) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            // Hard cap on iterations to defend against a corrupted prev
+            // pointer that loops back on itself.
+            if (visited++ > entryCount) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+
+            PostingIndexChainEntry.read(keyMem, entryOffset, coverCount, into);
+            // Sanity: the entry's own len must match what we peeked. read()
+            // re-reads LEN, so a torn or racing write could in principle
+            // surface a different value here. If so, treat as unreadable.
+            if (into.len != peekedLen) {
+                return RESULT_HEADER_UNREADABLE;
+            }
+            if (into.txnAtSeal <= pinnedTableTxn) {
+                return RESULT_OK;
+            }
+            entryOffset = into.prevEntryOffset;
+        }
+        // Walked off the chain — every entry's txnAtSeal exceeded pinnedTableTxn.
+        return RESULT_NO_VISIBLE_ENTRY;
+    }
+}

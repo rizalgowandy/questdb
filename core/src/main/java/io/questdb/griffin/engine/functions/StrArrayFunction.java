@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,14 +26,32 @@ package io.questdb.griffin.engine.functions;
 
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.FunctionExtension;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
 
-public abstract class StrArrayFunction implements Function {
+public abstract class StrArrayFunction implements Function, FunctionExtension {
+
+    @Override
+    public FunctionExtension extendedOps() {
+        throw new UnsupportedOperationException("Implementation error! StrArrayFunction must return a FunctionExtension");
+    }
+
+    @Override
+    public ArrayView getArray(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
     @Override
     public final BinarySequence getBin(Record rec) {
         throw new UnsupportedOperationException();
@@ -65,6 +83,36 @@ public abstract class StrArrayFunction implements Function {
     }
 
     @Override
+    public final void getDecimal128(Record rec, Decimal128 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final short getDecimal16(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final void getDecimal256(Record rec, Decimal256 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final int getDecimal32(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final long getDecimal64(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final byte getDecimal8(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public final double getDouble(Record rec) {
         throw new UnsupportedOperationException();
     }
@@ -75,7 +123,37 @@ public abstract class StrArrayFunction implements Function {
     }
 
     @Override
+    public byte getGeoByte(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int getGeoInt(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long getGeoLong(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public short getGeoShort(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final int getIPv4(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public final int getInt(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final @NotNull Interval getInterval(Record rec) {
         throw new UnsupportedOperationException();
     }
 
@@ -85,7 +163,17 @@ public abstract class StrArrayFunction implements Function {
     }
 
     @Override
-    public final void getLong256(Record rec, CharSink sink) {
+    public long getLong128Hi(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long getLong128Lo(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final void getLong256(Record rec, CharSink<?> sink) {
         throw new UnsupportedOperationException();
     }
 
@@ -105,38 +193,13 @@ public abstract class StrArrayFunction implements Function {
     }
 
     @Override
-    public Record getRecord(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
     public final short getShort(Record rec) {
         throw new UnsupportedOperationException();
     }
 
     @Override
-    public CharSequence getStr(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void getStr(Record rec, CharSink sink) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public CharSequence getStrB(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public int getStrLen(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
     public final CharSequence getSymbol(Record rec) {
-        return getStr(rec);
+        return getStrA(rec);
     }
 
     @Override
@@ -150,27 +213,22 @@ public abstract class StrArrayFunction implements Function {
     }
 
     @Override
-    public byte getGeoByte(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public short getGeoShort(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public int getGeoInt(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public long getGeoLong(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
     public final int getType() {
-        return ColumnType.STRING;
+        return ColumnType.ARRAY_STRING;
+    }
+
+    @Override
+    public Utf8Sequence getVarcharA(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Utf8Sequence getVarcharB(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int getVarcharSize(Record rec) {
+        throw new UnsupportedOperationException();
     }
 }

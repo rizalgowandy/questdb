@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,12 +26,10 @@ package io.questdb.griffin;
 
 public class OrderByMnemonic {
 
-    //Order is unknown at this stage and needs to be checked. It might be optional .    
-    public static final int ORDER_BY_UNKNOWN = 0;
-
-    //Order is required by current stage/nested model (even though it might still be unknown) 
-    public static final int ORDER_BY_REQUIRED = 1;
-
-    //Order is known and needs to be maintained at current stage/nested model 
+    //Order is known and needs to be maintained at current stage/nested model
     public static final int ORDER_BY_INVARIANT = 2;
+    //Order is required by current stage/nested model (even though it might still be unknown)
+    public static final int ORDER_BY_REQUIRED = 1;
+    //Order is unknown at this stage and needs to be checked. It might be optional .
+    public static final int ORDER_BY_UNKNOWN = 0;
 }

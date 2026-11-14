@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,106 +24,90 @@
 
 package io.questdb.griffin.engine.functions.groupby;
 
-import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.Record;
-import io.questdb.griffin.engine.functions.GroupByFunction;
-import io.questdb.griffin.engine.functions.LongFunction;
-import io.questdb.std.*;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
+import io.questdb.griffin.engine.groupby.GroupByUtils;
+import io.questdb.std.Long256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.Unsafe;
+import org.jetbrains.annotations.NotNull;
 
-public class CountLong256GroupByFunction extends LongFunction implements GroupByFunction {
-    private final Function arg;
-    private final ObjList<Long256HashSet> sets = new ObjList<>();
-    private int valueIndex;
-    private int setIndex;
+public class CountLong256GroupByFunction extends AbstractCountGroupByFunction {
+    private static final int LONG256_BYTES = 32;
+    private final int argColumnIndex;
 
-    public CountLong256GroupByFunction(Function arg) {
-        this.arg = arg;
+    public CountLong256GroupByFunction(@NotNull Function arg) {
+        super(arg);
+        this.argColumnIndex = GroupByUtils.directArgColumnIndex(arg, ColumnType.LONG256);
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
-        final Long256HashSet set;
-        if (sets.size() <= setIndex) {
-            sets.extendAndSet(setIndex, set = new Long256HashSet());
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
+        final Long256 value = arg.getLong256A(record);
+        if (!Long256Impl.isNull(value)) {
+            mapValue.putLong(valueIndex, 1);
         } else {
-            set = sets.getQuick(setIndex);
+            mapValue.putLong(valueIndex, 0);
         }
-
-        set.clear();
-        Long256 val = arg.getLong256A(record);
-        if (isNotNull(val)) {
-            set.add(val.getLong0(), val.getLong1(), val.getLong2(), val.getLong3());
-            mapValue.putLong(valueIndex, 1L);
-        } else {
-            mapValue.putLong(valueIndex, 0L);
-        }
-        mapValue.putInt(valueIndex + 1, setIndex++);
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
-        final Long256HashSet set = sets.getQuick(mapValue.getInt(valueIndex + 1));
-        final Long256 val = arg.getLong256A(record);
-        if (isNotNull(val)) {
-            final int index = set.keyIndex(val.getLong0(), val.getLong1(), val.getLong2(), val.getLong3());
-            if (index < 0) {
-                return;
+    public void computeKeyedBatch(
+            PageFrameMemoryRecord record,
+            FlyweightPackedMapValue mapValue,
+            long baseValueAddr,
+            long batchAddr,
+            long rowCount,
+            long baseRowId
+    ) {
+        // setEmpty stores 0, so the etalon seed matches the identity element for count
+        // and new entries need no branching. Each non-null row adds 1.
+        final long valueColumnOffset = mapValue.getOffset(valueIndex);
+        // Fast path: arg is a direct LONG256 column with data on the current frame.
+        // Zero page address means a column top; fall through to the record-based path.
+        final long argAddr = argColumnIndex >= 0 ? record.getPageAddress(argColumnIndex) : 0;
+        if (argAddr != 0) {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                final long rowIndex = Map.decodeBatchRowIndex(encoded);
+                final long base = argAddr + rowIndex * LONG256_BYTES;
+                final long l0 = Unsafe.getLong(base);
+                final long l1 = Unsafe.getLong(base + 8);
+                final long l2 = Unsafe.getLong(base + 16);
+                final long l3 = Unsafe.getLong(base + 24);
+                if (!Long256Impl.isNull(l0, l1, l2, l3)) {
+                    final long addr = baseValueAddr + Map.decodeBatchOffset(encoded) + valueColumnOffset;
+                    Unsafe.putLong(addr, Unsafe.getLong(addr) + 1);
+                }
             }
-            set.addAt(index, val.getLong0(), val.getLong1(), val.getLong2(), val.getLong3());
+        } else {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                record.setRowIndex(Map.decodeBatchRowIndex(encoded));
+                final Long256 value = arg.getLong256A(record);
+                if (!Long256Impl.isNull(value)) {
+                    final long addr = baseValueAddr + Map.decodeBatchOffset(encoded) + valueColumnOffset;
+                    Unsafe.putLong(addr, Unsafe.getLong(addr) + 1);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
+        final Long256 value = arg.getLong256A(record);
+        if (!Long256Impl.isNull(value)) {
             mapValue.addLong(valueIndex, 1);
         }
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
-        this.valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.LONG);
-        columnTypes.add(ColumnType.INT);
-    }
-
-    @Override
-    public void setEmpty(MapValue mapValue) {
-        mapValue.putLong(valueIndex, 0L);
-    }
-
-    @Override
-    public void setLong(MapValue mapValue, long value) {
-        mapValue.putLong(valueIndex, value);
-    }
-
-    @Override
-    public void setNull(MapValue mapValue) {
-        mapValue.putLong(valueIndex, Numbers.LONG_NaN);
-    }
-
-    @Override
-    public long getLong(Record rec) {
-        return rec.getLong(valueIndex);
-    }
-
-    @Override
-    public boolean isConstant() {
-        return false;
-    }
-
-    @Override
-    public boolean isReadThreadSafe() {
-        return true;
-    }
-
-    @Override
-    public void toTop() {
-        setIndex = 0;
-    }
-
-    private static boolean isNotNull(Long256 value) {
-        return value != null &&
-                value != Long256Impl.NULL_LONG256 && (value.getLong0() != Numbers.LONG_NaN ||
-                value.getLong1() != Numbers.LONG_NaN ||
-                value.getLong2() != Numbers.LONG_NaN ||
-                value.getLong3() != Numbers.LONG_NaN);
+    public int getComputeBatchArgType() {
+        return ColumnType.LONG256;
     }
 }

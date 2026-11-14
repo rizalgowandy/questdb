@@ -1,0 +1,390 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin.engine.functions.conditional;
+
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Test;
+
+public class NullIfFunctionFactoryTest extends AbstractCairoTest {
+
+    @Test
+    public void testCharSimple() throws Exception {
+        assertQuery("select ch1,ch2,nullif(ch1,ch2) from x")
+                .ddl("""
+                        create table x as (\
+                        select rnd_char() as ch1
+                        , rnd_char() as ch2
+                        from long_sequence(20)\
+                        )""")
+                .expectSize()
+                .returns("""
+                        ch1\tch2\tnullif
+                        V\tT\tV
+                        J\tW\tJ
+                        C\tP\tC
+                        S\tW\tS
+                        H\tY\tH
+                        R\tX\tR
+                        P\tE\tP
+                        H\tN\tH
+                        R\tX\tR
+                        G\tZ\tG
+                        S\tX\tS
+                        U\tX\tU
+                        I\tB\tI
+                        B\tT\tB
+                        G\tP\tG
+                        G\tW\tG
+                        F\tF\t
+                        Y\tU\tY
+                        D\tE\tD
+                        Y\tY\t
+                        """);
+    }
+
+    @Test
+    public void testDecimalNullBothOperands() throws Exception {
+        assertQuery("select nullif(a, b) is null n from x")
+                .ddl("create table x (a decimal(9,2), b decimal(38,5))",
+                        "insert into x values (null, null)")
+                .expectSize()
+                .returns("""
+                        n
+                        true
+                        """);
+    }
+
+    @Test
+    public void testDecimalNullLeftOperandRescaled() throws Exception {
+        // Operands differing in width or scale take the rescaling path.
+        // A NULL left operand must stay NULL at every result width.
+        assertQuery("""
+                select nullif(d8, r) is null n8, nullif(d16, r) is null n16, nullif(d32, r) is null n32\
+                , nullif(d64, r) is null n64, nullif(d128, r) is null n128, nullif(d256, r) is null n256 from x""")
+                .ddl("""
+                                create table x (d8 decimal(2,1), d16 decimal(4,2), d32 decimal(9,3)\
+                                , d64 decimal(18,4), d128 decimal(38,5), d256 decimal(76,6), r decimal(38,2))""",
+                        "insert into x values (null, null, null, null, null, null, 1.50m)")
+                .expectSize()
+                .returns("""
+                        n8\tn16\tn32\tn64\tn128\tn256
+                        true\ttrue\ttrue\ttrue\ttrue\ttrue
+                        """);
+    }
+
+    @Test
+    public void testDecimalNullLeftOperandUnscaled() throws Exception {
+        assertQuery("""
+                select nullif(d8, r8) is null n8, nullif(d16, r16) is null n16, nullif(d32, r32) is null n32\
+                , nullif(d64, r64) is null n64, nullif(d128, r128) is null n128, nullif(d256, r256) is null n256 from x""")
+                .ddl("""
+                                create table x (d8 decimal(2,1), r8 decimal(2,1), d16 decimal(4,2), r16 decimal(4,2)\
+                                , d32 decimal(9,3), r32 decimal(9,3), d64 decimal(18,4), r64 decimal(18,4)\
+                                , d128 decimal(38,5), r128 decimal(38,5), d256 decimal(76,6), r256 decimal(76,6))""",
+                        """
+                                insert into x values (null, 1.5m, null, 1.50m, null, 1.500m, null, 1.5000m\
+                                , null, 1.50000m, null, 1.500000m)""")
+                .expectSize()
+                .returns("""
+                        n8\tn16\tn32\tn64\tn128\tn256
+                        true\ttrue\ttrue\ttrue\ttrue\ttrue
+                        """);
+    }
+
+    @Test
+    public void testDecimalRescaledEquality() throws Exception {
+        assertQuery("select a, b, nullif(a, b) n, nullif(a, b) is null isNull from x")
+                .ddl("create table x (a decimal(9,2), b decimal(38,5))",
+                        "insert into x values (1.50m, 1.50000m), (2.50m, 1.50000m), (null, 1.50000m)")
+                .expectSize()
+                .returns("""
+                        a\tb\tn\tisNull
+                        1.50\t1.50000\t\ttrue
+                        2.50\t1.50000\t2.50\tfalse
+                        \t1.50000\t\ttrue
+                        """);
+    }
+
+    @Test
+    public void testDecimalSimple() throws Exception {
+        assertQuery("select dec, nullif(dec,0.3m) from x")
+                .ddl("create table x as (" +
+                        "select x / 10.0m as dec\n" +
+                        "from long_sequence(5)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        dec\tnullif
+                        0.1\t0.1
+                        0.2\t0.2
+                        0.3\t
+                        0.4\t0.4
+                        0.5\t0.5
+                        """);
+    }
+
+    @Test
+    public void testDoubleNonConstant() throws Exception {
+        assertQuery("""
+                select nullif(five, four) from x\s
+                UNION\s
+                select nullif(five, five) from x\s
+                UNION\s
+                select nullif(four, five) from x\s
+                """)
+                .ddl("create table x as (" +
+                        "SELECT 5::double as five, 4::double as four" +
+                        ")")
+                .noRandomAccess()
+                .returns("""
+                        nullif
+                        5.0
+                        null
+                        4.0
+                        """);
+    }
+
+    @Test
+    public void testDoubleSimple() throws Exception {
+        assertQuery("select double,nullif(double,0.3) from x")
+                .ddl("create table x as (" +
+                        "select x / 10.0 as double\n" +
+                        "from long_sequence(5)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        double\tnullif
+                        0.1\t0.1
+                        0.2\t0.2
+                        0.3\tnull
+                        0.4\t0.4
+                        0.5\t0.5
+                        """);
+    }
+
+    @Test
+    public void testFirstArgumentIsReadOncePerRow() throws Exception {
+        // nullif compared one read of its first argument and returned another. A second read of a
+        // non-deterministic argument is a fresh draw, so nullif returned the very value it was
+        // asked to exclude - roughly one row in four for a two-valued draw. Each count below is
+        // zero only while the argument is read once per row.
+        assertMemoryLeak(() -> {
+            assertQuery("SELECT count() AS c FROM (SELECT nullif(rnd_int(1, 2, 0), 1) AS v FROM long_sequence(10_000)) WHERE v = 1")
+                    .noLeakCheck().noRandomAccess().expectSize().returns("c\n0\n");
+            assertQuery("SELECT count() AS c FROM (SELECT nullif(rnd_long(1, 2, 0), 1) AS v FROM long_sequence(10_000)) WHERE v = 1")
+                    .noLeakCheck().noRandomAccess().expectSize().returns("c\n0\n");
+            assertQuery("SELECT count() AS c FROM (SELECT nullif(rnd_int(1, 2, 0)::DOUBLE, 1.0) AS v FROM long_sequence(10_000)) WHERE v = 1.0")
+                    .noLeakCheck().noRandomAccess().expectSize().returns("c\n0\n");
+            // 'B', not 'A': Rnd.nextChar() draws from 'B'..'Z', so excluding 'A' can never null a
+            // row out and the assertion would hold however many times the argument is read.
+            assertQuery("SELECT count() AS c FROM (SELECT nullif(rnd_char(), 'B') AS v FROM long_sequence(10_000)) WHERE v = 'B'")
+                    .noLeakCheck().noRandomAccess().expectSize().returns("c\n0\n");
+            assertQuery("SELECT count() AS c FROM (SELECT nullif(rnd_int(1, 2, 0)::IPV4, '0.0.0.1') AS v FROM long_sequence(10_000)) WHERE v = '0.0.0.1'")
+                    .noLeakCheck().noRandomAccess().expectSize().returns("c\n0\n");
+
+            // An INT argument that is neither width stable nor row stable cannot be read at both
+            // widths at all, so getLong() moves the comparison to long width and reads once there.
+            assertQuery("SELECT count() AS c FROM (SELECT nullif(rnd_int(1, 2, 0) * 2, 2)::LONG AS v FROM long_sequence(10_000)) WHERE v = 2")
+                    .noLeakCheck().noRandomAccess().expectSize().returns("c\n0\n");
+
+            // BOTH arguments have to move to long width together. p + q is 2147483648 there and the
+            // INT_NULL sentinel when it wraps, so comparing the 64-bit first argument against the
+            // wrapped second one misses the equal pair and hands back the excluded value.
+            execute("CREATE TABLE nw AS (SELECT 2_147_483_647 p, 1 q FROM long_sequence(1_000))");
+            assertQuery("SELECT count() AS c FROM (SELECT nullif(rnd_int(0, 1, 0) + 2_147_483_647, p + q)::LONG AS v FROM nw) WHERE v = 2_147_483_648")
+                    .noLeakCheck().noRandomAccess().expectSize().returns("c\n0\n");
+        });
+    }
+
+    @Test
+    public void testIntConstNull() throws Exception {
+        assertQuery("select nullif(null,5) nullif1, nullif(5,null) nullif2")
+                .expectSize()
+                .returns("""
+                        nullif1\tnullif2
+                        null\t5
+                        """);
+    }
+
+    @Test
+    public void testIntNonConstant() throws Exception {
+        assertQuery("""
+                select nullif(five, four) from x\s
+                UNION\s
+                select nullif(five, five) from x\s
+                UNION\s
+                select nullif(four, five) from x\s
+                """)
+                .ddl("create table x as (" +
+                        "SELECT 5 as five, 4 as four" +
+                        ")")
+                .noRandomAccess()
+                .returns("""
+                        nullif
+                        5
+                        null
+                        4
+                        """);
+    }
+
+    @Test
+    public void testIntSimple() throws Exception {
+        assertQuery("select int,nullif(int,5) from x")
+                .ddl("create table x as (" +
+                        "select rnd_int(1,5,0) as int\n" +
+                        "from long_sequence(5)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        int\tnullif
+                        4\t4
+                        2\t2
+                        5\tnull
+                        2\t2
+                        4\t4
+                        """);
+    }
+
+    @Test
+    public void testLongConstNull() throws Exception {
+        assertQuery("select nullif(null,5::long) nullif1, nullif(5::long,null) nullif2")
+                .expectSize()
+                .returns("""
+                        nullif1\tnullif2
+                        null\t5
+                        """);
+    }
+
+    @Test
+    public void testLongNonConstant() throws Exception {
+        assertQuery("""
+                select nullif(five, four) from x\s
+                UNION\s
+                select nullif(five, five) from x\s
+                UNION\s
+                select nullif(four, five) from x\s
+                """)
+                .ddl("create table x as (" +
+                        "SELECT 5::long as five, 4::long as four" +
+                        ")")
+                .noRandomAccess()
+                .returns("""
+                        nullif
+                        5
+                        null
+                        4
+                        """);
+    }
+
+    @Test
+    public void testLongSimple() throws Exception {
+        assertQuery("select long,nullif(long,3) from x")
+                .ddl("create table x as (" +
+                        "select x as long\n" +
+                        "from long_sequence(5)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        long\tnullif
+                        1\t1
+                        2\t2
+                        3\tnull
+                        4\t4
+                        5\t5
+                        """);
+    }
+
+    @Test
+    public void testNullCharConstantKeepsStringOverload() throws Exception {
+        assertMemoryLeak(() -> {
+            assertQuery("SELECT nullif('abc'::SYMBOL, null::CHAR) v, typeOf(nullif(null::CHAR, null)) t")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("v\tt\nabc\tSTRING\n");
+            execute("CREATE TABLE x (s SYMBOL)");
+            execute("INSERT INTO x VALUES ('abc'), ('abd'), ('x'), (null)");
+            assertQuery("SELECT s, nullif(s, null::CHAR) v FROM x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            s\tv
+                            abc\tabc
+                            abd\tabd
+                            x\tx
+                            \t
+                            """);
+        });
+    }
+
+    @Test
+    public void testStrSimple() throws Exception {
+        assertQuery("select str1,str2,nullif(str1,str2) from x")
+                .ddl("""
+                        create table x as (\
+                        select rnd_str('cat','dog',NULL) as str1
+                        , rnd_str('cat','dog',NULL) as str2
+                        from long_sequence(10)\
+                        )""")
+                .expectSize()
+                .returns("""
+                        str1\tstr2\tnullif
+                        cat\tcat\t
+                        dog\t\tdog
+                        \t\t
+                        \tdog\t
+                        cat\tdog\tcat
+                        dog\t\tdog
+                        dog\tdog\t
+                        dog\tcat\tdog
+                        cat\tdog\tcat
+                        cat\tdog\tcat
+                        """);
+    }
+
+    @Test
+    public void testVarcharSimple() throws Exception {
+        assertQuery("select str1,str2,nullif(str1,str2) from x")
+                .ddl("""
+                        create table x as (\
+                        select rnd_varchar('cat','dog',NULL) as str1
+                        , rnd_varchar('cat','dog',NULL) as str2
+                        from long_sequence(10)\
+                        )""")
+                .expectSize()
+                .returns("""
+                        str1\tstr2\tnullif
+                        cat\tcat\t
+                        dog\t\tdog
+                        \t\t
+                        \tdog\t
+                        cat\tdog\tcat
+                        dog\t\tdog
+                        dog\tdog\t
+                        dog\tcat\tdog
+                        cat\tdog\tcat
+                        cat\tdog\tcat
+                        """);
+    }
+}

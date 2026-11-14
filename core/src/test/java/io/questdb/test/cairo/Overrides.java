@@ -1,0 +1,519 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.cairo;
+
+import io.questdb.BuildInformationHolder;
+import io.questdb.ConfigPropertyKey;
+import io.questdb.DefaultFactoryProvider;
+import io.questdb.FactoryProvider;
+import io.questdb.FreeOnExit;
+import io.questdb.PropServerConfiguration;
+import io.questdb.PropertyKey;
+import io.questdb.ServerConfigurationException;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CommitMode;
+import io.questdb.cutlass.json.JsonException;
+import io.questdb.cutlass.qwp.codec.QwpServerInfoProvider;
+import io.questdb.std.Chars;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.Rnd;
+import io.questdb.std.RostiAllocFacade;
+import io.questdb.std.datetime.MicrosecondClock;
+import io.questdb.std.datetime.microtime.MicrosecondClockImpl;
+import io.questdb.tasks.ColumnPurgeTask;
+import io.questdb.test.AbstractCairoTest;
+import org.jetbrains.annotations.Nullable;
+import org.junit.Assume;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Properties;
+import java.util.function.ObjIntConsumer;
+
+import static io.questdb.cairo.DebugUtils.LOG;
+
+public class Overrides {
+
+    /**
+     * Pins the commit mode of every fuzz test class, to reproduce a failure under the mode its log names. Unset,
+     * each fuzz test class draws its own - see {@link #pickFuzzCommitMode}.
+     */
+    public static final String FUZZ_COMMIT_MODE = System.getProperty("questdb.test.fuzz.commit.mode");
+
+    /**
+     * Commit mode every test runs under, unless it sets one itself. The suite runs ADAPTIVE while the shipped
+     * default ({@link CommitMode#DEFAULT}) is NOSYNC, so the durable path is exercised everywhere; sweep the other
+     * way with {@code -Dquestdb.test.commit.mode=nosync}. CI ({@code ci/templates/select-test-commit-mode.yml})
+     * splits the jobs of a test shard between NOSYNC and ADAPTIVE and swaps them on the next run, so a test that
+     * needs one mode pins it. A fuzz test class ignores it and draws its own mode, see {@link #getTestCommitMode()}.
+     * Every path that builds a test configuration reads this: here,
+     * {@code DefaultTestCairoConfiguration} and {@code AbstractBootstrapTest}'s server.conf;
+     * {@code TestCommitModeSwitchTest} fails if another path skips it.
+     */
+    public static final String TEST_COMMIT_MODE = System.getProperty("questdb.test.commit.mode", "adaptive");
+
+    /**
+     * Whether {@code questdb.test.commit.mode} is set on the command line, as opposed to defaulted.
+     * <p>
+     * {@code TestCommitModeSwitchTest} and ENT's {@code EntSuiteCommitModeTest} pin the suite default, so an
+     * unset property must still fail if the default moves without the guard. An explicitly named mode is a
+     * deliberate sweep and must not be reported as a regression in the default.
+     */
+    public static final boolean TEST_COMMIT_MODE_EXPLICIT = System.getProperty("questdb.test.commit.mode") != null;
+    private static final BuildInformationHolder buildInformationHolder = new BuildInformationHolder();
+    private static final String[] FUZZ_COMMIT_MODES = {"nosync", "async", "sync", "adaptive"};
+    // The running fuzz test class's own commit mode; null outside a fuzz test class.
+    private static volatile String fuzzCommitMode;
+
+    /**
+     * Skips the calling test unless the suite runs ADAPTIVE.
+     * <p>
+     * For the adaptive-only machinery: the durable epoch manifest ({@code _epoch.manifest.0/1}),
+     * {@code RecoveryCoordinator} roll-forward, the extra WAL purge floor, and the {@code wal_tables()}
+     * columns {@code durableEpochSeqTxn} and {@code lastEpochTs}, which move only under ADAPTIVE.
+     */
+    public static void assumeAdaptiveCommitMode() {
+        assumeCommitMode(CommitMode.ADAPTIVE);
+    }
+
+    /**
+     * Skips the calling test unless the suite is running one of {@code allowed}. Use it only for a test that
+     * asserts the ambient configuration (a booted server's {@code getCommitMode()}, a fired durable epoch, a
+     * golden {@code wal_tables()} row); a test that can pin its own mode should, because a pinned test runs under
+     * every sweep. It uses {@link Assume}, so the skip shows in the surefire report where an early return would
+     * report a pass. Call it first in the {@code @Test} method, before {@code assertMemoryLeak}, whose harness
+     * would re-report the {@code AssumptionViolatedException} as a failure.
+     *
+     * @param allowed one or more {@link CommitMode} constants
+     */
+    public static void assumeCommitMode(int... allowed) {
+        final String testCommitMode = getTestCommitMode();
+        final int actual = CommitMode.fromString(testCommitMode);
+        for (int i = 0; i < allowed.length; i++) {
+            if (allowed[i] == actual) {
+                return;
+            }
+        }
+        final StringBuilder names = new StringBuilder();
+        for (int i = 0; i < allowed.length; i++) {
+            names.append(i == 0 ? "" : "/").append(CommitMode.toString(allowed[i]));
+        }
+        Assume.assumeTrue(
+                "requires commit mode " + names + ", test runs " + testCommitMode
+                        + " (-Dquestdb.test.commit.mode, -Dquestdb.test.fuzz.commit.mode)",
+                false
+        );
+    }
+
+    /**
+     * Skips the calling test under NOSYNC only.
+     * <p>
+     * For tests that need a real fsync grade rather than the epoch machinery: {@code TableTransactionLogV1}
+     * gates {@code crcSidecar.sync(...)} on {@code commitMode != CommitMode.NOSYNC}, so SYNC, ASYNC and
+     * ADAPTIVE all qualify. This is a weaker condition than {@link #assumeAdaptiveCommitMode()}, which
+     * would drop two thirds of the sweep matrix here.
+     * <p>
+     * The condition is about the durability grade, not about the sidecar existing: CRC entries are appended
+     * in every mode ({@code crcSidecar.append(...)} sits outside the gate), only their flush is graded.
+     */
+    public static void assumeDurableCommitMode() {
+        assumeCommitMode(CommitMode.SYNC, CommitMode.ASYNC, CommitMode.ADAPTIVE);
+    }
+
+    /**
+     * The commit mode the running fuzz test class drew, or {@code null} outside a fuzz test class. A test base that
+     * pins its own mode rather than reading {@link #getTestCommitMode()} takes this one instead when it is set.
+     */
+    public static @Nullable String getFuzzCommitMode() {
+        return fuzzCommitMode;
+    }
+
+    /**
+     * The commit mode the running test configures: a fuzz test class's own draw, else the suite's
+     * {@link #TEST_COMMIT_MODE}.
+     */
+    public static String getTestCommitMode() {
+        final String mode = fuzzCommitMode;
+        return mode != null ? mode : TEST_COMMIT_MODE;
+    }
+
+    /**
+     * Whether {@code testClass} is a fuzz test, which runs under a commit mode of its own rather than the suite's.
+     */
+    public static boolean isFuzzTest(@Nullable Class<?> testClass) {
+        return testClass != null && testClass.getSimpleName().contains("Fuzz");
+    }
+
+    /**
+     * Draws a fuzz test class's commit mode from every mode, independently of {@link #TEST_COMMIT_MODE}: the suite
+     * sweeps only NOSYNC and ADAPTIVE, and a fuzz class should also meet SYNC and ASYNC. {@link #FUZZ_COMMIT_MODE}
+     * pins the draw.
+     */
+    public static String pickFuzzCommitMode(Rnd rnd) {
+        if (FUZZ_COMMIT_MODE == null) {
+            return FUZZ_COMMIT_MODES[rnd.nextInt(FUZZ_COMMIT_MODES.length)];
+        }
+        if (CommitMode.fromString(FUZZ_COMMIT_MODE) == CommitMode.UNKNOWN) {
+            throw new IllegalArgumentException("questdb.test.fuzz.commit.mode must name a commit mode, was: " + FUZZ_COMMIT_MODE);
+        }
+        return FUZZ_COMMIT_MODE;
+    }
+
+    public static void setFuzzCommitMode(@Nullable String mode) {
+        fuzzCommitMode = mode;
+    }
+
+    private final Properties defaultProperties = new Properties();
+    private final Properties properties = new Properties();
+    private boolean adaptiveRecoveryRollForwardEnabled = true;
+    private boolean changed = true;
+    private ObjIntConsumer<ColumnPurgeTask> columnPurgeTruncateRefusalListener = null;
+    private long currentMicros = -1;
+    private final MicrosecondClock defaultMicrosecondClock = () -> currentMicros >= 0 ? currentMicros : MicrosecondClockImpl.INSTANCE.getTicks();
+    private MicrosecondClock testMicrosClock = defaultMicrosecondClock;
+    private CairoConfiguration defaultConfiguration;
+    private Map<String, String> env = null;
+    private FactoryProvider factoryProvider = null;
+    private FilesFacade ff;
+    private boolean freeLeakedReaders = false;
+    private boolean isHiddenTelemetryTable = false;
+    private boolean mangleTableDirNames = true;
+    private CairoConfiguration propsConfig;
+    private QwpServerInfoProvider qwpServerInfoProvider = null;
+    private RostiAllocFacade rostiAllocFacade = null;
+    private long spinLockTimeout = AbstractCairoTest.DEFAULT_SPIN_LOCK_TIMEOUT;
+
+    public Overrides() {
+        resetToDefaultTestProperties(defaultProperties);
+    }
+
+    public void freeLeakedReaders(boolean freeLeakedReaders) {
+        this.freeLeakedReaders = freeLeakedReaders;
+    }
+
+    public boolean freeLeakedReaders() {
+        return freeLeakedReaders;
+    }
+
+    public CairoConfiguration getConfiguration(String root) {
+        if (!properties.isEmpty()) {
+            if (changed) {
+                this.propsConfig = getTestConfiguration(root, defaultProperties, properties);
+                changed = false;
+            }
+            return this.propsConfig;
+        } else {
+            return getDefaultConfiguration(root);
+        }
+    }
+
+    public ObjIntConsumer<ColumnPurgeTask> getColumnPurgeTruncateRefusalListener() {
+        return columnPurgeTruncateRefusalListener;
+    }
+
+    public Map<String, String> getEnv() {
+        return env != null ? env : System.getenv();
+    }
+
+    public FactoryProvider getFactoryProvider() {
+        return factoryProvider;
+    }
+
+    public FilesFacade getFilesFacade() {
+        return ff;
+    }
+
+    public String getInputRoot() {
+        return null;
+    }
+
+    public String getInputWorkRoot() {
+        return null;
+    }
+
+    public QwpServerInfoProvider getQwpServerInfoProvider() {
+        return qwpServerInfoProvider;
+    }
+
+    public RostiAllocFacade getRostiAllocFacade() {
+        return rostiAllocFacade;
+    }
+
+    public long getSpinLockTimeout() {
+        return spinLockTimeout;
+    }
+
+    public MicrosecondClock getTestMicrosClock() {
+        return testMicrosClock;
+    }
+
+    public boolean isAdaptiveRecoveryRollForwardEnabled() {
+        return adaptiveRecoveryRollForwardEnabled;
+    }
+
+    public boolean isHidingTelemetryTable() {
+        return isHiddenTelemetryTable;
+    }
+
+    /**
+     * Whether a test has explicitly pinned {@code key}, as opposed to leaving it at its default. Lets a
+     * configuration override step aside for a deliberate choice instead of silently outvoting it.
+     */
+    public boolean isPropertySet(ConfigPropertyKey key) {
+        return properties.getProperty(key.getPropertyPath()) != null;
+    }
+
+    public boolean mangleTableDirNames() {
+        return mangleTableDirNames;
+    }
+
+    public void reset() {
+        currentMicros = -1;
+        testMicrosClock = defaultMicrosecondClock;
+        rostiAllocFacade = null;
+        columnPurgeTruncateRefusalListener = null;
+        ff = null;
+        mangleTableDirNames = true;
+        factoryProvider = null;
+        env = null;
+        isHiddenTelemetryTable = false;
+        qwpServerInfoProvider = null;
+        properties.clear();
+        changed = true;
+        spinLockTimeout = AbstractCairoTest.DEFAULT_SPIN_LOCK_TIMEOUT;
+        freeLeakedReaders = false;
+        adaptiveRecoveryRollForwardEnabled = true;
+    }
+
+    /**
+     * Turns startup roll-forward off so a test can drive {@link io.questdb.cairo.RecoveryCoordinator}'s refusal
+     * path. There is no server property for this.
+     */
+    public void setAdaptiveRecoveryRollForwardEnabled(boolean enabled) {
+        this.adaptiveRecoveryRollForwardEnabled = enabled;
+    }
+
+    public void setColumnPurgeTruncateRefusalListener(ObjIntConsumer<ColumnPurgeTask> listener) {
+        this.columnPurgeTruncateRefusalListener = listener;
+    }
+
+    public void setCurrentMicros(long currentMicros) {
+        this.currentMicros = currentMicros;
+    }
+
+    public void setIsHidingTelemetryTable(boolean val) {
+        this.isHiddenTelemetryTable = val;
+    }
+
+    public void setMangleTableDirNames(boolean mangle) {
+        this.mangleTableDirNames = mangle;
+    }
+
+    public void setProperty(ConfigPropertyKey propertyKey, long value) {
+        setProperty(propertyKey, String.valueOf(value));
+    }
+
+    public void setProperty(ConfigPropertyKey propertyKey, String value) {
+        String propertyPath = propertyKey.getPropertyPath();
+        if (value != null) {
+            String existing = properties.getProperty(propertyPath);
+            if (existing == null) {
+                if (value.equals(defaultProperties.get(propertyPath))) {
+                    return;
+                }
+            }
+            properties.setProperty(propertyPath, value);
+            changed = changed || !Chars.equalsNc(value, existing);
+        } else {
+            // Remove first, fold into the flag second: writing this as changed || remove(...) lets
+            // the short-circuit skip the removal outright whenever changed is already true, which
+            // leaves the cancelled override standing.
+            final boolean hasRemoved = properties.remove(propertyPath) != null;
+            changed = changed || hasRemoved;
+        }
+    }
+
+    public void setProperty(ConfigPropertyKey propertyKey, boolean value) {
+        setProperty(propertyKey, value ? "true" : "false");
+    }
+
+    public void setQwpServerInfoProvider(QwpServerInfoProvider provider) {
+        this.qwpServerInfoProvider = provider;
+    }
+
+    public void setRostiAllocFacade(RostiAllocFacade rostiAllocFacade) {
+        this.rostiAllocFacade = rostiAllocFacade;
+    }
+
+    private static CairoConfiguration getTestConfiguration(String installRoot, Properties defaultProperties, Properties properties) {
+        Properties props = new Properties();
+        props.putAll(defaultProperties);
+        if (properties != null) {
+            props.putAll(properties);
+        }
+
+        PropServerConfiguration propCairoConfiguration;
+        try {
+            propCairoConfiguration = new PropServerConfiguration(
+                    installRoot,
+                    props,
+                    null,
+                    new HashMap<>(),
+                    LOG,
+                    buildInformationHolder,
+                    FilesFacadeImpl.INSTANCE,
+                    MicrosecondClockImpl.INSTANCE,
+                    (configuration, engine, freeOnExitList) -> DefaultFactoryProvider.INSTANCE,
+                    false
+            );
+        } catch (ServerConfigurationException | JsonException e) {
+            throw new RuntimeException(e);
+        }
+        propCairoConfiguration.init(null, new FreeOnExit());
+        return propCairoConfiguration.getCairoConfiguration();
+    }
+
+    private static void resetToDefaultTestProperties(Properties properties) {
+        properties.clear();
+        // Without this the two config paths disagree: a test that sets no property at all gets
+        // DefaultTestCairoConfiguration, but a test that sets any property switches to
+        // PropServerConfiguration and would inherit the shipped default instead of the suite's mode.
+        properties.setProperty(PropertyKey.CAIRO_COMMIT_MODE.getPropertyPath(), TEST_COMMIT_MODE);
+        // The same trap for the epoch interval: the interface default is 1 s, the shipped default 60 s, so a test
+        // that set an unrelated property would silently run on the shipped cadence. The suite's value is the
+        // interface default; TestCommitModeSwitchTest pins both paths to it.
+        properties.setProperty(PropertyKey.CAIRO_ADAPTIVE_EPOCH_INTERVAL.getPropertyPath(), "1000");
+        properties.setProperty(PropertyKey.DEBUG_ALLOW_TABLE_REGISTRY_SHARED_WRITE.getPropertyPath(), "true");
+        properties.setProperty(PropertyKey.CIRCUIT_BREAKER_THROTTLE.getPropertyPath(), "5");
+        properties.setProperty(PropertyKey.QUERY_TIMEOUT.getPropertyPath(), "0");
+        properties.setProperty(PropertyKey.CAIRO_SQL_CREATE_TABLE_COLUMN_MODEL_POOL_CAPACITY.getPropertyPath(), "32");
+        properties.setProperty(PropertyKey.CAIRO_COLUMN_INDEXER_QUEUE_CAPACITY.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COLUMN_PURGE_QUEUE_CAPACITY.getPropertyPath(), "64");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COLUMN_PURGE_RETRY_DELAY_MULTIPLIER.getPropertyPath(), "2");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COLUMN_PURGE_RETRY_DELAY.getPropertyPath(), "10");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COLUMN_PURGE_TASK_POOL_CAPACITY.getPropertyPath(), "64");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COPY_MODEL_POOL_CAPACITY.getPropertyPath(), "16");
+        properties.setProperty(PropertyKey.CAIRO_WRITER_DATA_APPEND_PAGE_SIZE.getPropertyPath(), "2097152");
+        properties.setProperty(PropertyKey.CAIRO_WRITER_DATA_INDEX_KEY_APPEND_PAGE_SIZE.getPropertyPath(), "16384");
+        properties.setProperty(PropertyKey.CAIRO_WRITER_DATA_INDEX_VALUE_APPEND_PAGE_SIZE.getPropertyPath(), "1048576");
+        properties.setProperty(PropertyKey.CAIRO_DEFAULT_SYMBOL_CAPACITY.getPropertyPath(), "128");
+        properties.setProperty(PropertyKey.CAIRO_SQL_GROUPBY_ALLOCATOR_DEFAULT_CHUNK_SIZE.getPropertyPath(), "16384");
+        properties.setProperty(PropertyKey.CAIRO_SQL_GROUPBY_ALLOCATOR_MAX_CHUNK_SIZE.getPropertyPath(), "1073741824");
+        properties.setProperty(PropertyKey.CAIRO_SQL_PARALLEL_GROUPBY_MERGE_QUEUE_CAPACITY.getPropertyPath(), "32");
+        properties.setProperty(PropertyKey.CAIRO_SQL_PARALLEL_GROUPBY_SHARDING_THRESHOLD.getPropertyPath(), "1000");
+        properties.setProperty(PropertyKey.CAIRO_ID_GENERATE_STEP.getPropertyPath(), "512");
+        properties.setProperty(PropertyKey.CAIRO_IDLE_CHECK_INTERVAL.getPropertyPath(), "100");
+        properties.setProperty(PropertyKey.CAIRO_INACTIVE_READER_TTL.getPropertyPath(), "-10000");
+        properties.setProperty(PropertyKey.CAIRO_INACTIVE_WRITER_TTL.getPropertyPath(), "-10000");
+        properties.setProperty(PropertyKey.CAIRO_WAL_INACTIVE_WRITER_TTL.getPropertyPath(), "-10000");
+        properties.setProperty(PropertyKey.CAIRO_SQL_INSERT_MODEL_POOL_CAPACITY.getPropertyPath(), "8");
+        properties.setProperty(PropertyKey.CAIRO_MAX_CRASH_FILES.getPropertyPath(), "1");
+        properties.setProperty(PropertyKey.CAIRO_MAX_UNCOMMITTED_ROWS.getPropertyPath(), "1000");
+        properties.setProperty(PropertyKey.CAIRO_O3_CALLBACK_QUEUE_CAPACITY.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.DEBUG_CAIRO_O3_COLUMN_MEMORY_SIZE.getPropertyPath(), "1048576");
+        properties.setProperty(PropertyKey.CAIRO_O3_COPY_QUEUE_CAPACITY.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_O3_LAST_PARTITION_MAX_SPLITS.getPropertyPath(), "15");
+        properties.setProperty(PropertyKey.CAIRO_COMMIT_LAG.getPropertyPath(), "300000000");
+        properties.setProperty(PropertyKey.CAIRO_O3_OPEN_COLUMN_QUEUE_CAPACITY.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_O3_PARTITION_QUEUE_CAPACITY.getPropertyPath(), "1024");
+        // Composite partitions are OFF in production and reachable only behind this flag, so with the
+        // production default the whole feature - the pre-split, merge-append, and every read and write
+        // path that has to cope with a partition made of several pieces - would never run under test.
+        // TESTS ONLY: production keeps its default. A test that needs master's behaviour sets it false.
+        // Baked into the DEFAULT properties (not set by reset()) so it applies from the very first test
+        // in a JVM too - reset() only ever runs in tearDown(), after a test, so a value set there alone
+        // would leave whichever test runs first in a fresh JVM using the production default instead.
+        properties.setProperty(PropertyKey.CAIRO_O3_PARTITION_MERGE_APPEND_ENABLED.getPropertyPath(), "true");
+        properties.setProperty(PropertyKey.CAIRO_O3_PURGE_DISCOVERY_QUEUE_CAPACITY.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_PAGE_FRAME_REDUCE_QUEUE_CAPACITY.getPropertyPath(), "32");
+        properties.setProperty(PropertyKey.CAIRO_PAGE_FRAME_REDUCE_QUEUE_CAPACITY.getPropertyPath(), "32");
+        properties.setProperty(PropertyKey.CAIRO_O3_PARTITION_SPLIT_MIN_SIZE.getPropertyPath(), "524288");
+        properties.setProperty(PropertyKey.CAIRO_O3_PARTITION_PURGE_LIST_INITIAL_CAPACITY.getPropertyPath(), "64");
+        properties.setProperty(PropertyKey.CAIRO_SQL_QUERY_REGISTRY_POOL_SIZE.getPropertyPath(), "8");
+        properties.setProperty(PropertyKey.CAIRO_READER_POOL_MAX_SEGMENTS.getPropertyPath(), "5");
+        properties.setProperty(PropertyKey.CAIRO_SQL_RENAME_TABLE_MODEL_POOL_CAPACITY.getPropertyPath(), "8");
+        properties.setProperty(PropertyKey.CAIRO_REPEAT_MIGRATION_FROM_VERSION.getPropertyPath(), "-1");
+        properties.setProperty(PropertyKey.CAIRO_SPIN_LOCK_TIMEOUT.getPropertyPath(), "5000");
+        properties.setProperty(PropertyKey.CAIRO_CHARACTER_STORE_CAPACITY.getPropertyPath(), "64");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COPY_BUFFER_SIZE.getPropertyPath(), "1048576");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COPY_MAX_INDEX_CHUNK_SIZE.getPropertyPath(), "1048576");
+        properties.setProperty(PropertyKey.CAIRO_SQL_DISTINCT_TIMESTAMP_KEY_CAPACITY.getPropertyPath(), "256");
+        properties.setProperty(PropertyKey.CAIRO_SQL_HASH_JOIN_LIGHT_VALUE_MAX_PAGES.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_SQL_HASH_JOIN_VALUE_MAX_PAGES.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_SQL_JOIN_METADATA_MAX_RESIZES.getPropertyPath(), "10");
+        properties.setProperty(PropertyKey.CAIRO_SQL_MAP_MAX_PAGES.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_SQL_MAP_MAX_RESIZES.getPropertyPath(), "64");
+        properties.setProperty(PropertyKey.CAIRO_WRITER_FO_OPTS.getPropertyPath(), "o_async");
+        properties.setProperty(PropertyKey.CAIRO_WRITER_COMMAND_QUEUE_SLOT_SIZE.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_WRITER_COMMAND_QUEUE_CAPACITY.getPropertyPath(), "4");
+        properties.setProperty(PropertyKey.CAIRO_WRITER_ALTER_BUSY_WAIT_TIMEOUT.getPropertyPath(), "1000");
+        properties.setProperty(PropertyKey.CAIRO_WAL_WRITER_POOL_MAX_SEGMENTS.getPropertyPath(), "5");
+        properties.setProperty(PropertyKey.CAIRO_WAL_MAX_SEGMENT_FILE_DESCRIPTORS_CACHE.getPropertyPath(), "1000");
+        properties.setProperty(PropertyKey.CAIRO_WAL_MAX_LAG_TXN_COUNT.getPropertyPath(), "20");
+        properties.setProperty(PropertyKey.CAIRO_WAL_APPLY_TABLE_TIME_QUOTA.getPropertyPath(), "1000");
+        properties.setProperty(PropertyKey.CAIRO_WAL_APPLY_TABLE_TIME_QUOTA.getPropertyPath(), "-1");
+        properties.setProperty(PropertyKey.CAIRO_VECTOR_AGGREGATE_QUEUE_CAPACITY.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_O3_TXN_SCOREBOARD_ENTRY_COUNT.getPropertyPath(), "8192");
+        properties.setProperty(PropertyKey.HTTP_TEXT_TIMESTAMP_ADAPTER_POOL_CAPACITY.getPropertyPath(), "16");
+        properties.setProperty(PropertyKey.HTTP_TEXT_LEXER_STRING_POOL_CAPACITY.getPropertyPath(), "32");
+        properties.setProperty(PropertyKey.HTTP_TEXT_ROLL_BUFFER_SIZE.getPropertyPath(), "4096");
+        properties.setProperty(PropertyKey.HTTP_TEXT_ROLL_BUFFER_LIMIT.getPropertyPath(), "16384");
+        properties.setProperty(PropertyKey.HTTP_TEXT_MAX_REQUIRED_DELIMITER_STDDEV.getPropertyPath(), "0.35");
+        properties.setProperty(PropertyKey.TELEMETRY_QUEUE_CAPACITY.getPropertyPath(), "16");
+        properties.setProperty(PropertyKey.CAIRO_TABLE_REGISTRY_COMPACTION_THRESHOLD.getPropertyPath(), "0");
+        properties.setProperty(PropertyKey.CAIRO_SQL_WINDOW_TREE_PAGE_SIZE.getPropertyPath(), "4096");
+        properties.setProperty(PropertyKey.CAIRO_SQL_WINDOW_STORE_MAX_PAGES.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_SQL_SORT_VALUE_MAX_BYTES.getPropertyPath(), "16g");
+        properties.setProperty(PropertyKey.CAIRO_SQL_SORT_LIGHT_VALUE_MAX_BYTES.getPropertyPath(), "128m");
+        properties.setProperty(PropertyKey.CAIRO_SQL_SORT_KEY_MAX_BYTES.getPropertyPath(), "512m");
+        properties.setProperty(PropertyKey.CAIRO_SQL_WINDOW_ROWID_PAGE_SIZE.getPropertyPath(), "1024");
+        properties.setProperty(PropertyKey.CAIRO_SQL_UNORDERED_MAP_MAX_ENTRY_SIZE.getPropertyPath(), "32");
+        properties.setProperty(PropertyKey.CAIRO_SQL_SMALL_MAP_KEY_CAPACITY.getPropertyPath(), "64");
+        properties.setProperty(PropertyKey.CAIRO_SQL_PAGE_FRAME_MIN_ROWS.getPropertyPath(), "1000");
+        properties.setProperty(PropertyKey.CAIRO_SMALL_SQL_PAGE_FRAME_MIN_ROWS.getPropertyPath(), "100");
+        properties.setProperty(PropertyKey.CAIRO_PAGE_FRAME_SHARD_COUNT.getPropertyPath(), "4");
+        properties.setProperty(PropertyKey.DEBUG_ENABLE_TEST_FACTORIES.getPropertyPath(), "true");
+        // TESTS ONLY: TableWriter verifies its column-mapping and truncation invariants after every commit,
+        // structural change and close; TestUtils.LeakCheck and the AbstractTest rule fail the test on any violation.
+        properties.setProperty(PropertyKey.DEBUG_CAIRO_WRITER_INVARIANT_CHECK_ENABLED.getPropertyPath(), "true");
+        properties.setProperty(PropertyKey.CAIRO_O3_MAX_LAG.getPropertyPath(), "300000");
+        properties.setProperty(PropertyKey.CAIRO_SQL_PARALLEL_FILTER_ENABLED.getPropertyPath(), "true");
+        properties.setProperty(PropertyKey.CAIRO_SQL_PARALLEL_GROUPBY_ENABLED.getPropertyPath(), "true");
+        properties.setProperty(PropertyKey.CAIRO_WAL_ENABLED_DEFAULT.getPropertyPath(), "false");
+        properties.setProperty(PropertyKey.CAIRO_LEGACY_STRING_COLUMN_TYPE_DEFAULT.getPropertyPath(), "false");
+        properties.setProperty(PropertyKey.CAIRO_O3_PARTITION_OVERWRITE_CONTROL_ENABLED.getPropertyPath(), "true");
+        properties.setProperty(PropertyKey.CAIRO_SQL_COLUMN_ALIAS_EXPRESSION_ENABLED.getPropertyPath(), "false");
+        properties.setProperty(PropertyKey.DEBUG_MAT_VIEW_REFRESH_MISSING_WAL_FILES_FATAL.getPropertyPath(), "true");
+    }
+
+    private CairoConfiguration getDefaultConfiguration(String root) {
+        if (defaultConfiguration != null) {
+            return defaultConfiguration;
+        }
+        defaultConfiguration = getTestConfiguration(root, defaultProperties, null);
+        return defaultConfiguration;
+    }
+}

@@ -1,0 +1,224 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin.engine.functions.str;
+
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Test;
+
+public class StrPosVarcharFunctionFactoryTest extends AbstractCairoTest {
+
+    @Test
+    public void testCharVar() throws Exception {
+        assertQuery("select substr, str, strpos(str, substr) from x")
+                .ddl("create table x as (" +
+                        "select rnd_varchar('TEST', 'ABCDEFGHIJKLM', 'NOPQRSTUVW', NULL) as str," +
+                        " rnd_char() as substr" +
+                        " from long_sequence(15)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        substr\tstr\tstrpos
+                        T\tTEST\t1
+                        W\tABCDEFGHIJKLM\t0
+                        P\tABCDEFGHIJKLM\t0
+                        W\tNOPQRSTUVW\t10
+                        Y\tNOPQRSTUVW\t0
+                        X\tTEST\t0
+                        E\tNOPQRSTUVW\t0
+                        N\tABCDEFGHIJKLM\t0
+                        X\tTEST\t0
+                        Z\tABCDEFGHIJKLM\t0
+                        X\t\tnull
+                        X\tTEST\t0
+                        B\t\tnull
+                        T\tNOPQRSTUVW\t7
+                        P\t\tnull
+                        """);
+    }
+
+    @Test
+    public void testCharVarConst() throws Exception {
+        assertQuery("select str,strpos(str,'C') from x")
+                .ddl("create table x as (" +
+                        "select rnd_varchar('ABC XYZ XYZ','CBA','XYZ') as str\n" +
+                        "from long_sequence(5)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        str\tstrpos
+                        ABC XYZ XYZ\t3
+                        ABC XYZ XYZ\t3
+                        CBA\t1
+                        XYZ\t0
+                        XYZ\t0
+                        """);
+    }
+
+    @Test
+    public void testConstantEmptyString() throws Exception {
+        assertQuery("select strpos('','a') pos1, strpos('a',cast('' as string)) pos2, strpos('','') pos3")
+                .expectSize()
+                .returns("""
+                        pos1\tpos2\tpos3
+                        0\t1\t1
+                        """);
+    }
+
+    @Test
+    public void testConstantNull() throws Exception {
+        assertQuery("select strpos(null,'a') pos1, strpos(null,'abc') pos2, strpos('a',null) pos3, strpos(null,null) pos4")
+                .expectSize()
+                .returns("""
+                        pos1\tpos2\tpos3\tpos4
+                        null\tnull\tnull\tnull
+                        """);
+    }
+
+    @Test
+    public void testPositionAlias() throws Exception {
+        assertQuery("select str,position(str,'XYZ') from x")
+                .ddl("create table x as (" +
+                        "select rnd_varchar('ABC XYZ XYZ','XYZ','XYW') as str\n" +
+                        "from long_sequence(5)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        str\tposition
+                        ABC XYZ XYZ\t5
+                        ABC XYZ XYZ\t5
+                        XYZ\t1
+                        XYW\t0
+                        XYW\t0
+                        """);
+    }
+
+    @Test
+    public void testSplitColumn() throws Exception {
+        assertQuery("""
+                select str,
+                left(str, strpos(str, ',') - 1) str1,
+                right(str, length(str) - strpos(str, ',')) str2
+                from x""")
+                .ddl("create table x as (" +
+                        "select rnd_varchar('dog,cat','apple,pear') as str\n" +
+                        "from long_sequence(3)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        str\tstr1\tstr2
+                        dog,cat\tdog\tcat
+                        dog,cat\tdog\tcat
+                        apple,pear\tapple\tpear
+                        """);
+    }
+
+    @Test
+    public void testStrVar() throws Exception {
+        assertQuery("select substr,str,strpos(str,substr) from x")
+                .ddl("""
+                        create table x as (\
+                        select rnd_varchar('ABC XYZ XYZ','XYZ','XYW',NULL) as str
+                        , rnd_varchar('XYZ','C',NULL) as substr
+                        from long_sequence(15)\
+                        )""")
+                .expectSize()
+                .returns("""
+                        substr\tstr\tstrpos
+                        XYZ\tABC XYZ XYZ\t5
+                        \tXYZ\tnull
+                        \tXYZ\tnull
+                        C\tXYW\t0
+                        C\tXYW\t0
+                        \tABC XYZ XYZ\tnull
+                        C\tXYW\t0
+                        XYZ\tXYZ\t1
+                        C\tABC XYZ XYZ\t3
+                        C\tXYZ\t0
+                        XYZ\t\tnull
+                        \tABC XYZ XYZ\tnull
+                        C\t\tnull
+                        C\tXYW\t0
+                        XYZ\t\tnull
+                        """);
+    }
+
+    @Test
+    public void testStrVarConst() throws Exception {
+        assertQuery("select str,strpos(str,'XYZ') from x")
+                .ddl("create table x as (" +
+                        "select rnd_varchar('ABC XYZ XYZ','XYZ','XYW') as str\n" +
+                        "from long_sequence(5)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        str\tstrpos
+                        ABC XYZ XYZ\t5
+                        ABC XYZ XYZ\t5
+                        XYZ\t1
+                        XYW\t0
+                        XYW\t0
+                        """);
+    }
+
+    @Test
+    public void testStrVarNonAscii() throws Exception {
+        assertQuery("select substr, str, strpos(str, substr) from x")
+                .ddl("create table x as (" +
+                        "select rnd_varchar('čřž ěšč ěšč', 'ěšč', 'XYW', NULL) as str," +
+                        " rnd_varchar('ěšč', 'C', NULL) as substr" +
+                        " from long_sequence(25)" +
+                        ")")
+                .expectSize()
+                .returns("""
+                        substr\tstr\tstrpos
+                        ěšč\tčřž ěšč ěšč\t5
+                        \těšč\tnull
+                        \těšč\tnull
+                        C\tXYW\t0
+                        C\tXYW\t0
+                        \tčřž ěšč ěšč\tnull
+                        C\tXYW\t0
+                        ěšč\těšč\t1
+                        C\tčřž ěšč ěšč\t0
+                        C\těšč\t0
+                        ěšč\t\tnull
+                        \tčřž ěšč ěšč\tnull
+                        C\t\tnull
+                        C\tXYW\t0
+                        ěšč\t\tnull
+                        C\těšč\t0
+                        \tčřž ěšč ěšč\tnull
+                        C\tXYW\t0
+                        ěšč\t\tnull
+                        C\t\tnull
+                        ěšč\tXYW\t0
+                        C\t\tnull
+                        \těšč\tnull
+                        ěšč\t\tnull
+                        \t\tnull
+                        """);
+    }
+
+}

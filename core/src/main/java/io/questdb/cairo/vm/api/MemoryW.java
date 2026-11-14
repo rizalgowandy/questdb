@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,9 @@
 package io.questdb.cairo.vm.api;
 
 import io.questdb.std.Long256;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
 
@@ -36,13 +39,31 @@ public interface MemoryW extends Closeable {
     @Override
     void close();
 
-    void putBlockOfBytes(long offset, long from, long len);
-
     void putBool(long offset, boolean value);
 
     void putByte(long offset, byte value);
 
     void putChar(long offset, char value);
+
+    /**
+     * Writes a Decimal value to memory using 128 bits.
+     *
+     * @param offset the memory offset to write to
+     * @param high   the high 64-bit part of the value
+     * @param low    the low 64-bit part of the value
+     */
+    void putDecimal128(long offset, long high, long low);
+
+    /**
+     * Writes a Decimal value to memory using 256 bits.
+     *
+     * @param offset the memory offset to write to
+     * @param hh     the highest 64-bit part of the value
+     * @param hl     the high 64-bit part of the value
+     * @param lh     the middle 64-bit part of the value
+     * @param ll     the low 64-bit part of the value
+     */
+    void putDecimal256(long offset, long hh, long hl, long lh, long ll);
 
     void putDouble(long offset, double value);
 
@@ -63,6 +84,20 @@ public interface MemoryW extends Closeable {
     void putStr(long offset, CharSequence value);
 
     void putStr(long offset, CharSequence value, int pos, int len);
+
+    /**
+     * Appends UTF8 sequence bytes to the memory. The binary format is bytes
+     * only. Length to be encoded elsewhere.
+     *
+     * @param value any utf8 sequence
+     */
+    default void putVarchar(long offset, @Nullable Utf8Sequence value) {
+        if (value != null) {
+            putVarchar(offset, value, 0, value.size());
+        }
+    }
+
+    void putVarchar(long offset, @NotNull Utf8Sequence value, int lo, int hi);
 
     void truncate();
 

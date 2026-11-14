@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,53 +24,59 @@
 
 package io.questdb.griffin.engine.orderby;
 
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.DelegatingRecordCursor;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
-import io.questdb.griffin.SqlException;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.RecordComparator;
+import io.questdb.std.DirectIntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
 
 /**
- * SortedLightRecordCursor implementing LIMIT clause .
+ * SortedLightRecordCursor which implements LIMIT clause.
  */
-public class LimitedSizeSortedLightRecordCursor implements DelegatingRecordCursor {
-
+public class LimitedSizeSortedLightRecordCursor implements DelegatingRecordCursor, DynamicLimitCursor {
     private final LimitedSizeLongTreeChain chain;
-    private final RecordComparator comparator;
     private final LimitedSizeLongTreeChain.TreeCursor chainCursor;
-
-    private RecordCursor base;
+    private final RecordComparator comparator;
+    private final ObjList<DirectIntList> rankMaps;
+    private RecordCursor baseCursor;
     private Record baseRecord;
-
-    private final long limit; //<0 - limit disabled ; =0 means don't fetch any rows ; >0 - apply limit
-    private final long skipFirst; //skip first N rows
-    private final long skipLast;  //skip last N rows
+    private SqlExecutionCircuitBreaker circuitBreaker;
+    private boolean isChainBuilt;
+    private boolean isOpen;
+    private long limit; // <0 - limit disabled; =0 means don't fetch any rows; >0 - apply limit
     private long rowsLeft;
+    private long skipFirst; // skip first N rows
+    private long skipLast;  // skip last N rows
 
     public LimitedSizeSortedLightRecordCursor(
             LimitedSizeLongTreeChain chain,
             RecordComparator comparator,
-            long limit,
-            long skipFirst,
-            long skipLast
+            ObjList<DirectIntList> rankMaps
     ) {
         this.chain = chain;
         this.comparator = comparator;
         this.chainCursor = chain.getCursor();
-        this.limit = limit;
-        this.skipFirst = skipFirst;
-        this.skipLast = skipLast;
+        // Lazy variant: the chain skeleton is constructed but the key/value heaps
+        // are not allocated yet. The first of() call binds the MemoryTracker and
+        // calls chain.reopen() to allocate the initial backing under it.
+        this.isOpen = false;
+        this.rankMaps = rankMaps;
     }
 
     @Override
     public void close() {
-        chain.clear();
-        base.close();
-    }
-
-    @Override
-    public long size() {
-        return Math.max(chain.size() - skipFirst - skipLast, 0);
+        if (isOpen) {
+            Misc.freeObjListAndKeepObjects(rankMaps);
+            baseCursor = Misc.free(baseCursor);
+            Misc.free(chain);
+            isOpen = false;
+        }
     }
 
     @Override
@@ -79,32 +85,69 @@ public class LimitedSizeSortedLightRecordCursor implements DelegatingRecordCurso
     }
 
     @Override
-    public SymbolTable getSymbolTable(int columnIndex) {
-        return base.getSymbolTable(columnIndex);
+    public Record getRecordB() {
+        return baseCursor.getRecordB();
     }
 
     @Override
-    public SymbolTable newSymbolTable(int columnIndex) {
-        return base.newSymbolTable(columnIndex);
+    public SymbolTable getSymbolTable(int columnIndex) {
+        return baseCursor.getSymbolTable(columnIndex);
     }
 
     @Override
     public boolean hasNext() {
+        if (!isChainBuilt) {
+            buildChain();
+            isChainBuilt = true;
+        }
         if (rowsLeft-- > 0 && chainCursor.hasNext()) {
-            base.recordAt(baseRecord, chainCursor.next());
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            baseCursor.recordAt(baseRecord, chainCursor.next());
             return true;
         }
         return false;
     }
 
     @Override
-    public Record getRecordB() {
-        return base.getRecordB();
+    public SymbolTable newSymbolTable(int columnIndex) {
+        return baseCursor.newSymbolTable(columnIndex);
+    }
+
+    @Override
+    public void of(RecordCursor baseCursor, SqlExecutionContext executionContext) {
+        this.baseCursor = baseCursor;
+        baseRecord = baseCursor.getRecord();
+        baseCursor.setParquetDecodeHint(ParquetDecodeHint.SCATTERED);
+        if (!isOpen) {
+            isOpen = true;
+            chain.setMemoryTracker(executionContext.getMemoryTracker());
+            chain.reopen();
+        }
+        SortKeyEncoder.buildRankMaps(baseCursor, rankMaps, comparator);
+        circuitBreaker = executionContext.getCircuitBreaker();
+        isChainBuilt = false;
+        chain.clear();
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return RecordCursor.fromBool(isChainBuilt) + baseCursor.preComputedStateSize();
     }
 
     @Override
     public void recordAt(Record record, long atRowId) {
-        base.recordAt(record, atRowId);
+        baseCursor.recordAt(record, atRowId);
+    }
+
+    @Override
+    public void setParquetDecodeHint(ParquetDecodeHint hint) {
+        // We emit out of order, so of() pins the base to SCATTERED. An outer MONOTONIC push
+        // (e.g. an ASOF light join slave) must not downgrade it and force base re-decodes.
+    }
+
+    @Override
+    public long size() {
+        return isChainBuilt ? Math.max(chain.size() - skipFirst - skipLast, 0) : -1;
     }
 
     @Override
@@ -120,30 +163,33 @@ public class LimitedSizeSortedLightRecordCursor implements DelegatingRecordCurso
     }
 
     @Override
-    public void of(RecordCursor base, SqlExecutionContext executionContext) throws SqlException {
-        this.base = base;
-        this.baseRecord = base.getRecord();
-        final Record placeHolderRecord = base.getRecordB();
-        final SqlExecutionCircuitBreaker circuitBreaker = executionContext.getCircuitBreaker();
+    public void updateLimits(boolean isFirstN, long limit, long skipFirst, long skipLast) {
+        // This cursor drains the whole base cursor either way, so isFirstN only steers the
+        // chain's eviction end, which the factory sets on the chain directly.
+        this.limit = limit;
+        this.skipFirst = skipFirst;
+        this.skipLast = skipLast;
+    }
 
-        chain.clear();
+    private void buildChain() {
+        // Consult the breaker before consuming the base, so an empty base scan still observes cancellation.
+        circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottledOrYield();
+        final Record placeHolderRecord = baseCursor.getRecordB();
         if (limit != 0) {
-            while (base.hasNext()) {
-                circuitBreaker.statefulThrowExceptionIfTripped();
+            while (baseCursor.hasNext()) {
+                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
                 // Tree chain is liable to re-position record to
                 // other rows to do record comparison. We must use our
                 // own record instance in case base cursor keeps
                 // state in the record it returns.
                 chain.put(
                         baseRecord,
-                        base,
+                        baseCursor,
                         placeHolderRecord,
                         comparator
                 );
             }
         }
-
         toTop();
     }
 }
-

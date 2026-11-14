@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,27 +24,34 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.sql.DataFrame;
-import io.questdb.cairo.sql.DataFrameCursor;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.std.IntList;
 import org.jetbrains.annotations.NotNull;
 
-class LatestByValueRecordCursor extends AbstractDataFrameRecordCursor {
+class LatestByValueRecordCursor extends AbstractLatestByValueRecordCursor {
 
-    private final int columnIndex;
-    private final int symbolKey;
-    private boolean empty;
-    private boolean hasNext;
-
-    public LatestByValueRecordCursor(int columnIndex, int symbolKey, @NotNull IntList columnIndexes) {
-        super(columnIndexes);
-        this.columnIndex = columnIndex;
-        this.symbolKey = symbolKey;
+    public LatestByValueRecordCursor(
+            @NotNull CairoConfiguration configuration,
+            @NotNull RecordMetadata metadata,
+            int columnIndex,
+            int symbolKey
+    ) {
+        super(configuration, metadata, columnIndex, symbolKey);
     }
 
     @Override
     public boolean hasNext() {
+        circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+        if (!isFindPending) {
+            findRecord();
+            toTop();
+            isFindPending = true;
+        }
         if (hasNext) {
             hasNext = false;
             return true;
@@ -53,28 +60,15 @@ class LatestByValueRecordCursor extends AbstractDataFrameRecordCursor {
     }
 
     @Override
-    public void toTop() {
-        hasNext = !empty;
-    }
-
-    private void findRecord() {
-        empty = true;
-        DataFrame frame;
-        OUT:
-        while ((frame = this.dataFrameCursor.next()) != null) {
-            final long rowLo = frame.getRowLo();
-            final long rowHi = frame.getRowHi() - 1;
-
-            recordA.jumpTo(frame.getPartitionIndex(), rowHi);
-            for (long row = rowHi; row >= rowLo; row--) {
-                recordA.setRecordIndex(row);
-                int key = recordA.getInt(columnIndex);
-                if (key == symbolKey) {
-                    empty = false;
-                    break OUT;
-                }
-            }
-        }
+    public void of(PageFrameCursor pageFrameCursor, SqlExecutionContext executionContext) {
+        this.frameCursor = pageFrameCursor;
+        recordA.of(pageFrameCursor);
+        recordB.of(pageFrameCursor);
+        circuitBreaker = executionContext.getCircuitBreaker();
+        isRecordFound = false;
+        isFindPending = false;
+        // prepare for page frame iteration
+        super.init(executionContext.getMemoryTracker());
     }
 
     @Override
@@ -83,11 +77,44 @@ class LatestByValueRecordCursor extends AbstractDataFrameRecordCursor {
     }
 
     @Override
-    void of(DataFrameCursor dataFrameCursor, SqlExecutionContext executionContext) {
-        this.dataFrameCursor = dataFrameCursor;
-        this.recordA.of(dataFrameCursor.getTableReader());
-        this.recordB.of(dataFrameCursor.getTableReader());
-        findRecord();
-        toTop();
+    public long preComputedStateSize() {
+        return isFindPending ? 1 : 0;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Row backward scan");
+        sink.attr("symbolFilter").putColumnName(columnIndex).val('=').val(symbolKey);
+    }
+
+    @Override
+    public void toTop() {
+        hasNext = isRecordFound;
+    }
+
+    private void findRecord() {
+        // The reserved NULL key does not imply that this snapshot contains a NULL.
+        if (symbolKey == SymbolTable.VALUE_IS_NULL && !frameCursor.getSymbolTable(columnIndex).containsNullValue()) {
+            return;
+        }
+        PageFrame frame;
+        OUT:
+        while ((frame = frameCursor.next()) != null) {
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            final long partitionLo = frame.getPartitionLo();
+            final long partitionHi = frame.getPartitionHi() - 1;
+
+            frameAddressCache.add(frameCount, frame);
+            frameMemoryPool.navigateTo(frameCount++, recordA);
+
+            for (long row = partitionHi - partitionLo; row >= 0; row--) {
+                recordA.setRowIndex(row);
+                int key = recordA.getInt(columnIndex);
+                if (key == symbolKey) {
+                    isRecordFound = true;
+                    break OUT;
+                }
+            }
+        }
     }
 }

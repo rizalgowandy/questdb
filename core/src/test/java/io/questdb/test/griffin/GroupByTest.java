@@ -1,0 +1,4966 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+package io.questdb.test.griffin;
+
+import io.questdb.PropertyKey;
+import io.questdb.griffin.SqlException;
+import io.questdb.std.Rnd;
+import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.util.Arrays;
+
+public class GroupByTest extends AbstractCairoTest {
+
+    @Test
+    public void test1GroupByWithoutAggregateFunctionsReturnsUniqueKeys() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t as (" +
+                    "    select 1 as l, 'a' as s " +
+                    "    union all " +
+                    "    select 1, 'a' )");
+
+            String query1 = "select l, s from t group by l,s";
+            assertQuery(query1)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async Group By workers: 1
+                              keys: [l,s]
+                              filter: null
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: t
+                            """);
+            assertQuery(query1)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("l\ts\n1\ta\n");
+
+            String query2 = "select l as l1, s as s1 from t group by l,s";
+            // virtual model must be used here to change aliases
+            assertQuery(query2)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [l,s]
+                                Async Group By workers: 1
+                                  keys: [l,s]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+            assertQuery(query2)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("l1\ts1\n1\ta\n");
+        });
+    }
+
+    @Test
+    public void test2FailOnAggregateFunctionAliasInGroupByClause1() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            assertError(
+                    "select x, avg(x) as agx, avg(y) from t group by agx ",
+                    "[48] aggregate functions are not allowed in GROUP BY"
+            );
+        });
+    }
+
+    @Test
+    public void test2FailOnAggregateFunctionAliasInGroupByClause2() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            assertError(
+                    "select x, 2*avg(y) agy from t group by agy;",
+                    "[39] aggregate functions are not allowed in GROUP BY"
+            );
+        });
+    }
+
+    @Test
+    public void test2FailOnAggregateFunctionColumnIndexInGroupByClause() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            assertError(
+                    "select x, avg(x) as agx, avg(y) from t group by 2 ",
+                    "[48] aggregate functions are not allowed in GROUP BY"
+            );
+        });
+    }
+
+    @Test
+    public void test2FailOnAggregateFunctionInGroupByClause() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y) from t group by x, avg(x) ";
+            assertError(query, "[36] aggregate functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnExpressionWithAggFunctionNestedInFunctionInGroupByClause1() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y) from t group by x, concat('a', 'b', 'c', first(x)) ";
+            assertError(query, "[58] aggregate functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnExpressionWithAggFunctionNestedInFunctionInGroupByClause2() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y) from t group by x, case when x > 0 then 1 else first(x) end ";
+            assertError(query, "[64] aggregate functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnExpressionWithAggFunctionNestedInFunctionInGroupByClause3() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y) from t group by x, strpos('123', '1' || first(x)::string)";
+            assertError(query, "[57] aggregate functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnExpressionWithAggregateFunctionInGroupByClause() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y) from t group by x, y+avg(x) ";
+            assertError(query, "[38] aggregate functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnExpressionWithNonAggregateNonKeyColumnReference() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, x+y from t group by x ";
+            assertError(query, "[12] column must appear in GROUP BY clause or aggregate function");
+        });
+    }
+
+    @Test
+    public void test2FailOnNonAggregateNonKeyColumnReference() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, y from t group by x ";
+            assertError(query, "[10] column must appear in GROUP BY clause or aggregate function");
+        });
+    }
+
+    @Test
+    public void test2FailOnSelectAliasUsedInGroupByExpression() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            final String errorMessage = "[48] Invalid column: agx";
+
+            assertError("select x, abs(x) as agx, avg(y) from t group by agx+1 ", errorMessage);
+            assertError("select x, x+5    as agx, avg(y) from t group by agx+1 ", errorMessage);
+            assertError("select x, avg(x)    agx, avg(y) from t group by agx+1 ", errorMessage);
+        });
+    }
+
+    @Test
+    public void test2FailOnWindowFunctionAliasInGroupByClause() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, row_number() as z from t group by x, z ";
+            assertError(query, "[47] window functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnWindowFunctionColumnIndexInGroupByClause() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, row_number() as z from t group by x, 2 ";
+            assertError(query, "[47] window functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnWindowFunctionInGroupByClause() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y) from t group by x, row_number() ";
+            assertError(query, "[36] window functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnWindowFunctionNestedInFunctionAliasInGroupByClause1() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y), abs(row_number() ) z from t group by x, z";
+            assertError(query, "[58] window functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2FailOnWindowFunctionNestedInFunctionAliasInGroupByClause2() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            String query = "select x, avg(y), case when x > 0 then 1 else row_number() over (partition by x) end as z from t group by x, z";
+            assertError(query, "[109] window functions are not allowed in GROUP BY");
+        });
+    }
+
+    @Test
+    public void test2GroupByWithNonAggregateExpressionsOnKeyColumns1() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            execute("insert into t values (1, 11), (1, 12);");
+
+            String query = "select x+1, count(*) " +
+                    "from t " +
+                    "group by x+1 ";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [column,count]
+                                Async Group By workers: 1
+                                  keys: [column]
+                                  keyFunctions: [x+1]
+                                  values: [count(*)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            column\tcount
+                            2\t2
+                            """);
+        });
+    }
+
+    @Test
+    public void test2GroupByWithNonAggregateExpressionsOnKeyColumns2() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            execute("insert into t values (1, 11), (1, 12);");
+
+            String query = "select case when x < 0 then -1 when x = 0 then 0 else 1 end, count(*) " +
+                    "from t " +
+                    "group by case when x < 0 then -1 when x = 0 then 0 else 1 end ";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async Group By workers: 1
+                              keys: [case]
+                              keyFunctions: [case([x<0,-1,x=0,0,1])]
+                              values: [count(*)]
+                              filter: null
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: t
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            case\tcount
+                            1\t2
+                            """);
+        });
+    }
+
+    @Test
+    public void test2GroupByWithNonAggregateExpressionsOnKeyColumns3() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            execute("insert into t values (1, 11), (1, 12);");
+
+            String query = "select case when x+1 < 0 then -1 when x+1 = 0 then 0 else 1 end, count(*) " +
+                    "from t " +
+                    "group by x+1";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [case([column<0,-1,column=0,0,1]),count]
+                                Async Group By workers: 1
+                                  keys: [column]
+                                  keyFunctions: [x+1]
+                                  values: [count(*)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            case\tcount
+                            1\t2
+                            """);
+        });
+    }
+
+    @Test // expressions based on group by clause expressions should go to outer model
+    public void test2GroupByWithNonAggregateExpressionsOnKeyColumns4() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            execute("insert into t values (1, 11), (1, 12);");
+
+            String query = "select x, avg(y), avg(y) + min(y), x+10, avg(x), avg(x) + 10 " +
+                    "from t " +
+                    "group by x ";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [x,avg,avg+min,x+10,avg1,avg1+10]
+                                Async Group By workers: 1
+                                  keys: [x]
+                                  values: [avg(y),min(y),avg(x)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tavg\tcolumn\tcolumn1\tavg1\tcolumn2
+                            1\t11.5\t22.5\t11\t1.0\t11.0
+                            """);
+        });
+    }
+
+    @Test
+    public void test2GroupByWithNonAggregateExpressionsOnKeyColumnsAndBindVariable() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            execute("insert into t values (1, 11), (1, 12);");
+
+            bindVariableService.clear();
+            bindVariableService.setStr("bv", "x");
+            String query = "select x, avg(y), :bv " +
+                    "from t " +
+                    "group by x ";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [x,avg,:bv::string]
+                                Async Group By workers: 1
+                                  keys: [x]
+                                  values: [avg(y)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tavg\t:bv
+                            1\t11.5\tx
+                            """);
+        });
+    }
+
+    @Test
+    public void test2SuccessOnSelectWithExplicitGroupBy() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            execute("insert into t values (1, 11), (1, 12);");
+            String query = "select x*10, x+avg(y), min(y) from t group by x ";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [x*10,x+avg,min]
+                                Async Group By workers: 1
+                                  keys: [x]
+                                  values: [avg(y),min(y)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            column\tcolumn1\tmin
+                            10\t12.5\t11
+                            """);
+        });
+    }
+
+    @Test
+    public void test2SuccessOnSelectWithoutExplicitGroupBy() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (x long, y long);");
+            execute("insert into t values (1, 11), (1, 12);");
+            String query = "select x*10, x+avg(y), min(y) from t";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [column,x+avg,min]
+                                Async Group By workers: 1
+                                  keys: [column,x]
+                                  keyFunctions: [x*10]
+                                  values: [avg(y),min(y)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            column\tcolumn1\tmin
+                            10\t12.5\t11
+                            """);
+        });
+    }
+
+    @Test
+    public void test3GroupByWithNonAggregateExpressionUsingAliasDefinedOnSameLevel() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("""
+                    CREATE TABLE weather ( \
+                    timestamp TIMESTAMP, windDir INT, windSpeed INT, windGust INT,\s
+                    cloudCeiling INT, skyCover SYMBOL, visMiles DOUBLE, tempF INT,\s
+                    dewpF INT, rain1H DOUBLE, rain6H DOUBLE, rain24H DOUBLE, snowDepth INT) \
+                    timestamp (timestamp)""");
+
+            String query = "select  windSpeed, avg(windSpeed), avg + 10  " +
+                    "from weather " +
+                    "group by windSpeed " +
+                    "order by windSpeed";
+
+            assertError(query, "[35] Invalid column: avg");
+        });
+    }
+
+    @Test
+    public void test4GroupByWithNonAggregateExpressionUsingAliasDefinedOnSameLevel() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table dat as ( select cast(86400000000*(x%3) as timestamp) as date_report from long_sequence(10))");
+            String query = "select ordr.date_report, count(*) " +
+                    "from dat ordr " +
+                    "group by ordr.date_report " +
+                    "order by ordr.date_report";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [date_report]
+                                Async Group By workers: 1
+                                  keys: [date_report]
+                                  values: [count(*)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: dat
+                            """);
+            assertQuery(query)
+                    .timestamp("date_report")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            date_report\tcount
+                            1970-01-01T00:00:00.000000Z\t3
+                            1970-01-02T00:00:00.000000Z\t4
+                            1970-01-03T00:00:00.000000Z\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void test4GroupByWithNonAggregateExpressionUsingAliasDefinedOnSameLevel2() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table dat as ( select cast(86400000000*(x%3) as timestamp) as date_report from long_sequence(10))");
+            String query = "select ordr.date_report, count(*) " +
+                    "from dat ordr " +
+                    "group by date_report " + // no alias used here
+                    "order by ordr.date_report";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [date_report]
+                                Async Group By workers: 1
+                                  keys: [date_report]
+                                  values: [count(*)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: dat
+                            """);
+            assertQuery(query)
+                    .timestamp("date_report")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            date_report\tcount
+                            1970-01-01T00:00:00.000000Z\t3
+                            1970-01-02T00:00:00.000000Z\t4
+                            1970-01-03T00:00:00.000000Z\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void test4GroupByWithNonAggregateExpressionUsingAliasDefinedOnSameLevel3() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table dat as ( select cast(86400000000*(x%3) as timestamp) as date_report from long_sequence(10))");
+            String query = "select date_report, count(*) " +//date_report used with no alias
+                    "from dat ordr " +
+                    "group by ordr.date_report " +
+                    "order by ordr.date_report";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [date_report]
+                                Async Group By workers: 1
+                                  keys: [date_report]
+                                  values: [count(*)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: dat
+                            """);
+            assertQuery(query)
+                    .timestamp("date_report")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            date_report\tcount
+                            1970-01-01T00:00:00.000000Z\t3
+                            1970-01-02T00:00:00.000000Z\t4
+                            1970-01-03T00:00:00.000000Z\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void test4GroupByWithNonAggregateExpressionUsingAliasDefinedOnSameLevel4() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table dat as ( select cast(86400000000*(x%3) as timestamp) as date_report from long_sequence(10))");
+            String query = "select date_report, ordr.date_report,  count(*) " +
+                    "from dat ordr " +
+                    "group by date_report, ordr.date_report " +
+                    "order by ordr.date_report";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [date_report1]
+                                VirtualRecord
+                                  functions: [date_report,date_report,count]
+                                    Async Group By workers: 1
+                                      keys: [date_report]
+                                      values: [count(*)]
+                                      filter: null
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: dat
+                            """);
+
+            assertQuery(query)
+                    .timestamp("date_report1")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            date_report\tdate_report1\tcount
+                            1970-01-01T00:00:00.000000Z\t1970-01-01T00:00:00.000000Z\t3
+                            1970-01-02T00:00:00.000000Z\t1970-01-02T00:00:00.000000Z\t4
+                            1970-01-03T00:00:00.000000Z\t1970-01-03T00:00:00.000000Z\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void test4GroupByWithNonAggregateExpressionUsingAliasDefinedOnSameLevel5() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table dat as ( select cast(86400000000*(x%3) as timestamp) as date_report from long_sequence(10))");
+            String query = "select date_report, dateadd('d', -1, ordr.date_report) as minusday, dateadd('d', 1, date_report) as plusday, " +
+                    "concat('1', ordr.date_report, '3'), count(*) " +
+                    "from dat ordr " +
+                    "group by dateadd('d', -1, date_report), ordr.date_report " +
+                    "order by ordr.date_report";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [date_report]
+                                VirtualRecord
+                                  functions: [date_report,dateadd,dateadd('d',1,date_report),concat(['1',date_report,'3']),count]
+                                    Async Group By workers: 1
+                                      keys: [date_report,dateadd]
+                                      keyFunctions: [dateadd('d',-1,date_report)]
+                                      values: [count(*)]
+                                      filter: null
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: dat
+                            """);
+
+            assertQuery(query)
+                    .timestamp("date_report")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            date_report\tminusday\tplusday\tconcat\tcount
+                            1970-01-01T00:00:00.000000Z\t1969-12-31T00:00:00.000000Z\t1970-01-02T00:00:00.000000Z\t11970-01-01T00:00:00.000000Z3\t3
+                            1970-01-02T00:00:00.000000Z\t1970-01-01T00:00:00.000000Z\t1970-01-03T00:00:00.000000Z\t11970-01-02T00:00:00.000000Z3\t4
+                            1970-01-03T00:00:00.000000Z\t1970-01-02T00:00:00.000000Z\t1970-01-04T00:00:00.000000Z\t11970-01-03T00:00:00.000000Z3\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void test5GroupByWithNonAggregateExpressionUsingKeyColumn() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table dat as ( select cast(86400000000*(x%3) as timestamp) as date_report from long_sequence(10))");
+            String query = """
+                    select ordr.date_report, to_str(ordr.date_report, 'dd.MM.yyyy') as dt, \
+                    dateadd('d', 1, date_report) as plusday, dateadd('d', -1, ordr.date_report) as minusday, count(*)
+                    from dat ordr
+                    group by ordr.date_report
+                    order by ordr.date_report""";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [date_report]
+                                VirtualRecord
+                                  functions: [date_report,to_str(date_report),dateadd('d',1,date_report),dateadd('d',-1,date_report),count]
+                                    Async Group By workers: 1
+                                      keys: [date_report]
+                                      values: [count(*)]
+                                      filter: null
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: dat
+                            """);
+
+            assertQuery(query)
+                    .timestamp("date_report")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            date_report\tdt\tplusday\tminusday\tcount
+                            1970-01-01T00:00:00.000000Z\t01.01.1970\t1970-01-02T00:00:00.000000Z\t1969-12-31T00:00:00.000000Z\t3
+                            1970-01-02T00:00:00.000000Z\t02.01.1970\t1970-01-03T00:00:00.000000Z\t1970-01-01T00:00:00.000000Z\t4
+                            1970-01-03T00:00:00.000000Z\t03.01.1970\t1970-01-04T00:00:00.000000Z\t1970-01-02T00:00:00.000000Z\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void test6GroupByWithNonAggregateExpressionUsingKeyColumn1() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table ord as ( select cast(86400000000*(x%3) as timestamp) as date_report, x from long_sequence(10))");
+            execute("create table det as ( select cast(86400000000*(10+x%3) as timestamp) as date_report, x from long_sequence(10))");
+
+            String query = "select details.date_report, " +
+                    " to_str(details.date_report, 'dd.MM.yyyy') as dt, " +
+                    " dateadd('d', 1, details.date_report) as plusday, " +
+                    " min(details.x), " +
+                    " count(*), " +
+                    " min(dateadd('d', -1, ordr.date_report)) as minminusday " +
+                    "from ord ordr " +
+                    "join det details on ordr.x = details.x " +
+                    "group by details.date_report " +
+                    "order by details.date_report";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [date_report]
+                                VirtualRecord
+                                  functions: [date_report,to_str(date_report),dateadd('d',1,date_report),min,count,minminusday]
+                                    Async Hash Join Group By workers: 1
+                                      logicalJoinType: inner
+                                      physicalJoinType: inner
+                                      inputSwapped: false
+                                      condition: ordr.x=details.x
+                                      buildStrategy: shared
+                                      buildPayload: copied when the probe is large enough
+                                      keys: [date_report]
+                                      values: [min(details.x),count(*),min(dateadd('d',-1,ordr.date_report))]
+                                        Probe
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: ord
+                                        Build
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: det
+                            """);
+
+            assertQuery(query)
+                    .timestamp("date_report")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            date_report\tdt\tplusday\tmin\tcount\tminminusday
+                            1970-01-11T00:00:00.000000Z\t11.01.1970\t1970-01-12T00:00:00.000000Z\t3\t3\t1969-12-31T00:00:00.000000Z
+                            1970-01-12T00:00:00.000000Z\t12.01.1970\t1970-01-13T00:00:00.000000Z\t1\t4\t1970-01-01T00:00:00.000000Z
+                            1970-01-13T00:00:00.000000Z\t13.01.1970\t1970-01-14T00:00:00.000000Z\t2\t3\t1970-01-02T00:00:00.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void test6GroupByWithNonAggregateExpressionUsingKeyColumn2() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table ord as ( select cast(86400000000*(x%3) as timestamp) as date_report, x from long_sequence(10))");
+            execute("create table det as ( select cast(86400000000*(10+x%3) as timestamp) as date_report, x from long_sequence(10))");
+
+            String query = "select details.date_report, to_str(date_report, 'dd.MM.yyyy') as dt, min(details.x), count(*) " +
+                    "from ord ordr " +
+                    "join det details on ordr.x = details.x " +
+                    "group by details.date_report " +
+                    "order by details.date_report";
+            assertError(query, "[35] Ambiguous column [name=date_report]");
+        });
+    }
+
+    @Test
+    public void test6GroupByWithNonAggregateExpressionUsingKeyColumn3() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table ord as ( select cast(86400000000*(x%3) as timestamp) as date_report, x from long_sequence(10))");
+            execute("create table det as ( select cast(86400000000*(10+x%3) as timestamp) as date_report, x from long_sequence(10))");
+
+            String query = "select details.date_report, dateadd('d', 1, date_report), min(details.x), count(*) " +
+                    "from ord ordr " +
+                    "join det details on ordr.x = details.x " +
+                    "group by details.date_report " +
+                    "order by details.date_report";
+            assertError(query, "[44] Ambiguous column [name=date_report]");
+        });
+    }
+
+    @Test
+    public void testCountStarInExpressions() throws Exception {
+        assertQuery("SELECT count(*) + count(*) AS s, coalesce(count(*), 5) AS c, 2 * count(*) AS d FROM t")
+                .ddl("CREATE TABLE t AS (SELECT x AS v FROM long_sequence(3))")
+                .expectSize()
+                .noRandomAccess()
+                .returns("""
+                        s\tc\td
+                        6\t3\t6
+                        """);
+    }
+
+    @Test
+    public void testCountStarInWindowSpec() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x AS a, x AS b FROM long_sequence(3))");
+            assertExceptionNoLeakCheck(
+                    "SELECT row_number() OVER (PARTITION BY count(*)) FROM t",
+                    7,
+                    "aggregate functions in partition by are not supported",
+                    false
+            );
+            assertExceptionNoLeakCheck(
+                    "SELECT row_number() OVER (PARTITION BY 2 * count(*)) FROM t",
+                    43,
+                    "Aggregate function cannot be passed as an argument",
+                    false
+            );
+            assertExceptionNoLeakCheck(
+                    "SELECT row_number() OVER w FROM t WINDOW w AS (PARTITION BY 2 * count(*))",
+                    64,
+                    "Aggregate function cannot be passed as an argument",
+                    false
+            );
+        });
+    }
+
+    @Test
+    public void testGroupByAliasInDifferentOrder1() throws Exception {
+        assertQuery("select key1 as k1, key2 as k2, count(*) from t group by k2, k1 order by 1, 2")
+                .ddl("create table t as ( select x%2 key1, x%4 key2, x as value from long_sequence(10)); ")
+                .expectSize()
+                .returns("""
+                        k1\tk2\tcount
+                        0\t0\t2
+                        0\t2\t3
+                        1\t1\t3
+                        1\t3\t2
+                        """);
+    }
+
+    @Test
+    public void testGroupByAliasInDifferentOrder2() throws Exception {
+        assertQuery("select key1+1 as k1, key2 as k2, count(*) from t group by k2, k1 order by 1, 2")
+                .ddl("create table t as ( select x%2 key1, x%4 key2, x as value from long_sequence(10));")
+                .expectSize()
+                .returns("""
+                        k1\tk2\tcount
+                        1\t0\t2
+                        1\t2\t3
+                        2\t1\t3
+                        2\t3\t2
+                        """);
+    }
+
+    @Test
+    public void testGroupByAllIndexedColumns() throws Exception {
+        assertQuery("SELECT first(ts) as time, s1, first(s2), first(d1), first(d2) " +
+                "FROM x " +
+                "WHERE ts BETWEEN '2023-05-16T00:00:00.00Z' AND '2023-05-16T00:10:00.00Z' " +
+                "AND s2 = ('foo') " +
+                "GROUP BY s1, s2 " +
+                "ORDER BY s1, s2;")
+                .ddl("create table x as " +
+                        "(" +
+                        "select" +
+                        "   rnd_symbol('a','b','c') s1," +
+                        "   rnd_symbol('foo','bar') s2," +
+                        "   rnd_double(1) d1," +
+                        "   rnd_double(1) d2," +
+                        "   timestamp_sequence('2023-05-16T00:00:00.00000Z', 60*1000000L) ts" +
+                        "   from long_sequence(100)" +
+                        "), index(s1), index(s2) timestamp(ts) partition by DAY")
+                .expectSize()
+                .returns("""
+                        time\ts1\tfirst\tfirst1\tfirst2
+                        2023-05-16T00:00:00.000000Z\ta\tfoo\tnull\t0.08486964232560668
+                        2023-05-16T00:02:00.000000Z\tb\tfoo\t0.8899286912289663\t0.6254021542412018
+                        2023-05-16T00:05:00.000000Z\tc\tfoo\t0.1985581797355932\t0.33608255572515877
+                        """);
+    }
+
+    @Test
+    public void testGroupByArrayKeyDoesNotLeak() throws Exception {
+        // Regression: count_distinct(<expression>) over a row source rewrites to
+        //   count(*) FROM (SELECT <expr> FROM ... WHERE <expr> IS NOT NULL GROUP BY <expr>)
+        // When <expr> is an ARRAY constructor, GroupByUtils rejects the GROUP BY
+        // key as "unsupported type of expression". The first column loop in
+        // assembleGroupByFunctions adds the parsed ARRAY Function to both outer
+        // and inner projection lists, then the third loop replaces the outer
+        // entry with a column-ref Function -- leaving the original ARRAY (and
+        // its NATIVE_ND_ARRAY backing) reachable only via the inner list. The
+        // failure-path cleanup now walks both lists and frees each unique
+        // reference exactly once.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (x INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO t VALUES (1, '2024-01-01T00:00:00.000000Z')");
+            for (String q : new String[]{
+                    "SELECT count_distinct(ARRAY[0.9873]) FROM t WHERE ts < ts",
+                    "SELECT count_distinct(ARRAY[ARRAY[0.7172, 0.6604, 0.0546]," +
+                            " ARRAY[0.1216, 0.4188, 0.8926]]) FROM t WHERE ts < ts",
+            }) {
+                try {
+                    engine.select(q, sqlExecutionContext).close();
+                    Assert.fail("expected SqlException");
+                } catch (SqlException expected) {
+                    TestUtils.assertContains(expected.getFlyweightMessage(),
+                            "unsupported type of expression");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByBrokenColumnAfterTimestampClosesFunctionsOnce() throws Exception {
+        // Regression: assembleGroupByFunctions's first column loop adds the
+        // designated timestamp column as a null placeholder on the outer
+        // projection list but skips the inner list, so subsequent non-timestamp
+        // columns sit at outer[i] and inner[i-1]. When a later column fails to
+        // parse, the failure-path cleanup must dedupe shared Function references
+        // by reference identity rather than by index. A naive index-aligned
+        // dedup would close every shared reference past the timestamp slot
+        // twice and underflow the native allocator counter; assertMemoryLeak
+        // catches the imbalance.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (c0 INT, c1 INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO t VALUES (1, 10, '2024-01-01T00:00:00.000000Z')");
+            try {
+                engine.select(
+                        "SELECT ts, c0, c1, sum(nonexistent_col) FROM t SAMPLE BY 1h",
+                        sqlExecutionContext
+                ).close();
+                Assert.fail("expected SqlException");
+            } catch (SqlException expected) {
+                TestUtils.assertContains(expected.getFlyweightMessage(), "Invalid column");
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCastOverColumnStaysKey() throws Exception {
+        // Regression: the recursive walk in isEffectivelyConstantExpression
+        // must reject cast over a real column. (x)::STRING contains a LITERAL
+        // child that fails the type check, so the cast is not lifted into the
+        // outer projection and the column stays a real GROUP BY key.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (x INT)");
+            execute("INSERT INTO t VALUES (1), (2), (3)");
+            assertQuery("SELECT (x)::STRING AS e0, count() AS a0 FROM t GROUP BY 1 ORDER BY 1")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            e0\ta0
+                            1\t1
+                            2\t1
+                            3\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByColumnIdx1() throws Exception {
+        assertQuery("select key, count(*) from t group by 1 order by 1")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100))")
+                .expectSize()
+                .returns("""
+                        key\tcount
+                        0\t50
+                        1\t50
+                        """);
+    }
+
+    @Test
+    public void testGroupByColumnIdx2() throws Exception {
+        assertQuery("select key, count(*) from t group by 1, 1 order by 1")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100));")
+                .expectSize()
+                .returns("""
+                        key\tcount
+                        0\t50
+                        1\t50
+                        """);
+    }
+
+    @Test
+    public void testGroupByColumnIdx3() throws Exception {
+        assertQuery("select key, count(*) from t group by key, 1 order by 1")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100));")
+                .expectSize()
+                .returns("""
+                        key\tcount
+                        0\t50
+                        1\t50
+                        """);
+    }
+
+    @Test
+    public void testGroupByColumnIdx4() throws Exception {
+        assertQuery("select key+1, count(*) from t group by key, 1 order by key+1")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100));")
+                .expectSize()
+                .returns("""
+                        column\tcount
+                        1\t50
+                        2\t50
+                        """);
+    }
+
+    @Test
+    public void testGroupByColumnIdx5() throws Exception {
+        assertQuery("select key+1 as z, count(*) from t group by key, 1 order by z")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100));")
+                .expectSize()
+                .returns("""
+                        z\tcount
+                        1\t50
+                        2\t50
+                        """);
+    }
+
+    @Test
+    public void testGroupByColumnIdx6() throws Exception {
+        assertQuery("select key+1, count(*) from t group by key, 1 order by 1")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100));")
+                .expectSize()
+                .returns("""
+                        column\tcount
+                        1\t50
+                        2\t50
+                        """);
+    }
+
+    @Test
+    public void testGroupByColumnIdx7() throws Exception {
+        assertQuery("select key+1, count(*) from t group by key, 1 order by key+3 desc")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100));")
+                .expectSize()
+                .returns("""
+                        column\tcount
+                        2\t50
+                        1\t50
+                        """);
+    }
+
+    @Test
+    public void testGroupByColumnIdx8() throws Exception {
+        assertQuery("select key+1, key, key, count(*) from t group by key order by 1,2,3 desc")
+                .ddl("create table t as ( select x%2 as key, x as value from long_sequence(100));")
+                .expectSize()
+                .returns("""
+                        column\tkey\tkey1\tcount
+                        1\t0\t0\t50
+                        2\t1\t1\t50
+                        """);
+    }
+
+    @Test
+    public void testDistinctSymbolOptimizationOnQuoteProtectedAlias() throws Exception {
+        // SELECT DISTINCT over an indexed SYMBOL takes the distinct-symbol optimization in
+        // generateSelectGroupBy, which builds the result metadata name via toColumnName. A
+        // compiler-protected alias (dotted or operator token) must surface clean, not quoted.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (s SYMBOL INDEX)");
+            execute("INSERT INTO t VALUES ('x'), ('y'), ('x')");
+            assertQuery("SELECT DISTINCT s AS \"a.b\" FROM t ORDER BY 1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("a.b\nx\ny\n");
+            assertQuery("SELECT DISTINCT s AS \"in\" FROM t ORDER BY 1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("in\nx\ny\n");
+        });
+    }
+
+    @Test
+    public void testGroupByKeyOnQuoteProtectedAlias() throws Exception {
+        // A GROUP BY key that is a compiler-protected alias (dotted or operator token), referenced
+        // through the qualified subquery form, must resolve (the key-index strip-retry) and surface a
+        // clean column name (the GroupByUtils keep-alias metadata path via toColumnName).
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (g INT, v DOUBLE)");
+            execute("INSERT INTO t VALUES (1, 10.0), (1, 20.0), (2, 30.0)");
+            assertQuery("SELECT sub.\"a.b\", sum(v) FROM (SELECT g AS \"a.b\", v FROM t) sub GROUP BY sub.\"a.b\" ORDER BY 1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("a.b\tsum\n1\t30.0\n2\t30.0\n");
+            assertQuery("SELECT sub.\"in\", sum(v) FROM (SELECT g AS \"in\", v FROM t) sub GROUP BY sub.\"in\" ORDER BY 1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("in\tsum\n1\t30.0\n2\t30.0\n");
+        });
+    }
+
+    @Test
+    public void testGroupByConstantsOnlyMultiKey() throws Exception {
+        // SqlOptimiser drops effectively-constant GROUP BY keys when at least one
+        // other group-by key remains, but used to leave the dropped entries in
+        // groupByModel.getGroupBy(). validateGroupByColumns then iterated the
+        // stale list and threw "group by column does not match any key column"
+        // for any all-constant explicit GROUP BY. Bind variables hid the bug
+        // because :bN::TYPE is a FUNCTION node and not effectively-constant.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (c2 STRING)");
+            execute("INSERT INTO t VALUES ('J'), ('K')");
+            String expected = """
+                    e0\te1\ta0
+                    true\tJ\t1
+                    """;
+            String body = "FROM (SELECT c2 AS k, count() AS cnt FROM t)\nWHERE k > 'A'\n";
+            assertQuery("SELECT true AS e0, 'J' AS e1, max(cnt) AS a0\n" + body + "GROUP BY e0, e1")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            assertQuery("SELECT true AS e0, 'J' AS e1, max(cnt) AS a0\n" + body + "GROUP BY e0, 2")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            assertQuery("SELECT true AS e0, 'J' AS e1, max(cnt) AS a0\n" + body + "GROUP BY 1, 2")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+        });
+    }
+
+    @Test
+    public void testGroupByConstantsOnlySingleKey() throws Exception {
+        // Companion to testGroupByConstantsOnlyMultiKey: the single-key
+        // all-constant shape that originally surfaced the bug. With the
+        // effectively-constant key dropped from the inner GROUP BY, the
+        // optimiser must collapse to a non-keyed aggregate and still emit
+        // the lifted constant in the outer projection.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (x INT)");
+            execute("INSERT INTO t VALUES (1), (2), (3)");
+            String expected = """
+                    e0\ta0
+                    true\t3
+                    """;
+            assertQuery("SELECT true AS e0, max(x) AS a0 FROM t GROUP BY e0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            assertQuery("SELECT true AS e0, max(x) AS a0 FROM t GROUP BY 1")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryInAggregateArgument() throws Exception {
+        // FunctionParser generates a cursor sub-query while GroupByUtils.assembleGroupByFunctions()
+        // parses the aggregate argument. The sub-query's hash join must not leave its key and value
+        // types in the GROUP BY's map layout.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String hashJoinScalar = "(SELECT r.rts FROM tb2 r JOIN tc2 n ON n.cts = r.rts ORDER BY r.rts LIMIT 1)";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery("SELECT sum(CASE WHEN s IN " + hashJoinSet + " THEN 1 ELSE 0 END) c FROM tsym")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                c
+                                2
+                                """);
+                assertQuery("SELECT count() c, sum(CASE WHEN s IN " + hashJoinSet + " THEN v ELSE 0 END) d FROM tsym")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                c\td
+                                3\t30
+                                """);
+                assertQuery("SELECT s, sum(CASE WHEN ts > " + hashJoinScalar + " THEN v ELSE 0 END) c FROM tsym GROUP BY s ORDER BY s")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                s\tc
+                                10\t0
+                                20\t20
+                                7\t7
+                                """);
+                assertQuery("SELECT v, sum(CASE WHEN s IN " + hashJoinSet + " THEN 1 ELSE 0 END) c FROM tsym GROUP BY v ORDER BY v")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                v\tc
+                                7\t0
+                                10\t1
+                                20\t1
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryInHorizonJoin() throws Exception {
+        // HORIZON JOIN assembles its GROUP BY functions over the join; a cursor sub-query in a key or
+        // an aggregate argument must not change the key and value types of its map.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            execute("CREATE TABLE tsym2 (s SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO tsym2 VALUES ('a', '2020-01-01T00:20'), ('b', '2020-01-01T01:20')");
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String horizon = " FROM tsym AS t HORIZON JOIN tsym2 AS p ON (t.s = p.s) RANGE FROM 0s TO 2s STEP 1s AS h";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelHorizonJoinEnabled(isParallel);
+                assertQuery("SELECT h.offset / 1_000_000 k, sum(CASE WHEN t.s IN " + hashJoinSet + " THEN t.v ELSE 0 END) c" + horizon + " ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc
+                                0\t30
+                                1\t30
+                                2\t30
+                                """);
+                assertQuery("SELECT t.s IN " + hashJoinSet + " k, count() c" + horizon + " ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc
+                                false\t3
+                                true\t6
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryInKey() throws Exception {
+        // FunctionParser generates a cursor sub-query while GroupByUtils.assembleGroupByFunctions()
+        // parses the GROUP BY key. The sub-query's hash join or sort must not leave its key types,
+        // value types or sort columns in the GROUP BY's map layout and key column filter.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String sortSet = "(SELECT c1::SYMBOL FROM tb2 ORDER BY c1 DESC)";
+            final String hashJoinScalar = "(SELECT r.rts FROM tb2 r JOIN tc2 n ON n.cts = r.rts ORDER BY r.rts LIMIT 1)";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery("SELECT count() c FROM tsym GROUP BY s IN " + hashJoinSet + " ORDER BY c")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                c
+                                1
+                                2
+                                """);
+                assertQuery("SELECT s IN " + sortSet + " k, count() c FROM tsym GROUP BY k ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc
+                                false\t1
+                                true\t2
+                                """);
+                assertQuery("SELECT ts > " + hashJoinScalar + " k, count() c FROM tsym GROUP BY k ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc
+                                false\t1
+                                true\t2
+                                """);
+                assertQuery("SELECT s, s IN " + hashJoinSet + " k, count() c FROM tsym GROUP BY s, k ORDER BY s")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                s\tk\tc
+                                10\ttrue\t1
+                                20\ttrue\t1
+                                7\tfalse\t1
+                                """);
+                assertQuery("SELECT DISTINCT s IN " + hashJoinSet + " k FROM tsym ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k
+                                false
+                                true
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryInSampleBy() throws Exception {
+        // SAMPLE BY, with and without the GROUP BY rewrite, assembles its functions the same way; a
+        // cursor sub-query in an aggregate argument must not change the key and value types of its map.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String sortSet = "(SELECT c1::SYMBOL FROM tb2 ORDER BY c1 DESC)";
+            final String aggregate = "SELECT ts, sum(CASE WHEN s IN " + hashJoinSet + " THEN v ELSE 0 END) c";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery(aggregate + " FROM tsym SAMPLE BY 30m FILL(LINEAR)")
+                        .noLeakCheck()
+                        .expectSize()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tc
+                                2020-01-01T00:00:00.000000Z\t10
+                                2020-01-01T00:30:00.000000Z\t15
+                                2020-01-01T01:00:00.000000Z\t20
+                                2020-01-01T01:30:00.000000Z\t10
+                                2020-01-01T02:00:00.000000Z\t0
+                                """);
+                assertQuery("SELECT ts, sum(CASE WHEN s IN " + sortSet + " THEN v ELSE 0 END) c FROM tsym SAMPLE BY 1h")
+                        .noLeakCheck()
+                        .expectSize()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tc
+                                2020-01-01T00:00:00.000000Z\t10
+                                2020-01-01T01:00:00.000000Z\t20
+                                2020-01-01T02:00:00.000000Z\t0
+                                """);
+                assertQuery(aggregate + " FROM tsym SAMPLE BY 30m FILL(PREV)")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tc
+                                2020-01-01T00:00:00.000000Z\t10
+                                2020-01-01T00:30:00.000000Z\t10
+                                2020-01-01T01:00:00.000000Z\t20
+                                2020-01-01T01:30:00.000000Z\t20
+                                2020-01-01T02:00:00.000000Z\t0
+                                """);
+                assertQuery(aggregate + " FROM tsym SAMPLE BY 30m FILL(NULL) ALIGN TO FIRST OBSERVATION")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tc
+                                2020-01-01T00:00:00.000000Z\t10
+                                2020-01-01T00:30:00.000000Z\tnull
+                                2020-01-01T01:00:00.000000Z\t20
+                                2020-01-01T01:30:00.000000Z\tnull
+                                2020-01-01T02:00:00.000000Z\t0
+                                """);
+                assertQuery(aggregate + ", count() n FROM tsym SAMPLE BY 30m FILL(PREV, 0) ALIGN TO FIRST OBSERVATION")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tc\tn
+                                2020-01-01T00:00:00.000000Z\t10\t1
+                                2020-01-01T00:30:00.000000Z\t10\t0
+                                2020-01-01T01:00:00.000000Z\t20\t1
+                                2020-01-01T01:30:00.000000Z\t20\t0
+                                2020-01-01T02:00:00.000000Z\t0\t1
+                                """);
+                // SAMPLE BY keeps the bucket timestamp in the first map value; the sub-query's
+                // GROUP BY must not replace that value's type with its own INT.
+                assertQuery("SELECT ts, s, sum(CASE WHEN v > (SELECT max(v) - 95 FROM tb2) THEN v ELSE 0 END) a"
+                        + " FROM tsym SAMPLE BY 30m FILL(NULL) ALIGN TO FIRST OBSERVATION")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\ts\ta
+                                2020-01-01T00:00:00.000000Z\t10\t10
+                                2020-01-01T00:00:00.000000Z\t20\tnull
+                                2020-01-01T00:00:00.000000Z\t7\tnull
+                                2020-01-01T00:30:00.000000Z\t10\tnull
+                                2020-01-01T00:30:00.000000Z\t20\tnull
+                                2020-01-01T00:30:00.000000Z\t7\tnull
+                                2020-01-01T01:00:00.000000Z\t10\tnull
+                                2020-01-01T01:00:00.000000Z\t20\t20
+                                2020-01-01T01:00:00.000000Z\t7\tnull
+                                2020-01-01T01:30:00.000000Z\t10\tnull
+                                2020-01-01T01:30:00.000000Z\t20\tnull
+                                2020-01-01T01:30:00.000000Z\t7\tnull
+                                2020-01-01T02:00:00.000000Z\t10\tnull
+                                2020-01-01T02:00:00.000000Z\t20\tnull
+                                2020-01-01T02:00:00.000000Z\t7\t7
+                                """);
+                // The outer SAMPLE BY reorders its two fill values for the pruned projection; the
+                // sub-query's SAMPLE BY reorders its own fill values in the same list.
+                assertQuery("SELECT ts, b, a FROM (SELECT ts, sum(CASE WHEN v > (SELECT a FROM (SELECT rts, max(v) a, count() b"
+                        + " FROM tb2 SAMPLE BY 1h FILL(NULL, 7) ALIGN TO FIRST OBSERVATION) LIMIT 1) THEN v ELSE 0 END) a, count() b"
+                        + " FROM tsym SAMPLE BY 30m FILL(PREV, 5) ALIGN TO FIRST OBSERVATION)")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tb\ta
+                                2020-01-01T00:00:00.000000Z\t1\t10
+                                2020-01-01T00:30:00.000000Z\t5\t10
+                                2020-01-01T01:00:00.000000Z\t1\t20
+                                2020-01-01T01:30:00.000000Z\t5\t20
+                                2020-01-01T02:00:00.000000Z\t1\t7
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryInSampleByFillLinearReportsErrorPosition() throws Exception {
+        // The sub-query's own GROUP BYs must not leave their aggregate positions in the list the
+        // FILL(LINEAR) factory reads its error position from.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            execute("CREATE TABLE tsx (ts TIMESTAMP, v INT, t2 TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            final String subQuery = "(SELECT max(k) FROM (SELECT c1 k, first(v) f FROM tb2 GROUP BY c1))";
+            final String sumFirst = "SELECT ts, sum(CASE WHEN v > " + subQuery + " THEN v ELSE 0 END) a, first(t2) f"
+                    + " FROM tsx SAMPLE BY 30m FILL(LINEAR)";
+            final String firstFirst = "SELECT ts, first(t2) f, sum(CASE WHEN v > " + subQuery + " THEN v ELSE 0 END) a"
+                    + " FROM tsx SAMPLE BY 30m FILL(LINEAR)";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery(sumFirst).noLeakCheck().fails(sumFirst.indexOf("first(t2)"), "Unsupported interpolation type: TIMESTAMP");
+                assertQuery(firstFirst).noLeakCheck().fails(firstFirst.indexOf("first(t2)"), "Unsupported interpolation type: TIMESTAMP");
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryInSampleByReportsErrorPosition() throws Exception {
+        // The sub-query's own GROUP BY must not leave its function positions in the list the SAMPLE BY
+        // fill factory reads its error position from.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String query = "SELECT ts, sum(CASE WHEN v > (SELECT max(k) FROM (SELECT c1 k, first(v) f FROM tb2 GROUP BY c1))"
+                    + " THEN v ELSE 0 END) a, first(s) f FROM tsym SAMPLE BY 30m FILL(5, 5) ALIGN TO FIRST OBSERVATION";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery(query).noLeakCheck().fails(query.indexOf("first(s)"), "Unsupported type: SYMBOL");
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryInWhereOfVectorizedGroupBy() throws Exception {
+        // The vectorized GROUP BY clears its key lists before it generates its base query. A scalar
+        // sub-query in the WHERE clause, compiled as an interval bound, runs a vectorized GROUP BY of
+        // its own and must not leave its key in the outer GROUP BY's key lists.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            execute("CREATE TABLE tsym2 (s SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO tsym2 VALUES ('a', '2020-01-01T00:20'), ('b', '2020-01-01T01:20')");
+            // Each sub-query returns 2020-01-01T00:20; the sub-query's vectorized GROUP BY has an INT
+            // key, a SYMBOL key and an hour() key, respectively.
+            final String intKeyWhere = " FROM tsym WHERE ts > (SELECT m FROM (SELECT c1, min(rts) m FROM tb2 GROUP BY c1) ORDER BY c1 LIMIT 1)";
+            final String symbolKeyWhere = " FROM tsym WHERE ts > (SELECT m FROM (SELECT s, min(ts) m FROM tsym2 GROUP BY s) ORDER BY s LIMIT 1)";
+            final String hourKeyWhere = " FROM tsym WHERE ts > (SELECT m FROM (SELECT hour(rts) h, min(rts) m FROM tb2 GROUP BY h) ORDER BY h LIMIT 1)";
+            final String intKeyResult = """
+                    v\tc
+                    7\t1
+                    20\t1
+                    """;
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery("SELECT v, count() c" + intKeyWhere + " GROUP BY v ORDER BY v")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns(intKeyResult);
+                assertQuery("SELECT count() c, sum(v) sv" + intKeyWhere)
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                c\tsv
+                                2\t27
+                                """);
+                // the key types of the two GROUP BYs differ
+                assertQuery("SELECT v, count() c" + symbolKeyWhere + " GROUP BY v ORDER BY v")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns(intKeyResult);
+                assertQuery("SELECT s, count() c" + intKeyWhere + " GROUP BY s ORDER BY s")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                s\tc
+                                20\t1
+                                7\t1
+                                """);
+                // one of the two GROUP BYs groups by hour()
+                assertQuery("SELECT v, count() c" + hourKeyWhere + " GROUP BY v ORDER BY v")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns(intKeyResult);
+                assertQuery("SELECT hour(ts) h, count() c" + intKeyWhere + " GROUP BY h ORDER BY h")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                h\tc
+                                1\t1
+                                2\t1
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryNestedInAggregateArgument() throws Exception {
+        // The aggregate argument holds a cursor sub-query whose own GROUP BY holds a second cursor
+        // sub-query in a key or in an aggregate argument. SqlCodeGenerator generates the second
+        // sub-query two generate() calls deep, while both GROUP BYs above it assemble their functions.
+        // Each of them must get its own key and value types back, not those of the hash join below.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String intHashJoinSet = "(SELECT p.s FROM tsym p JOIN tb2 r ON r.c1 = p.v)";
+            // s IN ('10', '20', '30') splits tsym into two groups, their first symbols are '10' and '7'
+            final String functionKeySet = "(SELECT first(q.s) FROM tsym q GROUP BY q.s IN " + hashJoinSet + ")";
+            // one group per row, the sums for '10', '20' and '7' are 10, 20 and 0
+            final String columnKeySet = "(SELECT sum(CASE WHEN q.s IN " + intHashJoinSet + " THEN q.v ELSE 0 END)::SYMBOL FROM tsym q GROUP BY q.ts)";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery("SELECT count() c, sum(CASE WHEN s IN " + functionKeySet + " THEN v ELSE 0 END) sv FROM tsym")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                c\tsv
+                                3\t17
+                                """);
+                assertQuery("SELECT v, sum(CASE WHEN s IN " + functionKeySet + " THEN 1 ELSE 0 END) n FROM tsym GROUP BY v ORDER BY v")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                v\tn
+                                7\t1
+                                10\t1
+                                20\t0
+                                """);
+                assertQuery("SELECT v, sum(CASE WHEN s IN " + columnKeySet + " THEN 1 ELSE 0 END) n FROM tsym GROUP BY v ORDER BY v")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                v\tn
+                                7\t0
+                                10\t1
+                                20\t1
+                                """);
+                // the scalar sub-query returns (10 + 20 + 0) / 2
+                assertQuery("SELECT s, sum(CASE WHEN v > (SELECT sum(CASE WHEN r.c1::SYMBOL IN " + intHashJoinSet + " THEN r.c1 ELSE 0 END) / 2 FROM tb2 r)"
+                        + " THEN v ELSE 0 END) a FROM tsym GROUP BY s ORDER BY s")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                s\ta
+                                10\t0
+                                20\t20
+                                7\t0
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryNestedInHorizonJoin() throws Exception {
+        // HORIZON JOIN assembles its GROUP BY functions over the join. A cursor sub-query in a key or
+        // an aggregate argument runs a GROUP BY that holds a second cursor sub-query. Neither of the
+        // two may change the key and value types of the map above it.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            execute("CREATE TABLE tsym2 (s SYMBOL, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO tsym2 VALUES ('a', '2020-01-01T00:20'), ('b', '2020-01-01T01:20')");
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String intHashJoinSet = "(SELECT p.s FROM tsym p JOIN tb2 r ON r.c1 = p.v)";
+            // s IN ('10', '20', '30') splits tsym into two groups, their first symbols are '10' and '7'
+            final String functionKeySet = "(SELECT first(q.s) FROM tsym q GROUP BY q.s IN " + hashJoinSet + ")";
+            // one group per row, the sums for '10', '20' and '7' are 10, 20 and 0
+            final String columnKeySet = "(SELECT sum(CASE WHEN q.s IN " + intHashJoinSet + " THEN q.v ELSE 0 END)::SYMBOL FROM tsym q GROUP BY q.ts)";
+            final String horizon = " FROM tsym AS t HORIZON JOIN tsym2 AS p ON (t.s = p.s) RANGE FROM 0s TO 2s STEP 1s AS h";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelHorizonJoinEnabled(isParallel);
+                assertQuery("SELECT h.offset / 1_000_000 k, sum(CASE WHEN t.s IN " + functionKeySet + " THEN t.v ELSE 0 END) c" + horizon + " ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc
+                                0\t17
+                                1\t17
+                                2\t17
+                                """);
+                assertQuery("SELECT t.s IN " + functionKeySet + " k, count() c, sum(t.v) sv" + horizon + " ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc\tsv
+                                false\t3\t60
+                                true\t6\t51
+                                """);
+                assertQuery("SELECT t.s IN " + columnKeySet + " k, count() c, sum(t.v) sv" + horizon + " ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc\tsv
+                                false\t3\t21
+                                true\t6\t90
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryNestedInKey() throws Exception {
+        // The GROUP BY key holds a cursor sub-query whose own GROUP BY holds a second cursor sub-query
+        // in a key or in an aggregate argument. SqlCodeGenerator generates the second sub-query two
+        // generate() calls deep; its hash join or sort must not leave its key types, value types or
+        // sort columns in the map layout and key column filter of either GROUP BY above it.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String intHashJoinSet = "(SELECT p.s FROM tsym p JOIN tb2 r ON r.c1 = p.v)";
+            final String sortSet = "(SELECT c1::SYMBOL FROM tb2 ORDER BY c1 DESC)";
+            final String hashJoinScalar = "(SELECT r.rts FROM tb2 r JOIN tc2 n ON n.cts = r.rts ORDER BY r.rts LIMIT 1)";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                // s IN ('10', '20', '30') splits tsym into two groups, their first symbols are '10' and '7'
+                assertQuery("SELECT s IN (SELECT first(q.s) FROM tsym q GROUP BY q.s IN " + hashJoinSet + ") k, count() c, sum(v) sv"
+                        + " FROM tsym GROUP BY k ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc\tsv
+                                false\t1\t20
+                                true\t2\t17
+                                """);
+                // ts > 2020-01-01T00:20 splits tsym into two groups, their first symbols are '10' and '20'
+                assertQuery("SELECT s IN (SELECT first(q.s) FROM tsym q GROUP BY q.ts > " + hashJoinScalar + ") k, count() c, sum(v) sv"
+                        + " FROM tsym GROUP BY k ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc\tsv
+                                false\t1\t7
+                                true\t2\t30
+                                """);
+                assertQuery("SELECT s, s IN (SELECT first(q.s) FROM tsym q GROUP BY q.s IN " + sortSet + ") k, count() c"
+                        + " FROM tsym GROUP BY s, k ORDER BY s")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                s\tk\tc
+                                10\ttrue\t1
+                                20\tfalse\t1
+                                7\ttrue\t1
+                                """);
+                // the scalar sub-query returns 10 + 20 + 0 - 15
+                assertQuery("SELECT v > (SELECT sum(CASE WHEN q.s IN " + hashJoinSet + " THEN q.v ELSE 0 END) - 15 FROM tsym q) k, count() c, sum(v) sv"
+                        + " FROM tsym GROUP BY k ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc\tsv
+                                false\t2\t17
+                                true\t1\t20
+                                """);
+                // one group per row, the sums for '10', '20' and '7' are 10, 20 and 0
+                assertQuery("SELECT s IN (SELECT sum(CASE WHEN q.s IN " + intHashJoinSet + " THEN q.v ELSE 0 END)::SYMBOL FROM tsym q GROUP BY q.ts) k,"
+                        + " count() c, sum(v) sv FROM tsym GROUP BY k ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc\tsv
+                                false\t1\t7
+                                true\t2\t30
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryNestedInSampleBy() throws Exception {
+        // SAMPLE BY, with and without the GROUP BY rewrite, holds a cursor sub-query whose own GROUP BY
+        // holds a second cursor sub-query. Without the rewrite, SAMPLE BY puts the bucket timestamp or
+        // the FILL(LINEAR) gap flag in the first map value before it assembles its functions, so the
+        // three levels have three different map layouts and each must build its map from its own.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String intHashJoinSet = "(SELECT p.s FROM tsym p JOIN tb2 r ON r.c1 = p.v)";
+            final String hashJoinScalar = "(SELECT r.rts FROM tb2 r JOIN tc2 n ON n.cts = r.rts ORDER BY r.rts LIMIT 1)";
+            // s IN ('10', '20', '30') splits tsym into two groups, their first symbols are '10' and '7'
+            final String functionKeySet = "(SELECT first(q.s) FROM tsym q GROUP BY q.s IN " + hashJoinSet + ")";
+            // ts > 2020-01-01T00:20 splits tsym into two groups, their first symbols are '10' and '20'
+            final String scalarKeySet = "(SELECT first(q.s) FROM tsym q GROUP BY q.ts > " + hashJoinScalar + ")";
+            final String aggregate = "SELECT ts, sum(CASE WHEN s IN " + functionKeySet + " THEN v ELSE 0 END) a";
+            for (boolean isParallel : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                assertQuery(aggregate + " FROM tsym SAMPLE BY 1h")
+                        .noLeakCheck()
+                        .expectSize()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\ta
+                                2020-01-01T00:00:00.000000Z\t10
+                                2020-01-01T01:00:00.000000Z\t0
+                                2020-01-01T02:00:00.000000Z\t7
+                                """);
+                assertQuery(aggregate + " FROM tsym SAMPLE BY 30m FILL(NULL) ALIGN TO FIRST OBSERVATION")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\ta
+                                2020-01-01T00:00:00.000000Z\t10
+                                2020-01-01T00:30:00.000000Z\tnull
+                                2020-01-01T01:00:00.000000Z\t0
+                                2020-01-01T01:30:00.000000Z\tnull
+                                2020-01-01T02:00:00.000000Z\t7
+                                """);
+                assertQuery("SELECT ts, s, sum(CASE WHEN s IN " + functionKeySet + " THEN v ELSE 0 END) a"
+                        + " FROM tsym SAMPLE BY 1h FILL(NULL) ALIGN TO FIRST OBSERVATION")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\ts\ta
+                                2020-01-01T00:00:00.000000Z\t10\t10
+                                2020-01-01T00:00:00.000000Z\t20\tnull
+                                2020-01-01T00:00:00.000000Z\t7\tnull
+                                2020-01-01T01:00:00.000000Z\t10\tnull
+                                2020-01-01T01:00:00.000000Z\t20\t0
+                                2020-01-01T01:00:00.000000Z\t7\tnull
+                                2020-01-01T02:00:00.000000Z\t10\tnull
+                                2020-01-01T02:00:00.000000Z\t20\tnull
+                                2020-01-01T02:00:00.000000Z\t7\t7
+                                """);
+                assertQuery("SELECT ts, sum(CASE WHEN s IN " + scalarKeySet + " THEN v ELSE 0 END) a FROM tsym SAMPLE BY 30m FILL(LINEAR)")
+                        .noLeakCheck()
+                        .expectSize()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\ta
+                                2020-01-01T00:00:00.000000Z\t10
+                                2020-01-01T00:30:00.000000Z\t15
+                                2020-01-01T01:00:00.000000Z\t20
+                                2020-01-01T01:30:00.000000Z\t10
+                                2020-01-01T02:00:00.000000Z\t0
+                                """);
+                // Here the SAMPLE BY is the middle level. Its aggregate argument holds the hash join,
+                // and the GROUP BY key compares v with its first bucket, the c1 of the tb2 row at 00:20.
+                assertQuery("SELECT v > (SELECT a FROM (SELECT rts, sum(CASE WHEN c1::SYMBOL IN " + intHashJoinSet + " THEN c1 ELSE 0 END) a"
+                        + " FROM tb2 SAMPLE BY 1h FILL(NULL) ALIGN TO FIRST OBSERVATION) LIMIT 1) k, count() c, sum(v) sv FROM tsym GROUP BY k ORDER BY k")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("""
+                                k\tc\tsv
+                                false\t2\t17
+                                true\t1\t20
+                                """);
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryNestedInWhereOfVectorizedGroupBy() throws Exception {
+        // The vectorized GROUP BY clears its key lists before it generates its base query. The
+        // sub-query runs a vectorized GROUP BY whose WHERE clause holds a second scalar sub-query
+        // with a vectorized GROUP BY of its own, so the key lists of two callers are in flight when
+        // SqlCodeGenerator generates the innermost one. The parallel GROUP BY stays on because only
+        // that path vectorizes.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            // 2020-01-01T00:20, the vectorized GROUP BY has an INT key
+            final String innerScalar = "(SELECT m FROM (SELECT v, min(cts) m FROM tc2 GROUP BY v) ORDER BY m LIMIT 1)";
+            // Each sub-query reads the tb2 rows after 00:20. The first two return 2020-01-01T01:20,
+            // their vectorized GROUP BY has an INT key and an hour() key, respectively. The third one
+            // returns '20' and '30'.
+            final String intKeyScalar = "(SELECT m FROM (SELECT c1, min(rts) m FROM tb2 WHERE rts > " + innerScalar + " GROUP BY c1) ORDER BY c1 LIMIT 1)";
+            final String hourKeyScalar = "(SELECT m FROM (SELECT hour(rts) h, min(rts) m FROM tb2 WHERE rts > " + innerScalar + " GROUP BY h) ORDER BY h LIMIT 1)";
+            final String intKeySet = "(SELECT m::SYMBOL FROM (SELECT v, max(c1) m FROM tb2 WHERE rts > " + innerScalar + " GROUP BY v))";
+            final String vectorized = "vectorized: true";
+            sqlExecutionContext.setParallelGroupByEnabled(true);
+            assertQuery("SELECT v, count() c FROM tsym WHERE ts < " + intKeyScalar + " GROUP BY v ORDER BY v")
+                    .noLeakCheck()
+                    .expectSize()
+                    .withPlanContaining(vectorized)
+                    .returns("""
+                            v\tc
+                            10\t1
+                            20\t1
+                            """);
+            assertQuery("SELECT count() c, sum(v) sv FROM tsym WHERE ts < " + intKeyScalar)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .withPlanContaining(vectorized)
+                    .returns("""
+                            c\tsv
+                            2\t30
+                            """);
+            // the key types of the three GROUP BYs differ
+            assertQuery("SELECT s, count() c FROM tsym WHERE ts < " + hourKeyScalar + " GROUP BY s ORDER BY s")
+                    .noLeakCheck()
+                    .expectSize()
+                    .withPlanContaining(vectorized)
+                    .returns("""
+                            s\tc
+                            10\t1
+                            20\t1
+                            """);
+            assertQuery("SELECT hour(ts) h, count() c FROM tsym WHERE ts < " + intKeyScalar + " GROUP BY h ORDER BY h")
+                    .noLeakCheck()
+                    .expectSize()
+                    .withPlanContaining(vectorized)
+                    .returns("""
+                            h\tc
+                            0\t1
+                            1\t1
+                            """);
+            // The outer queries below do not vectorize; the sub-query in their WHERE clause, key or
+            // aggregate argument does.
+            assertQuery("SELECT ts, count() c FROM tsym WHERE ts < " + intKeyScalar + " SAMPLE BY 1h")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tc
+                            2020-01-01T00:00:00.000000Z\t1
+                            2020-01-01T01:00:00.000000Z\t1
+                            """);
+            assertQuery("SELECT s IN " + intKeySet + " k, count() c, sum(v) sv FROM tsym GROUP BY k ORDER BY k")
+                    .noLeakCheck()
+                    .expectSize()
+                    .withPlanContaining(vectorized)
+                    .returns("""
+                            k\tc\tsv
+                            false\t2\t17
+                            true\t1\t20
+                            """);
+            assertQuery("SELECT v, sum(CASE WHEN s IN " + intKeySet + " THEN 1 ELSE 0 END) n FROM tsym GROUP BY v ORDER BY v")
+                    .noLeakCheck()
+                    .expectSize()
+                    .withPlanContaining(vectorized)
+                    .returns("""
+                            v\tn
+                            7\t0
+                            10\t0
+                            20\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByCursorSubQueryOverHashJoin() throws Exception {
+        // A GROUP BY over a hash join with a cursor sub-query in a key or an aggregate argument, with
+        // and without the fused hash join GROUP BY.
+        assertMemoryLeak(() -> {
+            createCursorSubQueryTables();
+            final String hashJoinSet = "(SELECT r.c1::SYMBOL FROM tb2 r JOIN tc2 n ON n.cts = r.rts)";
+            final String hashJoinScalar = "(SELECT r.rts FROM tb2 r JOIN tc2 n ON n.cts = r.rts ORDER BY r.rts LIMIT 1)";
+            final String from = " FROM tb2 r JOIN tc2 n ON n.v = r.v";
+            for (boolean isFusedEnabled : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelHashJoinGroupByEnabled(isFusedEnabled);
+                for (boolean isParallel : new boolean[]{true, false}) {
+                    sqlExecutionContext.setParallelGroupByEnabled(isParallel);
+                    assertQuery("SELECT r.rts > " + hashJoinScalar + " k, count() c" + from + " GROUP BY k ORDER BY k")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    k\tc
+                                    false\t1
+                                    true\t2
+                                    """);
+                    assertQuery("SELECT sum(CASE WHEN r.c1::SYMBOL IN " + hashJoinSet + " THEN 1 ELSE 0 END) c" + from)
+                            .noLeakCheck()
+                            .noRandomAccess()
+                            .expectSize()
+                            .returns("""
+                                    c
+                                    3
+                                    """);
+                    assertQuery("SELECT n.v, sum(CASE WHEN r.c1 > (SELECT r.c1 FROM tb2 r JOIN tc2 n ON n.cts = r.rts ORDER BY r.c1 LIMIT 1)"
+                            + " THEN 1 ELSE 0 END) c" + from + " GROUP BY n.v ORDER BY n.v")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    v\tc
+                                    0\t1
+                                    5\t0
+                                    100\t1
+                                    """);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByDuplicateColumn() throws Exception {
+        assertQuery("select key1 as k1, key2 as k2, count(*) from t group by k2, k1, k2 order by 1, 2")
+                .ddl("create table t as ( select x%2 key1, x%4 key2, x as value from long_sequence(10));")
+                .expectSize()
+                .returns("""
+                        k1\tk2\tcount
+                        0\t0\t2
+                        0\t2\t3
+                        1\t1\t3
+                        1\t3\t2
+                        """);
+    }
+
+    @Test
+    public void testGroupByExpressionAndLiteral() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t as (" +
+                    "    select 1 as l, 'a' as s " +
+                    "    union all " +
+                    "    select 1, 'a' )");
+
+            String query = "select l, s, l+1 from t group by l+1,s, l, l+2";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [l,s,column]
+                                Async Group By workers: 1
+                                  keys: [l,s,column,column1]
+                                  keyFunctions: [l+1,l+2]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            l\ts\tcolumn
+                            1\ta\t2
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByExpressionKeyOnJoinWithSharedColumnName() throws Exception {
+        // An explicit GROUP BY that names an expression key by alias or position used to fail
+        // with "Ambiguous column" when the expression read a column that both joined tables
+        // carry, however qualified: emitting the key's literals stripped the table prefixes
+        // from the projection column's AST, which the GROUP BY key shared.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE a (sym SYMBOL, k INT, c1 DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("CREATE TABLE b (sym SYMBOL, k INT, c1 DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("""
+                    INSERT INTO a VALUES
+                        ('x', 1, 1.5, '2024-01-01T00:00'),
+                        ('y', 1, 2.5, '2024-01-01T01:00'),
+                        ('x', 2, 3.5, '2024-01-01T02:00'),
+                        ('y', 3, 4.5, '2024-01-01T03:00')
+                    """);
+            execute("""
+                    INSERT INTO b VALUES
+                        ('x', 1, 10.0, '2024-01-01T00:30'),
+                        ('y', 2, 20.0, '2024-01-01T01:30'),
+                        ('x', 2, 20.0, '2024-01-01T02:30'),
+                        ('y', 4, 40.0, '2024-01-01T03:30')
+                    """);
+            final String[] joins = {"JOIN", "LEFT JOIN", "RIGHT JOIN"};
+            final String[] arithmeticKeyResults = {
+                    """
+                    e0\tc
+                    20.0\t2
+                    40.0\t2
+                    """,
+                    """
+                    e0\tc
+                    20.0\t2
+                    40.0\t2
+                    null\t1
+                    """,
+                    """
+                    e0\tc
+                    20.0\t2
+                    40.0\t2
+                    80.0\t1
+                    """
+            };
+            final String[] functionKeyResults = {
+                    """
+                    e0\tk\tc
+                    X\t1\t2
+                    X\t2\t1
+                    Y\t2\t1
+                    """,
+                    """
+                    e0\tk\tc
+                    \t3\t1
+                    X\t1\t2
+                    X\t2\t1
+                    Y\t2\t1
+                    """,
+                    """
+                    e0\tk\tc
+                    X\t1\t2
+                    X\t2\t1
+                    Y\tnull\t1
+                    Y\t2\t1
+                    """
+            };
+            for (boolean isFusedEnabled : new boolean[]{true, false}) {
+                sqlExecutionContext.setParallelHashJoinGroupByEnabled(isFusedEnabled);
+                for (int i = 0; i < joins.length; i++) {
+                    for (String input : new String[]{"b", "(SELECT * FROM b)"}) {
+                        final String from = " FROM a l " + joins[i] + ' ' + input + " r ON l.k = r.k";
+                        for (String key : new String[]{"e0", "1"}) {
+                            assertQuery("SELECT (r.c1 * 2) AS e0, count() c" + from + " GROUP BY " + key + " ORDER BY e0")
+                                    .expectSize()
+                                    .returns(arithmeticKeyResults[i]);
+                        }
+                        assertQuery("SELECT upper(r.sym) e0, l.k, count() c" + from + " GROUP BY e0, 2 ORDER BY e0, l.k")
+                                .expectSize()
+                                .returns(functionKeyResults[i]);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByIndexOutsideSelectList() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab as (select x, x%2 as y from long_sequence(2))");
+            assertError(
+                    "select * from tab group by 5",
+                    "[27] GROUP BY position 5 is not in select list"
+            );
+        });
+    }
+
+    @Test
+    public void testGroupByInterval1() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> assertQuery("select i, count() from (" +
+                "  (select interval(100000,200000) i) " +
+                "  union all " +
+                "  (select interval(100000,200000) i) " +
+                "  union all " +
+                "  (select null::interval i)" +
+                ")")
+                .expectSize()
+                .noLeakCheck()
+                .returns("""
+                        i\tcount
+                        ('1970-01-01T00:00:00.100Z', '1970-01-01T00:00:00.200Z')\t2
+                        \t1
+                        """));
+    }
+
+    @Test
+    public void testGroupByInterval2() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> assertQuery("select i, s, count() from (" +
+                "  (select interval(100000,200000) i, 'foobar' s) " +
+                "  union all " +
+                "  (select interval(100000,200000) i, 'foobar' s) " +
+                "  union all " +
+                "  (select null::interval i, null::string s)" +
+                ")")
+                .expectSize()
+                .noLeakCheck()
+                .returns("""
+                        i\ts\tcount
+                        ('1970-01-01T00:00:00.100Z', '1970-01-01T00:00:00.200Z')\tfoobar\t2
+                        \t\t1
+                        """));
+    }
+
+    @Test
+    public void testGroupByInvalidOrderByExpression() throws Exception {
+        assertQuery("SELECT ts AS ref0 FROM x WHERE 1=1 GROUP BY ts ORDER BY (ts) NOT IN ('{}') LIMIT 1;")
+                .ddl("CREATE TABLE x (ts TIMESTAMP, event SHORT, origin SHORT) TIMESTAMP(ts);")
+                .fails(69, "Invalid date");
+    }
+
+    @Test
+    public void testGroupByMixedRealKeyAndConstantBind() throws Exception {
+        // Real column key plus constant bind projection: the bind goes to
+        // the outer virtual projection while the real column stays in the
+        // inner GROUP BY key set. Both keyed and non-empty input flow.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (c STRING)");
+            execute("INSERT INTO t VALUES ('A'), ('A'), ('B')");
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "X");
+            assertQuery("SELECT :b0 AS e0, c, count() AS a0 FROM t GROUP BY c ORDER BY c")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            e0\tc\ta0
+                            X\tA\t2
+                            X\tB\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByNonPartitioned() throws Exception {
+        assertQuery("SELECT k, sum(val) FROM tab ORDER BY k LIMIT 3;")
+                .ddl("CREATE TABLE tab AS (SELECT rnd_str(4, 4, 0) k, rnd_double() val FROM long_sequence(100000));")
+                .expectSize()
+                .returns("""
+                        k\tsum
+                        BBBE\t0.7453598685393461
+                        BBBI\t0.7394866029725212
+                        BBBK\t1.370328208214273
+                        """);
+    }
+
+    @Test
+    public void testGroupByNullKeyBeforeOtherKeys() throws Exception {
+        // A NULL key takes no bytes in the map key, so the keys after it read their own values, in
+        // the fixed-size key layout and in the var-size one. The NULL key is a subquery column, or
+        // a CASE without a non-NULL branch, which the optimizer keeps as a key, unlike a bare NULL.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (x INT, s STRING)");
+            execute("INSERT INTO t VALUES (1, 'a'), (1, 'a'), (2, ''), (3, 'ccc')");
+            assertQuery("SELECT k, x, count() c FROM (SELECT null AS k, x FROM t) GROUP BY k, x ORDER BY x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            k\tx\tc
+                            null\t1\t2
+                            null\t2\t1
+                            null\t3\t1
+                            """);
+            assertQuery("SELECT k, s, x, count() c FROM (SELECT null AS k, s, x FROM t) GROUP BY k, s, x ORDER BY x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            k\ts\tx\tc
+                            null\ta\t1\t2
+                            null\t\t2\t1
+                            null\tccc\t3\t1
+                            """);
+            assertQuery("SELECT CASE WHEN x > 1 THEN NULL END AS k, x + 1 AS b, count() c FROM t GROUP BY 1, 2 ORDER BY 2")
+                    .noLeakCheck()
+                    .withPlanContaining("keys: [k,b]")
+                    .expectSize()
+                    .returns("""
+                            k\tb\tc
+                            null\t2\t2
+                            null\t3\t1
+                            null\t4\t1
+                            """);
+            assertQuery("SELECT x * 2 AS d, CASE WHEN x > 1 THEN NULL END AS k, concat(s, '!') AS b, count() c FROM t GROUP BY 1, 2, 3 ORDER BY 1")
+                    .noLeakCheck()
+                    .withPlanContaining("keys: [d,k,b]")
+                    .expectSize()
+                    .returns("""
+                            d\tk\tb\tc
+                            2\tnull\ta!\t2
+                            4\tnull\t!\t1
+                            6\tnull\tccc!\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByNullLiteralKey() throws Exception {
+        // Regression: a bare `null` literal in the SELECT list referenced from GROUP BY
+        // used to blow up the map key sink codegen with
+        //     IllegalArgumentException: Unexpected function type: NULL
+        // The NULL-typed key is now stored as a zero-width column (no bytes reserved),
+        // so all rows collapse into a single group as expected.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT) ");
+            execute("INSERT INTO t VALUES (1), (2), (3)");
+            assertQuery("SELECT null AS e0, avg(v) AS a0 FROM t GROUP BY 1")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            e0\ta0
+                            null\t2.0
+                            """);
+            // A real key alongside the constant NULL still grouped per real-key value.
+            execute("CREATE TABLE t2 (k INT, v INT)");
+            execute("INSERT INTO t2 VALUES (1, 10), (1, 20), (2, 30)");
+            assertQuery("SELECT null AS e0, k, avg(v) AS a FROM t2 GROUP BY 1, k ORDER BY k")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            e0\tk\ta
+                            null\t1\t15.0
+                            null\t2\t30.0
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByNullLiteralKeyWithTightMapPage() throws Exception {
+        // A 17-byte map page fits the 16-byte value of count_distinct() or avg() but not a key
+        // length header in front of it, on the single-threaded and on the parallel factory.
+        setProperty(PropertyKey.CAIRO_SQL_SMALL_MAP_PAGE_SIZE, 17);
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE null_key_t (v INT)");
+            execute("INSERT INTO null_key_t VALUES (1), (1), (2)");
+            assertQuery("""
+                    SELECT null AS e0, count_distinct(cnt) AS a0
+                    FROM (SELECT v AS k, count() AS cnt FROM null_key_t)
+                    GROUP BY 1
+                    """)
+                    .noLeakCheck()
+                    .withPlanContaining("GroupBy vectorized: false")
+                    .expectSize()
+                    .returns("""
+                            e0\ta0
+                            null\t2
+                            """);
+            assertQuery("SELECT null AS e0, avg(v) AS a0 FROM null_key_t GROUP BY 1")
+                    .noLeakCheck()
+                    .withPlanContaining("Async Group By")
+                    .expectSize()
+                    .returns("""
+                            e0\ta0
+                            null\t1.3333333333333333
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByOrderByExpression() throws Exception {
+        assertQuery("SELECT ts AS ref0 FROM x WHERE 1=1 GROUP BY ts ORDER BY (ts) NOT IN ('1970-01-01T00:00:00.000002Z');")
+                .ddl("CREATE TABLE x AS (SELECT x::timestamp AS ts, x::short AS event, x::short AS origin FROM long_sequence(2)) TIMESTAMP(ts);")
+                .expectSize()
+                .returns("""
+                        ref0
+                        1970-01-01T00:00:00.000002Z
+                        1970-01-01T00:00:00.000001Z
+                        """);
+    }
+
+    @Test
+    public void testGroupByOrderByExpressionOverNonSelectedColumn() throws Exception {
+        // ORDER BY an expression over a column that the select list does not output, such as
+        // price * 2, adds the expression to the GROUP BY model as a hidden key, so the groups split
+        // by it. When the select list also needs a projection above the GROUP BY model, as with
+        // avg(price) + 1, that projection used to reference the key as a regular column, so the
+        // query, and SELECT * over it, returned an extra column named "column".
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE trades (ts TIMESTAMP, sym SYMBOL, price DOUBLE) TIMESTAMP(ts)");
+            execute("""
+                    INSERT INTO trades VALUES
+                        ('2000-01-01T00:00:00.000000Z', 'A', 10.0),
+                        ('2000-01-01T00:00:01.000000Z', 'B', 20.0),
+                        ('2000-01-01T00:00:02.000000Z', 'A', 30.0),
+                        ('2000-01-01T00:00:03.000000Z', 'C', 40.0)
+                    """);
+
+            final String splitGroups = """
+                    sym\ta
+                    A\t11.0
+                    B\t21.0
+                    A\t31.0
+                    C\t41.0
+                    """;
+            final String[][] queries = {
+                    {"SELECT sym, avg(price) + 1 a FROM trades ORDER BY price * 2, sym", splitGroups},
+                    {"SELECT sym, avg(price) + 1 a FROM trades ORDER BY abs(price), sym", splitGroups},
+                    {"SELECT sym, avg(price) + 1 a FROM trades ORDER BY price::INT, sym", splitGroups},
+                    {"SELECT sym, avg(price) + 1 a FROM trades WHERE price > 0 ORDER BY price * 2, sym", splitGroups},
+                    // a duplicate aggregate puts a projection above the GROUP BY model
+                    {
+                            "SELECT sym, avg(price) a, avg(price) b FROM trades ORDER BY price * 2, sym",
+                            """
+                            sym\ta\tb
+                            A\t10.0\t10.0
+                            B\t20.0\t20.0
+                            A\t30.0\t30.0
+                            C\t40.0\t40.0
+                            """
+                    },
+                    // so does a constant
+                    {
+                            "SELECT sym, 1 one, avg(price) a FROM trades ORDER BY price * 2, sym",
+                            """
+                            sym\tone\ta
+                            A\t1\t10.0
+                            B\t1\t20.0
+                            A\t1\t30.0
+                            C\t1\t40.0
+                            """
+                    },
+                    {
+                            "SELECT ts, avg(price) + 1 a FROM trades SAMPLE BY 1s ORDER BY price * 2",
+                            """
+                            ts\ta
+                            2000-01-01T00:00:00.000000Z\t11.0
+                            2000-01-01T00:00:01.000000Z\t21.0
+                            2000-01-01T00:00:02.000000Z\t31.0
+                            2000-01-01T00:00:03.000000Z\t41.0
+                            """
+                    },
+                    // with DISTINCT, the distinct model referenced the expression as a regular column
+                    {
+                            "SELECT DISTINCT sym, count() c FROM trades ORDER BY max(price) * 2, sym",
+                            """
+                            sym\tc
+                            B\t1
+                            A\t2
+                            C\t1
+                            """
+                    },
+                    {
+                            "SELECT DISTINCT sym, avg(price) a FROM trades GROUP BY sym ORDER BY sym || 'x'",
+                            """
+                            sym\ta
+                            A\t20.0
+                            B\t20.0
+                            C\t40.0
+                            """
+                    },
+            };
+            // SAMPLE BY with FILL, and ALIGN TO FIRST OBSERVATION, which keeps the SAMPLE BY model,
+            // with and without a projection above it; their sorted cursors do not report a size
+            final String[][] sampleByQueries = {
+                    {
+                            "SELECT ts, avg(price) + 1 a FROM trades WHERE sym = 'A' SAMPLE BY 1s FILL(NULL) ORDER BY price * 2, ts",
+                            """
+                            ts\ta
+                            2000-01-01T00:00:00.000000Z\t11.0
+                            2000-01-01T00:00:01.000000Z\tnull
+                            2000-01-01T00:00:02.000000Z\tnull
+                            2000-01-01T00:00:00.000000Z\tnull
+                            2000-01-01T00:00:01.000000Z\tnull
+                            2000-01-01T00:00:02.000000Z\t31.0
+                            """
+                    },
+                    {
+                            "SELECT ts, avg(price) a FROM trades SAMPLE BY 1s ALIGN TO FIRST OBSERVATION ORDER BY price * 2, ts",
+                            """
+                            ts\ta
+                            2000-01-01T00:00:00.000000Z\t10.0
+                            2000-01-01T00:00:01.000000Z\t20.0
+                            2000-01-01T00:00:02.000000Z\t30.0
+                            2000-01-01T00:00:03.000000Z\t40.0
+                            """
+                    },
+                    {
+                            "SELECT ts, avg(price) + 1 a FROM trades SAMPLE BY 1s ALIGN TO FIRST OBSERVATION ORDER BY price * 2, ts",
+                            """
+                            ts\ta
+                            2000-01-01T00:00:00.000000Z\t11.0
+                            2000-01-01T00:00:01.000000Z\t21.0
+                            2000-01-01T00:00:02.000000Z\t31.0
+                            2000-01-01T00:00:03.000000Z\t41.0
+                            """
+                    },
+            };
+            for (String[] query : queries) {
+                assertOrderByHiddenKeyNoLeakCheck(query[0], query[1], true);
+            }
+            for (String[] query : sampleByQueries) {
+                assertOrderByHiddenKeyNoLeakCheck(query[0], query[1], false);
+            }
+
+            // a re-sort over the query drops its ORDER BY, and the groups still split by the hidden key
+            assertQuery("SELECT * FROM (" + queries[0][0] + ") ORDER BY sym, a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            sym\ta
+                            A\t11.0
+                            A\t31.0
+                            B\t21.0
+                            C\t41.0
+                            """);
+
+            // the sort still reads the hidden key
+            assertQuery(queries[0][0])
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            SelectedRecord
+                                Encode sort light
+                                  keys: [column, sym]
+                                    VirtualRecord
+                                      functions: [sym,avg+1,column]
+                                        Async Group By workers: 1
+                                          keys: [sym,column]
+                                          keyFunctions: [price*2]
+                                          values: [avg(price)]
+                                          filter: null
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: trades
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupBySingleVarcharKeyFromSampleByWithFill() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (vch varchar, l long, ts timestamp) timestamp(ts) partition by day;");
+            execute("""
+                    insert into t values\s
+                    ('USD', 1, '2021-11-17T17:00:00.000000Z'),
+                    ('USD', 2, '2021-11-17T17:35:02.000000Z'),
+                    ('EUR', 3, '2021-11-17T17:45:02.000000Z'),
+                    ('USD', 1, '2021-11-17T19:04:00.000000Z'),
+                    ('USD', 2, '2021-11-17T19:35:02.000000Z'),
+                    ('USD', 3, '2021-11-17T19:45:02.000000Z');""");
+
+            String query = """
+                    with samp as (
+                      select ts, vch, min(l), max(l)
+                      from t
+                      sample by 1h fill(prev)
+                    )
+                    select vch, sum(min)
+                    from samp
+                    order by vch;""";
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            vch\tsum
+                            EUR\t9
+                            USD\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupBySingleVarcharKeyFromUnionAllAndFunction() throws Exception {
+        // grouping by a single varchar key uses a fast-path which assume most of the time keys are just stable
+        // pointers into mmaped memory. This test verifies that the fast-path is not broken when some grouping
+        // keys are indeed stable and some are not. to_uppercase() produces a varchar which is not stable.
+
+        assertMemoryLeak(() -> {
+            execute("create table tab1 as (select (x % 5)::varchar as vch, x, now() as ts from long_sequence(20)) \n" +
+                    "timestamp(ts) PARTITION by day");
+
+            String query = """
+                    with\s
+                      w1 as (
+                        select * from tab1
+                        order by vch asc
+                      ),\s
+                      w2 as (
+                        select * from tab1
+                        order by vch desc
+                      ),
+                      u as (select * from w1
+                        UNION all w2
+                      ),
+                      uo as (
+                        select * from u order by vch
+                      ),
+                      grouped as (
+                        select vch, count(vch)
+                        from uo
+                        order by vch
+                      ),
+                      nested as (
+                        select vch, sum(count) from grouped
+                        group by vch
+                        order by vch
+                      )
+                    select tab1.vch, tab1.x, nested.vch as nested_vch, sum
+                    from tab1
+                    join nested on nested.vch = tab1.vch;""";
+            assertQuery(query)
+                    .noRandomAccess()
+                    .noLeakCheck()
+                    .returns("""
+                            vch\tx\tnested_vch\tsum
+                            1\t1\t1\t8
+                            2\t2\t2\t8
+                            3\t3\t3\t8
+                            4\t4\t4\t8
+                            0\t5\t0\t8
+                            1\t6\t1\t8
+                            2\t7\t2\t8
+                            3\t8\t3\t8
+                            4\t9\t4\t8
+                            0\t10\t0\t8
+                            1\t11\t1\t8
+                            2\t12\t2\t8
+                            3\t13\t3\t8
+                            4\t14\t4\t8
+                            0\t15\t0\t8
+                            1\t16\t1\t8
+                            2\t17\t2\t8
+                            3\t18\t3\t8
+                            4\t19\t4\t8
+                            0\t20\t0\t8
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByTrivialExpressionKeyReferencedByAlias() throws Exception {
+        // rewriteTrivialGroupByExpressions lifts a trivial key such as
+        // 859371 + (cnt * -237288) out of the inner GROUP BY when its base
+        // column (cnt) is also a key, recomputing the offset in an outer
+        // VIRTUAL and removing the lifted key column from the group-by model.
+        // It used to leave the alias reference behind in the model's GROUP BY
+        // list, and validateGroupByColumns then rejected the now-missing alias
+        // with "group by column does not match any key column". Expression keys
+        // hid the bug because validateGroupByColumns matches them against the
+        // surviving base column, but a bare alias reference has nothing to match.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE fuzz_t1 (c4 INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO fuzz_t1 VALUES (1, 0), (2, 1000), (1, 2000)");
+            String expected = """
+                    e0\te1\ta0
+                    1\t622083\t1
+                    2\t384795\t1
+                    """;
+            String body = "FROM (SELECT c4 AS k, count() AS cnt FROM fuzz_t1) t0\n";
+            // alias reference in GROUP BY - the shape the query fuzzer hit
+            assertQuery("SELECT t0.cnt AS e0, (859371 + (t0.cnt * -237288)) AS e1, count() AS a0\n"
+                    + body + "GROUP BY t0.cnt, e1 ORDER BY 1 ASC, e1")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            // and the same query spelling out the expression in GROUP BY
+            assertQuery("SELECT t0.cnt AS e0, (859371 + (t0.cnt * -237288)) AS e1, count() AS a0\n"
+                    + body + "GROUP BY t0.cnt, (859371 + (t0.cnt * -237288)) ORDER BY 1 ASC, e1")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+        });
+    }
+
+    @Test
+    public void testGroupByVarchar() throws Exception {
+        assertQuery("select key, max(value) from t group by key order by key")
+                .ddl("create table t as ( select (x%10)::varchar key, x as value from long_sequence(100)); ")
+                .expectSize()
+                .returns("""
+                        key\tmax
+                        0\t100
+                        1\t91
+                        2\t92
+                        3\t93
+                        4\t94
+                        5\t95
+                        6\t96
+                        7\t97
+                        8\t98
+                        9\t99
+                        """);
+    }
+
+    @Test
+    public void testGroupByWithAliasClash1() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute(
+                    "create table t as (" +
+                            "    select 1 as l, 'a' as s, -1 max " +
+                            "    union all " +
+                            "    select 1, 'a', -2" +
+                            "    )"
+            );
+
+            String query = "select s, max, max(l) from t group by s, max order by s, max";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [s, max]
+                                Async Group By workers: 1
+                                  keys: [s,max]
+                                  values: [max(l)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            s\tmax\tmax1
+                            a\t-2\t1
+                            a\t-1\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByWithAliasClash2() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t1 as (select x, x%2 as y from long_sequence(2))");
+            execute("create table t2 as (select x, x%2 as y from long_sequence(2))");
+
+            String query = "select t1.x, max(t2.y), t2.x " +
+                    "from t1 " +
+                    "join t2 on t1.y = t2.y  " +
+                    "group by t1.x, t2.x " +
+                    "order by t1.x, t2.x";
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tmax\tx1
+                            1\t1\t1
+                            2\t0\t2
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByWithAliasClash3() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t1 as (select x, x%2 as y from long_sequence(2))");
+            execute("create table t2 as (select x, x%2 as y from long_sequence(2))");
+
+            String query = "select t1.x, max(t2.y), case when t1.x > 1 then 100*t1.x else 10*t2.x end " +
+                    "from t1 " +
+                    "join t2 on t1.y = t2.y  " +
+                    "group by t1.x, t2.x " +
+                    "order by t1.x, t2.x";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            SelectedRecord
+                                Encode sort light
+                                  keys: [x, x1]
+                                    VirtualRecord
+                                      functions: [x,max,case([1<x,100*x,10*x1]),x1]
+                                        Async Hash Join Group By workers: 1
+                                          logicalJoinType: inner
+                                          physicalJoinType: inner
+                                          inputSwapped: false
+                                          condition: t1.y=t2.y
+                                          buildStrategy: shared
+                                          buildPayload: copied when the probe is large enough
+                                          keys: [x,x1]
+                                          values: [max(t2.y)]
+                                            Probe
+                                                PageFrame
+                                                    Row forward scan
+                                                    Frame forward scan on: t1
+                                            Build
+                                                PageFrame
+                                                    Row forward scan
+                                                    Frame forward scan on: t2
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tmax\tcase
+                            1\t1\t10
+                            2\t0\t200
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByWithAliasClash4() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t1 as (select x, x%2 as y from long_sequence(2))");
+            execute("create table t2 as (select x, x%2 as y from long_sequence(2))");
+
+            String query = "select t1.x, max(t2.y), case when t1.x > 1 then 30*t1.x else 20*t2.x end " +
+                    "from t1 " +
+                    "join t2 on t1.y = t2.y  " +
+                    "group by t1.x, t2.x, case when t1.x > 1 then 30*t1.x else 20*t2.x end";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [x,max,case]
+                                Async Hash Join Group By workers: 1
+                                  logicalJoinType: inner
+                                  physicalJoinType: inner
+                                  inputSwapped: false
+                                  condition: t1.y=t2.y
+                                  buildStrategy: shared
+                                  buildPayload: copied when the probe is large enough
+                                  keys: [x,case,x1]
+                                  keyFunctions: [case([1<t1.x,30*t1.x,20*t2.x])]
+                                  values: [max(t2.y)]
+                                    Probe
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: t1
+                                    Build
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: t2
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tmax\tcase
+                            1\t1\t20
+                            2\t0\t60
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByWithAliasClash5() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t1 as (select x::int as x, x%2 as y from long_sequence(2))");
+            execute("create table t2 as (select x::int as x, x%2 as y from long_sequence(2))");
+
+            String query = "select t1.x, max(t2.y), dateadd('d', t1.x, '2023-03-01T00:00:00')::long + t2.x " +
+                    "from t1 " +
+                    "join t2 on t1.y = t2.y  " +
+                    "group by t1.x, t2.x, dateadd('d', t1.x, '2023-03-01T00:00:00') " +
+                    "order by 1";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [x]
+                                VirtualRecord
+                                  functions: [x,max,dateadd::long+x1]
+                                    Async Hash Join Group By workers: 1
+                                      logicalJoinType: inner
+                                      physicalJoinType: inner
+                                      inputSwapped: false
+                                      condition: t1.y=t2.y
+                                      buildStrategy: shared
+                                      buildPayload: copied when the probe is large enough
+                                      keys: [x,x1,dateadd]
+                                      keyFunctions: [dateadd('d',t1.x,2023-03-01T00:00:00.000000Z)]
+                                      values: [max(t2.y)]
+                                        Probe
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t1
+                                        Build
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t2
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tmax\tcolumn
+                            1\t1\t1677715200000001
+                            2\t0\t1677801600000002
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByWithAliasClash6() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t1 as (select x::int as x, x%2 as y from long_sequence(2))");
+            execute("create table t2 as (select x::int as x, x%2 as y from long_sequence(2))");
+
+            String query = "select t1.x, max(t2.y), dateadd('s', max(t2.y)::int, dateadd('d', t1.x, '2023-03-01T00:00:00') ) " +
+                    "from t1 " +
+                    "join t2 on t1.y = t2.y  " +
+                    "group by t1.x, t2.x, dateadd('d', t1.x, '2023-03-01T00:00:00') " +
+                    "order by 1, 2, 3";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [x, max, dateadd]
+                                VirtualRecord
+                                  functions: [x,max,dateadd('s',max::int,dateadd)]
+                                    Async Hash Join Group By workers: 1
+                                      logicalJoinType: inner
+                                      physicalJoinType: inner
+                                      inputSwapped: false
+                                      condition: t1.y=t2.y
+                                      buildStrategy: shared
+                                      buildPayload: copied when the probe is large enough
+                                      keys: [x,dateadd,x1]
+                                      keyFunctions: [dateadd('d',t1.x,2023-03-01T00:00:00.000000Z)]
+                                      values: [max(t2.y)]
+                                        Probe
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t1
+                                        Build
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t2
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tmax\tdateadd
+                            1\t1\t2023-03-02T00:00:01.000000Z
+                            2\t0\t2023-03-03T00:00:00.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByWithDuplicateSelectColumn() throws Exception {
+        assertQuery("select key1 as k1, key2, key2, count(*) from t group by key2, k1 order by 1, 2")
+                .ddl("create table t as ( select x%2 key1, x%4 key2, x as value from long_sequence(10));")
+                .expectSize()
+                .returns("""
+                        k1\tkey2\tkey21\tcount
+                        0\t0\t0\t2
+                        0\t2\t2\t3
+                        1\t1\t1\t3
+                        1\t3\t3\t2
+                        """);
+    }
+
+    @Test
+    public void testGroupByWithLeftJoin() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute(
+                    "create table dim_apTemperature as (" +
+                            "  select x::int id," +
+                            "         rnd_str('a','b','c') as category," +
+                            "         rnd_float() aparent_temperature" +
+                            "  from long_sequence(10)" +
+                            ");"
+            );
+            execute(
+                    "create table fact_table as (" +
+                            "  select x::int id_aparent_temperature," +
+                            "         (x * 120000000)::timestamp date_time," +
+                            "         rnd_float() radiation," +
+                            "         rnd_float() energy_power" +
+                            "  from long_sequence(10)" +
+                            ");"
+            );
+
+            final String expectedResult = """
+                    dim_ap_temperature__category\tfact_table__date_time_day\tfact_table__avg_radiation\tfact_table__energy_power
+                    c\t1970-01-01T00:00:00.000000Z\t0.5421442091464996\t0.6145070195198059
+                    b\t1970-01-01T00:00:00.000000Z\t0.525111973285675\t0.6171746551990509
+                    a\t1970-01-01T00:00:00.000000Z\t0.33940355479717255\t0.47865718603134155
+                    """;
+
+            String[] joinTypes = new String[]{"Left", "Right", "Full"};
+            // With GROUP BY clause
+            // This query is generated by Cube.js
+            for (String joinType : joinTypes) {
+                final String query1 = "SELECT\n" +
+                        "  \"dim_ap_temperature\".category \"dim_ap_temperature__category\",\n" +
+                        "  timestamp_floor('d', to_timezone(\"fact_table\".date_time, 'UTC')) \"fact_table__date_time_day\",\n" +
+                        "  avg(\"fact_table\".radiation) \"fact_table__avg_radiation\",\n" +
+                        "  avg(\"fact_table\".energy_power) \"fact_table__energy_power\"\n" +
+                        "FROM\n" +
+                        "  fact_table AS \"fact_table\"\n" +
+                        "  " + joinType + " JOIN dim_apTemperature AS \"dim_ap_temperature\" ON \"fact_table\".id_aparent_temperature = \"dim_ap_temperature\".id\n" +
+                        "GROUP BY\n" +
+                        "  \"dim_ap_temperature__category\",\n" +
+                        "  \"fact_table__date_time_day\"\n" +
+                        "ORDER BY\n" +
+                        "  \"fact_table__avg_radiation\" DESC\n" +
+                        "LIMIT\n" +
+                        "  10000;";
+                assertQuery(query1)
+                        .expectSize()
+                        .noLeakCheck()
+                        .returns(expectedResult);
+                assertQuery(query1)
+                        .noLeakCheck()
+                        .assertsPlan("Encode sort light lo: 10000\n" +
+                                "  keys: [fact_table__avg_radiation desc]\n" +
+                                "    VirtualRecord\n" +
+                                "      functions: [dim_ap_temperature__category,fact_table__date_time_day,fact_table__avg_radiation,fact_table__energy_power]\n" +
+                                "        GroupBy vectorized: false\n" +
+                                "          keys: [dim_ap_temperature__category,fact_table__date_time_day]\n" +
+                                "          values: [avg(radiation),avg(energy_power)]\n" +
+                                "            SelectedRecord\n" +
+                                "                Hash " + joinType + " Outer Join Light\n" +
+                                "                  condition: dim_ap_temperature.id=fact_table.id_aparent_temperature\n" +
+                                "                    PageFrame\n" +
+                                "                        Row forward scan\n" +
+                                "                        Frame forward scan on: fact_table\n" +
+                                "                    Hash\n" +
+                                "                        PageFrame\n" +
+                                "                            Row forward scan\n" +
+                                "                            Frame forward scan on: dim_apTemperature\n");
+
+                // With no aliases in GROUP BY clause - 1
+                final String query2 = "SELECT\n" +
+                        "  \"dim_ap_temperature\".category \"dim_ap_temperature__category\",\n" +
+                        "  timestamp_floor('d', to_timezone(\"fact_table\".date_time, 'UTC')) \"fact_table__date_time_day\",\n" +
+                        "  avg(\"fact_table\".radiation) \"fact_table__avg_radiation\",\n" +
+                        "  avg(\"fact_table\".energy_power) \"fact_table__energy_power\"\n" +
+                        "FROM\n" +
+                        "  fact_table AS \"fact_table\"\n" +
+                        "  " + joinType + " JOIN dim_apTemperature AS \"dim_ap_temperature\" ON \"fact_table\".id_aparent_temperature = \"dim_ap_temperature\".id\n" +
+                        "GROUP BY\n" +
+                        "  \"dim_ap_temperature\".category,\n" +
+                        "  timestamp_floor('d', to_timezone(\"fact_table\".date_time, 'UTC'))\n" +
+                        "ORDER BY\n" +
+                        "  \"fact_table__avg_radiation\" DESC\n" +
+                        "LIMIT\n" +
+                        "  10000;";
+                assertQuery(query2)
+                        .expectSize()
+                        .noLeakCheck()
+                        .returns(expectedResult);
+                assertQuery(query2)
+                        .noLeakCheck()
+                        .assertsPlan("Encode sort light lo: 10000\n" +
+                                "  keys: [fact_table__avg_radiation desc]\n" +
+                                "    VirtualRecord\n" +
+                                "      functions: [category,timestamp_floor,fact_table__avg_radiation,fact_table__energy_power]\n" +
+                                "        GroupBy vectorized: false\n" +
+                                "          keys: [category,timestamp_floor]\n" +
+                                "          values: [avg(radiation),avg(energy_power)]\n" +
+                                "            SelectedRecord\n" +
+                                "                Hash " + joinType + " Outer Join Light\n" +
+                                "                  condition: dim_ap_temperature.id=fact_table.id_aparent_temperature\n" +
+                                "                    PageFrame\n" +
+                                "                        Row forward scan\n" +
+                                "                        Frame forward scan on: fact_table\n" +
+                                "                    Hash\n" +
+                                "                        PageFrame\n" +
+                                "                            Row forward scan\n" +
+                                "                            Frame forward scan on: dim_apTemperature\n");
+
+                // With no aliases in GROUP BY clause - 2
+                final String query3 = "SELECT\n" +
+                        "  category \"dim_ap_temperature__category\",\n" +
+                        "  timestamp_floor('d', to_timezone(date_time, 'UTC')) \"fact_table__date_time_day\",\n" +
+                        "  avg(radiation) \"fact_table__avg_radiation\",\n" +
+                        "  avg(energy_power) \"fact_table__energy_power\"\n" +
+                        "FROM\n" +
+                        "  fact_table AS \"fact_table\"\n" +
+                        "  " + joinType + " JOIN dim_apTemperature AS \"dim_ap_temperature\" ON \"fact_table\".id_aparent_temperature = \"dim_ap_temperature\".id\n" +
+                        "GROUP BY\n" +
+                        "  category,\n" +
+                        "  timestamp_floor('d', to_timezone(date_time, 'UTC'))\n" +
+                        "ORDER BY\n" +
+                        "  \"fact_table__avg_radiation\" DESC\n" +
+                        "LIMIT\n" +
+                        "  10000;";
+                assertQuery(query3)
+                        .expectSize()
+                        .noLeakCheck()
+                        .returns(expectedResult);
+                assertQuery(query3)
+                        .noLeakCheck()
+                        .assertsPlan("Encode sort light lo: 10000\n" +
+                                "  keys: [fact_table__avg_radiation desc]\n" +
+                                "    VirtualRecord\n" +
+                                "      functions: [category,timestamp_floor,fact_table__avg_radiation,fact_table__energy_power]\n" +
+                                "        GroupBy vectorized: false\n" +
+                                "          keys: [category,timestamp_floor]\n" +
+                                "          values: [avg(radiation),avg(energy_power)]\n" +
+                                "            SelectedRecord\n" +
+                                "                Hash " + joinType + " Outer Join Light\n" +
+                                "                  condition: dim_ap_temperature.id=fact_table.id_aparent_temperature\n" +
+                                "                    PageFrame\n" +
+                                "                        Row forward scan\n" +
+                                "                        Frame forward scan on: fact_table\n" +
+                                "                    Hash\n" +
+                                "                        PageFrame\n" +
+                                "                            Row forward scan\n" +
+                                "                            Frame forward scan on: dim_apTemperature\n");
+
+                // Without GROUP BY clause
+                final String query4 = "SELECT\n" +
+                        "  \"dim_ap_temperature\".category \"dim_ap_temperature__category\",\n" +
+                        "  timestamp_floor('d', to_timezone(\"fact_table\".date_time, 'UTC')) \"fact_table__date_time_day\",\n" +
+                        "  avg(\"fact_table\".radiation) \"fact_table__avg_radiation\",\n" +
+                        "  avg(\"fact_table\".energy_power) \"fact_table__energy_power\"\n" +
+                        "FROM\n" +
+                        "  fact_table AS \"fact_table\"\n" +
+                        "  " + joinType + " JOIN dim_apTemperature AS \"dim_ap_temperature\" ON \"fact_table\".id_aparent_temperature = \"dim_ap_temperature\".id\n" +
+                        "ORDER BY\n" +
+                        "  \"fact_table__avg_radiation\" DESC\n" +
+                        "LIMIT\n" +
+                        "  10000;";
+                assertQuery(query4)
+                        .expectSize()
+                        .noLeakCheck()
+                        .returns(expectedResult);
+                assertQuery(query4)
+                        .noLeakCheck()
+                        .assertsPlan("Encode sort light lo: 10000\n" +
+                                "  keys: [fact_table__avg_radiation desc]\n" +
+                                "    GroupBy vectorized: false\n" +
+                                "      keys: [dim_ap_temperature__category,fact_table__date_time_day]\n" +
+                                "      values: [avg(radiation),avg(energy_power)]\n" +
+                                "        SelectedRecord\n" +
+                                "            Hash " + joinType + " Outer Join Light\n" +
+                                "              condition: dim_ap_temperature.id=fact_table.id_aparent_temperature\n" +
+                                "                PageFrame\n" +
+                                "                    Row forward scan\n" +
+                                "                    Frame forward scan on: fact_table\n" +
+                                "                Hash\n" +
+                                "                    PageFrame\n" +
+                                "                        Row forward scan\n" +
+                                "                        Frame forward scan on: dim_apTemperature\n");
+            }
+        });
+    }
+
+    @Test
+    public void testGroupByWithNonConstantSelectClauseExpression() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+        allowFunctionMemoization();
+        assertMemoryLeak(() -> {
+            execute("create table t as (" +
+                    "    select 1 as l, 'a' as s " +
+                    "    union all " +
+                    "    select 1, 'a' )");
+
+            String query = "select l,s,rnd_int(0,1,0)/10 from t group by l,s";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [l,s,memoize(rnd_int(0,1,0)/10)]
+                                Async Group By workers: 1
+                                  keys: [l,s]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            l\ts\tcolumn
+                            1\ta\t0
+                            """);
+        });
+    }
+
+    @Test
+    public void testGroupByWithTimestampKey() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("""
+                    CREATE TABLE foo (
+                      timestamp TIMESTAMP,
+                      bar INT
+                    ) TIMESTAMP (timestamp)
+                    PARTITION BY DAY;""");
+            execute("INSERT INTO foo VALUES ('2020', 0);");
+            String query = """
+                    SELECT
+                      timestamp AS time,
+                      TO_STR(timestamp, 'yyyy-MM-dd'),
+                      SUM(1)\s
+                    FROM foo;""";
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            time\tTO_STR\tSUM
+                            2020-01-01T00:00:00.000000Z\t2020-01-01\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testLatestByImplicitGroupBy1() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (s1 symbol, s2 symbol, l long, ts timestamp) timestamp(ts) partition by day;");
+            execute(
+                    "insert into t values " +
+                            "('a', 'c', 11, '2021-11-17T17:35:01.000000Z')," +
+                            "('a', 'd', 12, '2021-11-17T17:35:02.000000Z')," +
+                            "('b', 'd', 13, '2021-11-17T17:35:01.000000Z')," +
+                            "('b', 'c', 14, '2021-11-17T17:35:02.000000Z');"
+            );
+            String query = "select s2, sum(l) from t where s2 in ('c') latest on ts partition by s1";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            GroupBy vectorized: false
+                              keys: [s2]
+                              values: [sum(l)]
+                                LatestByDeferredListValuesFiltered
+                                  jit: true
+                                  filter: s2 in [c]
+                                    Frame backward scan on: t
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            s2\tsum
+                            c\t25
+                            """);
+        });
+    }
+
+    @Test
+    public void testLatestByImplicitGroupBy2() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (s1 symbol index, s2 symbol index, l long, ts timestamp) timestamp(ts) partition by day;");
+            execute(
+                    "insert into t values " +
+                            "('a', 'c', 11, '2021-11-17T17:35:01.000000Z')," +
+                            "('a', 'd', 12, '2021-11-17T17:35:02.000000Z')," +
+                            "('b', 'd', 13, '2021-11-17T17:35:01.000000Z')," +
+                            "('b', 'c', 14, '2021-11-17T17:35:02.000000Z');"
+            );
+            String query = "select s2, sum(l) from t where s2 in ('c', 'd') latest on ts partition by s1 order by s2";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [s2]
+                                GroupBy vectorized: false
+                                  keys: [s2]
+                                  values: [sum(l)]
+                                    LatestByDeferredListValuesFiltered
+                                      jit: true
+                                      filter: s2 in [c,d]
+                                        Frame backward scan on: t
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            s2\tsum
+                            c\t14
+                            d\t12
+                            """);
+        });
+    }
+
+    @Test
+    public void testLatestByImplicitGroupBy3() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table t (s1 symbol index, s2 symbol index, l long, ts timestamp) timestamp(ts) partition by day;");
+            execute(
+                    "insert into t values " +
+                            "('a', 'c', 11, '2021-11-17T17:35:01.000000Z')," +
+                            "('a', 'd', 12, '2021-11-17T17:35:02.000000Z')," +
+                            "('b', 'd', 13, '2021-11-17T17:35:01.000000Z')," +
+                            "('b', 'c', 14, '2021-11-17T17:35:02.000000Z');"
+            );
+            String query = "select concat('_', s2, '_'), sum(l) from t where s2 in ('d') latest on ts partition by s1";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            GroupBy vectorized: false
+                              keys: [concat]
+                              values: [sum(l)]
+                                LatestByDeferredListValuesFiltered
+                                  jit: true
+                                  filter: s2 in [d]
+                                    Frame backward scan on: t
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            concat\tsum
+                            _d_\t25
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect1() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table x ( a int, b int, c symbol, ts timestamp ) timestamp(ts) partition by DAY WAL;");
+            execute("insert into x values (1,2,'3', now()), (2,3, '3', now()), (5,6,'4', now())");
+            drainWalQueue();
+            String query =
+                    """
+                            select a, b, c as z, count(*) as views
+                            from x
+                            where a = 1
+                            group by a,b,z
+                            """;
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async JIT Group By workers: 1
+                              keys: [a,b,z]
+                              values: [count(*)]
+                              filter: a=1
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: x
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            a\tb\tz\tviews
+                            1\t2\t3\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect10() throws Exception {
+        // test that it properly handles max(ts) ts on lhs and data.ts ts on rhs
+        assertMemoryLeak(() -> {
+            execute("create table tab (ts timestamp, i long, j long) timestamp(ts)");
+            execute("insert into tab " +
+                    "select (100000+x)::timestamp, " +
+                    "rnd_long(1,20,10), " +
+                    "rnd_long(1,1000,5) " +
+                    "from long_sequence(1000000)");
+
+            String query1 = "select max(ts) as ts, i, avg(j) as avg, sum(j::double) as sum, first(j::double) as first_value " +
+                    "from (" +
+                    "  select data.ts, data.i, data.j " +
+                    "  from (select i, max(ts) as max from tab group by i) cnt " +
+                    "  join tab data on cnt.i = data.i and data.ts >= (cnt.max - 80000) " +
+                    "  order by data.i, ts" +
+                    ")" +
+                    "group by i " +
+                    "order by i ";
+
+            // cross-check with re-write using aggregate functions
+            assertQuery(query1)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            ts\ti\tavg\tsum\tfirst_value
+                            1970-01-01T00:00:01.099967Z\tnull\t495.40261282660333\t1668516.0\t481.0
+                            1970-01-01T00:00:01.099995Z\t1\t495.08707124010556\t1688742.0\tnull
+                            1970-01-01T00:00:01.099973Z\t2\t506.5011448196909\t1769715.0\t697.0
+                            1970-01-01T00:00:01.099908Z\t3\t505.95267958950967\t1774882.0\t16.0
+                            1970-01-01T00:00:01.099977Z\t4\t501.16155593412833\t1765091.0\t994.0
+                            1970-01-01T00:00:01.099994Z\t5\t494.87667161961366\t1665260.0\t701.0
+                            1970-01-01T00:00:01.099991Z\t6\t500.67453098351336\t1761373.0\t830.0
+                            1970-01-01T00:00:01.099998Z\t7\t497.7231450719823\t1797776.0\t293.0
+                            1970-01-01T00:00:01.099997Z\t8\t498.6340425531915\t1757685.0\t868.0
+                            1970-01-01T00:00:01.099992Z\t9\t499.1758750361585\t1725651.0\t528.0
+                            1970-01-01T00:00:01.099989Z\t10\t500.3242937853107\t1771148.0\t936.0
+                            1970-01-01T00:00:01.099976Z\t11\t501.4019192774485\t1776467.0\t720.0
+                            1970-01-01T00:00:01.099984Z\t12\t489.8953058321479\t1721982.0\t949.0
+                            1970-01-01T00:00:01.099952Z\t13\t500.65723270440253\t1751299.0\t518.0
+                            1970-01-01T00:00:01.099996Z\t14\t506.8769141866513\t1754301.0\tnull
+                            1970-01-01T00:00:01.100000Z\t15\t497.0794058840331\t1740275.0\t824.0
+                            1970-01-01T00:00:01.099979Z\t16\t499.3338209479228\t1706723.0\t38.0
+                            1970-01-01T00:00:01.099951Z\t17\t492.7804469273743\t1764154.0\t698.0
+                            1970-01-01T00:00:01.099999Z\t18\t501.4806333050608\t1773737.0\t204.0
+                            1970-01-01T00:00:01.099957Z\t19\t501.01901034386356\t1792145.0\t712.0
+                            1970-01-01T00:00:01.099987Z\t20\t498.1350566366541\t1715079.0\t188.0
+                            """);
+
+            assertQuery(query1)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [i]
+                                VirtualRecord
+                                  functions: [ts,i,avg,sum,first_value]
+                                    GroupBy vectorized: false
+                                      keys: [i]
+                                      values: [max(ts),avg(j),sum(j::double),first(j::double)]
+                                        Encode sort
+                                          keys: [i, ts]
+                                            SelectedRecord
+                                                Filter filter: data.ts>=cnt.max-80000
+                                                    Hash Join Light
+                                                      condition: data.i=cnt.i
+                                                        Async Group By workers: 1
+                                                          keys: [i]
+                                                          values: [max(ts)]
+                                                          filter: null
+                                                            PageFrame
+                                                                Row forward scan
+                                                                Frame forward scan on: tab
+                                                        Hash
+                                                            PageFrame
+                                                                Row forward scan
+                                                                Frame forward scan on: tab
+                            """);
+
+            String query2 = "select last(ts) as ts, " +
+                    "i, " +
+                    "last(avg) as avg, " +
+                    "last(sum) as sum, " +
+                    "last(first_value) as first_value " +
+                    "from (  " +
+                    "  select * from (" +
+                    "    select ts, i, " +
+                    "    avg(j) over (partition by i order by ts range between 80000 preceding and current row) avg, " +
+                    "    sum(j) over (partition by i order by ts range between 80000 preceding and current row) sum, " +
+                    "    first_value(j) over (partition by i order by ts range between 80000 preceding and current row) first_value, " +
+                    "    from tab ) " +
+                    "  limit -100 )" +
+                    "order by i";
+
+            assertQuery(query2)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            ts\ti\tavg\tsum\tfirst_value
+                            1970-01-01T00:00:01.099967Z\tnull\t495.40261282660333\t1668516.0\t481
+                            1970-01-01T00:00:01.099995Z\t1\t495.08707124010556\t1688742.0\tnull
+                            1970-01-01T00:00:01.099973Z\t2\t506.5011448196909\t1769715.0\t697
+                            1970-01-01T00:00:01.099908Z\t3\t505.95267958950967\t1774882.0\t16
+                            1970-01-01T00:00:01.099977Z\t4\t501.16155593412833\t1765091.0\t994
+                            1970-01-01T00:00:01.099994Z\t5\t494.87667161961366\t1665260.0\t701
+                            1970-01-01T00:00:01.099991Z\t6\t500.67453098351336\t1761373.0\t830
+                            1970-01-01T00:00:01.099998Z\t7\t497.7231450719823\t1797776.0\t293
+                            1970-01-01T00:00:01.099997Z\t8\t498.6340425531915\t1757685.0\t868
+                            1970-01-01T00:00:01.099992Z\t9\t499.1758750361585\t1725651.0\t528
+                            1970-01-01T00:00:01.099989Z\t10\t500.3242937853107\t1771148.0\t936
+                            1970-01-01T00:00:01.099976Z\t11\t501.4019192774485\t1776467.0\t720
+                            1970-01-01T00:00:01.099984Z\t12\t489.8953058321479\t1721982.0\t949
+                            1970-01-01T00:00:01.099952Z\t13\t500.65723270440253\t1751299.0\t518
+                            1970-01-01T00:00:01.099996Z\t14\t506.8769141866513\t1754301.0\tnull
+                            1970-01-01T00:00:01.100000Z\t15\t497.0794058840331\t1740275.0\t824
+                            1970-01-01T00:00:01.099979Z\t16\t499.3338209479228\t1706723.0\t38
+                            1970-01-01T00:00:01.099951Z\t17\t492.7804469273743\t1764154.0\t698
+                            1970-01-01T00:00:01.099999Z\t18\t501.4806333050608\t1773737.0\t204
+                            1970-01-01T00:00:01.099957Z\t19\t501.01901034386356\t1792145.0\t712
+                            1970-01-01T00:00:01.099987Z\t20\t498.1350566366541\t1715079.0\t188
+                            """);
+
+            assertQuery(query2)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [i]
+                                GroupBy vectorized: false
+                                  keys: [i]
+                                  values: [last(ts),last(avg),last(sum),last(first_value)]
+                                    Limit value: -100 skip-rows: 999900 take-rows: 100
+                                        Window
+                                          functions: [avg(j) over (partition by [i] range between 80000 preceding and current row),sum(j) over (partition by [i] range between 80000 preceding and current row),first_value(j) over (partition by [i] range between 80000 preceding and current row)]
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: tab
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect11() throws Exception {
+        // test output naming
+        assertMemoryLeak(() -> {
+            execute("create table x ( a int, b int, c symbol, ts timestamp ) timestamp(ts) partition by DAY WAL;");
+            execute("insert into x values (1,2,'3', now()), (2,3, '3', now()), (5,6,'4', now())");
+            drainWalQueue();
+            String query =
+                    """
+                            select a, b as B, c as z, count(*) as views
+                            from x
+                            where a = 1
+                            group by a,b,z
+                            """;
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async JIT Group By workers: 1
+                              keys: [a,b,z]
+                              values: [count(*)]
+                              filter: a=1
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: x
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            a\tb\tz\tviews
+                            1\t2\t3\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect12() throws Exception {
+        // test output naming
+        assertMemoryLeak(() -> {
+            execute("create table x ( a int, b int, c symbol, ts timestamp ) timestamp(ts) partition by DAY WAL;");
+            execute("insert into x values (1,2,'3', now()), (2,3, '3', now()), (5,6,'4', now())");
+            drainWalQueue();
+            String query =
+                    """
+                            select a, b as B, c as z, count(*) as views
+                            from x
+                            where a = 1
+                            group by a,B,z
+                            """;
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async JIT Group By workers: 1
+                              keys: [a,B,z]
+                              values: [count(*)]
+                              filter: a=1
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: x
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            a\tB\tz\tviews
+                            1\t2\t3\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect2() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table x ( a int, b int, c symbol, ts timestamp ) timestamp(ts) partition by DAY WAL;");
+            execute("insert into x values (1,2,'3', now()), (2,3, '3', now()), (5,6,'4', now())");
+            drainWalQueue();
+            String query =
+                    """
+                            select a, b, c as z, count(*) as views
+                            from x
+                            where a = 1
+                            group by a,b,c
+                            """;
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [a,b,c,views]
+                                Async JIT Group By workers: 1
+                                  keys: [a,b,c]
+                                  values: [count(*)]
+                                  filter: a=1
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: x
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            a\tb\tz\tviews
+                            1\t2\t3\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect3() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table x ( a int, b int, c symbol, ts timestamp ) timestamp(ts) partition by DAY WAL;");
+            execute("insert into x values (1,2,'3', now()), (2,3, '3', now()), (5,6,'4', now())");
+            drainWalQueue();
+            String query =
+                    """
+                            select a, b, c, count(*) as views
+                            from x
+                            where a = 1
+                            group by a,b,c
+                            """;
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async JIT Group By workers: 1
+                              keys: [a,b,c]
+                              values: [count(*)]
+                              filter: a=1
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: x
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            a\tb\tc\tviews
+                            1\t2\t3\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect4() throws Exception {
+        // Check that if a select-choose node is elided by the factory, the WHERE condition can
+        // be retrieved from the inner PartitionFrame.
+        assertMemoryLeak(() -> {
+            execute("create table trades as (" +
+                    "select" +
+                    " timestamp_sequence(0, 15*60*1000000L) delivery_start_utc," +
+                    " rnd_symbol('sf', null) seller," +
+                    " rnd_symbol('sf', null) buyer," +
+                    " rnd_double() volume_mw" +
+                    " from long_sequence(100)" +
+                    "), index(seller), index(buyer) timestamp(delivery_start_utc)");
+            String expected = """
+                    y_utc_15m\ty_sf_position_mw
+                    1970-01-01T00:00:00.000000Z\t-0.2246301342497259
+                    1970-01-01T00:30:00.000000Z\t-0.6508594025855301
+                    1970-01-01T00:45:00.000000Z\t-0.9856290845874263
+                    1970-01-01T01:00:00.000000Z\t-0.5093827001617407
+                    1970-01-01T01:30:00.000000Z\t0.5599161804800813
+                    1970-01-01T01:45:00.000000Z\t0.2390529010846525
+                    1970-01-01T02:00:00.000000Z\t-0.6778564558839208
+                    1970-01-01T02:15:00.000000Z\t0.38539947865244994
+                    1970-01-01T02:30:00.000000Z\t-0.33608255572515877
+                    1970-01-01T02:45:00.000000Z\t0.7675673070796104
+                    1970-01-01T03:00:00.000000Z\t0.6217326707853098
+                    1970-01-01T03:15:00.000000Z\t0.6381607531178513
+                    1970-01-01T03:45:00.000000Z\t0.12026122412833129
+                    1970-01-01T04:00:00.000000Z\t-0.8912587536603974
+                    1970-01-01T04:15:00.000000Z\t-0.42281342727402726
+                    1970-01-01T04:30:00.000000Z\t-0.7664256753596138
+                    1970-01-01T05:15:00.000000Z\t-0.8847591603509142
+                    1970-01-01T05:30:00.000000Z\t0.931192737286751
+                    1970-01-01T05:45:00.000000Z\t0.8001121139739173
+                    1970-01-01T06:00:00.000000Z\t0.92050039469858
+                    1970-01-01T06:15:00.000000Z\t0.456344569609078
+                    1970-01-01T06:30:00.000000Z\t0.40455469747939254
+                    1970-01-01T06:45:00.000000Z\t0.5659429139861241
+                    1970-01-01T07:00:00.000000Z\t-0.6821660861001273
+                    1970-01-01T07:30:00.000000Z\t-0.11585982949541473
+                    1970-01-01T07:45:00.000000Z\t0.8164182592467494
+                    1970-01-01T08:00:00.000000Z\t0.5449155021518948
+                    1970-01-01T08:30:00.000000Z\t0.49428905119584543
+                    1970-01-01T08:45:00.000000Z\t-0.6551335839796312
+                    1970-01-01T09:15:00.000000Z\t0.9540069089049732
+                    1970-01-01T09:30:00.000000Z\t-0.03167026265669903
+                    1970-01-01T09:45:00.000000Z\t-0.19751370382305056
+                    1970-01-01T10:00:00.000000Z\t0.6806873134626418
+                    1970-01-01T10:15:00.000000Z\t-0.24008362859107102
+                    1970-01-01T10:30:00.000000Z\t-0.9455893004802433
+                    1970-01-01T10:45:00.000000Z\t-0.6247427794126656
+                    1970-01-01T11:00:00.000000Z\t-0.3901731258748704
+                    1970-01-01T11:15:00.000000Z\t-0.10643046345788132
+                    1970-01-01T11:30:00.000000Z\t0.07246172621937097
+                    1970-01-01T11:45:00.000000Z\t-0.3679848625908545
+                    1970-01-01T12:00:00.000000Z\t0.6697969295620055
+                    1970-01-01T12:15:00.000000Z\t-0.26369335635512836
+                    1970-01-01T12:45:00.000000Z\t-0.19846258365662472
+                    1970-01-01T13:00:00.000000Z\t-0.8595900073631431
+                    1970-01-01T13:15:00.000000Z\t0.7458169804091256
+                    1970-01-01T13:30:00.000000Z\t0.4274704286353759
+                    1970-01-01T14:00:00.000000Z\t-0.8291193369353376
+                    1970-01-01T14:30:00.000000Z\t0.2711532808184136
+                    1970-01-01T15:00:00.000000Z\t-0.8189713915910615
+                    1970-01-01T15:15:00.000000Z\t0.7365115215570027
+                    1970-01-01T15:30:00.000000Z\t-0.9418719455092096
+                    1970-01-01T16:00:00.000000Z\t-0.05024615679069011
+                    1970-01-01T16:15:00.000000Z\t-0.8952510116133903
+                    1970-01-01T16:30:00.000000Z\t-0.029227696942726644
+                    1970-01-01T16:45:00.000000Z\t-0.7668146556860689
+                    1970-01-01T17:00:00.000000Z\t-0.05158459929273784
+                    1970-01-01T17:15:00.000000Z\t-0.06846631555382798
+                    1970-01-01T17:30:00.000000Z\t-0.5708643723875381
+                    1970-01-01T17:45:00.000000Z\t0.7260468106076399
+                    1970-01-01T18:15:00.000000Z\t-0.1010501916946902
+                    1970-01-01T18:30:00.000000Z\t-0.05094182589333662
+                    1970-01-01T18:45:00.000000Z\t-0.38402128906440336
+                    1970-01-01T19:15:00.000000Z\t0.7694744648762927
+                    1970-01-01T19:45:00.000000Z\t0.6901976778065181
+                    1970-01-01T20:00:00.000000Z\t-0.5913874468544745
+                    1970-01-01T20:30:00.000000Z\t-0.14261321308606745
+                    1970-01-01T20:45:00.000000Z\t0.4440250924606578
+                    1970-01-01T21:00:00.000000Z\t-0.09618589590900506
+                    1970-01-01T21:15:00.000000Z\t-0.08675950660182763
+                    1970-01-01T21:30:00.000000Z\t-0.741970173888595
+                    1970-01-01T21:45:00.000000Z\t0.4167781163798937
+                    1970-01-01T22:00:00.000000Z\t-0.05514933756198426
+                    1970-01-01T22:30:00.000000Z\t-0.2093569947644236
+                    1970-01-01T22:45:00.000000Z\t-0.8439276969435359
+                    1970-01-01T23:00:00.000000Z\t-0.03973283003449557
+                    1970-01-01T23:15:00.000000Z\t-0.8551850405049611
+                    1970-01-01T23:45:00.000000Z\t0.6226001464598434
+                    1970-01-02T00:00:00.000000Z\t-0.7195457109208119
+                    1970-01-02T00:15:00.000000Z\t-0.23493793601747937
+                    1970-01-02T00:30:00.000000Z\t-0.6334964081687151
+                    """;
+            String query = """
+                    SELECT
+                        delivery_start_utc as y_utc_15m,
+                        sum(case
+                                when seller='sf' then -1.0*volume_mw
+                                when buyer='sf' then 1.0*volume_mw
+                                else 0.0
+                            end)
+                        as y_sf_position_mw
+                    FROM (
+                        SELECT delivery_start_utc, seller, buyer, volume_mw FROM trades
+                        WHERE
+                            (seller = 'sf' OR buyer = 'sf')
+                        )
+                    group by y_utc_15m \
+                    order by y_utc_15m""";
+
+            assertQuery(query)
+                    .timestamp("y_utc_15m")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [y_utc_15m]
+                                GroupBy vectorized: false
+                                  keys: [y_utc_15m]
+                                  values: [sum(case([seller='sf',-1.0*volume_mw,buyer='sf',1.0*volume_mw,0.0]))]
+                                    SelectedRecord
+                                        Async JIT Filter workers: 1
+                                          filter: (seller='sf' or buyer='sf')
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: trades
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect5() throws Exception {
+        // Test aliasing a function name
+        assertMemoryLeak(() -> {
+            execute("create table x ( a int, b int, c symbol, ts timestamp ) timestamp(ts) partition by DAY WAL;");
+            execute("insert into x values (1,2,'3', now()), (2,3, '3', now()), (5,6,'4', now())");
+            execute("insert into x values (1, 5, '4', now()), (1, 3, '1', now())");
+            drainWalQueue();
+            String query = """
+                    select a, sum(b) sum, c as z, count(*) views
+                    from x
+                    where a = 1
+                    group by a,b,z
+                    order by a,b,z
+                    """;
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            SelectedRecord
+                                Encode sort light
+                                  keys: [a, b, z]
+                                    VirtualRecord
+                                      functions: [a,sum,z,views,b]
+                                        Async JIT Group By workers: 1
+                                          keys: [a,z,b]
+                                          values: [sum(b),count(*)]
+                                          filter: a=1
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: x
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            a\tsum\tz\tviews
+                            1\t2\t3\t1
+                            1\t3\t1\t1
+                            1\t5\t4\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect6() throws Exception {
+        // Test ClickBench Q39 plan
+        assertMemoryLeak(() -> {
+            execute("""
+                    CREATE TABLE hits
+                    (
+                        URL string,
+                        Referer string,
+                        TraficSourceID int,
+                        SearchEngineID short,
+                        AdvEngineID short,
+                        EventTime timestamp,
+                        CounterID int,
+                        IsRefresh short
+                    ) TIMESTAMP(EventTime) PARTITION BY DAY;""");
+            String query1 =
+                    """
+                            SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews
+                            FROM hits
+                            WHERE CounterID = 62 AND EventTime >= '2013-07-01T00:00:00Z' AND EventTime <= '2013-07-31T23:59:59Z' AND IsRefresh = 0
+                            GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst
+                            ORDER BY PageViews DESC
+                            LIMIT 1000, 1010;""";
+            assertQuery(query1)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light lo: 1000 hi: 1010
+                              keys: [PageViews desc]
+                                VirtualRecord
+                                  functions: [TraficSourceID,SearchEngineID,AdvEngineID,Src,Dst,PageViews]
+                                    Async JIT Group By workers: 1
+                                      keys: [TraficSourceID,SearchEngineID,AdvEngineID,Src,Dst]
+                                      keyFunctions: [case([(SearchEngineID=0 and AdvEngineID=0),Referer,''])]
+                                      values: [count(*)]
+                                      filter: (CounterID=62 and IsRefresh=0)
+                                        PageFrame
+                                            Row forward scan
+                                            Interval forward scan on: hits
+                                              intervals: [("2013-07-01T00:00:00.000000Z","2013-07-31T23:59:59.000000Z")]
+                            """);
+            String query2 =
+                    """
+                            SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL, COUNT(*) AS PageViews
+                            FROM hits
+                            WHERE CounterID = 62 AND EventTime >= '2013-07-01T00:00:00Z' AND EventTime <= '2013-07-31T23:59:59Z' AND IsRefresh = 0
+                            GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, URL
+                            ORDER BY PageViews DESC
+                            LIMIT 1000, 1010;""";
+            assertQuery(query2)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light lo: 1000 hi: 1010
+                              keys: [PageViews desc]
+                                VirtualRecord
+                                  functions: [TraficSourceID,SearchEngineID,AdvEngineID,Src,URL,PageViews]
+                                    Async JIT Group By workers: 1
+                                      keys: [TraficSourceID,SearchEngineID,AdvEngineID,Src,URL]
+                                      keyFunctions: [case([(SearchEngineID=0 and AdvEngineID=0),Referer,''])]
+                                      values: [count(*)]
+                                      filter: (CounterID=62 and IsRefresh=0)
+                                        PageFrame
+                                            Row forward scan
+                                            Interval forward scan on: hits
+                                              intervals: [("2013-07-01T00:00:00.000000Z","2013-07-31T23:59:59.000000Z")]
+                            """);
+            String query3 = """
+                    SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL, COUNT(*) AS PageViews, concat(lpad(cast(TraficSourceId as string), 10, '0'), lpad(cast(Referer as string), 32, '0')) as cat
+                    FROM hits
+                    WHERE CounterID = 62 AND EventTime >= '2013-07-01T00:00:00Z' AND EventTime <= '2013-07-31T23:59:59Z' AND IsRefresh = 0
+                    GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, URL, cat
+                    ORDER BY PageViews DESC
+                    LIMIT 1000, 1010;""";
+            assertQuery(query3)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light lo: 1000 hi: 1010
+                              keys: [PageViews desc]
+                                VirtualRecord
+                                  functions: [TraficSourceID,SearchEngineID,AdvEngineID,Src,URL,PageViews,cat]
+                                    Async JIT Group By workers: 1
+                                      keys: [TraficSourceID,SearchEngineID,AdvEngineID,Src,URL,cat]
+                                      keyFunctions: [case([(SearchEngineID=0 and AdvEngineID=0),Referer,'']),concat([lpad(TraficSourceID::string,10,'0'),lpad(Referer,32,'0')])]
+                                      values: [count(*)]
+                                      filter: (CounterID=62 and IsRefresh=0)
+                                        PageFrame
+                                            Row forward scan
+                                            Interval forward scan on: hits
+                                              intervals: [("2013-07-01T00:00:00.000000Z","2013-07-31T23:59:59.000000Z")]
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect7() throws Exception {
+        // test duplicate key ordering
+        assertMemoryLeak(() -> {
+            execute("create table t as ( select x%2 key1, x%4 key2, x as value from long_sequence(10));");
+            String query = "select key1 as k1, key2, key2, count(*) from t group by key2, k1 order by 1, 2";
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            k1\tkey2\tkey21\tcount
+                            0\t0\t0\t2
+                            0\t2\t2\t3
+                            1\t1\t1\t3
+                            1\t3\t3\t2
+                            """);
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [k1, key2]
+                                VirtualRecord
+                                  functions: [k1,key2,key2,count]
+                                    Async Group By workers: 1
+                                      keys: [k1,key2]
+                                      values: [count(*)]
+                                      filter: null
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: t
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect8() throws Exception {
+        // test ordering by number
+        assertMemoryLeak(() -> {
+            execute("create table t as ( select x%2 as key, x as value from long_sequence(100));");
+            String query = "select key+1, key, key, count(*) from t group by key order by 1,2,3 desc";
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            column\tkey\tkey1\tcount
+                            1\t0\t0\t50
+                            2\t1\t1\t50
+                            """);
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [column, key, key1 desc]
+                                VirtualRecord
+                                  functions: [key+1,key,key,count]
+                                    Async Group By workers: 1
+                                      keys: [key]
+                                      values: [count(*)]
+                                      filter: null
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: t
+                            """);
+        });
+    }
+
+    @Test
+    public void testLiftAliasesFromInnerSelect9() throws Exception {
+        // test args requiring de-aliasing when moved to rhs
+        assertMemoryLeak(() -> {
+            execute("create table t1 as (select x::int as x, x%2 as y from long_sequence(2))");
+            execute("create table t2 as (select x::int as x, x%2 as y from long_sequence(2))");
+
+            String query = "select t1.x, max(t2.y), dateadd('s', max(t2.y)::int, dateadd('d', t1.x, '2023-03-01T00:00:00') ) " +
+                    "from t1 " +
+                    "join t2 on t1.y = t2.y  " +
+                    "group by t1.x, t2.x, dateadd('d', t1.x, '2023-03-01T00:00:00') " +
+                    "order by 1, 2, 3";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [x, max, dateadd]
+                                VirtualRecord
+                                  functions: [x,max,dateadd('s',max::int,dateadd)]
+                                    Async Hash Join Group By workers: 1
+                                      logicalJoinType: inner
+                                      physicalJoinType: inner
+                                      inputSwapped: false
+                                      condition: t1.y=t2.y
+                                      buildStrategy: shared
+                                      buildPayload: copied when the probe is large enough
+                                      keys: [x,dateadd,x1]
+                                      keyFunctions: [dateadd('d',t1.x,2023-03-01T00:00:00.000000Z)]
+                                      values: [max(t2.y)]
+                                        Probe
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t1
+                                        Build
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t2
+                            """);
+
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            x\tmax\tdateadd
+                            1\t1\t2023-03-02T00:00:01.000000Z
+                            2\t0\t2023-03-03T00:00:00.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testLimitedOrderByLongConstant() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table x (sym symbol, ts timestamp) timestamp(ts) partition by day;");
+            execute("insert into x values ('1','2023-01-01T00:00:00'),('1','2023-01-01T00:00:01'),('2','2023-01-01T00:00:03')");
+            assertQuery("SELECT sym, first((0::timestamp)::long) latest " +
+                    "FROM x " +
+                    "WHERE ts IN '2023-01-01' " +
+                    "ORDER BY latest DESC " +
+                    "LIMIT 10;")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sym\tlatest
+                            1\t0
+                            2\t0
+                            """);
+        });
+    }
+
+    @Test
+    public void testManyAggregatesFallbackUpdater() throws Exception {
+        // This test verifies that GROUP BY queries with many aggregate functions
+        // don't fail with "Bytecode is too long" error. See issue #3326.
+        assertMemoryLeak(() -> {
+            // change to 6k to reproduce the OG issue
+            final int functionCount = 1000;
+            execute("create table t (value double)");
+            execute("insert into t values (1.5)");
+
+            StringBuilder query = new StringBuilder("select ");
+            StringBuilder expectedHeader = new StringBuilder();
+            StringBuilder expectedValues = new StringBuilder();
+            for (int i = 0; i < functionCount; i++) {
+                query.append("avg(value + ").append(i).append(") avg").append(i);
+                expectedHeader.append("avg").append(i);
+                expectedValues.append(1.5 + i);
+                if (i != functionCount - 1) {
+                    query.append(", ");
+                    expectedHeader.append("\t");
+                    expectedValues.append("\t");
+                }
+            }
+            query.append(" from t;");
+            expectedHeader.append("\n");
+            expectedValues.append("\n");
+
+            // assertQueryNoLeakCheck's cursor memory verification is too strict, so we're using assertSql;
+            // that's because non-keyed group by cursors only close their map value when the factory is closed
+            assertQuery(query)
+                    .noLeakCheck()
+                    .returnsOnce(expectedHeader + expectedValues.toString());
+        });
+    }
+
+    @Test
+    public void testManyAggregatesFallbackUpdaterNoAliases() throws Exception {
+        // Same as testManyAggregatesFallbackUpdater, but without aliases.
+        final Rnd rnd = TestUtils.generateRandom(LOG);
+        final boolean aliasExprEnabled = rnd.nextBoolean();
+        setProperty(PropertyKey.CAIRO_SQL_COLUMN_ALIAS_EXPRESSION_ENABLED, Boolean.toString(aliasExprEnabled));
+        assertMemoryLeak(() -> {
+            final int functionCount = 1000;
+            execute("create table t (value double)");
+            execute("insert into t values (1.5)");
+
+            StringBuilder query = new StringBuilder("select ");
+            StringBuilder expectedHeader = new StringBuilder();
+            StringBuilder expectedValues = new StringBuilder();
+            for (int i = 0; i < functionCount; i++) {
+                query.append("avg(value + ").append(i).append(")");
+                if (aliasExprEnabled) {
+                    expectedHeader.append("avg(value + ").append(i).append(")");
+                } else {
+                    expectedHeader.append("avg");
+                    if (i > 0) {
+                        expectedHeader.append(i);
+                    }
+                }
+                expectedValues.append(1.5 + i);
+                if (i != functionCount - 1) {
+                    query.append(", ");
+                    expectedHeader.append("\t");
+                    expectedValues.append("\t");
+                }
+            }
+            query.append(" from t;");
+            expectedHeader.append("\n");
+            expectedValues.append("\n");
+
+            // assertQueryNoLeakCheck's cursor memory verification is too strict, so we're using assertSql;
+            // that's because non-keyed group by cursors only close their map value when the factory is closed
+            assertQuery(query.toString())
+                    .noLeakCheck()
+                    .returnsOnce(expectedHeader + expectedValues.toString());
+        });
+    }
+
+    @Test
+    public void testNestedFilterAcrossGroupByWithBindVariable() throws Exception {
+        // The optimiser splits a WHERE over a GROUP BY subquery into two
+        // model filters when one conjunct references the aggregated column
+        // and the other references no column at all (e.g. a bind variable
+        // comparison): the constant-only conjunct gets pushed past the
+        // aggregate while the agg-column conjunct stays at the outer
+        // level. The literal form folds the constant conjunct away so this
+        // never surfaced; the bind form keeps it opaque, so codegen wraps
+        // a FilteredRecordCursorFactory over another, which historically
+        // tripped a constructor-time assertion. The factory now collapses
+        // those into a single combined-filter wrapper.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (sym SYMBOL, ts TIMESTAMP) timestamp(ts) PARTITION BY DAY");
+            execute("INSERT INTO t VALUES ('A', '2024-01-01T00:00:00.000000Z')");
+
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "KNWL");
+
+            assertQuery("SELECT * FROM (SELECT sym AS k, count() AS cnt FROM t)\n" +
+                    "WHERE (cnt IS NOT NULL) AND (:b0::VARCHAR != 'UX')")
+                    .noLeakCheck()
+                    .returns("""
+                            k\tcnt
+                            A\t1
+                            """);
+        });
+    }
+
+    @Test
+    public void testNestedGroupByWithExplicitGroupByClause() throws Exception {
+        String expected = """
+                url\tu_count\tcnt\tavg_m_sum
+                RXPEHNRXGZ\t4\t4\t414.25
+                DXYSBEOUOJ\t1\t1\t225.0
+                SXUXIBBTGP\t2\t2\t379.5
+                GWFFYUDEYY\t5\t5\t727.2
+                LOFJGETJRS\t2\t2\t524.5
+                ZSRYRFBVTM\t2\t2\t337.0
+                VTJWCPSWHY\t1\t1\t660.0
+                HGOOZZVDZJ\t1\t1\t540.0
+                SHRUEDRQQU\t2\t2\t468.0
+                """;
+        assertQuery("""
+                WITH x_sample AS (
+                  SELECT id, uuid, url, sum(metric) m_sum
+                  FROM x
+                  WHERE ts >= '1023-03-31T00:00:00' and ts <= '2023-04-02T23:59:59'
+                  GROUP BY id, uuid, url
+                )
+                SELECT url, count_distinct(uuid) u_count, count() cnt, avg(m_sum) avg_m_sum
+                FROM x_sample
+                GROUP BY url""")
+                .ddl("""
+                        create table x as (
+                        select timestamp_sequence(100000000, 100000000) ts,
+                          rnd_int(0, 10, 0) id,
+                          rnd_uuid4() uuid,
+                          rnd_str(10, 10, 10, 0) url,
+                          rnd_long(0, 1000, 0) metric
+                        from long_sequence(20)) timestamp(ts)""")
+                .expectSize()
+                .returns(expected);
+        assertQuery("""
+                WITH x_sample AS (
+                  SELECT id, uuid, url, sum(metric) m_sum
+                  FROM x
+                  WHERE ts >= '1023-03-31T00:00:00' and ts <= '2023-04-02T23:59:59'
+                  GROUP BY id, uuid, url
+                )
+                SELECT url, count(distinct uuid) u_count, count() cnt, avg(m_sum) avg_m_sum
+                FROM x_sample
+                GROUP BY url""")
+                .expectSize()
+                .noLeakCheck()
+                .returns(expected);
+    }
+
+    @Test
+    public void testNonKeyedAggOverArithmeticBind() throws Exception {
+        // OPERATION (+) over a BIND_VARIABLE leaf is effectively-constant via
+        // the recursive walk in isEffectivelyConstantExpression, so it lifts
+        // to the outer projection in a non-keyed aggregate.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (x INT)");
+            execute("INSERT INTO t VALUES (1), (2), (3)");
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "5");
+            assertQuery("SELECT :b0::LONG + 1 AS e0, count() AS a0 FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("e0\ta0\n6\t3\n");
+        });
+    }
+
+    @Test
+    public void testNonKeyedAggOverConstantCastNonEmpty() throws Exception {
+        // Sanity check: cast and bind projections render correctly when
+        // WHERE doesn't filter everything out, so the non-keyed aggregate
+        // sees real rows and the lifted projection still resolves to its
+        // bind / constant value at row time.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (c2 STRING)");
+            execute("INSERT INTO t VALUES ('A'), ('B'), ('C')");
+            String expected = "e0\ta0\nX\t3\n";
+            assertQuery("SELECT 'X'::CHAR AS e0, count() AS a0 FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "X");
+            assertQuery("SELECT :b0::CHAR AS e0, count() AS a0 FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "X");
+            assertQuery("SELECT :b0 AS e0, count() AS a0 FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+        });
+    }
+
+    @Test
+    public void testNonKeyedAggOverConstantCastProjection() throws Exception {
+        // Regression: a SELECT projection like 'X'::CHAR or :b0::CHAR is
+        // semantically constant per query, but isEffectivelyConstantExpression
+        // rejected FUNCTION nodes whose factory wasn't registered as runtime-
+        // constant. The optimiser then routed the projection through the
+        // keyed GROUP BY path, so a WHERE that filtered out every row produced
+        // an empty result instead of the single default-aggregate row a
+        // non-keyed aggregate is supposed to emit. Casts over constants and
+        // bind variables are now treated as effectively-constant.
+        //
+        // Without an explicit GROUP BY clause QuestDB returns the aggregate
+        // default row (the rule); explicit GROUP BY by a constant key still
+        // returns no rows on empty input (the documented exception).
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (c2 STRING)");
+            execute("INSERT INTO t VALUES ('A')");
+            String expected = """
+                    e0\ta0
+                    X\t0
+                    """;
+            assertQuery("SELECT 'X'::CHAR AS e0, count() AS a0 FROM t WHERE 1=0")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "X");
+            assertQuery("SELECT :b0::CHAR AS e0, count() AS a0 FROM t WHERE 1=0")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "X");
+            assertQuery("SELECT :b0 AS e0, count() AS a0 FROM t WHERE 1=0")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expected);
+            // Explicit GROUP BY by a constant-equivalent key keeps the empty-result exception.
+            // The grammar accepts column references / aliases / position numbers in GROUP
+            // BY, so route the bind cases through their projection alias.
+            String expectedEmpty = "e0\ta0\n";
+            assertQuery("SELECT 'X'::CHAR AS e0, count() AS a0 FROM t WHERE 1=0 GROUP BY 'X'::CHAR")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expectedEmpty);
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "X");
+            assertQuery("SELECT :b0::CHAR AS e0, count() AS a0 FROM t WHERE 1=0 GROUP BY e0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expectedEmpty);
+            bindVariableService.clear();
+            bindVariableService.setStr("b0", "X");
+            assertQuery("SELECT :b0 AS e0, count() AS a0 FROM t WHERE 1=0 GROUP BY e0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns(expectedEmpty);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedAllBatchEligible() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    """
+                            INSERT INTO t VALUES
+                            (10, '2024-01-01T00:00:00.000000Z'),
+                            (20, '2024-01-01T12:00:00.000000Z'),
+                            (30, '2024-01-02T00:00:00.000000Z'),
+                            (40, '2024-01-02T12:00:00.000000Z'),
+                            (50, '2024-01-03T00:00:00.000000Z')"""
+            );
+
+            String query = "SELECT sum(v), min(v), max(v), count(*), avg(v), first(v), last(v) FROM t";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async Group By workers: 1
+                              vectorized: true
+                              values: [sum(v),min(v),max(v),count(*),avg(v),first(v),last(v)]
+                              filter: null
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sum\tmin\tmax\tcount\tavg\tfirst\tlast
+                            150\t10\t50\t5\t30.0\t10\t50
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedAllNulls() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    """
+                            INSERT INTO t(ts) VALUES
+                            ('2024-01-01T00:00:00.000000Z'),
+                            ('2024-01-02T00:00:00.000000Z')"""
+            );
+
+            assertQuery("SELECT sum(v), min(v), max(v), count(*), avg(v), first(v), last(v), first_not_null(v), last_not_null(v) FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sum\tmin\tmax\tcount\tavg\tfirst\tlast\tfirst_not_null\tlast_not_null
+                            null\tnull\tnull\t2\tnull\tnull\tnull\tnull\tnull
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedColumnTops() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    """
+                            INSERT INTO t VALUES
+                            (10, '2024-01-01T00:00:00.000000Z'),
+                            (20, '2024-01-02T00:00:00.000000Z')"""
+            );
+            // Add a new column — older partitions will have column tops.
+            execute("ALTER TABLE t ADD COLUMN v2 INT");
+            execute("""
+                    INSERT INTO t VALUES
+                    (30, '2024-01-03T00:00:00.000000Z', 100),
+                    (40, '2024-01-04T00:00:00.000000Z', 200)""");
+
+            assertQuery("SELECT sum(v), min(v), max(v), count(*), first(v), last(v), sum(v2), first_not_null(v2), last_not_null(v2) FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sum\tmin\tmax\tcount\tfirst\tlast\tsum1\tfirst_not_null\tlast_not_null
+                            100\t10\t40\t4\t10\t40\t300\t100\t200
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedEmptyTable() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+
+            assertQuery("SELECT sum(v), min(v), max(v), count(*), avg(v), first(v), last(v) FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sum\tmin\tmax\tcount\tavg\tfirst\tlast
+                            null\tnull\tnull\t0\tnull\tnull\tnull
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedFirstLastNotNull() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    """
+                            INSERT INTO t VALUES
+                            (null, '2024-01-01T00:00:00.000000Z'),
+                            (10, '2024-01-01T12:00:00.000000Z'),
+                            (20, '2024-01-02T00:00:00.000000Z'),
+                            (null, '2024-01-02T12:00:00.000000Z'),
+                            (30, '2024-01-03T00:00:00.000000Z'),
+                            (null, '2024-01-03T12:00:00.000000Z')"""
+            );
+
+            String query = "SELECT first(v), last(v), first_not_null(v), last_not_null(v) FROM t";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async Group By workers: 1
+                              vectorized: true
+                              values: [first(v),last(v),first_not_null(v),last_not_null(v)]
+                              filter: null
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            first\tlast\tfirst_not_null\tlast_not_null
+                            null\tnull\t10\t30
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedHybridPath() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    """
+                            INSERT INTO t VALUES
+                            (10, '2024-01-01T00:00:00.000000Z'),
+                            (20, '2024-01-01T12:00:00.000000Z'),
+                            (30, '2024-01-02T00:00:00.000000Z')"""
+            );
+
+            // first(v) is batch-eligible, last(v + 1) is not (expression arg, not decomposable).
+            String query = "SELECT first(v), last(v + 1) FROM t";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async Group By workers: 1
+                              vectorized: true
+                              values: [first(v),last(v+1)]
+                              filter: null
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            first\tlast
+                            10\t31
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedMultipleTypes() throws Exception {
+        assertMemoryLeak(() -> {
+            execute(
+                    """
+                            CREATE TABLE t (
+                                vi INT, vl LONG, vd DOUBLE, vf FLOAT, vs SHORT,
+                                ts TIMESTAMP
+                            ) TIMESTAMP(ts) PARTITION BY DAY"""
+            );
+            execute(
+                    """
+                            INSERT INTO t VALUES
+                            (1, 100, 1.5, 1.5, 10, '2024-01-01T00:00:00.000000Z'),
+                            (2, 200, 2.5, 2.5, 20, '2024-01-02T00:00:00.000000Z'),
+                            (3, 300, 3.5, 3.5, 30, '2024-01-03T00:00:00.000000Z')"""
+            );
+
+            assertQuery("SELECT sum(vi), sum(vl), sum(vd), sum(vf), sum(vs), min(vi), max(vi), first(vi), last(vi) FROM t")
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sum\tsum1\tsum2\tsum3\tsum4\tmin\tmax\tfirst\tlast
+                            6\t600\t7.5\t7.5\t60\t1\t3\t1\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedNotEligible() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    """
+                            INSERT INTO t VALUES
+                            (10, '2024-01-01T00:00:00.000000Z'),
+                            (20, '2024-01-02T00:00:00.000000Z')"""
+            );
+
+            // All functions use expression args, so none are batch-eligible.
+            String query = "SELECT first(v * 2), last(v + 1) FROM t";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async Group By workers: 1
+                              vectorized: false
+                              values: [first(v*2),last(v+1)]
+                              filter: null
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            first\tlast
+                            20\t21
+                            """);
+        });
+    }
+
+    @Test
+    public void testNonKeyedVectorizedWithFilter() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute(
+                    """
+                            INSERT INTO t VALUES
+                            (10, '2024-01-01T00:00:00.000000Z'),
+                            (20, '2024-01-01T12:00:00.000000Z'),
+                            (30, '2024-01-02T00:00:00.000000Z'),
+                            (40, '2024-01-02T12:00:00.000000Z')"""
+            );
+
+            // Filter disables the vectorized path.
+            String query = "SELECT sum(v), count(*), first(v) FROM t WHERE v > 15";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Async JIT Group By workers: 1
+                              vectorized: false
+                              values: [sum(v),count(*),first(v)]
+                              filter: 15<v
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: t
+                            """);
+            assertQuery(query)
+                    .noRandomAccess()
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sum\tcount\tfirst
+                            90\t3\t20
+                            """);
+        });
+    }
+
+    @Test
+    public void testOrderByOnAliasedColumnAfterGroupBy() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table tst ( ts timestamp ) timestamp(ts);");
+            execute("insert into tst values ('2023-05-29T15:30:00.000000Z')");
+
+            execute("create table data ( dts timestamp, s symbol ) timestamp(dts);");
+            execute("insert into data values ('2023-05-29T15:29:59.000000Z', 'USD')");
+
+            // single table
+            assertQuery("SELECT ts AS ref0 " +
+                    "FROM tst " +
+                    "GROUP BY ts " +
+                    "ORDER BY ts")
+                    .timestamp("ref0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("ref0\n2023-05-29T15:30:00.000000Z\n");
+
+            assertQuery("SELECT tst.ts AS ref0 " +
+                    "FROM tst " +
+                    "GROUP BY tst.ts " +
+                    "ORDER BY tst.ts")
+                    .timestamp("ref0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("ref0\n2023-05-29T15:30:00.000000Z\n");
+
+            assertQuery("SELECT tst.ts AS ref0 " +
+                    "FROM tst " +
+                    "GROUP BY ts " +
+                    "ORDER BY tst.ts")
+                    .timestamp("ref0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("ref0\n2023-05-29T15:30:00.000000Z\n");
+
+            assertQuery("SELECT ts AS ref0 " +
+                    "FROM tst " +
+                    "GROUP BY tst.ts " +
+                    "ORDER BY ts")
+                    .timestamp("ref0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("ref0\n2023-05-29T15:30:00.000000Z\n");
+
+            // joins
+            for (String join : Arrays.asList("LT JOIN data ", "ASOF JOIN data ", "LEFT JOIN data on (tst.ts > data.dts) ", "INNER JOIN data on (tst.ts > data.dts) ", "CROSS JOIN data ")) {
+                assertQuery("SELECT ts AS ref0, dts " +
+                        "FROM tst " +
+                        join +
+                        "GROUP BY tst.ts, data.dts " +
+                        "ORDER BY ts")
+                        .timestamp("ref0")
+                        .expectSize()
+                        .noLeakCheck()
+                        .returns("ref0\tdts\n2023-05-29T15:30:00.000000Z\t2023-05-29T15:29:59.000000Z\n");
+
+                assertQuery("SELECT ts AS ref0, dts " +
+                        "FROM tst " +
+                        join +
+                        "GROUP BY ts, data.dts " +
+                        "ORDER BY tst.ts")
+                        .timestamp("ref0")
+                        .expectSize()
+                        .noLeakCheck()
+                        .returns("ref0\tdts\n2023-05-29T15:30:00.000000Z\t2023-05-29T15:29:59.000000Z\n");
+            }
+        });
+    }
+
+    @Test
+    public void testSelectDistinctOnAliasedColumnWithOrderBy() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table tab (created timestamp, i int) timestamp(created)");
+            execute("insert into tab select x::timestamp, x from long_sequence(3)");
+            drainWalQueue();
+
+            String query = "SELECT DISTINCT tab.created AS ref0 " +
+                    "FROM tab " +
+                    "WHERE (tab.created) IS NOT NULL " +
+                    "GROUP BY tab.created " +
+                    "ORDER BY tab.created";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [ref0]
+                                VirtualRecord
+                                  functions: [created]
+                                    Async JIT Group By workers: 1
+                                      keys: [created]
+                                      filter: null!=created
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: tab
+                            """);
+
+            assertQuery(query)
+                    .timestamp("ref0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            ref0
+                            1970-01-01T00:00:00.000001Z
+                            1970-01-01T00:00:00.000002Z
+                            1970-01-01T00:00:00.000003Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testSelectDistinctOnExpressionWithOrderBy() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table tab (created timestamp, i int) timestamp(created)");
+            execute("insert into tab select x::timestamp, x from long_sequence(3)");
+            drainWalQueue();
+
+            String query = "SELECT DISTINCT dateadd('h', 1, tab.created) AS ref0 " +
+                    "FROM tab " +
+                    "WHERE (tab.created) IS NOT NULL " +
+                    "GROUP BY tab.created " +
+                    "ORDER BY dateadd('h', 1, tab.created)";
+
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [ref0]
+                                VirtualRecord
+                                  functions: [dateadd('h',1,created)]
+                                    Async JIT Group By workers: 1
+                                      keys: [created]
+                                      filter: null!=created
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: tab
+                            """);
+
+            assertQuery(query)
+                    .timestamp("ref0")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            ref0
+                            1970-01-01T01:00:00.000001Z
+                            1970-01-01T01:00:00.000002Z
+                            1970-01-01T01:00:00.000003Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testSelectDistinctOnUnaliasedColumnWithOrderBy() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table tab (created timestamp, i int) timestamp(created)");
+            execute("insert into tab select x::timestamp, x from long_sequence(3)");
+            drainWalQueue();
+
+            String query = "SELECT DISTINCT tab.created " +
+                    "FROM tab " +
+                    "WHERE (tab.created) IS NOT NULL " +
+                    "GROUP BY tab.created " +
+                    "ORDER BY tab.created";
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [created]
+                                Async JIT Group By workers: 1
+                                  keys: [created]
+                                  filter: null!=created
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: tab
+                            """);
+
+            assertQuery(query)
+                    .timestamp("created")
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            created
+                            1970-01-01T00:00:00.000001Z
+                            1970-01-01T00:00:00.000002Z
+                            1970-01-01T00:00:00.000003Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testSelectMatchingButInDifferentOrderThanGroupBy() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table x (" +
+                    "    sym symbol," +
+                    "    bid double, " +
+                    "    ts timestamp " +
+                    ") timestamp(ts) partition by DAY");
+            execute("insert into x " +
+                    " select rnd_symbol('A', 'B'), rnd_double(), dateadd('m', x::int, 0::timestamp) " +
+                    " from long_sequence(20)");
+
+            String query = "select sym, hour(ts), avg(bid) avgBid from x group by hour(ts), sym order by hour(ts), sym";
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [hour, sym]
+                                VirtualRecord
+                                  functions: [sym,hour,avgBid]
+                                    Async Group By workers: 1
+                                      keys: [sym,hour]
+                                      keyFunctions: [hour(ts)]
+                                      values: [avg(bid)]
+                                      filter: null
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: x
+                            """);
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sym\thour\tavgBid
+                            A\t0\t0.4922298136511458
+                            B\t0\t0.4796420804429589
+                            """);
+        });
+    }
+
+    @Test
+    public void testStarIsNotAllowedInGroupBy() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab as (select x, x%2 as y from long_sequence(2))");
+            assertError(
+                    "select * from tab group by tab.*",
+                    "[27] '*' is not allowed in GROUP BY"
+            );
+        });
+    }
+
+    @Test
+    public void testSumOverSumColumn() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, rnd.nextInt(4));
+
+        assertMemoryLeak(() -> {
+            execute("create table \"avg\" as (" +
+                    "select rnd_symbol('A', 'B', 'C') category, " +
+                    "rnd_double() sum, " +
+                    "rnd_double() count, " +
+                    "timestamp_sequence(0, 100000000000) timestamp " +
+                    "from long_sequence(20)" +
+                    ") timestamp(timestamp) partition by DAY");
+
+            String query = "select sum(\"sum\"), sum(\"count\"), \"category\" from \"avg\" group by \"category\" order by 3";
+            assertQuery(query)
+                    .expectSize()
+                    .noLeakCheck()
+                    .returns("""
+                            sum\tsum1\tcategory
+                            1.920104572218119\t0.9826178313717698\tA
+                            2.0117879412419453\t3.362073294894596\tB
+                            6.020496469863701\t5.702005218155505\tC
+                            """);
+
+            assertQuery(query)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Encode sort light
+                              keys: [category]
+                                VirtualRecord
+                                  functions: [sum,sum1,category]
+                                    GroupBy vectorized: true workers: 1
+                                      keys: [category]
+                                      values: [sum(sum),sum(count)]
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: avg
+                            """);
+        });
+    }
+
+    @Test
+    public void testWindowSpecExpressionRewrites() throws Exception {
+        assertQuery("""
+                SELECT x, grp, sum(v) OVER w AS running, count(*) OVER w AS n
+                FROM t
+                WINDOW w AS (
+                    PARTITION BY grp::string, concat(
+                        CASE
+                            WHEN grp = 0 THEN 'a'
+                            WHEN grp = 1 THEN 'b'
+                            ELSE 'c'
+                        END,
+                        'partition'
+                    )
+                    ORDER BY x
+                    ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW
+                )
+                ORDER BY x
+                """)
+                .ddl("CREATE TABLE t AS (SELECT x, x % 2 AS grp, x AS v FROM long_sequence(6))")
+                .expectSize()
+                .returns("""
+                        x\tgrp\trunning\tn
+                        1\t1\t1.0\t1
+                        2\t0\t2.0\t1
+                        3\t1\t4.0\t2
+                        4\t0\t6.0\t2
+                        5\t1\t9.0\t3
+                        6\t0\t12.0\t3
+                        """);
+        assertQuery("""
+                SELECT x, abs(sum(v) OVER (
+                    PARTITION BY grp::string, concat(
+                        CASE
+                            WHEN grp = 0 THEN 'a'
+                            WHEN grp = 1 THEN 'b'
+                            ELSE 'c'
+                        END,
+                        'partition'
+                    )
+                    ORDER BY x
+                    ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW
+                )) AS running
+                FROM t
+                ORDER BY x
+                """)
+                .expectSize()
+                .returns("""
+                        x\trunning
+                        1\t1.0
+                        2\t2.0
+                        3\t4.0
+                        4\t6.0
+                        5\t9.0
+                        6\t12.0
+                        """);
+    }
+
+    @Test
+    public void testWindowSpecNonSwitchCaseRewrite() throws Exception {
+        // a CASE whose WHEN is not `col = const` cannot fold to a switch, so rewriteCase
+        // takes its in-place else-branch; the window-spec rewrite must apply it exactly once
+        assertQuery("""
+                SELECT x, sum(v) OVER (
+                    PARTITION BY CASE WHEN x > 3 THEN 'hi' ELSE 'lo' END
+                ) AS partition_sum
+                FROM t
+                ORDER BY x
+                """)
+                .ddl("CREATE TABLE t AS (SELECT x, x AS v FROM long_sequence(6))")
+                .expectSize()
+                .returns("""
+                        x\tpartition_sum
+                        1\t6.0
+                        2\t6.0
+                        3\t6.0
+                        4\t15.0
+                        5\t15.0
+                        6\t15.0
+                        """);
+    }
+
+    private void assertError(String query, String errorMessage) throws Exception {
+        // errorMessage is the full position-prefixed message, e.g. "[48] aggregate functions ...".
+        // SqlException.getMessage() == "[" + position + "] " + flyweightMessage, so split it into the
+        // position and the flyweight message and assert both via the builder's fails() terminal.
+        final int close = errorMessage.indexOf(']');
+        final int position = Integer.parseInt(errorMessage.substring(1, close));
+        assertQuery(query).fails(position, errorMessage.substring(close + 2));
+    }
+
+    private void createCursorSubQueryTables() throws SqlException {
+        execute("CREATE TABLE tb2 (rts TIMESTAMP, v INT, c1 INT) TIMESTAMP(rts) PARTITION BY DAY");
+        execute("CREATE TABLE tc2 (cts TIMESTAMP, v INT) TIMESTAMP(cts) PARTITION BY DAY");
+        execute("CREATE TABLE tsym (s SYMBOL, ts TIMESTAMP, v INT) TIMESTAMP(ts) PARTITION BY DAY");
+        execute("""
+                INSERT INTO tb2 VALUES
+                ('2020-01-01T00:20', 5, 10),
+                ('2020-01-01T01:20', 0, 20),
+                ('2020-01-01T03:20', 100, 30)
+                """);
+        execute("""
+                INSERT INTO tc2 VALUES
+                ('2020-01-01T00:20', 5),
+                ('2020-01-01T01:20', 0),
+                ('2020-01-01T03:20', 100)
+                """);
+        execute("""
+                INSERT INTO tsym VALUES
+                ('10', '2020-01-01T00:00', 10),
+                ('20', '2020-01-01T01:00', 20),
+                ('7', '2020-01-01T02:00', 7)
+                """);
+    }
+}

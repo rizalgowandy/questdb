@@ -1,0 +1,2708 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin;
+
+import io.questdb.PropertyKey;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.engine.functions.rnd.SharedRandom;
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.util.Arrays;
+
+public class UnionTest extends AbstractCairoTest {
+
+    @Test
+    public void testAggregateOverUnionAllLegacyFlagReintroducesCrash() throws Exception {
+        // The cairo.sql.legacy.union.column.propagation flag restores the pre-fix by-name emit,
+        // which reintroduces the column-count divergence so the otherwise-fixed query fails again
+        // with an AssertionError during code generation. Guards the rollback switch against
+        // silently becoming a no-op. Reset the flag in finally so it cannot leak into other tests
+        // in this class (overrides are otherwise only cleared at @AfterClass).
+        setProperty(PropertyKey.CAIRO_SQL_LEGACY_UNION_COLUMN_PROPAGATION, "true");
+        try {
+            assertMemoryLeak(() -> {
+                execute("create table u1 (a symbol, close double)");
+                execute("create table u2 (a symbol, close double)");
+                execute("insert into u1 values ('x', 1.0), ('y', 2.0)");
+                execute("insert into u2 values ('z', 3.0)");
+
+                final String unionSql = "select a, close price from u1 union all select a, close price from u2";
+                boolean threw = false;
+                try (RecordCursorFactory ignored = select("select count() from (" + unionSql + ")")) {
+                    // unreachable: the legacy by-name emit diverges the branch column counts
+                } catch (AssertionError e) {
+                    threw = true;
+                }
+                Assert.assertTrue("legacy flag should restore the by-name emit and reintroduce the crash", threw);
+            });
+        } finally {
+            setProperty(PropertyKey.CAIRO_SQL_LEGACY_UNION_COLUMN_PROPAGATION, "false");
+        }
+    }
+
+    @Test
+    public void testAggregateOverUnionAllOfLatestOn() throws Exception {
+        // Regression test: an aggregate (count/sum) over a UNION ALL of LATEST ON
+        // sub-queries used to crash with an AssertionError in SqlCodeGenerator
+        // (columnCount == metadataB.getColumnCount()). Top-down column pruning over
+        // the union chain pruned one branch down to just the LATEST ON partition key
+        // while leaving the others with all projected columns, so the union sides
+        // diverged in column count. Not specific to count() - any aggregate that
+        // prunes the projection triggers it.
+        assertMemoryLeak(() -> {
+            for (int i = 1; i <= 4; i++) {
+                execute("create table t" + i + " (tvId symbol, close double, timestamp timestamp) timestamp(timestamp) partition by day wal");
+            }
+            // t1: A -> latest close 11, B -> 20  (2 rows after LATEST ON)
+            execute("insert into t1 values " +
+                    "('A', 10.0, '2024-01-01T00:00:01.000000Z'), " +
+                    "('A', 11.0, '2024-01-01T00:00:02.000000Z'), " +
+                    "('B', 20.0, '2024-01-01T00:00:01.000000Z')");
+            // t2: C -> 30  (1 row)
+            execute("insert into t2 values ('C', 30.0, '2024-01-01T00:00:01.000000Z')");
+            // t3: D -> latest close 41  (1 row)
+            execute("insert into t3 values " +
+                    "('D', 40.0, '2024-01-01T00:00:01.000000Z'), " +
+                    "('D', 41.0, '2024-01-01T00:00:02.000000Z')");
+            // t4: E -> 50  (1 row)
+            execute("insert into t4 values ('E', 50.0, '2024-01-01T00:00:01.000000Z')");
+            drainWalQueue();
+
+            final String unionSql =
+                    "SELECT tvId, close price, timestamp mts FROM t1 LATEST ON timestamp PARTITION BY tvId " +
+                            "UNION ALL " +
+                            "SELECT tvId, close price, timestamp mts FROM t2 LATEST ON timestamp PARTITION BY tvId " +
+                            "UNION ALL " +
+                            "SELECT tvId, close price, timestamp mts FROM t3 LATEST ON timestamp PARTITION BY tvId " +
+                            "UNION ALL " +
+                            "SELECT tvId, close price, timestamp mts FROM t4 LATEST ON timestamp PARTITION BY tvId";
+
+            // 2 + 1 + 1 + 1 = 5 rows
+            assertQuery("select count() from (" + unionSql + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            count
+                            5
+                            """);
+            // 11 + 20 + 30 + 41 + 50 = 152
+            assertQuery("select sum(price) from (" + unionSql + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            sum
+                            152.0
+                            """);
+        });
+    }
+
+    @Test
+    public void testAggregateOverUnionAllWithAliasMismatch() throws Exception {
+        // Minimal root-cause regression test: the crash is driven by alias divergence between
+        // UNION ALL branches, not by LATEST ON (which only forces the CHOOSE-wrapper structure).
+        // Here one column is aliased (close -> price) and one is not (a). The old by-name emit
+        // matched only the same-named column (a) into the sibling, pruning it to 1 column while
+        // the head kept 2, so the union sides diverged in column count under count()/sum().
+        assertMemoryLeak(() -> {
+            execute("create table u1 (a symbol, close double)");
+            execute("create table u2 (a symbol, close double)");
+            execute("insert into u1 values ('x', 1.0), ('y', 2.0)");
+            execute("insert into u2 values ('z', 3.0)");
+
+            final String unionSql =
+                    "select a, close price from u1 " +
+                            "union all " +
+                            "select a, close price from u2";
+
+            // 2 + 1 = 3 rows
+            assertQuery("select count() from (" + unionSql + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            count
+                            3
+                            """);
+            // 1 + 2 + 3 = 6
+            assertQuery("select sum(price) from (" + unionSql + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            sum
+                            6.0
+                            """);
+        });
+    }
+
+    @Test
+    public void testExcept() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table events2 (contact symbol, groupid symbol, eventid string)");
+            execute("insert into events2 values ('amy', 'grp1', 'flash')");
+            execute("insert into events2 values ('joey', 'grp2', 'sit')");
+            execute("insert into events2 values ('stewy', 'grp1', 'stand')");
+            execute("insert into events2 values ('bobby', 'grp1', 'flash')");
+            execute("insert into events2 values ('stewy', 'grp1', 'flash')");
+
+            assertQuery("""
+                    select groupid, contact from events2 where groupid = 'grp1' and eventid = 'flash'
+                    except
+                    select groupid, contact from events2 where groupid = 'grp1' and eventid = 'stand'""")
+                    .noLeakCheck()
+                    .returns("""
+                            groupid\tcontact
+                            grp1\tamy
+                            grp1\tbobby
+                            """);
+        });
+    }
+
+    @Test
+    public void testExceptOfLiterals() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected1 = """
+                    2020-04-21\t1
+                    2020-04-21\t1
+                    """;
+            final String query1 = """
+                    select '2020-04-21', 1
+                    except
+                    select '2020-04-22', 2""";
+            assertQuery(query1)
+                    .noLeakCheck()
+                    .returns(expected1);
+
+            final String expected2 = """
+                    a\tb
+                    2020-04-21\t1
+                    """;
+            final String query2 = """
+                    select '2020-04-21' a, 1 b
+                    except
+                    select '2020-04-22', 2""";
+            assertQuery(query2)
+                    .noLeakCheck()
+                    .returns(expected2);
+        });
+    }
+
+    @Test
+    public void testExceptSymbolsDifferentTables() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table events1 (contact symbol, groupid symbol, eventid string)");
+            execute("insert into events1 values ('1', 'grp1', 'flash')");
+            execute("insert into events1 values ('2', 'grp1', 'stand')");
+            execute("insert into events1 values ('3', 'grp1', 'flash')");
+            execute("insert into events1 values ('4', 'grp1', 'flash')");
+            execute("insert into events1 values ('5', 'grp2', 'sit')");
+
+            execute("create table events2 (contact symbol, groupid symbol, eventid string)");
+            execute("insert into events2 values ('5', 'grp2', 'sit')");
+            execute("insert into events2 values ('4', 'grp1', 'flash')");
+            execute("insert into events2 values ('3', 'grp1', 'flash')");
+            execute("insert into events2 values ('2', 'grp1', 'stand')");
+            execute("insert into events2 values ('1', 'grp1', 'flash')");
+
+            assertQuery("""
+                    select contact, eventid from events1 where eventid in ('flash', 'sit')
+                    except
+                    select contact, eventid from events2 where eventid in ('flash')""")
+                    .noLeakCheck()
+                    .returns("""
+                            contact\teventid
+                            5\tsit
+                            """);
+        });
+    }
+
+    @Test
+    public void testExceptWithLargeNumberOfSubqueries() throws Exception {
+        testLargeNumberOfSubqueries("except", 0);
+    }
+
+    @Test
+    public void testFilteredUnionAll() throws Exception {
+        assertMemoryLeak(() -> {
+            execute(
+                    "CREATE TABLE x as " +
+                            "(SELECT " +
+                            " rnd_symbol('CAR', 'VAN', 'PLANE', NULL) t, " +
+                            " CAST(x%2 as int) i" +
+                            " FROM long_sequence(20) x)"
+            );
+
+            execute(
+                    "CREATE TABLE y as " +
+                            "(SELECT " +
+                            " rnd_symbol('BUS', 'BIKE', NULL) t, " +
+                            " CAST(x%2 as int) i" +
+                            " FROM long_sequence(20) x)"
+            );
+
+            assertQuery("(x union y) where i = 0 order by t")
+                    .noLeakCheck()
+                    .returns("""
+                            t\ti
+                            \t0
+                            BIKE\t0
+                            BUS\t0
+                            CAR\t0
+                            PLANE\t0
+                            VAN\t0
+                            """);
+        });
+    }
+
+    @Test
+    public void testIntersect() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table events2 (contact symbol, groupid symbol, eventid string)");
+            execute("insert into events2 values ('amy', 'grp1', 'flash')");
+            execute("insert into events2 values ('joey', 'grp2', 'sit')");
+            execute("insert into events2 values ('stewy', 'grp1', 'stand')");
+            execute("insert into events2 values ('bobby', 'grp1', 'flash')");
+            execute("insert into events2 values ('stewy', 'grp1', 'flash')");
+
+            assertQuery("""
+                    select groupid, contact from events2 where groupid = 'grp1' and eventid = 'flash'
+                    intersect
+                    select groupid, contact from events2 where groupid = 'grp1' and eventid = 'stand'""")
+                    .noLeakCheck()
+                    .returns("""
+                            groupid\tcontact
+                            grp1\tstewy
+                            """);
+        });
+    }
+
+    @Test
+    public void testIntersectOfLiterals() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected1 = """
+                    2020-04-21\t1
+                    2020-04-21\t1
+                    """;
+            final String query1 = """
+                    select '2020-04-21', 1
+                    intersect
+                    select '2020-04-21', 1""";
+            assertQuery(query1)
+                    .noLeakCheck()
+                    .returns(expected1);
+
+            final String expected2 = """
+                    a\tb
+                    2020-04-21\t1
+                    """;
+            final String query2 = """
+                    select '2020-04-21' a, 1 b
+                    intersect
+                    select '2020-04-21', 1""";
+            assertQuery(query2)
+                    .noLeakCheck()
+                    .returns(expected2);
+        });
+    }
+
+    @Test
+    public void testIntersectWithLargeNumberOfSubqueries() throws Exception {
+        testLargeNumberOfSubqueries("intersect", 1);
+    }
+
+    public void testLargeNumberOfSubqueries(String operation, int expectedCount) throws Exception {
+        assertMemoryLeak(() -> {
+            sink.clear();
+            sink.put("select count(*) cnt from ( ");
+            sink.put(" select 'a' as a, 'b' as b, 'c' as c ");
+            for (int i = 0; i < 99; i++) {
+                sink.put(operation).put(" select 'a' as a, 'b' as b, 'c' as c ");
+            }
+            sink.put(')');
+
+            assertQuery(sink.toString())
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("cnt\n" + expectedCount + "\n");
+        });
+
+    }
+
+    @Test
+    public void testMultiSetOperationIsLeftAssociative() throws Exception {
+        assertQuery("select 2 x " +
+                "union all " +
+                "select 1  " +
+                "intersect " +
+                "select 1 from long_sequence(1)")
+                .ddl(null)
+                .noRandomAccess()
+                .returns("x\n1\n");
+    }
+
+    @Test
+    public void testMultiSetOperationWithLimitIsLeftAssociative() throws Exception {
+        assertQuery("select 1 x " +
+                "except " +
+                "select 1  " +
+                "union all " +
+                "select 3 from long_sequence(1) limit 1")
+                .ddl(null)
+                .noRandomAccess()
+                .returns("x\n3\n");
+    }
+
+    @Test
+    public void testMultiSetOperationWithOrderByIsLeftAssociative() throws Exception {
+        assertQuery("select 2 x " +
+                "union all " +
+                "select 1  " +
+                "intersect " +
+                "select 1 from long_sequence(1) order by 1")
+                .ddl(null)
+                .returns("x\n1\n");
+    }
+
+    @Test
+    public void testNestedSetOperationWithOrderByAndLimit() throws Exception {
+        assertQuery("select * from (select 1 x union all select 2 union all select 3 from long_sequence(1) order by x desc limit 2) " +
+                "intersect " +
+                "select * from (select x from long_sequence(4) order by x limit 2) " +
+                "union all " +
+                "select x-1 from long_sequence(1) order by 1 limit 2")
+                .ddl(null)
+                .returns("x\n0\n2\n");
+    }
+
+    @Test
+    public void testNestedSetOperationWithOrderExpressionByAndLimit() throws Exception {
+        assertQuery("select * from (select 1 x union all select 2 union all select 3 from long_sequence(1) order by abs(x) desc limit 2) " +
+                "intersect " +
+                "select * from (select x from long_sequence(4) order by x limit 2) " +
+                "union all " +
+                "select x-1 from long_sequence(1) order by 1 limit 2")
+                .ddl(null)
+                .returns("x\n0\n2\n");
+    }
+
+    @Test
+    public void testNestedSetOperationWithOrderExpressionByAndLimit2() throws Exception {
+        assertQuery("select * from " +
+                "(select 1 x union all select 2 union all select 3 from long_sequence(1) order by x*2 desc limit 2) " +
+                "intersect " +
+                "select * from (select x from long_sequence(4) order by x*2 limit 2) " +
+                "union all " +
+                "select x-1 from long_sequence(1) order by 1 limit 2")
+                .ddl(null)
+                .returns("x\n0\n2\n");
+    }
+
+    @Test
+    public void testNullConversionsFromDate() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE foo (ts TIMESTAMP, colA DOUBLE, colB FLOAT, colC TIMESTAMP, colD LONG, colE INT, colF TIMESTAMP_NS) timestamp(ts) PARTITION BY DAY WAL;");
+            execute("INSERT INTO foo (ts, colA, colB, colC, colD, colE, colF) " +
+                    "SELECT '2025-04-09 17:20:00.000' AS ts, " +
+                    "null::date as colA, " +
+                    "null::date as colB, " +
+                    "null::date as colC, " +
+                    "null::date as colD, " +
+                    "null::date as colE, " +
+                    "null::date as colF;");
+            drainWalQueue();
+
+            assertQuery("foo;")
+                    .noLeakCheck()
+                    .timestampAsc("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tcolA\tcolB\tcolC\tcolD\tcolE\tcolF
+                            2025-04-09T17:20:00.000000Z\tnull\tnull\t\tnull\tnull\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testNullConversionsFromFloat() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE foo (ts TIMESTAMP, colA DOUBLE, colB TIMESTAMP, colC DATE, colD LONG, colE INT, colF TIMESTAMP_NS) timestamp(ts) PARTITION BY DAY WAL;");
+            execute("INSERT INTO foo (ts, colA, colB, colC, colD, colE, colF) " +
+                    "SELECT '2025-04-09 17:20:00.000' AS ts, " +
+                    "cast(null as float) as colA, " +
+                    "cast(null as float) as colB, " +
+                    "cast(null as float) as colC, " +
+                    "cast(null as float) as colD, " +
+                    "cast(null as float) as colE, " +
+                    "cast(null as float) as colF;");
+            drainWalQueue();
+
+            assertQuery("foo;")
+                    .noLeakCheck()
+                    .timestampAsc("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tcolA\tcolB\tcolC\tcolD\tcolE\tcolF
+                            2025-04-09T17:20:00.000000Z\tnull\t\t\tnull\tnull\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testNullConversionsFromInt() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE foo (ts TIMESTAMP, colA DOUBLE, colB FLOAT, colC TIMESTAMP, colD DATE, colE LONG, colF TIMESTAMP_NS) timestamp(ts) PARTITION BY DAY WAL;");
+            execute("INSERT INTO foo (ts, colA, colB, colC, colD, colE, colF) " +
+                    "SELECT '2025-04-09 17:20:00.000' AS ts, " +
+                    "null::int as colA, " +
+                    "null::int as colB, " +
+                    "null::int as colC, " +
+                    "null::int as colD, " +
+                    "null::int as colE, " +
+                    "null::int as colF;");
+            drainWalQueue();
+
+            assertQuery("foo;")
+                    .noLeakCheck()
+                    .timestampAsc("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tcolA\tcolB\tcolC\tcolD\tcolE\tcolF
+                            2025-04-09T17:20:00.000000Z\tnull\tnull\t\t\tnull\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testNullConversionsFromLong() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE foo (ts TIMESTAMP, colA DOUBLE, colB FLOAT, colC TIMESTAMP, colD DATE, colE INT, colF TIMESTAMP_NS) timestamp(ts) PARTITION BY DAY WAL;");
+            execute("INSERT INTO foo (ts, colA, colB, colC, colD, colE, colF) " +
+                    "SELECT '2025-04-09 17:20:00.000' AS ts, " +
+                    "null::long as colA, " +
+                    "null::long as colB, " +
+                    "null::long as colC, " +
+                    "null::long as colD, " +
+                    "null::long as colE, " +
+                    "null::long as colF;");
+            drainWalQueue();
+
+            assertQuery("foo;")
+                    .noLeakCheck()
+                    .timestampAsc("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tcolA\tcolB\tcolC\tcolD\tcolE\tcolF
+                            2025-04-09T17:20:00.000000Z\tnull\tnull\t\t\tnull\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testNullConversionsFromTimestamp() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE foo (ts TIMESTAMP, colA DOUBLE, colB FLOAT, colC DATE, colD LONG, colE INT, colF TIMESTAMP_NS) timestamp(ts) PARTITION BY DAY WAL;");
+            execute("INSERT INTO foo (ts, colA, colB, colC, colD, colE, colF) " +
+                    "SELECT '2025-04-09 17:20:00.000' AS ts, " +
+                    "null::timestamp as colA, " +
+                    "null::timestamp as colB, " +
+                    "null::timestamp as colC, " +
+                    "null::timestamp as colD, " +
+                    "null::timestamp as colE, " +
+                    "null::timestamp as colF;");
+            drainWalQueue();
+
+            assertQuery("foo;")
+                    .noLeakCheck()
+                    .timestampAsc("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tcolA\tcolB\tcolC\tcolD\tcolE\tcolF
+                            2025-04-09T17:20:00.000000Z\tnull\tnull\t\tnull\tnull\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testNullConversionsFromTimestampNanos() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE foo (ts TIMESTAMP, colA DOUBLE, colB FLOAT, colC DATE, colD LONG, colE INT, colF TIMESTAMP_NS) timestamp(ts) PARTITION BY DAY WAL;");
+            execute("INSERT INTO foo (ts, colA, colB, colC, colD, colE, colF) " +
+                    "SELECT '2025-04-09 17:20:00.000' AS ts, " +
+                    "null::timestamp_ns as colA, " +
+                    "null::timestamp_ns as colB, " +
+                    "null::timestamp_ns as colC, " +
+                    "null::timestamp_ns as colD, " +
+                    "null::timestamp_ns as colE, " +
+                    "null::timestamp_ns as colF;");
+            drainWalQueue();
+
+            assertQuery("foo;")
+                    .noLeakCheck()
+                    .timestampAsc("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tcolA\tcolB\tcolC\tcolD\tcolE\tcolF
+                            2025-04-09T17:20:00.000000Z\tnull\tnull\t\tnull\tnull\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testOrderByIsNotIgnoredInExceptsSecondSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  except " +
+                "  (select sym, max(x) from x order by sym limit 2,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .returns("""
+                        sym\tmax
+                        GWFFYUDEYY\t99
+                        RXPEHNRXGZ\t100
+                        """);
+    }
+
+    @Test
+    public void testOrderByIsNotIgnoredInExceptsThirdSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  except " +
+                "  (select sym, max(x) from x order by sym limit 2,3)" +
+                "  except " +
+                "  (select sym, max(x) from x order by sym limit 3,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .returns("""
+                        sym\tmax
+                        GWFFYUDEYY\t99
+                        RXPEHNRXGZ\t100
+                        """);
+    }
+
+    @Test
+    public void testOrderByIsNotIgnoredInIntersectsSecondSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  intersect " +
+                "  (select sym, max(x) from x order by sym limit 2,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .returns("sym\tmax\n");
+    }
+
+    @Test
+    public void testOrderByIsNotIgnoredInIntersectsThirdSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  intersect " +
+                "  (select sym, max(x) from x order by sym limit 2,3)" +
+                "  intersect " +
+                "  (select sym, max(x) from x order by sym limit 3,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .returns("sym\tmax\n");
+    }
+
+    @Test
+    public void testOrderByIsNotIgnoredInUnionAllsSecondSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  union all" +
+                "  (select sym, max(x) from x order by sym limit 2,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sym\tmax
+                        GWFFYUDEYY\t99
+                        RXPEHNRXGZ\t100
+                        SXUXIBBTGP\t88
+                        VTJWCPSWHY\t97
+                        """);
+    }
+
+
+    @Test
+    public void testOrderByIsNotIgnoredInUnionAllsThirdSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  union all" +
+                "  (select sym, max(x) from x order by sym limit 2,3) " +
+                "  union all " +
+                "  (select sym, max(x) from x order by sym limit 3,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sym\tmax
+                        GWFFYUDEYY\t99
+                        RXPEHNRXGZ\t100
+                        SXUXIBBTGP\t88
+                        VTJWCPSWHY\t97
+                        """);
+    }
+
+    @Test
+    public void testOrderByIsNotIgnoredInUnionsSecondSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  union " +
+                "  (select sym, max(x) from x order by sym limit 2,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .noRandomAccess()
+                .returns("""
+                        sym\tmax
+                        GWFFYUDEYY\t99
+                        RXPEHNRXGZ\t100
+                        SXUXIBBTGP\t88
+                        VTJWCPSWHY\t97
+                        """);
+    }
+
+    @Test
+    public void testOrderByIsNotIgnoredInUnionsThirdSubquery() throws Exception {
+        assertQuery("select * from " +
+                "(" +
+                "  (select sym, max(x) from x order by sym limit 0,2)" +
+                "  union " +
+                "  (select sym, max(x) from x order by sym limit 2,3)" +
+                "  union " +
+                "  (select sym, max(x) from x order by sym limit 3,4)" +
+                ");")
+                .ddl("create table x as (" +
+                        "  select x, rnd_symbol(4, 10, 10, 0) sym " +
+                        "  from long_sequence(100) );")
+                .noRandomAccess()
+                .returns("""
+                        sym\tmax
+                        GWFFYUDEYY\t99
+                        RXPEHNRXGZ\t100
+                        SXUXIBBTGP\t88
+                        VTJWCPSWHY\t97
+                        """);
+    }
+
+    @Test
+    public void testSetOperationNestedInLaterBranchWithOrderByAndLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // The trailing ORDER BY and LIMIT of a set operation in a later branch of another one
+            // apply to the whole inner set operation, whichever set operations the two are.
+            final String top1 = "SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY 1 DESC LIMIT 1";
+            assertQuery("SELECT -1L v UNION SELECT -2L UNION SELECT * FROM (" + top1 + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            3
+                            """);
+            assertQuery("SELECT 3L v UNION ALL SELECT 2L EXCEPT SELECT * FROM (" + top1 + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v
+                            2
+                            """);
+            assertQuery("SELECT 1L v UNION ALL SELECT 3L INTERSECT SELECT * FROM (" + top1 + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v
+                            3
+                            """);
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM (SELECT v FROM t UNION SELECT v FROM t ORDER BY 1 DESC LIMIT 1)")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            3
+                            """);
+            assertQuery("""
+                    SELECT -1L v
+                    UNION ALL
+                    SELECT -2L
+                    UNION ALL
+                    SELECT * FROM (SELECT v FROM t EXCEPT SELECT v FROM t WHERE v = 1 ORDER BY 1 DESC LIMIT 1)
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            3
+                            """);
+            assertQuery("""
+                    SELECT -1L v
+                    UNION ALL
+                    SELECT -2L
+                    UNION ALL
+                    SELECT * FROM (SELECT v FROM t WHERE v > 1 INTERSECT SELECT v FROM t ORDER BY 1 LIMIT 1)
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            2
+                            """);
+        });
+    }
+
+    @Test
+    public void testSetOperationsAllowsOrderByAndLimitInAllSubqueries() throws Exception {
+        String template = "select * from (select x from t #CLAUSE0# ) " +
+                "#SET# " +
+                "select * from (select 3 from t #CLAUSE1# ) " +
+                "#SET# " +
+                "select * from (select 2 from t #CLAUSE2# ) ";
+
+        assertMemoryLeak(() -> {
+            execute("create table t as (select x, 's' || x from long_sequence(1) )");
+
+            for (String setOperation : Arrays.asList("union    ", "union all", "intersect", "except   ")) {
+                for (int i = 0; i <= 2; i++) {
+                    String orderQuery = template.replace("#SET#", setOperation)
+                            .replace("#CLAUSE" + i + "#", "order by x desc")
+                            .replace("#CLAUSE" + (i + 1) % 3 + "#", "")
+                            .replace("#CLAUSE" + (i + 2) % 3 + "#", "");
+                    select(orderQuery).close();
+
+                    String limitQuery = template.replace("#SET#", setOperation)
+                            .replace("#CLAUSE" + i + "#", "limit 1        ")
+                            .replace("#CLAUSE" + (i + 1) % 3 + "#", "")
+                            .replace("#CLAUSE" + (i + 2) % 3 + "#", "");
+                    select(limitQuery).close();
+                }
+            }
+        });
+    }
+
+    //test accept limit and order by in last component ?
+    @Test
+    public void testSetOperationsRejectsOrderByAndLimitInAllButLastDirectQuery() throws Exception {
+        String template = "select x from t #CLAUSE0# " +
+                "#SET# " +
+                "select 3 from t #CLAUSE1# " +
+                "#SET# " +
+                "select 2 from t ";
+
+        assertMemoryLeak(() -> execute("create table t as (select x, 's' || x from long_sequence(1))"));
+
+        for (String setOperation : Arrays.asList("union    ", "union all", "intersect", "except   ")) {
+            for (int i = 0; i <= 1; i++) {
+                String orderQuery = template.replace("#SET#", setOperation)
+                        .replace("#CLAUSE" + i + "#", "order by x desc")
+                        .replace("#CLAUSE" + (i + 1) % 2 + "#", "");
+
+                assertQuery(orderQuery)
+                        .fails((i == 0 ? 16 : 43), "unexpected token 'order'");
+
+                String limitQuery = template.replace("#SET#", setOperation)
+                        .replace("#CLAUSE" + i + "#", "limit 1        ")
+                        .replace("#CLAUSE" + (i + 1) % 2 + "#", "");
+
+                assertQuery(limitQuery)
+                        .fails((i == 0 ? 16 : 43), "unexpected token 'limit'");
+            }
+        }
+    }
+
+    @Test
+    public void testUnionAllOfAllSupportedTypes() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected = """
+                    a\tb\tc\td\te\tf\tg\ti\tj\tk\tl\tm\tn\tl256\tchr
+                    1569490116\tfalse\tZ\tnull\t0.7611029\t428\t2015-05-16T20:27:48.158Z\tVTJW\t-8671107786057422727\t1970-01-01T00:00:00.000000Z\t26\t00000000 68 61 26 af 19 c4 95 94 36 53 49\tFOWLPD\t0x5f20a35e80e154f458dfd08eeb9cc39ecec82869edec121bc2593f82b430328d\tE
+                    -461611463\tfalse\tJ\t0.9687423276940171\t0.6761935\t279\t2015-11-21T14:32:13.134Z\tHYRX\t-6794405451419334859\t1970-01-01T00:16:40.000000Z\t6\t\tETJRSZSRYR\t0x69440048957ae05360802a2ca499f211b771e27f939096b9c356f99ae70523b5\tM
+                    -1515787781\tfalse\t\t0.8001121139739173\t0.18769705\t759\t2015-06-17T02:40:55.328Z\tCPSW\t-4091897709796604687\t1970-01-01T00:33:20.000000Z\t6\t00000000 9c 1d 06 ac 37 c8 cd 82 89 2b 4d 5f f6 46 90 c3\tDYYCTGQOLYXWCKYL\t0x78c594c496995885aa1896d0ad3419d2910aa7b6d58506dc7c97a2cb4ac4b047\tS
+                    1235206821\ttrue\t\t0.9540069089049732\t0.25533193\t310\t\tVTJW\t6623443272143014835\t1970-01-01T00:50:00.000000Z\t17\t00000000 cc 76 48 a3 bb 64 d2 ad 49 1c f2 3c ed 39 ac\tVSJOJIPHZEPIHVLT\t0xb942438168662cb7aa21f9d816335363d27e6df7d9d5b758ea7a0db859a19e14\tU
+                    454820511\tfalse\tL\t0.9918093114862231\t0.32424557\t727\t2015-02-10T08:56:03.707Z\t\t5703149806881083206\t1970-01-01T01:06:40.000000Z\t36\t00000000 68 79 8b 43 1d 57 34 04 23 8d d8 57\tWVDKFLOPJOXPK\t0x550988dbaca497348692bc8c04e4bb71d24b84c08ea7606a70061ac6a4115ca7\tH
+                    1728220848\tfalse\tO\t0.24642266252221556\t0.26721203\t174\t2015-02-20T01:11:53.748Z\t\t2151565237758036093\t1970-01-01T01:23:20.000000Z\t31\t\tHZSQLDGLOGIFO\t0x8531876c963316d961f392242addf45287dd0b29ca2c4c8455b68bf3e1f27620\tZ
+                    -120660220\tfalse\tB\t0.07594017197103131\t0.06381655\t542\t2015-01-16T16:01:53.328Z\tVTJW\t5048272224871876586\t1970-01-01T01:40:00.000000Z\t23\t00000000 f5 0f 2d b3 14 33 80 c9 eb a3 67 7a 1a 79 e4 35
+                    00000010 e4 3a dc 5c\tULIGYVFZ\t0x99193c2e0a9e76da695f8ae33a2cc2aa529d71aba0f6fec5172a489c48c26926\tL
+                    -1548274994\ttrue\tX\t0.9292491654871197\tnull\t523\t2015-01-05T19:01:46.416Z\tHYRX\t9044897286885345735\t1970-01-01T01:56:40.000000Z\t16\t00000000 cd 47 0b 0c 39 12 f7 05 10 f4 6d f1 e3 ee 58 35
+                    00000010 61\tMXSLUQDYOPHNIMYF\t0x483c83d88ac674e3894499a1a1680580cfedff23a67d918fb49b3c24e456ad6e\tP
+                    1430716856\tfalse\tP\t0.7707249647497968\tnull\t162\t2015-02-05T10:14:02.889Z\t\t7046578844650327247\t1970-01-01T02:13:20.000000Z\t47\t\tLEGPUHHIUGGLNYR\t0x36be4fe79117ebd53756b77218c738a7737b1dacd6be597192384aabd888ecb3\tD
+                    -772867311\tfalse\tQ\t0.7653255982993546\tnull\t681\t2015-05-07T02:45:07.603Z\t\t4794469881975683047\t1970-01-01T02:30:00.000000Z\t31\t00000000 4e d6 b2 57 5b e3 71 3d 20 e2 37 f2 64 43 84 55
+                    00000010 a0 dd\tVTNPIW\t0x2d1c6f57bbfd47ec39bd4dd9ad497a2721dc4adc870c62fe19b2faa4e8255a0d\tP
+                    494704403\ttrue\tC\t0.4834201611292943\t0.7942522\t28\t2015-06-16T21:00:55.459Z\tHYRX\t6785355388782691241\t1970-01-01T02:46:40.000000Z\t39\t\tRVNGSTEQOD\t0xbabcd0482f05618f926cdd99e63abb35650d1fb462d014df59070392ef6aa389\tW
+                    -173290754\ttrue\tK\t0.7198854503668188\tnull\t114\t2015-06-15T20:39:39.538Z\tVTJW\t9064962137287142402\t1970-01-01T03:03:20.000000Z\t20\t00000000 3b 94 5f ec d3 dc f8 43 b2 e3\tTIZKYFLUHZQSNPX\t0x74c509677990f1c962588b84eddb7b4a64a4822086748dc4b096d89b65baebef\tM
+                    -2041781509\ttrue\tE\t0.44638626240707313\t0.034652293\t605\t\tVTJW\t415951511685691973\t1970-01-01T03:20:00.000000Z\t28\t00000000 00 7c fb 01 19 ca f2 bf 84 5a 6f 38 35\t\t0x543554ee7efea2c341b1a691af3ce51f91a63337ac2e96836e87bac2e9746529\tW
+                    813111021\ttrue\t\t0.1389067130304884\t0.37303334\t259\t\tCPSW\t4422067104162111415\t1970-01-01T03:36:40.000000Z\t19\t00000000 2d 16 f3 89 a3 83 64 de d6 fd c4 5b c4 e9\tPNXHQUTZODWKOC\t0x50902704a317faeea7fc3b8563ada5ab985499c7f07368a33b8ad671f6730aab\tP
+                    980916820\tfalse\tC\t0.8353079103853974\t0.011099219\t670\t2015-10-06T01:12:57.175Z\t\t7536661420632276058\t1970-01-01T03:53:20.000000Z\t37\t\tFDBZWNIJEE\t0xb265942d3a1f96a1cff85f9258847e03a6f2e2a772cd2f3751d822a67dff3d23\tP
+                    -2016176825\ttrue\tT\tnull\t0.23567414\t813\t2015-12-27T00:19:42.415Z\tCPSW\t3464609208866088600\t1970-01-01T04:10:00.000000Z\t49\t\tFNUHNR\t0x8ca81bb363d7ac4585afb517c8aee023d107b1affff76a2c79189b578191a8f6\tW
+                    1173790070\tfalse\t\t0.5380626833618448\tnull\t440\t2015-07-18T08:33:51.750Z\tCPSW\t-5206126114193456581\t1970-01-01T04:26:40.000000Z\t31\t00000000 a1 46 87 28 92 a3 9b e3 cb c2 64 8a b0 35 d8 ab
+                    00000010 3f a1 f5\t\t0x8e230f5d5b94e76393ce26b5c735a6c94d2c5190fa645a018c7dd745bfadc2ea\tQ
+                    2146422524\ttrue\tI\t0.11025007918539531\t0.86413944\t539\t\t\t5637967617527425113\t1970-01-01T04:43:20.000000Z\t12\t00000000 81 c6 3d bc b5 05 2b 73 51 cf c3 7e c0 1d 6c\t\t0x70c4f4015e9b707986026ba259cee6ad9c3c470dfd351e81960599005766a265\tC
+                    -1433178628\tfalse\tW\t0.9246085617322545\t0.9216729\t578\t2015-06-28T14:27:36.686Z\t\t7861908914614478025\t1970-01-01T05:00:00.000000Z\t32\t00000000 0e 98 0a 8a 0b 1e c4 fd a2 9e b3 77 f8 f6 78\tRPXZSFXUNYQXT\t0x98065c0bf90d68899f5ac37d91bde62260af712d2a1cbb23579b0bab5109229c\tI
+                    94087085\ttrue\tY\t0.5675831821917149\t0.46343064\t872\t2015-11-16T04:04:55.664Z\tPEHN\t8951464047863942551\t1970-01-01T05:16:40.000000Z\t26\t00000000 33 3f b2 67 da 98 47 47 bf 4f ea 5f 48 ed\tDDCIHCNP\t0x680d2fd4ebf181c6960658463c4b85af603e1494ba44804a7fa40f7e4efac82e\tP
+                    """;
+
+            final String expected2 = """
+                    a\tb\tc\td\te\tf\tg\ti\tj\tk\tl\tm\tn\tl256\tchr
+                    1569490116\tfalse\tZ\tnull\t0.7611029\t428\t2015-05-16T20:27:48.158Z\tVTJW\t-8671107786057422727\t1970-01-01T00:00:00.000000Z\t26\t00000000 68 61 26 af 19 c4 95 94 36 53 49\tFOWLPD\t0x5f20a35e80e154f458dfd08eeb9cc39ecec82869edec121bc2593f82b430328d\tE
+                    -461611463\tfalse\tJ\t0.9687423276940171\t0.6761935\t279\t2015-11-21T14:32:13.134Z\tHYRX\t-6794405451419334859\t1970-01-01T00:16:40.000000Z\t6\t\tETJRSZSRYR\t0x69440048957ae05360802a2ca499f211b771e27f939096b9c356f99ae70523b5\tM
+                    -1515787781\tfalse\t\t0.8001121139739173\t0.18769705\t759\t2015-06-17T02:40:55.328Z\tCPSW\t-4091897709796604687\t1970-01-01T00:33:20.000000Z\t6\t00000000 9c 1d 06 ac 37 c8 cd 82 89 2b 4d 5f f6 46 90 c3\tDYYCTGQOLYXWCKYL\t0x78c594c496995885aa1896d0ad3419d2910aa7b6d58506dc7c97a2cb4ac4b047\tS
+                    1235206821\ttrue\t\t0.9540069089049732\t0.25533193\t310\t\tVTJW\t6623443272143014835\t1970-01-01T00:50:00.000000Z\t17\t00000000 cc 76 48 a3 bb 64 d2 ad 49 1c f2 3c ed 39 ac\tVSJOJIPHZEPIHVLT\t0xb942438168662cb7aa21f9d816335363d27e6df7d9d5b758ea7a0db859a19e14\tU
+                    454820511\tfalse\tL\t0.9918093114862231\t0.32424557\t727\t2015-02-10T08:56:03.707Z\t\t5703149806881083206\t1970-01-01T01:06:40.000000Z\t36\t00000000 68 79 8b 43 1d 57 34 04 23 8d d8 57\tWVDKFLOPJOXPK\t0x550988dbaca497348692bc8c04e4bb71d24b84c08ea7606a70061ac6a4115ca7\tH
+                    1728220848\tfalse\tO\t0.24642266252221556\t0.26721203\t174\t2015-02-20T01:11:53.748Z\t\t2151565237758036093\t1970-01-01T01:23:20.000000Z\t31\t\tHZSQLDGLOGIFO\t0x8531876c963316d961f392242addf45287dd0b29ca2c4c8455b68bf3e1f27620\tZ
+                    -120660220\tfalse\tB\t0.07594017197103131\t0.06381655\t542\t2015-01-16T16:01:53.328Z\tVTJW\t5048272224871876586\t1970-01-01T01:40:00.000000Z\t23\t00000000 f5 0f 2d b3 14 33 80 c9 eb a3 67 7a 1a 79 e4 35
+                    00000010 e4 3a dc 5c\tULIGYVFZ\t0x99193c2e0a9e76da695f8ae33a2cc2aa529d71aba0f6fec5172a489c48c26926\tL
+                    -1548274994\ttrue\tX\t0.9292491654871197\tnull\t523\t2015-01-05T19:01:46.416Z\tHYRX\t9044897286885345735\t1970-01-01T01:56:40.000000Z\t16\t00000000 cd 47 0b 0c 39 12 f7 05 10 f4 6d f1 e3 ee 58 35
+                    00000010 61\tMXSLUQDYOPHNIMYF\t0x483c83d88ac674e3894499a1a1680580cfedff23a67d918fb49b3c24e456ad6e\tP
+                    1430716856\tfalse\tP\t0.7707249647497968\tnull\t162\t2015-02-05T10:14:02.889Z\t\t7046578844650327247\t1970-01-01T02:13:20.000000Z\t47\t\tLEGPUHHIUGGLNYR\t0x36be4fe79117ebd53756b77218c738a7737b1dacd6be597192384aabd888ecb3\tD
+                    -772867311\tfalse\tQ\t0.7653255982993546\tnull\t681\t2015-05-07T02:45:07.603Z\t\t4794469881975683047\t1970-01-01T02:30:00.000000Z\t31\t00000000 4e d6 b2 57 5b e3 71 3d 20 e2 37 f2 64 43 84 55
+                    00000010 a0 dd\tVTNPIW\t0x2d1c6f57bbfd47ec39bd4dd9ad497a2721dc4adc870c62fe19b2faa4e8255a0d\tP
+                    494704403\ttrue\tC\t0.4834201611292943\t0.7942522\t28\t2015-06-16T21:00:55.459Z\tHYRX\t6785355388782691241\t1970-01-01T02:46:40.000000Z\t39\t\tRVNGSTEQOD\t0xbabcd0482f05618f926cdd99e63abb35650d1fb462d014df59070392ef6aa389\tW
+                    -173290754\ttrue\tK\t0.7198854503668188\tnull\t114\t2015-06-15T20:39:39.538Z\tVTJW\t9064962137287142402\t1970-01-01T03:03:20.000000Z\t20\t00000000 3b 94 5f ec d3 dc f8 43 b2 e3\tTIZKYFLUHZQSNPX\t0x74c509677990f1c962588b84eddb7b4a64a4822086748dc4b096d89b65baebef\tM
+                    -2041781509\ttrue\tE\t0.44638626240707313\t0.034652293\t605\t\tVTJW\t415951511685691973\t1970-01-01T03:20:00.000000Z\t28\t00000000 00 7c fb 01 19 ca f2 bf 84 5a 6f 38 35\t\t0x543554ee7efea2c341b1a691af3ce51f91a63337ac2e96836e87bac2e9746529\tW
+                    813111021\ttrue\t\t0.1389067130304884\t0.37303334\t259\t\tCPSW\t4422067104162111415\t1970-01-01T03:36:40.000000Z\t19\t00000000 2d 16 f3 89 a3 83 64 de d6 fd c4 5b c4 e9\tPNXHQUTZODWKOC\t0x50902704a317faeea7fc3b8563ada5ab985499c7f07368a33b8ad671f6730aab\tP
+                    980916820\tfalse\tC\t0.8353079103853974\t0.011099219\t670\t2015-10-06T01:12:57.175Z\t\t7536661420632276058\t1970-01-01T03:53:20.000000Z\t37\t\tFDBZWNIJEE\t0xb265942d3a1f96a1cff85f9258847e03a6f2e2a772cd2f3751d822a67dff3d23\tP
+                    -2016176825\ttrue\tT\tnull\t0.23567414\t813\t2015-12-27T00:19:42.415Z\tCPSW\t3464609208866088600\t1970-01-01T04:10:00.000000Z\t49\t\tFNUHNR\t0x8ca81bb363d7ac4585afb517c8aee023d107b1affff76a2c79189b578191a8f6\tW
+                    1173790070\tfalse\t\t0.5380626833618448\tnull\t440\t2015-07-18T08:33:51.750Z\tCPSW\t-5206126114193456581\t1970-01-01T04:26:40.000000Z\t31\t00000000 a1 46 87 28 92 a3 9b e3 cb c2 64 8a b0 35 d8 ab
+                    00000010 3f a1 f5\t\t0x8e230f5d5b94e76393ce26b5c735a6c94d2c5190fa645a018c7dd745bfadc2ea\tQ
+                    2146422524\ttrue\tI\t0.11025007918539531\t0.86413944\t539\t\t\t5637967617527425113\t1970-01-01T04:43:20.000000Z\t12\t00000000 81 c6 3d bc b5 05 2b 73 51 cf c3 7e c0 1d 6c\t\t0x70c4f4015e9b707986026ba259cee6ad9c3c470dfd351e81960599005766a265\tC
+                    -1433178628\tfalse\tW\t0.9246085617322545\t0.9216729\t578\t2015-06-28T14:27:36.686Z\t\t7861908914614478025\t1970-01-01T05:00:00.000000Z\t32\t00000000 0e 98 0a 8a 0b 1e c4 fd a2 9e b3 77 f8 f6 78\tRPXZSFXUNYQXT\t0x98065c0bf90d68899f5ac37d91bde62260af712d2a1cbb23579b0bab5109229c\tI
+                    94087085\ttrue\tY\t0.5675831821917149\t0.46343064\t872\t2015-11-16T04:04:55.664Z\tPEHN\t8951464047863942551\t1970-01-01T05:16:40.000000Z\t26\t00000000 33 3f b2 67 da 98 47 47 bf 4f ea 5f 48 ed\tDDCIHCNP\t0x680d2fd4ebf181c6960658463c4b85af603e1494ba44804a7fa40f7e4efac82e\tP
+                    1569490116\tfalse\tZ\tnull\t0.7611029\t428\t2015-05-16T20:27:48.158Z\tVTJW\t-8671107786057422727\t1970-01-01T00:00:00.000000Z\t26\t00000000 68 61 26 af 19 c4 95 94 36 53 49\tFOWLPD\t0x5f20a35e80e154f458dfd08eeb9cc39ecec82869edec121bc2593f82b430328d\tE
+                    -461611463\tfalse\tJ\t0.9687423276940171\t0.6761935\t279\t2015-11-21T14:32:13.134Z\tHYRX\t-6794405451419334859\t1970-01-01T00:16:40.000000Z\t6\t\tETJRSZSRYR\t0x69440048957ae05360802a2ca499f211b771e27f939096b9c356f99ae70523b5\tM
+                    -1515787781\tfalse\t\t0.8001121139739173\t0.18769705\t759\t2015-06-17T02:40:55.328Z\tCPSW\t-4091897709796604687\t1970-01-01T00:33:20.000000Z\t6\t00000000 9c 1d 06 ac 37 c8 cd 82 89 2b 4d 5f f6 46 90 c3\tDYYCTGQOLYXWCKYL\t0x78c594c496995885aa1896d0ad3419d2910aa7b6d58506dc7c97a2cb4ac4b047\tS
+                    1235206821\ttrue\t\t0.9540069089049732\t0.25533193\t310\t\tVTJW\t6623443272143014835\t1970-01-01T00:50:00.000000Z\t17\t00000000 cc 76 48 a3 bb 64 d2 ad 49 1c f2 3c ed 39 ac\tVSJOJIPHZEPIHVLT\t0xb942438168662cb7aa21f9d816335363d27e6df7d9d5b758ea7a0db859a19e14\tU
+                    454820511\tfalse\tL\t0.9918093114862231\t0.32424557\t727\t2015-02-10T08:56:03.707Z\t\t5703149806881083206\t1970-01-01T01:06:40.000000Z\t36\t00000000 68 79 8b 43 1d 57 34 04 23 8d d8 57\tWVDKFLOPJOXPK\t0x550988dbaca497348692bc8c04e4bb71d24b84c08ea7606a70061ac6a4115ca7\tH
+                    1728220848\tfalse\tO\t0.24642266252221556\t0.26721203\t174\t2015-02-20T01:11:53.748Z\t\t2151565237758036093\t1970-01-01T01:23:20.000000Z\t31\t\tHZSQLDGLOGIFO\t0x8531876c963316d961f392242addf45287dd0b29ca2c4c8455b68bf3e1f27620\tZ
+                    -120660220\tfalse\tB\t0.07594017197103131\t0.06381655\t542\t2015-01-16T16:01:53.328Z\tVTJW\t5048272224871876586\t1970-01-01T01:40:00.000000Z\t23\t00000000 f5 0f 2d b3 14 33 80 c9 eb a3 67 7a 1a 79 e4 35
+                    00000010 e4 3a dc 5c\tULIGYVFZ\t0x99193c2e0a9e76da695f8ae33a2cc2aa529d71aba0f6fec5172a489c48c26926\tL
+                    -1548274994\ttrue\tX\t0.9292491654871197\tnull\t523\t2015-01-05T19:01:46.416Z\tHYRX\t9044897286885345735\t1970-01-01T01:56:40.000000Z\t16\t00000000 cd 47 0b 0c 39 12 f7 05 10 f4 6d f1 e3 ee 58 35
+                    00000010 61\tMXSLUQDYOPHNIMYF\t0x483c83d88ac674e3894499a1a1680580cfedff23a67d918fb49b3c24e456ad6e\tP
+                    1430716856\tfalse\tP\t0.7707249647497968\tnull\t162\t2015-02-05T10:14:02.889Z\t\t7046578844650327247\t1970-01-01T02:13:20.000000Z\t47\t\tLEGPUHHIUGGLNYR\t0x36be4fe79117ebd53756b77218c738a7737b1dacd6be597192384aabd888ecb3\tD
+                    -772867311\tfalse\tQ\t0.7653255982993546\tnull\t681\t2015-05-07T02:45:07.603Z\t\t4794469881975683047\t1970-01-01T02:30:00.000000Z\t31\t00000000 4e d6 b2 57 5b e3 71 3d 20 e2 37 f2 64 43 84 55
+                    00000010 a0 dd\tVTNPIW\t0x2d1c6f57bbfd47ec39bd4dd9ad497a2721dc4adc870c62fe19b2faa4e8255a0d\tP
+                    """;
+
+            execute("create table x as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(20))"
+            );
+
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
+            SharedRandom.RANDOM.get().reset();
+
+            execute("create table y as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(10))"
+            );
+
+            assertQuery("select * from x union all y")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected2);
+        });
+    }
+
+    @Test
+    public void testUnionAllOfLiterals() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected1 = """
+                    2020-04-21\t1
+                    2020-04-21\t1
+                    2020-04-22\t2
+                    """;
+            final String query1 = """
+                    select '2020-04-21', 1
+                    union all
+                    select '2020-04-22', 2""";
+            assertQuery(query1)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected1);
+
+            final String expected2 = """
+                    a\tb
+                    2020-04-21\t1
+                    2020-04-22\t2
+                    """;
+            final String query2 = """
+                    select '2020-04-21' a, 1 b
+                    union all
+                    select '2020-04-22', 2""";
+            assertQuery(query2)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected2);
+        });
+    }
+
+    // select distinct sym from a union all b
+    @Test
+    public void testUnionAllOfSymbol() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected = """
+                    t
+                    CAR
+                    CAR
+                    VAN
+                    PLANE
+                    PLANE
+                    PLANE
+                    PLANE
+                    """;
+
+            final String expected2 = """
+                    t
+                    BICYCLE
+                    CAR
+                    PLANE
+                    PLANE
+                    PLANE
+                    SCOOTER
+                    SCOOTER
+                    SCOOTER
+                    SCOOTER
+                    VAN
+                    """;
+
+            execute(
+                    "CREATE TABLE x as " +
+                            "(SELECT " +
+                            " rnd_symbol('CAR', 'VAN', 'PLANE') t " +
+                            " FROM long_sequence(7) x)"
+            );
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
+            SharedRandom.RANDOM.get().reset();
+
+            execute(
+                    "CREATE TABLE y as " +
+                            "(SELECT " +
+                            " rnd_symbol('PLANE', 'BICYCLE', 'SCOOTER') t " +
+                            " FROM long_sequence(7) x)"
+            ); // produces PLANE PLANE BICYCLE SCOOTER SCOOTER SCOOTER SCOOTER
+
+            assertQuery("select distinct t from x union all y order by t")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected2);
+        });
+    }
+
+    // select distinct sym from a union all b
+    @Test
+    public void testUnionAllOfSymbolFor3Tables() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected = """
+                    t
+                    CAR
+                    CAR
+                    VAN
+                    PLANE
+                    PLANE
+                    PLANE
+                    PLANE
+                    """;
+
+            final String expected2 = """
+                    t
+                    CAR
+                    PLANE
+                    VAN
+                    PLANE
+                    PLANE
+                    BICYCLE
+                    SCOOTER
+                    SCOOTER
+                    SCOOTER
+                    SCOOTER
+                    HELICOPTER
+                    MOTORBIKE
+                    HELICOPTER
+                    HELICOPTER
+                    VAN
+                    HELICOPTER
+                    HELICOPTER
+                    HELICOPTER
+                    MOTORBIKE
+                    MOTORBIKE
+                    HELICOPTER
+                    MOTORBIKE
+                    HELICOPTER
+                    """;
+
+            execute(
+                    "CREATE TABLE x as " +
+                            "(SELECT " +
+                            " rnd_symbol('CAR', 'VAN', 'PLANE') t " +
+                            " FROM long_sequence(7) x)"
+            );
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
+            SharedRandom.RANDOM.get().reset();
+
+            execute(
+                    "CREATE TABLE y as " +
+                            "(SELECT " +
+                            " rnd_symbol('PLANE', 'BICYCLE', 'SCOOTER') t " +
+                            " FROM long_sequence(7) x)"
+            ); // produces PLANE PLANE BICYCLE SCOOTER SCOOTER SCOOTER SCOOTER
+
+            execute(
+                    "CREATE TABLE z as " +
+                            "(SELECT " +
+                            " rnd_symbol('MOTORBIKE', 'HELICOPTER', 'VAN') t " +
+                            " FROM long_sequence(13) x)"
+            ); // produces HELICOPTER MOTORBIKE HELICOPTER HELICOPTER VAN HELICOPTER HELICOPTER HELICOPTER MOTORBIKE MOTORBIKE HELICOPTER MOTORBIKE HELICOPTER
+
+            assertQuery(
+                    "select t from (" +
+                            "select * from (select distinct t from x order by 1) " +
+                            "union all " +
+                            "y " +
+                            "union all " +
+                            "z " +
+                            ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected2);
+        });
+    }
+
+    @Test
+    public void testUnionAllOfSymbolOrderBy() throws Exception {
+        assertMemoryLeak(() -> {
+            execute(
+                    "CREATE TABLE x as " +
+                            "(SELECT " +
+                            " rnd_symbol('CAR', 'VAN', 'PLANE') t " +
+                            " FROM long_sequence(7) x)"
+            );
+
+            execute(
+                    "CREATE TABLE y as " +
+                            "(SELECT " +
+                            " rnd_symbol('PLANE', 'BICYCLE', 'SCOOTER') t " +
+                            " FROM long_sequence(7) x)"
+            );
+
+            execute(
+                    "CREATE TABLE z as " +
+                            "(SELECT " +
+                            " rnd_symbol('BUS', NULL) t " +
+                            " FROM long_sequence(5) x)"
+            );
+
+            assertQuery("select typeof(t), t from (select t from x union all y)")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("""
+                            typeof\tt
+                            SYMBOL\tCAR
+                            SYMBOL\tCAR
+                            SYMBOL\tVAN
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tPLANE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tSCOOTER
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            """);
+
+            assertQuery("select typeof(t), t from (select t from x union all y order by t)")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            typeof\tt
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tCAR
+                            SYMBOL\tCAR
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tSCOOTER
+                            SYMBOL\tVAN
+                            """);
+
+            assertQuery("select typeof(t), t from (select t from x union all y) order by t")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            typeof\tt
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tCAR
+                            SYMBOL\tCAR
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tPLANE
+                            SYMBOL\tSCOOTER
+                            SYMBOL\tVAN
+                            """);
+
+            assertQuery("select typeof(t), t from (select t from x union all y union y except x) order by t")
+                    .noLeakCheck()
+                    .returns("""
+                            typeof\tt
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tSCOOTER
+                            """);
+
+            assertQuery("select typeof(t), t from (x union y union z)")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            typeof\tt
+                            SYMBOL\tCAR
+                            SYMBOL\tVAN
+                            SYMBOL\tPLANE
+                            SYMBOL\tBICYCLE
+                            SYMBOL\tSCOOTER
+                            SYMBOL\t
+                            SYMBOL\tBUS
+                            """);
+
+            assertQuery("select typeof(t), t from (x union y union z intersect x)")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            typeof\tt
+                            SYMBOL\tCAR
+                            SYMBOL\tVAN
+                            SYMBOL\tPLANE
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionAllOrderBy() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected2 = """
+                    t
+                    BICYCLE
+                    CAR
+                    HELICOPTER
+                    HELICOPTER
+                    HELICOPTER
+                    HELICOPTER
+                    HELICOPTER
+                    HELICOPTER
+                    HELICOPTER
+                    HELICOPTER
+                    MOTORBIKE
+                    MOTORBIKE
+                    MOTORBIKE
+                    MOTORBIKE
+                    PLANE
+                    PLANE
+                    PLANE
+                    SCOOTER
+                    SCOOTER
+                    SCOOTER
+                    SCOOTER
+                    VAN
+                    VAN
+                    """;
+
+            execute(
+                    "CREATE TABLE x as " +
+                            "(SELECT " +
+                            " rnd_symbol('CAR', 'VAN', 'PLANE') t " +
+                            " FROM long_sequence(7) x)"
+            );
+
+            SharedRandom.RANDOM.get().reset();
+
+            execute(
+                    "CREATE TABLE y as " +
+                            "(SELECT " +
+                            " rnd_symbol('PLANE', 'BICYCLE', 'SCOOTER') t " +
+                            " FROM long_sequence(7) x)"
+            ); // produces PLANE PLANE BICYCLE SCOOTER SCOOTER SCOOTER SCOOTER
+
+            execute(
+                    "CREATE TABLE z as " +
+                            "(SELECT " +
+                            " rnd_symbol('MOTORBIKE', 'HELICOPTER', 'VAN') t " +
+                            " FROM long_sequence(13) x)"
+            ); // produces HELICOPTER MOTORBIKE HELICOPTER HELICOPTER VAN HELICOPTER HELICOPTER HELICOPTER MOTORBIKE MOTORBIKE HELICOPTER MOTORBIKE HELICOPTER
+
+            assertQuery(
+                    "select t from (" +
+                            "select distinct t from x " +
+                            "union all " +
+                            "y " +
+                            "union all " +
+                            "z " +
+                            ")  order by 1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected2);
+        });
+    }
+
+    @Test
+    public void testUnionAllSupportedTypes() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected = """
+                    a\tb\tc\td\te\tf\tg\ti\tj\tk\tl\tm\tn\tl256\tchr
+                    1569490116\tfalse\tZ\tnull\t0.7611029\t428\t2015-05-16T20:27:48.158Z\tVTJW\t-8671107786057422727\t1970-01-01T00:00:00.000000Z\t26\t00000000 68 61 26 af 19 c4 95 94 36 53 49\tFOWLPD\t0x5f20a35e80e154f458dfd08eeb9cc39ecec82869edec121bc2593f82b430328d\tE
+                    -461611463\tfalse\tJ\t0.9687423276940171\t0.6761935\t279\t2015-11-21T14:32:13.134Z\tHYRX\t-6794405451419334859\t1970-01-01T00:16:40.000000Z\t6\t\tETJRSZSRYR\t0x69440048957ae05360802a2ca499f211b771e27f939096b9c356f99ae70523b5\tM
+                    -1515787781\tfalse\t\t0.8001121139739173\t0.18769705\t759\t2015-06-17T02:40:55.328Z\tCPSW\t-4091897709796604687\t1970-01-01T00:33:20.000000Z\t6\t00000000 9c 1d 06 ac 37 c8 cd 82 89 2b 4d 5f f6 46 90 c3\tDYYCTGQOLYXWCKYL\t0x78c594c496995885aa1896d0ad3419d2910aa7b6d58506dc7c97a2cb4ac4b047\tS
+                    1235206821\ttrue\t\t0.9540069089049732\t0.25533193\t310\t\tVTJW\t6623443272143014835\t1970-01-01T00:50:00.000000Z\t17\t00000000 cc 76 48 a3 bb 64 d2 ad 49 1c f2 3c ed 39 ac\tVSJOJIPHZEPIHVLT\t0xb942438168662cb7aa21f9d816335363d27e6df7d9d5b758ea7a0db859a19e14\tU
+                    454820511\tfalse\tL\t0.9918093114862231\t0.32424557\t727\t2015-02-10T08:56:03.707Z\t\t5703149806881083206\t1970-01-01T01:06:40.000000Z\t36\t00000000 68 79 8b 43 1d 57 34 04 23 8d d8 57\tWVDKFLOPJOXPK\t0x550988dbaca497348692bc8c04e4bb71d24b84c08ea7606a70061ac6a4115ca7\tH
+                    1728220848\tfalse\tO\t0.24642266252221556\t0.26721203\t174\t2015-02-20T01:11:53.748Z\t\t2151565237758036093\t1970-01-01T01:23:20.000000Z\t31\t\tHZSQLDGLOGIFO\t0x8531876c963316d961f392242addf45287dd0b29ca2c4c8455b68bf3e1f27620\tZ
+                    -120660220\tfalse\tB\t0.07594017197103131\t0.06381655\t542\t2015-01-16T16:01:53.328Z\tVTJW\t5048272224871876586\t1970-01-01T01:40:00.000000Z\t23\t00000000 f5 0f 2d b3 14 33 80 c9 eb a3 67 7a 1a 79 e4 35
+                    00000010 e4 3a dc 5c\tULIGYVFZ\t0x99193c2e0a9e76da695f8ae33a2cc2aa529d71aba0f6fec5172a489c48c26926\tL
+                    -1548274994\ttrue\tX\t0.9292491654871197\tnull\t523\t2015-01-05T19:01:46.416Z\tHYRX\t9044897286885345735\t1970-01-01T01:56:40.000000Z\t16\t00000000 cd 47 0b 0c 39 12 f7 05 10 f4 6d f1 e3 ee 58 35
+                    00000010 61\tMXSLUQDYOPHNIMYF\t0x483c83d88ac674e3894499a1a1680580cfedff23a67d918fb49b3c24e456ad6e\tP
+                    1430716856\tfalse\tP\t0.7707249647497968\tnull\t162\t2015-02-05T10:14:02.889Z\t\t7046578844650327247\t1970-01-01T02:13:20.000000Z\t47\t\tLEGPUHHIUGGLNYR\t0x36be4fe79117ebd53756b77218c738a7737b1dacd6be597192384aabd888ecb3\tD
+                    -772867311\tfalse\tQ\t0.7653255982993546\tnull\t681\t2015-05-07T02:45:07.603Z\t\t4794469881975683047\t1970-01-01T02:30:00.000000Z\t31\t00000000 4e d6 b2 57 5b e3 71 3d 20 e2 37 f2 64 43 84 55
+                    00000010 a0 dd\tVTNPIW\t0x2d1c6f57bbfd47ec39bd4dd9ad497a2721dc4adc870c62fe19b2faa4e8255a0d\tP
+                    494704403\ttrue\tC\t0.4834201611292943\t0.7942522\t28\t2015-06-16T21:00:55.459Z\tHYRX\t6785355388782691241\t1970-01-01T02:46:40.000000Z\t39\t\tRVNGSTEQOD\t0xbabcd0482f05618f926cdd99e63abb35650d1fb462d014df59070392ef6aa389\tW
+                    -173290754\ttrue\tK\t0.7198854503668188\tnull\t114\t2015-06-15T20:39:39.538Z\tVTJW\t9064962137287142402\t1970-01-01T03:03:20.000000Z\t20\t00000000 3b 94 5f ec d3 dc f8 43 b2 e3\tTIZKYFLUHZQSNPX\t0x74c509677990f1c962588b84eddb7b4a64a4822086748dc4b096d89b65baebef\tM
+                    -2041781509\ttrue\tE\t0.44638626240707313\t0.034652293\t605\t\tVTJW\t415951511685691973\t1970-01-01T03:20:00.000000Z\t28\t00000000 00 7c fb 01 19 ca f2 bf 84 5a 6f 38 35\t\t0x543554ee7efea2c341b1a691af3ce51f91a63337ac2e96836e87bac2e9746529\tW
+                    813111021\ttrue\t\t0.1389067130304884\t0.37303334\t259\t\tCPSW\t4422067104162111415\t1970-01-01T03:36:40.000000Z\t19\t00000000 2d 16 f3 89 a3 83 64 de d6 fd c4 5b c4 e9\tPNXHQUTZODWKOC\t0x50902704a317faeea7fc3b8563ada5ab985499c7f07368a33b8ad671f6730aab\tP
+                    980916820\tfalse\tC\t0.8353079103853974\t0.011099219\t670\t2015-10-06T01:12:57.175Z\t\t7536661420632276058\t1970-01-01T03:53:20.000000Z\t37\t\tFDBZWNIJEE\t0xb265942d3a1f96a1cff85f9258847e03a6f2e2a772cd2f3751d822a67dff3d23\tP
+                    -2016176825\ttrue\tT\tnull\t0.23567414\t813\t2015-12-27T00:19:42.415Z\tCPSW\t3464609208866088600\t1970-01-01T04:10:00.000000Z\t49\t\tFNUHNR\t0x8ca81bb363d7ac4585afb517c8aee023d107b1affff76a2c79189b578191a8f6\tW
+                    1173790070\tfalse\t\t0.5380626833618448\tnull\t440\t2015-07-18T08:33:51.750Z\tCPSW\t-5206126114193456581\t1970-01-01T04:26:40.000000Z\t31\t00000000 a1 46 87 28 92 a3 9b e3 cb c2 64 8a b0 35 d8 ab
+                    00000010 3f a1 f5\t\t0x8e230f5d5b94e76393ce26b5c735a6c94d2c5190fa645a018c7dd745bfadc2ea\tQ
+                    2146422524\ttrue\tI\t0.11025007918539531\t0.86413944\t539\t\t\t5637967617527425113\t1970-01-01T04:43:20.000000Z\t12\t00000000 81 c6 3d bc b5 05 2b 73 51 cf c3 7e c0 1d 6c\t\t0x70c4f4015e9b707986026ba259cee6ad9c3c470dfd351e81960599005766a265\tC
+                    -1433178628\tfalse\tW\t0.9246085617322545\t0.9216729\t578\t2015-06-28T14:27:36.686Z\t\t7861908914614478025\t1970-01-01T05:00:00.000000Z\t32\t00000000 0e 98 0a 8a 0b 1e c4 fd a2 9e b3 77 f8 f6 78\tRPXZSFXUNYQXT\t0x98065c0bf90d68899f5ac37d91bde62260af712d2a1cbb23579b0bab5109229c\tI
+                    94087085\ttrue\tY\t0.5675831821917149\t0.46343064\t872\t2015-11-16T04:04:55.664Z\tPEHN\t8951464047863942551\t1970-01-01T05:16:40.000000Z\t26\t00000000 33 3f b2 67 da 98 47 47 bf 4f ea 5f 48 ed\tDDCIHCNP\t0x680d2fd4ebf181c6960658463c4b85af603e1494ba44804a7fa40f7e4efac82e\tP
+                    """;
+
+            final String expected2 = """
+                    a\tb\tc\td\te\tf\tg\ti\tj\tk\tl\tm\tn\tl256\tchr
+                    1569490116\tfalse\tZ\tnull\t0.7611029\t428\t2015-05-16T20:27:48.158Z\tVTJW\t-8671107786057422727\t1970-01-01T00:00:00.000000Z\t26\t00000000 68 61 26 af 19 c4 95 94 36 53 49\tFOWLPD\t0x5f20a35e80e154f458dfd08eeb9cc39ecec82869edec121bc2593f82b430328d\tE
+                    -461611463\tfalse\tJ\t0.9687423276940171\t0.6761935\t279\t2015-11-21T14:32:13.134Z\tHYRX\t-6794405451419334859\t1970-01-01T00:16:40.000000Z\t6\t\tETJRSZSRYR\t0x69440048957ae05360802a2ca499f211b771e27f939096b9c356f99ae70523b5\tM
+                    -1515787781\tfalse\t\t0.8001121139739173\t0.18769705\t759\t2015-06-17T02:40:55.328Z\tCPSW\t-4091897709796604687\t1970-01-01T00:33:20.000000Z\t6\t00000000 9c 1d 06 ac 37 c8 cd 82 89 2b 4d 5f f6 46 90 c3\tDYYCTGQOLYXWCKYL\t0x78c594c496995885aa1896d0ad3419d2910aa7b6d58506dc7c97a2cb4ac4b047\tS
+                    1235206821\ttrue\t\t0.9540069089049732\t0.25533193\t310\t\tVTJW\t6623443272143014835\t1970-01-01T00:50:00.000000Z\t17\t00000000 cc 76 48 a3 bb 64 d2 ad 49 1c f2 3c ed 39 ac\tVSJOJIPHZEPIHVLT\t0xb942438168662cb7aa21f9d816335363d27e6df7d9d5b758ea7a0db859a19e14\tU
+                    454820511\tfalse\tL\t0.9918093114862231\t0.32424557\t727\t2015-02-10T08:56:03.707Z\t\t5703149806881083206\t1970-01-01T01:06:40.000000Z\t36\t00000000 68 79 8b 43 1d 57 34 04 23 8d d8 57\tWVDKFLOPJOXPK\t0x550988dbaca497348692bc8c04e4bb71d24b84c08ea7606a70061ac6a4115ca7\tH
+                    1728220848\tfalse\tO\t0.24642266252221556\t0.26721203\t174\t2015-02-20T01:11:53.748Z\t\t2151565237758036093\t1970-01-01T01:23:20.000000Z\t31\t\tHZSQLDGLOGIFO\t0x8531876c963316d961f392242addf45287dd0b29ca2c4c8455b68bf3e1f27620\tZ
+                    -120660220\tfalse\tB\t0.07594017197103131\t0.06381655\t542\t2015-01-16T16:01:53.328Z\tVTJW\t5048272224871876586\t1970-01-01T01:40:00.000000Z\t23\t00000000 f5 0f 2d b3 14 33 80 c9 eb a3 67 7a 1a 79 e4 35
+                    00000010 e4 3a dc 5c\tULIGYVFZ\t0x99193c2e0a9e76da695f8ae33a2cc2aa529d71aba0f6fec5172a489c48c26926\tL
+                    -1548274994\ttrue\tX\t0.9292491654871197\tnull\t523\t2015-01-05T19:01:46.416Z\tHYRX\t9044897286885345735\t1970-01-01T01:56:40.000000Z\t16\t00000000 cd 47 0b 0c 39 12 f7 05 10 f4 6d f1 e3 ee 58 35
+                    00000010 61\tMXSLUQDYOPHNIMYF\t0x483c83d88ac674e3894499a1a1680580cfedff23a67d918fb49b3c24e456ad6e\tP
+                    1430716856\tfalse\tP\t0.7707249647497968\tnull\t162\t2015-02-05T10:14:02.889Z\t\t7046578844650327247\t1970-01-01T02:13:20.000000Z\t47\t\tLEGPUHHIUGGLNYR\t0x36be4fe79117ebd53756b77218c738a7737b1dacd6be597192384aabd888ecb3\tD
+                    -772867311\tfalse\tQ\t0.7653255982993546\tnull\t681\t2015-05-07T02:45:07.603Z\t\t4794469881975683047\t1970-01-01T02:30:00.000000Z\t31\t00000000 4e d6 b2 57 5b e3 71 3d 20 e2 37 f2 64 43 84 55
+                    00000010 a0 dd\tVTNPIW\t0x2d1c6f57bbfd47ec39bd4dd9ad497a2721dc4adc870c62fe19b2faa4e8255a0d\tP
+                    494704403\ttrue\tC\t0.4834201611292943\t0.7942522\t28\t2015-06-16T21:00:55.459Z\tHYRX\t6785355388782691241\t1970-01-01T02:46:40.000000Z\t39\t\tRVNGSTEQOD\t0xbabcd0482f05618f926cdd99e63abb35650d1fb462d014df59070392ef6aa389\tW
+                    -173290754\ttrue\tK\t0.7198854503668188\tnull\t114\t2015-06-15T20:39:39.538Z\tVTJW\t9064962137287142402\t1970-01-01T03:03:20.000000Z\t20\t00000000 3b 94 5f ec d3 dc f8 43 b2 e3\tTIZKYFLUHZQSNPX\t0x74c509677990f1c962588b84eddb7b4a64a4822086748dc4b096d89b65baebef\tM
+                    -2041781509\ttrue\tE\t0.44638626240707313\t0.034652293\t605\t\tVTJW\t415951511685691973\t1970-01-01T03:20:00.000000Z\t28\t00000000 00 7c fb 01 19 ca f2 bf 84 5a 6f 38 35\t\t0x543554ee7efea2c341b1a691af3ce51f91a63337ac2e96836e87bac2e9746529\tW
+                    813111021\ttrue\t\t0.1389067130304884\t0.37303334\t259\t\tCPSW\t4422067104162111415\t1970-01-01T03:36:40.000000Z\t19\t00000000 2d 16 f3 89 a3 83 64 de d6 fd c4 5b c4 e9\tPNXHQUTZODWKOC\t0x50902704a317faeea7fc3b8563ada5ab985499c7f07368a33b8ad671f6730aab\tP
+                    980916820\tfalse\tC\t0.8353079103853974\t0.011099219\t670\t2015-10-06T01:12:57.175Z\t\t7536661420632276058\t1970-01-01T03:53:20.000000Z\t37\t\tFDBZWNIJEE\t0xb265942d3a1f96a1cff85f9258847e03a6f2e2a772cd2f3751d822a67dff3d23\tP
+                    -2016176825\ttrue\tT\tnull\t0.23567414\t813\t2015-12-27T00:19:42.415Z\tCPSW\t3464609208866088600\t1970-01-01T04:10:00.000000Z\t49\t\tFNUHNR\t0x8ca81bb363d7ac4585afb517c8aee023d107b1affff76a2c79189b578191a8f6\tW
+                    1173790070\tfalse\t\t0.5380626833618448\tnull\t440\t2015-07-18T08:33:51.750Z\tCPSW\t-5206126114193456581\t1970-01-01T04:26:40.000000Z\t31\t00000000 a1 46 87 28 92 a3 9b e3 cb c2 64 8a b0 35 d8 ab
+                    00000010 3f a1 f5\t\t0x8e230f5d5b94e76393ce26b5c735a6c94d2c5190fa645a018c7dd745bfadc2ea\tQ
+                    2146422524\ttrue\tI\t0.11025007918539531\t0.86413944\t539\t\t\t5637967617527425113\t1970-01-01T04:43:20.000000Z\t12\t00000000 81 c6 3d bc b5 05 2b 73 51 cf c3 7e c0 1d 6c\t\t0x70c4f4015e9b707986026ba259cee6ad9c3c470dfd351e81960599005766a265\tC
+                    -1433178628\tfalse\tW\t0.9246085617322545\t0.9216729\t578\t2015-06-28T14:27:36.686Z\t\t7861908914614478025\t1970-01-01T05:00:00.000000Z\t32\t00000000 0e 98 0a 8a 0b 1e c4 fd a2 9e b3 77 f8 f6 78\tRPXZSFXUNYQXT\t0x98065c0bf90d68899f5ac37d91bde62260af712d2a1cbb23579b0bab5109229c\tI
+                    94087085\ttrue\tY\t0.5675831821917149\t0.46343064\t872\t2015-11-16T04:04:55.664Z\tPEHN\t8951464047863942551\t1970-01-01T05:16:40.000000Z\t26\t00000000 33 3f b2 67 da 98 47 47 bf 4f ea 5f 48 ed\tDDCIHCNP\t0x680d2fd4ebf181c6960658463c4b85af603e1494ba44804a7fa40f7e4efac82e\tP
+                    374615833\ttrue\tK\t0.023600615130049185\t0.13525593\t553\t2015-09-02T18:25:47.825Z\tVTJW\t-7637525141395615332\t1970-01-01T05:33:20.000000Z\t7\t00000000 5d 2d 44 ea 00 81 c4 19 a1 ec 74\tMIFDYPDKOEZBR\t0x4a3ad201ebc732d67b16b1feb1be805bd3da193a04a376caa08679cf663ea669\tG
+                    126163977\tfalse\tH\t0.9321703394650436\t0.48465264\t991\t2015-06-29T17:59:41.483Z\tCPSW\t-6872420962128019931\t1970-01-01T05:50:00.000000Z\t19\t00000000 47 b3 80 69 b9 14 d6 fc ee 03 22 81 b8 06 c4 06
+                    00000010 af 38 71\tBHLNEJRM\t0xd93db19428fc489eb01e38b8cbaf881782ffe46771f9b5f956897ab3e2068b4e\tI
+                    -1536345939\ttrue\tB\t0.5884931033499815\t0.75878596\t805\t\tYQPZ\t5227940066601195428\t1970-01-01T00:00:00.000000Z\t15\t00000000 50 b1 8c 4d 66 e8 32 6a 9b cd bb 2e 74 cd 44 54
+                    00000010 13 3f\t\t0x34fa8218520f9a046282dda91ca20ccda519bc9c0850a07eaa0106bdfb6d9cb6\tE
+                    -1896190362\tfalse\tL\tnull\t0.33000046\t442\t2015-02-06T14:17:40.815Z\tSGQF\t8892131787872519172\t1970-01-01T00:16:40.000000Z\t41\t\t\t0x49e5a0f99d31a104a75dd7280fc9b66b84debde2e574e061463243e5bb8a743d\tK
+                    1996219179\ttrue\tZ\t0.7022152611814457\t0.3257869\t410\t2015-10-24T06:25:39.828Z\t\t-8698821645604291033\t1970-01-01T00:33:20.000000Z\t25\t00000000 2a 42 71 a3 7a 58 e5 78 b8 1c d6 fc\tGZTOY\t0x6eb1dd50a390ca7e2c60ac400987268c77962e845080f34354377431fb8f0a1d\tS
+                    1403475204\tfalse\tR\t0.981074259037815\t0.98916423\t483\t2015-05-09T04:42:23.511Z\t\t-4912776313422450773\t1970-01-01T00:50:00.000000Z\t48\t\tFCYQWPKLHTIIGQ\t0xb58ffdb93190ab917fb4298ae30f186b48c87eff38ac95a63fbc031330b2396e\tD
+                    """;
+
+            execute("create table x as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(20))"
+            );
+
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
+            SharedRandom.RANDOM.get().reset();
+
+            execute("create table y as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(22))"
+            );
+
+
+            execute("create table z as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(4))"
+            );
+
+            assertQuery("select * from x union y union z")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns(expected2);
+        });
+    }
+
+    @Test
+    public void testUnionAllWithLargeNumberOfSubqueries() throws Exception {
+        testLargeNumberOfSubqueries("union all", 100);
+    }
+
+    @Test
+    public void testUnionAndUnionAllOfAllSupportedTypes() throws Exception {
+        assertMemoryLeak(() -> {
+            final String expected = """
+                    a\tb\tc\td\te\tf\tg\ti\tj\tk\tl\tm\tn\tl256\tchr
+                    1569490116\tfalse\tZ\tnull\t0.7611029\t428\t2015-05-16T20:27:48.158Z\tVTJW\t-8671107786057422727\t1970-01-01T00:00:00.000000Z\t26\t00000000 68 61 26 af 19 c4 95 94 36 53 49\tFOWLPD\t0x5f20a35e80e154f458dfd08eeb9cc39ecec82869edec121bc2593f82b430328d\tE
+                    -461611463\tfalse\tJ\t0.9687423276940171\t0.6761935\t279\t2015-11-21T14:32:13.134Z\tHYRX\t-6794405451419334859\t1970-01-01T00:16:40.000000Z\t6\t\tETJRSZSRYR\t0x69440048957ae05360802a2ca499f211b771e27f939096b9c356f99ae70523b5\tM
+                    -1515787781\tfalse\t\t0.8001121139739173\t0.18769705\t759\t2015-06-17T02:40:55.328Z\tCPSW\t-4091897709796604687\t1970-01-01T00:33:20.000000Z\t6\t00000000 9c 1d 06 ac 37 c8 cd 82 89 2b 4d 5f f6 46 90 c3\tDYYCTGQOLYXWCKYL\t0x78c594c496995885aa1896d0ad3419d2910aa7b6d58506dc7c97a2cb4ac4b047\tS
+                    1235206821\ttrue\t\t0.9540069089049732\t0.25533193\t310\t\tVTJW\t6623443272143014835\t1970-01-01T00:50:00.000000Z\t17\t00000000 cc 76 48 a3 bb 64 d2 ad 49 1c f2 3c ed 39 ac\tVSJOJIPHZEPIHVLT\t0xb942438168662cb7aa21f9d816335363d27e6df7d9d5b758ea7a0db859a19e14\tU
+                    454820511\tfalse\tL\t0.9918093114862231\t0.32424557\t727\t2015-02-10T08:56:03.707Z\t\t5703149806881083206\t1970-01-01T01:06:40.000000Z\t36\t00000000 68 79 8b 43 1d 57 34 04 23 8d d8 57\tWVDKFLOPJOXPK\t0x550988dbaca497348692bc8c04e4bb71d24b84c08ea7606a70061ac6a4115ca7\tH
+                    1728220848\tfalse\tO\t0.24642266252221556\t0.26721203\t174\t2015-02-20T01:11:53.748Z\t\t2151565237758036093\t1970-01-01T01:23:20.000000Z\t31\t\tHZSQLDGLOGIFO\t0x8531876c963316d961f392242addf45287dd0b29ca2c4c8455b68bf3e1f27620\tZ
+                    -120660220\tfalse\tB\t0.07594017197103131\t0.06381655\t542\t2015-01-16T16:01:53.328Z\tVTJW\t5048272224871876586\t1970-01-01T01:40:00.000000Z\t23\t00000000 f5 0f 2d b3 14 33 80 c9 eb a3 67 7a 1a 79 e4 35
+                    00000010 e4 3a dc 5c\tULIGYVFZ\t0x99193c2e0a9e76da695f8ae33a2cc2aa529d71aba0f6fec5172a489c48c26926\tL
+                    -1548274994\ttrue\tX\t0.9292491654871197\tnull\t523\t2015-01-05T19:01:46.416Z\tHYRX\t9044897286885345735\t1970-01-01T01:56:40.000000Z\t16\t00000000 cd 47 0b 0c 39 12 f7 05 10 f4 6d f1 e3 ee 58 35
+                    00000010 61\tMXSLUQDYOPHNIMYF\t0x483c83d88ac674e3894499a1a1680580cfedff23a67d918fb49b3c24e456ad6e\tP
+                    1430716856\tfalse\tP\t0.7707249647497968\tnull\t162\t2015-02-05T10:14:02.889Z\t\t7046578844650327247\t1970-01-01T02:13:20.000000Z\t47\t\tLEGPUHHIUGGLNYR\t0x36be4fe79117ebd53756b77218c738a7737b1dacd6be597192384aabd888ecb3\tD
+                    -772867311\tfalse\tQ\t0.7653255982993546\tnull\t681\t2015-05-07T02:45:07.603Z\t\t4794469881975683047\t1970-01-01T02:30:00.000000Z\t31\t00000000 4e d6 b2 57 5b e3 71 3d 20 e2 37 f2 64 43 84 55
+                    00000010 a0 dd\tVTNPIW\t0x2d1c6f57bbfd47ec39bd4dd9ad497a2721dc4adc870c62fe19b2faa4e8255a0d\tP
+                    494704403\ttrue\tC\t0.4834201611292943\t0.7942522\t28\t2015-06-16T21:00:55.459Z\tHYRX\t6785355388782691241\t1970-01-01T02:46:40.000000Z\t39\t\tRVNGSTEQOD\t0xbabcd0482f05618f926cdd99e63abb35650d1fb462d014df59070392ef6aa389\tW
+                    -173290754\ttrue\tK\t0.7198854503668188\tnull\t114\t2015-06-15T20:39:39.538Z\tVTJW\t9064962137287142402\t1970-01-01T03:03:20.000000Z\t20\t00000000 3b 94 5f ec d3 dc f8 43 b2 e3\tTIZKYFLUHZQSNPX\t0x74c509677990f1c962588b84eddb7b4a64a4822086748dc4b096d89b65baebef\tM
+                    -2041781509\ttrue\tE\t0.44638626240707313\t0.034652293\t605\t\tVTJW\t415951511685691973\t1970-01-01T03:20:00.000000Z\t28\t00000000 00 7c fb 01 19 ca f2 bf 84 5a 6f 38 35\t\t0x543554ee7efea2c341b1a691af3ce51f91a63337ac2e96836e87bac2e9746529\tW
+                    813111021\ttrue\t\t0.1389067130304884\t0.37303334\t259\t\tCPSW\t4422067104162111415\t1970-01-01T03:36:40.000000Z\t19\t00000000 2d 16 f3 89 a3 83 64 de d6 fd c4 5b c4 e9\tPNXHQUTZODWKOC\t0x50902704a317faeea7fc3b8563ada5ab985499c7f07368a33b8ad671f6730aab\tP
+                    980916820\tfalse\tC\t0.8353079103853974\t0.011099219\t670\t2015-10-06T01:12:57.175Z\t\t7536661420632276058\t1970-01-01T03:53:20.000000Z\t37\t\tFDBZWNIJEE\t0xb265942d3a1f96a1cff85f9258847e03a6f2e2a772cd2f3751d822a67dff3d23\tP
+                    -2016176825\ttrue\tT\tnull\t0.23567414\t813\t2015-12-27T00:19:42.415Z\tCPSW\t3464609208866088600\t1970-01-01T04:10:00.000000Z\t49\t\tFNUHNR\t0x8ca81bb363d7ac4585afb517c8aee023d107b1affff76a2c79189b578191a8f6\tW
+                    1173790070\tfalse\t\t0.5380626833618448\tnull\t440\t2015-07-18T08:33:51.750Z\tCPSW\t-5206126114193456581\t1970-01-01T04:26:40.000000Z\t31\t00000000 a1 46 87 28 92 a3 9b e3 cb c2 64 8a b0 35 d8 ab
+                    00000010 3f a1 f5\t\t0x8e230f5d5b94e76393ce26b5c735a6c94d2c5190fa645a018c7dd745bfadc2ea\tQ
+                    2146422524\ttrue\tI\t0.11025007918539531\t0.86413944\t539\t\t\t5637967617527425113\t1970-01-01T04:43:20.000000Z\t12\t00000000 81 c6 3d bc b5 05 2b 73 51 cf c3 7e c0 1d 6c\t\t0x70c4f4015e9b707986026ba259cee6ad9c3c470dfd351e81960599005766a265\tC
+                    -1433178628\tfalse\tW\t0.9246085617322545\t0.9216729\t578\t2015-06-28T14:27:36.686Z\t\t7861908914614478025\t1970-01-01T05:00:00.000000Z\t32\t00000000 0e 98 0a 8a 0b 1e c4 fd a2 9e b3 77 f8 f6 78\tRPXZSFXUNYQXT\t0x98065c0bf90d68899f5ac37d91bde62260af712d2a1cbb23579b0bab5109229c\tI
+                    94087085\ttrue\tY\t0.5675831821917149\t0.46343064\t872\t2015-11-16T04:04:55.664Z\tPEHN\t8951464047863942551\t1970-01-01T05:16:40.000000Z\t26\t00000000 33 3f b2 67 da 98 47 47 bf 4f ea 5f 48 ed\tDDCIHCNP\t0x680d2fd4ebf181c6960658463c4b85af603e1494ba44804a7fa40f7e4efac82e\tP
+                    """;
+
+            final String expected2 = """
+                    a\tb\tc\td\te\tf\tg\ti\tj\tk\tl\tm\tn\tl256\tchr
+                    1569490116\tfalse\tZ\tnull\t0.7611029\t428\t2015-05-16T20:27:48.158Z\tVTJW\t-8671107786057422727\t1970-01-01T00:00:00.000000Z\t26\t00000000 68 61 26 af 19 c4 95 94 36 53 49\tFOWLPD\t0x5f20a35e80e154f458dfd08eeb9cc39ecec82869edec121bc2593f82b430328d\tE
+                    -461611463\tfalse\tJ\t0.9687423276940171\t0.6761935\t279\t2015-11-21T14:32:13.134Z\tHYRX\t-6794405451419334859\t1970-01-01T00:16:40.000000Z\t6\t\tETJRSZSRYR\t0x69440048957ae05360802a2ca499f211b771e27f939096b9c356f99ae70523b5\tM
+                    -1515787781\tfalse\t\t0.8001121139739173\t0.18769705\t759\t2015-06-17T02:40:55.328Z\tCPSW\t-4091897709796604687\t1970-01-01T00:33:20.000000Z\t6\t00000000 9c 1d 06 ac 37 c8 cd 82 89 2b 4d 5f f6 46 90 c3\tDYYCTGQOLYXWCKYL\t0x78c594c496995885aa1896d0ad3419d2910aa7b6d58506dc7c97a2cb4ac4b047\tS
+                    1235206821\ttrue\t\t0.9540069089049732\t0.25533193\t310\t\tVTJW\t6623443272143014835\t1970-01-01T00:50:00.000000Z\t17\t00000000 cc 76 48 a3 bb 64 d2 ad 49 1c f2 3c ed 39 ac\tVSJOJIPHZEPIHVLT\t0xb942438168662cb7aa21f9d816335363d27e6df7d9d5b758ea7a0db859a19e14\tU
+                    454820511\tfalse\tL\t0.9918093114862231\t0.32424557\t727\t2015-02-10T08:56:03.707Z\t\t5703149806881083206\t1970-01-01T01:06:40.000000Z\t36\t00000000 68 79 8b 43 1d 57 34 04 23 8d d8 57\tWVDKFLOPJOXPK\t0x550988dbaca497348692bc8c04e4bb71d24b84c08ea7606a70061ac6a4115ca7\tH
+                    1728220848\tfalse\tO\t0.24642266252221556\t0.26721203\t174\t2015-02-20T01:11:53.748Z\t\t2151565237758036093\t1970-01-01T01:23:20.000000Z\t31\t\tHZSQLDGLOGIFO\t0x8531876c963316d961f392242addf45287dd0b29ca2c4c8455b68bf3e1f27620\tZ
+                    -120660220\tfalse\tB\t0.07594017197103131\t0.06381655\t542\t2015-01-16T16:01:53.328Z\tVTJW\t5048272224871876586\t1970-01-01T01:40:00.000000Z\t23\t00000000 f5 0f 2d b3 14 33 80 c9 eb a3 67 7a 1a 79 e4 35
+                    00000010 e4 3a dc 5c\tULIGYVFZ\t0x99193c2e0a9e76da695f8ae33a2cc2aa529d71aba0f6fec5172a489c48c26926\tL
+                    -1548274994\ttrue\tX\t0.9292491654871197\tnull\t523\t2015-01-05T19:01:46.416Z\tHYRX\t9044897286885345735\t1970-01-01T01:56:40.000000Z\t16\t00000000 cd 47 0b 0c 39 12 f7 05 10 f4 6d f1 e3 ee 58 35
+                    00000010 61\tMXSLUQDYOPHNIMYF\t0x483c83d88ac674e3894499a1a1680580cfedff23a67d918fb49b3c24e456ad6e\tP
+                    1430716856\tfalse\tP\t0.7707249647497968\tnull\t162\t2015-02-05T10:14:02.889Z\t\t7046578844650327247\t1970-01-01T02:13:20.000000Z\t47\t\tLEGPUHHIUGGLNYR\t0x36be4fe79117ebd53756b77218c738a7737b1dacd6be597192384aabd888ecb3\tD
+                    -772867311\tfalse\tQ\t0.7653255982993546\tnull\t681\t2015-05-07T02:45:07.603Z\t\t4794469881975683047\t1970-01-01T02:30:00.000000Z\t31\t00000000 4e d6 b2 57 5b e3 71 3d 20 e2 37 f2 64 43 84 55
+                    00000010 a0 dd\tVTNPIW\t0x2d1c6f57bbfd47ec39bd4dd9ad497a2721dc4adc870c62fe19b2faa4e8255a0d\tP
+                    494704403\ttrue\tC\t0.4834201611292943\t0.7942522\t28\t2015-06-16T21:00:55.459Z\tHYRX\t6785355388782691241\t1970-01-01T02:46:40.000000Z\t39\t\tRVNGSTEQOD\t0xbabcd0482f05618f926cdd99e63abb35650d1fb462d014df59070392ef6aa389\tW
+                    -173290754\ttrue\tK\t0.7198854503668188\tnull\t114\t2015-06-15T20:39:39.538Z\tVTJW\t9064962137287142402\t1970-01-01T03:03:20.000000Z\t20\t00000000 3b 94 5f ec d3 dc f8 43 b2 e3\tTIZKYFLUHZQSNPX\t0x74c509677990f1c962588b84eddb7b4a64a4822086748dc4b096d89b65baebef\tM
+                    -2041781509\ttrue\tE\t0.44638626240707313\t0.034652293\t605\t\tVTJW\t415951511685691973\t1970-01-01T03:20:00.000000Z\t28\t00000000 00 7c fb 01 19 ca f2 bf 84 5a 6f 38 35\t\t0x543554ee7efea2c341b1a691af3ce51f91a63337ac2e96836e87bac2e9746529\tW
+                    813111021\ttrue\t\t0.1389067130304884\t0.37303334\t259\t\tCPSW\t4422067104162111415\t1970-01-01T03:36:40.000000Z\t19\t00000000 2d 16 f3 89 a3 83 64 de d6 fd c4 5b c4 e9\tPNXHQUTZODWKOC\t0x50902704a317faeea7fc3b8563ada5ab985499c7f07368a33b8ad671f6730aab\tP
+                    980916820\tfalse\tC\t0.8353079103853974\t0.011099219\t670\t2015-10-06T01:12:57.175Z\t\t7536661420632276058\t1970-01-01T03:53:20.000000Z\t37\t\tFDBZWNIJEE\t0xb265942d3a1f96a1cff85f9258847e03a6f2e2a772cd2f3751d822a67dff3d23\tP
+                    -2016176825\ttrue\tT\tnull\t0.23567414\t813\t2015-12-27T00:19:42.415Z\tCPSW\t3464609208866088600\t1970-01-01T04:10:00.000000Z\t49\t\tFNUHNR\t0x8ca81bb363d7ac4585afb517c8aee023d107b1affff76a2c79189b578191a8f6\tW
+                    1173790070\tfalse\t\t0.5380626833618448\tnull\t440\t2015-07-18T08:33:51.750Z\tCPSW\t-5206126114193456581\t1970-01-01T04:26:40.000000Z\t31\t00000000 a1 46 87 28 92 a3 9b e3 cb c2 64 8a b0 35 d8 ab
+                    00000010 3f a1 f5\t\t0x8e230f5d5b94e76393ce26b5c735a6c94d2c5190fa645a018c7dd745bfadc2ea\tQ
+                    2146422524\ttrue\tI\t0.11025007918539531\t0.86413944\t539\t\t\t5637967617527425113\t1970-01-01T04:43:20.000000Z\t12\t00000000 81 c6 3d bc b5 05 2b 73 51 cf c3 7e c0 1d 6c\t\t0x70c4f4015e9b707986026ba259cee6ad9c3c470dfd351e81960599005766a265\tC
+                    -1433178628\tfalse\tW\t0.9246085617322545\t0.9216729\t578\t2015-06-28T14:27:36.686Z\t\t7861908914614478025\t1970-01-01T05:00:00.000000Z\t32\t00000000 0e 98 0a 8a 0b 1e c4 fd a2 9e b3 77 f8 f6 78\tRPXZSFXUNYQXT\t0x98065c0bf90d68899f5ac37d91bde62260af712d2a1cbb23579b0bab5109229c\tI
+                    94087085\ttrue\tY\t0.5675831821917149\t0.46343064\t872\t2015-11-16T04:04:55.664Z\tPEHN\t8951464047863942551\t1970-01-01T05:16:40.000000Z\t26\t00000000 33 3f b2 67 da 98 47 47 bf 4f ea 5f 48 ed\tDDCIHCNP\t0x680d2fd4ebf181c6960658463c4b85af603e1494ba44804a7fa40f7e4efac82e\tP
+                    374615833\ttrue\tK\t0.023600615130049185\t0.13525593\t553\t2015-09-02T18:25:47.825Z\tVTJW\t-7637525141395615332\t1970-01-01T05:33:20.000000Z\t7\t00000000 5d 2d 44 ea 00 81 c4 19 a1 ec 74\tMIFDYPDKOEZBR\t0x4a3ad201ebc732d67b16b1feb1be805bd3da193a04a376caa08679cf663ea669\tG
+                    126163977\tfalse\tH\t0.9321703394650436\t0.48465264\t991\t2015-06-29T17:59:41.483Z\tCPSW\t-6872420962128019931\t1970-01-01T05:50:00.000000Z\t19\t00000000 47 b3 80 69 b9 14 d6 fc ee 03 22 81 b8 06 c4 06
+                    00000010 af 38 71\tBHLNEJRM\t0xd93db19428fc489eb01e38b8cbaf881782ffe46771f9b5f956897ab3e2068b4e\tI
+                    -1604872342\ttrue\tF\t0.9674352881185491\t0.30878645\t643\t2015-12-07T03:56:58.742Z\tHYRX\t-6544713176186588811\t1970-01-01T06:06:40.000000Z\t35\t00000000 87 88 45 b9 9d 20 13 51 c0 e0 b7\tSNSXH\t0x5ae63bdf09a84e32bac4484bdeec40e887ec84d0151017668c17a681e308fd4d\tE
+                    172654235\tfalse\tM\tnull\t0.86428\t184\t2015-10-10T03:50:18.267Z\t\t-6196664199248241482\t1970-01-01T06:23:20.000000Z\t50\t00000000 27 66 94 89 db 3c 1a 23 f3 88 83 73\tGJBFQ\t0xcfd0f01a76fbe32b8e7fd4a84ba9813349e5a0f99d31a104a75dd7280fc9b66b\tI
+                    """;
+
+            execute("create table x as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(20))"
+            );
+
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
+            SharedRandom.RANDOM.get().reset();
+
+            execute("create table y as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(10))"
+            );
+
+
+            SharedRandom.RANDOM.get().reset();
+
+            execute("create table z as " +
+                    "(" +
+                    "select" +
+                    " rnd_int() a," +
+                    " rnd_boolean() b," +
+                    " rnd_str(1,1,2) c," +
+                    " rnd_double(2) d," +
+                    " rnd_float(2) e," +
+                    " rnd_short(10,1024) f," +
+                    " rnd_date(to_date('2015', 'yyyy'), to_date('2016', 'yyyy'), 2) g," +
+                    " rnd_symbol(4,4,4,2) i," +
+                    " rnd_long() j," +
+                    " timestamp_sequence(0, 1000000000) k," +
+                    " rnd_byte(2,50) l," +
+                    " rnd_bin(10, 20, 2) m," +
+                    " rnd_str(5,16,2) n," +
+                    " rnd_long256() l256," +
+                    " rnd_char() chr" +
+                    " from" +
+                    " long_sequence(24))"
+            );
+
+            assertQuery("select * from x union all y union z")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns(expected2);
+        });
+    }
+
+    @Test
+    public void testUnionDistinctSymbolAndString() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("""
+                    create table table1 as\s
+                    (
+                      select cast(x as symbol) as sym1\s
+                      from long_sequence(3)
+                    )""");
+            execute("""
+                    create table table3 as\s
+                    (
+                      select cast(x+2 as string) as str3
+                      from long_sequence(3)
+                    )""");
+
+            assertQuery("""
+                    select sym1 from table1\s
+                    union distinct
+                    select str3 from table3""")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            sym1
+                            1
+                            2
+                            3
+                            4
+                            5
+                            """);
+        });
+    }
+
+    /**
+     * Tests UNION DISTINCT of VARCHAR and SYMBOL with duplicate values.
+     * This exercises RecordSink's handling in the distinct operation where
+     * both VARCHAR and SYMBOL values need to be compared correctly.
+     */
+    @Test
+    public void testUnionDistinctVarcharAndSymbol() throws Exception {
+        assertMemoryLeak(() -> {
+            // Table with VARCHAR column - include 'common' value
+            execute("create table t_varchar as (" +
+                    "  select cast(case when x = 1 then 'common' else 'varchar_' || x end as varchar) as col " +
+                    "  from long_sequence(3)" +
+                    ")");
+
+            // Table with SYMBOL column - include 'common' value
+            execute("create table t_symbol (col symbol)");
+            execute("insert into t_symbol values ('common')");
+            execute("insert into t_symbol values ('sym_a')");
+            execute("insert into t_symbol values ('sym_b')");
+
+            // UNION DISTINCT should deduplicate 'common' value
+            // Result should have 5 unique values, not 6
+            assertQuery("select col from (" +
+                    "  select col from t_varchar " +
+                    "  union distinct " +
+                    "  select col from t_symbol" +
+                    ") order by col")
+                    .noLeakCheck()
+                    .returns("""
+                            col
+                            common
+                            sym_a
+                            sym_b
+                            varchar_2
+                            varchar_3
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionGroupBy() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table x1 as (select rnd_symbol('b', 'c', 'a') s, rnd_double() val from long_sequence(20))", sqlExecutionContext);
+            execute("create table x2 as (select rnd_symbol('c', 'a', 'b') s, rnd_double() val from long_sequence(20))", sqlExecutionContext);
+
+            assertQuery("select typeof(s), s, sum(val) from (x1 union all x2)")
+                    .expectSize()
+                    .returns("""
+                            typeof\ts\tsum
+                            SYMBOL\tb\t9.711630235623893
+                            SYMBOL\ta\t4.567523321042871
+                            SYMBOL\tc\t6.077503835152431
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInJoinLateralWithOrderByAndLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // The trailing ORDER BY and LIMIT of a set operation that a lateral join reads apply to
+            // the whole set operation, once per row of the join's left side. For the row t1.v the
+            // branches return 1 to t1.v and 11 to t1.v + 10, so the largest value is t1.v + 10.
+            assertQuery("""
+                    SELECT t1.v, t2.v
+                    FROM t t1
+                    JOIN LATERAL (
+                        SELECT v FROM t WHERE v <= t1.v
+                        UNION ALL
+                        SELECT v + 10 FROM t WHERE v <= t1.v
+                        ORDER BY v DESC
+                        LIMIT 1
+                    ) t2
+                    ORDER BY t1.v
+                    """)
+                    .noLeakCheck()
+                    .returns("""
+                            v\tv1
+                            1\t11
+                            2\t12
+                            3\t13
+                            """);
+            // a row of the left side for which both branches are empty
+            assertQuery("""
+                    SELECT t1.v, t2.v
+                    FROM t t1
+                    LEFT JOIN LATERAL (
+                        SELECT v FROM t WHERE v < t1.v
+                        UNION ALL
+                        SELECT v + 10 FROM t WHERE v < t1.v
+                        ORDER BY v DESC
+                        LIMIT 1
+                    ) t2 ON true
+                    ORDER BY t1.v
+                    """)
+                    .noLeakCheck()
+                    .returns("""
+                            v\tv1
+                            1\tnull
+                            2\t11
+                            3\t12
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInJoinRejectsOrderByAliasOfLastBranch() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // The trailing ORDER BY of a set operation that a join reads applies to the whole set
+            // operation, which takes its column names from its first branch. The ORDER BY cannot
+            // name an alias that only the last branch declares, and can name the first branch's.
+            assertQuery("SELECT * FROM t t1 JOIN (SELECT v FROM t UNION ALL SELECT v w FROM t ORDER BY w DESC LIMIT 1) t2 ON t1.v = t2.v")
+                    .noLeakCheck()
+                    .fails(78, "Invalid column: w");
+            assertQuery("SELECT * FROM t t1 JOIN (SELECT v w FROM t UNION ALL SELECT v FROM t ORDER BY w DESC LIMIT 1) t2 ON t1.v = t2.w")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tw
+                            3\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInJoinWithLimitOrOrderByAlone() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // A trailing LIMIT without an ORDER BY, and a trailing ORDER BY without a LIMIT, of a
+            // set operation that a join reads apply to the whole set operation, the same as the
+            // two together.
+            final String rows = "SELECT v FROM t UNION ALL SELECT v + 10 FROM t";
+            // LIMIT alone
+            assertQuery("SELECT * FROM t t1 CROSS JOIN (" + rows + " LIMIT 2) t2 ORDER BY t1.v, t2.v")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            v\tv1
+                            1\t1
+                            1\t2
+                            2\t1
+                            2\t2
+                            3\t1
+                            3\t2
+                            """);
+            // a negative LIMIT alone
+            assertQuery("SELECT * FROM t t1 CROSS JOIN (" + rows + " LIMIT -2) t2 ORDER BY t1.v, t2.v")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            v\tv1
+                            1\t12
+                            1\t13
+                            2\t12
+                            2\t13
+                            3\t12
+                            3\t13
+                            """);
+            // ORDER BY alone: an outer ORDER BY would hide the order the set operation returns its
+            // rows in, so the join's left side has one row instead.
+            assertQuery("SELECT t2.v FROM long_sequence(1) CROSS JOIN (" + rows + " ORDER BY 1 DESC) t2")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            13
+                            12
+                            11
+                            3
+                            2
+                            1
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInJoinWithOrderByAndLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // The trailing ORDER BY and LIMIT of a set operation that a join reads apply to the
+            // whole set operation, in a positional and in a named spelling alike, and whichever
+            // branch of an outer set operation the join sits in.
+            final String top1 = "SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY 1 DESC LIMIT 1";
+            final String joinRow = """
+                    v\tv1
+                    3\t3
+                    """;
+            assertQuery("SELECT * FROM t t1 JOIN (" + top1 + ") t2 ON t1.v = t2.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns(joinRow);
+            assertQuery("SELECT * FROM t t1 JOIN (SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY v DESC LIMIT 1) t2 ON t1.v = t2.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns(joinRow);
+            assertQuery("WITH c AS (" + top1 + ") SELECT * FROM t t1 JOIN c t2 ON t1.v = t2.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns(joinRow);
+            assertQuery("SELECT * FROM t t1 LEFT JOIN (" + top1 + ") t2 ON t1.v = t2.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1
+                            1\tnull
+                            2\tnull
+                            3\t3
+                            """);
+            assertQuery("SELECT * FROM t t1 CROSS JOIN (" + top1 + ") t2")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v\tv1
+                            1\t3
+                            2\t3
+                            3\t3
+                            """);
+            assertQuery("SELECT 0L v, 0L v1 UNION ALL SELECT * FROM t t1 JOIN (" + top1 + ") t2 ON t1.v = t2.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1
+                            0\t0
+                            3\t3
+                            """);
+            assertQuery("""
+                    SELECT 0L v, 0L v1
+                    UNION ALL
+                    SELECT -1L, -1L
+                    UNION ALL
+                    SELECT * FROM t t1
+                    JOIN (SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY v DESC LIMIT 1) t2 ON t1.v = t2.v
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1
+                            0\t0
+                            -1\t-1
+                            3\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInLaterBranchWithDifferentColumnCount() throws Exception {
+        assertMemoryLeak(() -> {
+            // A set operation inside the second or a later branch of another one, reached through
+            // the branch's nested or join models, gets the column count check the first branch's
+            // gets.
+            final String error = "queries have different number of columns";
+            assertQuery("SELECT * FROM (SELECT 1 a, 2 b, 3 c UNION ALL (SELECT 1 a, 2 b, 3 c UNION ALL SELECT 1 a, 2 b))")
+                    .noLeakCheck()
+                    .fails(78, error);
+            assertQuery("WITH c0 AS (SELECT 1 a, 2 b), c1 AS (SELECT 1 a, 2 b, 3 c), c2 AS (SELECT * FROM c1 UNION ALL SELECT * FROM c0) SELECT * FROM c1 UNION ALL SELECT * FROM c2")
+                    .noLeakCheck()
+                    .fails(94, error);
+            assertQuery("SELECT 1 a, 2 b UNION ALL SELECT * FROM (SELECT 1 a) x CROSS JOIN (SELECT 2 b UNION ALL SELECT 2 b, 3 c) y")
+                    .noLeakCheck()
+                    .fails(88, error);
+            assertQuery("SELECT 1 a, 2 b UNION ALL SELECT 1 a, 2 b UNION ALL (SELECT 1 a, 2 b EXCEPT SELECT 3 a)")
+                    .noLeakCheck()
+                    .fails(76, error);
+            assertQuery("SELECT 1 a, 2 b UNION (SELECT 1 a, 2 b INTERSECT SELECT 3 a)")
+                    .noLeakCheck()
+                    .fails(49, error);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInLaterBranchWithOrderByAndLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            execute("CREATE VIEW top1_view AS (SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY v DESC LIMIT 1)");
+            drainWalAndViewQueues();
+            // The trailing ORDER BY and LIMIT of a set operation apply to the whole set operation,
+            // not to its last branch, whichever branch of an outer set operation reads it, and
+            // however that branch reads it: through a sub-query, brackets, a CTE, a declared
+            // sub-query or a view.
+            final String top1 = "SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY 1 DESC LIMIT 1";
+            final String expected = """
+                    v
+                    -1
+                    -2
+                    3
+                    """;
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM (" + top1 + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .withPlan("""
+                            Union All
+                                Union All
+                                    VirtualRecord
+                                      functions: [-1L]
+                                        long_sequence count: 1
+                                    VirtualRecord
+                                      functions: [-2L]
+                                        long_sequence count: 1
+                                Limit value: 1 skip-rows: 0 take-rows: 1
+                                    Encode sort
+                                      keys: [v desc]
+                                        Union All
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t
+                            """)
+                    .returns(expected);
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL (" + top1 + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("WITH top1 AS (" + top1 + ") SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM top1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("WITH top1 AS (" + top1 + ") SELECT -1L v UNION ALL SELECT * FROM top1 UNION ALL SELECT * FROM top1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            3
+                            3
+                            """);
+            assertQuery("DECLARE @top1 := (" + top1 + ") SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM @top1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM top1_view")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("""
+                    SELECT -1L v
+                    UNION ALL
+                    SELECT -2L
+                    UNION ALL
+                    SELECT * FROM (SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY v DESC LIMIT 1)
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
+            // a fourth branch
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT -3L UNION ALL SELECT * FROM (" + top1 + ")")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            -3
+                            3
+                            """);
+            // a later branch of a set operation that sits in a later branch itself
+            assertQuery("""
+                    SELECT -1L v
+                    UNION ALL
+                    SELECT -2L
+                    UNION ALL
+                    SELECT * FROM (SELECT -3L v UNION ALL SELECT -4L UNION ALL SELECT * FROM (""" + top1 + "))")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            -3
+                            -4
+                            3
+                            """);
+            // LIMIT alone
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM (SELECT v FROM t UNION ALL SELECT v + 10 FROM t LIMIT 2)")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            1
+                            2
+                            """);
+            // ORDER BY alone
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM (SELECT v FROM t UNION ALL SELECT v + 10 FROM t ORDER BY 1 DESC)")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            13
+                            12
+                            11
+                            3
+                            2
+                            1
+                            """);
+            // the outer set operation keeps its own trailing ORDER BY and LIMIT
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM (" + top1 + ") ORDER BY 1 DESC LIMIT 2")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            v
+                            3
+                            -1
+                            """);
+            // A bracketed last branch scopes its ORDER BY and LIMIT to itself, in a later branch
+            // of an outer set operation as well.
+            assertQuery("""
+                    SELECT -1L v
+                    UNION ALL
+                    SELECT -2L
+                    UNION ALL
+                    SELECT * FROM (SELECT v FROM t UNION ALL (SELECT v FROM t ORDER BY 1 DESC LIMIT 1))
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v
+                            -1
+                            -2
+                            1
+                            2
+                            3
+                            3
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInLaterBranchWithPositionalOrderBy() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE k (s SYMBOL, l LONG)");
+            execute("INSERT INTO k VALUES ('a', 1), ('b', 2), ('a', 3)");
+            // A positional ORDER BY in a bracketed branch of a set operation resolves against
+            // that branch and applies to it alone, whether that set operation sits in the first
+            // branch of another one or in a later branch. A trailing ORDER BY of a whole set
+            // operation that a later branch reads is in testUnionNestedInLaterBranchWithOrderByAndLimit.
+            assertQuery("SELECT * FROM (SELECT s, l FROM k UNION ALL (SELECT s, l FROM k ORDER BY 2 DESC LIMIT 1)) UNION ALL SELECT 'x' s, 0L l")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            s\tl
+                            a\t1
+                            b\t2
+                            a\t3
+                            a\t3
+                            x\t0
+                            """);
+            assertQuery("SELECT 'x' s, 0L l UNION ALL SELECT * FROM (SELECT s, l FROM k UNION ALL (SELECT s, l FROM k ORDER BY 2 DESC LIMIT 1))")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            s\tl
+                            x\t0
+                            a\t1
+                            b\t2
+                            a\t3
+                            a\t3
+                            """);
+            assertQuery("""
+                    WITH c AS (SELECT s, l FROM k UNION ALL (SELECT s, l FROM k ORDER BY 2 DESC LIMIT 1))
+                    SELECT * FROM c
+                    UNION ALL
+                    SELECT * FROM c
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            s\tl
+                            a\t1
+                            b\t2
+                            a\t3
+                            a\t3
+                            a\t1
+                            b\t2
+                            a\t3
+                            a\t3
+                            """);
+            assertQuery("SELECT 'x' s, 0L l UNION ALL (SELECT s, l FROM k UNION ALL (SELECT s, l FROM k ORDER BY 3))")
+                    .noLeakCheck()
+                    .fails(88, "order column position is out of range [max=2]");
+        });
+    }
+
+    @Test
+    public void testUnionNestedInMiddleBranchWithOrderByAndLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // The trailing ORDER BY and LIMIT of a set operation apply to the whole set operation
+            // also when a middle branch of an outer one reads it: a branch that comes after the
+            // second one and has more branches after it.
+            final String top1 = "SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY 1 DESC LIMIT 1";
+            final String thirdOfFour = """
+                    v
+                    -1
+                    -2
+                    3
+                    -3
+                    """;
+            final String fourthOfFive = """
+                    v
+                    -1
+                    -2
+                    -3
+                    3
+                    -4
+                    """;
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM (" + top1 + ") UNION ALL SELECT -3L")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .withPlan("""
+                            Union All
+                                Union All
+                                    Union All
+                                        VirtualRecord
+                                          functions: [-1L]
+                                            long_sequence count: 1
+                                        VirtualRecord
+                                          functions: [-2L]
+                                            long_sequence count: 1
+                                    Limit value: 1 skip-rows: 0 take-rows: 1
+                                        Encode sort
+                                          keys: [v desc]
+                                            Union All
+                                                PageFrame
+                                                    Row forward scan
+                                                    Frame forward scan on: t
+                                                PageFrame
+                                                    Row forward scan
+                                                    Frame forward scan on: t
+                                VirtualRecord
+                                  functions: [-3L]
+                                    long_sequence count: 1
+                            """)
+                    .returns(thirdOfFour);
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT -3L UNION ALL SELECT * FROM (" + top1 + ") UNION ALL SELECT -4L")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(fourthOfFive);
+            assertQuery("SELECT -1L v UNION ALL SELECT -2L UNION ALL (" + top1 + ") UNION ALL SELECT -3L")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(thirdOfFour);
+            assertQuery("WITH top1 AS (" + top1 + ") SELECT -1L v UNION ALL SELECT -2L UNION ALL SELECT * FROM top1 UNION ALL SELECT -3L")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(thirdOfFour);
+            assertQuery("WITH top1 AS (" + top1 + """
+                    )
+                    SELECT -1L v
+                    UNION ALL
+                    SELECT -2L
+                    UNION ALL
+                    SELECT -3L
+                    UNION ALL
+                    SELECT * FROM top1
+                    UNION ALL
+                    SELECT -4L
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(fourthOfFive);
+            // an outer UNION
+            assertQuery("SELECT -1L v UNION SELECT -2L UNION SELECT * FROM (" + top1 + ") UNION SELECT -3L")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns(thirdOfFour);
+            // a join in the middle branch reads the set operation
+            assertQuery("""
+                    SELECT 0L v, 0L v1
+                    UNION ALL
+                    SELECT -1L, -1L
+                    UNION ALL
+                    SELECT * FROM t t1 JOIN (""" + top1 + """
+                    ) t2 ON t1.v = t2.v
+                    UNION ALL
+                    SELECT -2L, -2L
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1
+                            0\t0
+                            -1\t-1
+                            3\t3
+                            -2\t-2
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInRightAndFullJoinWithOrderByAndLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // The trailing ORDER BY and LIMIT of a set operation that a right or a full join reads
+            // apply to the whole set operation. The join reads 4 and 3 from it, and keeps the 4,
+            // which no row of its left side matches.
+            final String top2 = "SELECT v FROM t UNION ALL SELECT v + 1 FROM t ORDER BY 1 DESC LIMIT 2";
+            assertQuery("SELECT * FROM t t1 RIGHT JOIN (" + top2 + ") t2 ON t1.v = t2.v ORDER BY t2.v")
+                    .noLeakCheck()
+                    .returns("""
+                            v\tv1
+                            3\t3
+                            null\t4
+                            """);
+            assertQuery("SELECT * FROM t t1 FULL JOIN (" + top2 + ") t2 ON t1.v = t2.v ORDER BY coalesce(t1.v, t2.v)")
+                    .noLeakCheck()
+                    .returns("""
+                            v\tv1
+                            1\tnull
+                            2\tnull
+                            3\t3
+                            null\t4
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInSecondJoinWithOrderByAndLimit() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t AS (SELECT x v FROM long_sequence(3))");
+            // The trailing ORDER BY and LIMIT of a set operation that the second join of a query
+            // reads apply to the whole set operation, the same as when the first join reads it.
+            final String top1 = "SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY 1 DESC LIMIT 1";
+            final String joinRow = """
+                    v\tv1\tv2
+                    3\t3\t3
+                    """;
+            assertQuery("SELECT * FROM t t1 JOIN t t2 ON t1.v = t2.v JOIN (" + top1 + ") t3 ON t1.v = t3.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .withPlan("""
+                            SelectedRecord
+                                Hash Join Light
+                                  condition: t3.v=t1.v
+                                    Hash Join Light
+                                      condition: t2.v=t1.v
+                                        PageFrame
+                                            Row forward scan
+                                            Frame forward scan on: t
+                                        Hash
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: t
+                                    Hash
+                                        Limit value: 1 skip-rows: 0 take-rows: 1
+                                            Encode sort
+                                              keys: [v desc]
+                                                Union All
+                                                    PageFrame
+                                                        Row forward scan
+                                                        Frame forward scan on: t
+                                                    PageFrame
+                                                        Row forward scan
+                                                        Frame forward scan on: t
+                            """)
+                    .returns(joinRow);
+            assertQuery("WITH c AS (" + top1 + ") SELECT * FROM t t1 JOIN t t2 ON t1.v = t2.v JOIN c t3 ON t1.v = t3.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns(joinRow);
+            assertQuery("SELECT * FROM t t1 LEFT JOIN t t2 ON t1.v = t2.v LEFT JOIN (" + top1 + ") t3 ON t1.v = t3.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1\tv2
+                            1\t1\tnull
+                            2\t2\tnull
+                            3\t3\t3
+                            """);
+            assertQuery("SELECT * FROM t t1 CROSS JOIN t t2 CROSS JOIN (" + top1 + ") t3")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v\tv1\tv2
+                            1\t1\t3
+                            1\t2\t3
+                            1\t3\t3
+                            2\t1\t3
+                            2\t2\t3
+                            2\t3\t3
+                            3\t1\t3
+                            3\t2\t3
+                            3\t3\t3
+                            """);
+            // the first join and the second join read a set operation each
+            assertQuery("SELECT * FROM t t1 JOIN (" + top1 + """
+                    ) t2 ON t1.v = t2.v
+                    JOIN (SELECT v FROM t UNION ALL SELECT v FROM t ORDER BY 1 LIMIT 1) t3 ON t1.v = t3.v + 2
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1\tv2
+                            3\t3\t1
+                            """);
+            // the second join of a later branch of an outer set operation
+            assertQuery("SELECT 0L v, 0L v1, 0L v2 UNION ALL SELECT * FROM t t1 JOIN t t2 ON t1.v = t2.v JOIN (" + top1 + ") t3 ON t1.v = t3.v")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1\tv2
+                            0\t0\t0
+                            3\t3\t3
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInTimeSeriesJoinWithLimitHasNoTimestamp() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE ts1 (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("CREATE TABLE ts2 (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            // A UNION ALL has no designated timestamp, and its trailing LIMIT, which applies to
+            // the whole set operation, gives it none, so a time-series join rejects it on either
+            // side. The error points at the start of the bracketed sub-query, where it also points
+            // for a hand-written SELECT * FROM (<set operation>) LIMIT 3.
+            final String error = "TIMESTAMP column is required but not provided";
+            final String ts1Rows = """
+                    SELECT v, ts FROM ts1
+                    UNION ALL
+                    SELECT v + 1, ts FROM ts1
+                    """;
+            final String ts2Rows = """
+                    SELECT v, ts FROM ts2
+                    UNION ALL
+                    SELECT v + 1, ts FROM ts2
+                    """;
+            // the right side of the join, and last the hand-written spelling of the ASOF JOIN
+            assertQuery("SELECT a.v, b.v FROM ts1 a ASOF JOIN (" + ts2Rows + "LIMIT 3) b")
+                    .noLeakCheck()
+                    .fails(38, error);
+            assertQuery("SELECT a.v, b.v FROM ts1 a LT JOIN (" + ts2Rows + "LIMIT 3) b")
+                    .noLeakCheck()
+                    .fails(36, error);
+            assertQuery("SELECT a.v, b.v FROM ts1 a SPLICE JOIN (" + ts2Rows + "LIMIT 3) b")
+                    .noLeakCheck()
+                    .fails(40, error);
+            assertQuery("SELECT a.v, b.v FROM ts1 a ASOF JOIN (SELECT * FROM (" + ts2Rows + ") LIMIT 3) b")
+                    .noLeakCheck()
+                    .fails(38, error);
+            // the left side of the join, and the hand-written spelling of it
+            assertQuery("SELECT a.v, b.v FROM (" + ts1Rows + "LIMIT 3) a ASOF JOIN ts2 b")
+                    .noLeakCheck()
+                    .fails(22, error);
+            assertQuery("SELECT a.v, b.v FROM (SELECT * FROM (" + ts1Rows + ") LIMIT 3) a ASOF JOIN ts2 b")
+                    .noLeakCheck()
+                    .fails(22, error);
+            // a CTE: the error points at the set operation inside the CTE's definition
+            assertQuery("WITH c AS (" + ts2Rows + "LIMIT 3) SELECT a.v, b.v FROM ts1 a ASOF JOIN c b")
+                    .noLeakCheck()
+                    .fails(11, error);
+        });
+    }
+
+    @Test
+    public void testUnionNestedInTimeSeriesJoinWithOrderBy() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE ts1 (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("CREATE TABLE ts2 (v LONG, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("""
+                    INSERT INTO ts1 VALUES
+                        (1, '2024-01-01T00:00:01'),
+                        (2, '2024-01-01T00:00:02'),
+                        (3, '2024-01-01T00:00:03'),
+                        (4, '2024-01-01T00:00:04')
+                    """);
+            execute("""
+                    INSERT INTO ts2 VALUES
+                        (10, '2024-01-01T00:00:00'),
+                        (20, '2024-01-01T00:00:02'),
+                        (30, '2024-01-01T00:00:03'),
+                        (40, '2024-01-01T00:00:05')
+                    """);
+            // The trailing ORDER BY of a set operation that a time-series join reads applies to
+            // the whole set operation, and gives the join the timestamp order it requires. The
+            // two branches return the rows of ts2 out of that order, so the ordered set operation
+            // holds the rows of ts2 in the order of ts2, and each join returns the rows it returns
+            // when it reads ts2 itself.
+            final String ts2Rows = """
+                    SELECT v, ts FROM ts2 WHERE v > 20
+                    UNION ALL
+                    SELECT v, ts FROM ts2 WHERE v <= 20
+                    ORDER BY ts
+                    """;
+            assertQuery("SELECT a.v, b.v FROM ts1 a ASOF JOIN (" + ts2Rows + ") b")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v\tv1
+                            1\t10
+                            2\t20
+                            3\t30
+                            4\t30
+                            """);
+            assertQuery("SELECT a.v, b.v FROM ts1 a LT JOIN (" + ts2Rows + ") b")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            v\tv1
+                            1\t10
+                            2\t10
+                            3\t20
+                            4\t30
+                            """);
+            assertQuery("SELECT a.v, b.v FROM ts1 a SPLICE JOIN (" + ts2Rows + ") b")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            v\tv1
+                            null\t10
+                            1\t10
+                            2\t20
+                            3\t30
+                            4\t30
+                            4\t40
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionSymbolAndString() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("""
+                    create table table1 as\s
+                    (
+                      select cast(x as symbol) as sym1\s
+                      from long_sequence(3)
+                    )""");
+            execute("""
+                    create table table3 as\s
+                    (
+                      select cast(x+2 as string) as str3
+                      from long_sequence(3)
+                    )""");
+
+            assertQuery("""
+                    select sym1 from table1\s
+                    union
+                    select str3 from table3""")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            sym1
+                            1
+                            2
+                            3
+                            4
+                            5
+                            """);
+        });
+    }
+
+    /**
+     * Tests UNION of VARCHAR and SYMBOL columns.
+     * This exercises RecordSink's handling of type coercion where:
+     * - SYMBOL values need to be written as VARCHAR
+     * - The result column type should be VARCHAR (wider type)
+     */
+    @Test
+    public void testUnionVarcharAndSymbol() throws Exception {
+        assertMemoryLeak(() -> {
+            // Table with VARCHAR column
+            execute("create table t_varchar as (" +
+                    "  select cast('varchar_' || x as varchar) as col " +
+                    "  from long_sequence(3)" +
+                    ")");
+
+            // Table with SYMBOL column - use explicit values
+            execute("create table t_symbol (col symbol)");
+            execute("insert into t_symbol values ('sym_a')");
+            execute("insert into t_symbol values ('sym_b')");
+            execute("insert into t_symbol values ('sym_c')");
+
+            // UNION should coerce SYMBOL to VARCHAR
+            // Verify the actual data and type - result type should be VARCHAR
+            assertQuery("select typeof(col), col from (" +
+                    "  select col from t_varchar " +
+                    "  union " +
+                    "  select col from t_symbol" +
+                    ") order by col")
+                    .noLeakCheck()
+                    .returns("""
+                            typeof\tcol
+                            VARCHAR\tsym_a
+                            VARCHAR\tsym_b
+                            VARCHAR\tsym_c
+                            VARCHAR\tvarchar_1
+                            VARCHAR\tvarchar_2
+                            VARCHAR\tvarchar_3
+                            """);
+        });
+    }
+
+    @Test
+    public void testUnionWithLargeNumberOfSubqueries() throws Exception {
+        testLargeNumberOfSubqueries("union", 1);
+    }
+
+    @Test
+    public void testUnionWithNegativeLimitReturnsLastNRows() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE trades (symbol SYMBOL, side SYMBOL, price DOUBLE, amount DOUBLE, timestamp TIMESTAMP) " +
+                    "timestamp (timestamp) PARTITION BY DAY WAL;");
+            execute("INSERT INTO trades VALUES('BTC', 'sell', 50000.0, 1.0, '2022-03-08T18:03:57.609765Z');");
+            execute("INSERT INTO trades VALUES('ETH', 'buy', 3000.0, 10.0, '2022-03-09T18:03:57.609765Z');");
+            execute("INSERT INTO trades VALUES('BTC', 'buy', 51000.0, 2.0, '2022-03-10T18:03:57.609765Z');");
+            drainWalQueue();
+
+            String limitQuery = "(SELECT timestamp FROM trades LIMIT 1) " +
+                    "UNION ALL " +
+                    "(SELECT timestamp FROM trades LIMIT -1);";
+
+            String groupQuery = "(SELECT min(timestamp) timestamp FROM trades) " +
+                    "UNION ALL " +
+                    "(SELECT max(timestamp) FROM trades);";
+
+            assertQuery(limitQuery)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .withPlan("""
+                            Union All
+                                Limit value: 1 skip-rows: 0 take-rows: 1
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                                Limit value: -1 skip-rows: 2 take-rows: 1
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """)
+                    .returns("""
+                            timestamp
+                            2022-03-08T18:03:57.609765Z
+                            2022-03-10T18:03:57.609765Z
+                            """);
+
+            assertQuery("(SELECT min(timestamp) timestamp FROM trades) " +
+                    "UNION ALL " +
+                    "(SELECT max(timestamp) FROM trades);")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            timestamp
+                            2022-03-08T18:03:57.609765Z
+                            2022-03-10T18:03:57.609765Z
+                            """);
+
+            assertQuery(groupQuery)
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            Union All
+                                Limit value: 1 skip-rows: 0 take-rows: 1
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                                Limit value: 1 skip-rows: 0 take-rows: 1
+                                    SelectedRecord
+                                        PageFrame
+                                            Row backward scan
+                                            Frame backward scan on: trades
+                            """);
+        });
+    }
+
+    @Test
+    public void testWithClauseWithSetOperationAndOrderByAndLimit() throws Exception {
+        assertQuery("with q as  (select 1 x union all select 2 union all select 3 from long_sequence(1) order by x desc limit 2) " +
+                "select * from q " +
+                "intersect " +
+                "select * from (select x from long_sequence(4) order by x limit 2) " +
+                "union all " +
+                "select x-1 from long_sequence(1) order by 1 limit 2")
+                .ddl(null)
+                .returns("x\n0\n2\n");
+    }
+}

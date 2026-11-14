@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 package io.questdb.griffin.engine.functions.columns;
 
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.ScalarFunction;
 import io.questdb.griffin.engine.functions.Long256Function;
 import io.questdb.std.Long256;
 import io.questdb.std.ObjList;
@@ -33,11 +32,11 @@ import io.questdb.std.str.CharSink;
 
 import static io.questdb.griffin.engine.functions.columns.ColumnUtils.STATIC_COLUMN_COUNT;
 
-public class Long256Column extends Long256Function implements ScalarFunction {
+public class Long256Column extends Long256Function implements ColumnFunction {
     private static final ObjList<Long256Column> COLUMNS = new ObjList<>(STATIC_COLUMN_COUNT);
     private final int columnIndex;
 
-    public Long256Column(int columnIndex) {
+    private Long256Column(int columnIndex) {
         this.columnIndex = columnIndex;
     }
 
@@ -49,7 +48,12 @@ public class Long256Column extends Long256Function implements ScalarFunction {
     }
 
     @Override
-    public void getLong256(Record rec, CharSink sink) {
+    public int getColumnIndex() {
+        return columnIndex;
+    }
+
+    @Override
+    public void getLong256(Record rec, CharSink<?> sink) {
         rec.getLong256(columnIndex, sink);
     }
 
@@ -68,10 +72,5 @@ public class Long256Column extends Long256Function implements ScalarFunction {
         for (int i = 0; i < STATIC_COLUMN_COUNT; i++) {
             COLUMNS.setQuick(i, new Long256Column(i));
         }
-    }
-
-    @Override
-    public boolean isReadThreadSafe() {
-        return true;
     }
 }

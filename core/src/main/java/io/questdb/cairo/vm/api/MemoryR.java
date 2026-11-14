@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,19 +24,29 @@
 
 package io.questdb.cairo.vm.api;
 
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
 import io.questdb.std.Long256;
 import io.questdb.std.Long256Acceptor;
-import io.questdb.std.Unsafe;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.Utf8SplitString;
 
 import java.io.Closeable;
 
-//readable 
+// readable
 public interface MemoryR extends Closeable {
+
+    long addressOf(long offset);
 
     @Override
     void close();
+
+    void extend(long size);
+
+    ArrayView getArray(long offset);
 
     BinarySequence getBin(long offset);
 
@@ -46,13 +56,43 @@ public interface MemoryR extends Closeable {
 
     byte getByte(long offset);
 
+    char getChar(long offset);
+
+    void getDecimal128(long offset, Decimal128 sink);
+
+    short getDecimal16(long offset);
+
+    void getDecimal256(long offset, Decimal256 sink);
+
+    int getDecimal32(long offset);
+
+    long getDecimal64(long offset);
+
+    byte getDecimal8(long offset);
+
+    default DirectUtf8Sequence getDirectVarchar(long offset, int size, boolean ascii) {
+        throw new UnsupportedOperationException();
+    }
+
     double getDouble(long offset);
 
     float getFloat(long offset);
 
+    int getIPv4(long offset);
+
     int getInt(long offset);
 
     long getLong(long offset);
+
+    void getLong256(long offset, CharSink<?> sink);
+
+    default void getLong256(long offset, Long256Acceptor sink) {
+        sink.fromAddress(addressOf(offset + Long.BYTES * 4) - Long.BYTES * 4);
+    }
+
+    Long256 getLong256A(long offset);
+
+    Long256 getLong256B(long offset);
 
     long getPageAddress(int pageIndex);
 
@@ -62,52 +102,23 @@ public interface MemoryR extends Closeable {
 
     short getShort(long offset);
 
-    CharSequence getStr(long offset);
-
-    CharSequence getStr2(long offset);
-
-    Long256 getLong256A(long offset);
-
-    void getLong256(long offset, CharSink sink);
-
-    default void getLong256(long offset, Long256Acceptor sink) {
-        long addr = addressOf(offset + Long.BYTES * 4);
-        sink.setAll(
-                Unsafe.getUnsafe().getLong(addr - Long.BYTES * 4),
-                Unsafe.getUnsafe().getLong(addr - Long.BYTES * 3),
-                Unsafe.getUnsafe().getLong(addr - Long.BYTES * 2),
-                Unsafe.getUnsafe().getLong(addr - Long.BYTES)
-        );
+    default Utf8SplitString getSplitVarcharA(long auxLo, long dataLo, long dataLim, int size, boolean ascii) {
+        throw new UnsupportedOperationException();
     }
 
-    Long256 getLong256B(long offset);
+    default Utf8SplitString getSplitVarcharB(long auxLo, long dataLo, long dataLim, int size, boolean ascii) {
+        throw new UnsupportedOperationException();
+    }
 
-    char getChar(long offset);
+    CharSequence getStrA(long offset);
+
+    CharSequence getStrB(long offset);
 
     int getStrLen(long offset);
-
-    void extend(long size);
-
-    long size();
-
-    long addressOf(long offset);
 
     long offsetInPage(long offset);
 
     int pageIndex(long offset);
 
-    default long hash0(long offset, long size) {
-        long n = size - (size & 7);
-        long h = 179426491L;
-        for (long i = 0; i < n; i += 4) {
-            h = (h << 5) - h + getInt(offset + i);
-        }
-
-        for (; n < size; n++) {
-            h = (h << 5) - h + getByte(offset + n);
-        }
-        return h;
-    }
-
-    long getGrownLength();
+    long size();
 }

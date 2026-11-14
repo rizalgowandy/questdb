@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,19 +33,20 @@ import org.openjdk.jmh.runner.options.OptionsBuilder;
 
 import java.util.concurrent.TimeUnit;
 
-@State(Scope.Thread)
+@State(Scope.Benchmark)
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 public class LogBenchmark {
 
-    private static final Log LOG;
     private long counter = 0;
+    private LogFactory factory;
+    private Log log;
 
     public static void main(String[] args) throws RunnerException {
         Options opt = new OptionsBuilder()
                 .include(LogBenchmark.class.getSimpleName())
-                .warmupIterations(5)
-                .measurementIterations(5)
+                .warmupIterations(2)
+                .measurementIterations(2)
                 .addProfiler("gc")
                 .forks(1)
                 .build();
@@ -53,29 +54,40 @@ public class LogBenchmark {
         new Runner(opt).run();
     }
 
-    @Benchmark
-    public void testLogOneInt() {
-        LOG.info().$("brown fox jumped over ").$(counter).$(" fence").$();
+    @Setup(Level.Iteration)
+    public void setUp() {
+        factory = new LogFactory();
+        factory.add(new LogWriterConfig(LogLevel.INFO, (queue, subSeq, level) -> {
+            LogRollingFileWriter w = new LogRollingFileWriter(queue, subSeq, level);
+            w.setLocation("log-bench1.log");
+            return w;
+        }));
+        factory.bind();
+        factory.startThread();
+        log = factory.create(LogBenchmark.class);
     }
 
-    @Benchmark
-    public void testLogOneIntDisabled() {
-        LOG.debug().$("brown fox jumped over ").$(counter).$(" fence").$();
+    @TearDown(Level.Iteration)
+    public void tearDown() {
+        factory.close();
     }
 
     @Benchmark
     public void testBaseline() {
     }
 
-    static {
-        LogFactory.INSTANCE.add(new LogWriterConfig(LogLevel.INFO, (queue, subSeq, level) -> {
-            LogRollingFileWriter w = new LogRollingFileWriter(queue, subSeq, level);
-            w.setLocation("log-bench1.log");
-            return w;
-        }));
-        LogFactory.INSTANCE.bind();
-        LogFactory.INSTANCE.startThread();
+    @Benchmark
+    public void testLogOneInt() {
+        log.info().$("brown fox jumped over ").$(counter++).$(" fence").$();
+    }
 
-        LOG = LogFactory.getLog(LogBenchmark.class);
+    @Benchmark
+    public void testLogOneIntBlocking() {
+        log.infoW().$("brown fox jumped over ").$(counter++).$(" fence").$();
+    }
+
+    @Benchmark
+    public void testLogOneIntDisabled() {
+        log.debug().$("brown fox jumped over ").$(counter++).$(" fence").$();
     }
 }

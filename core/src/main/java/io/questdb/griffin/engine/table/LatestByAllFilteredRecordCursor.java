@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,66 +24,104 @@
 
 package io.questdb.griffin.engine.table;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
-import io.questdb.cairo.sql.DataFrame;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.DirectLongList;
-import io.questdb.std.IntList;
 import io.questdb.std.Rows;
 import org.jetbrains.annotations.NotNull;
 
 class LatestByAllFilteredRecordCursor extends AbstractDescendingRecordListCursor {
-
+    protected final Function filter;
     private final Map map;
     private final RecordSink recordSink;
-    private final Function filter;
+    private final LatestByFrameScanner scanner;
 
     public LatestByAllFilteredRecordCursor(
+            @NotNull CairoConfiguration configuration,
+            @NotNull RecordMetadata metadata,
             @NotNull Map map,
             @NotNull DirectLongList rows,
             @NotNull RecordSink recordSink,
-            @NotNull Function filter,
-            @NotNull IntList columnIndexes
+            @NotNull Function filter
     ) {
-        super(rows, columnIndexes);
+        super(configuration, metadata, rows);
         this.map = map;
         this.recordSink = recordSink;
         this.filter = filter;
+        this.scanner = new LatestByFrameScanner(filter, frameMemoryPool, frameAddressCache);
     }
 
     @Override
     public void close() {
-        filter.close();
-        super.close();
+        if (isOpen()) {
+            filter.cursorClosed();
+            map.close();
+            super.close();
+        }
     }
 
     @Override
-    protected void buildTreeMap(SqlExecutionContext executionContext) throws SqlException {
-        map.clear();
-        filter.init(this, executionContext);
+    public void of(PageFrameCursor pageFrameCursor, SqlExecutionContext executionContext) throws SqlException {
+        // open before the first allocation so close() frees the map if a later alloc in of() breaches
+        isOpen = true;
+        map.setMemoryTracker(executionContext.getMemoryTracker());
+        map.reopen();
+        super.of(pageFrameCursor, executionContext);
+        filter.init(pageFrameCursor, executionContext);
+    }
 
-        DataFrame frame;
-        while ((frame = this.dataFrameCursor.next()) != null) {
-            final int partitionIndex = frame.getPartitionIndex();
-            final long rowLo = frame.getRowLo();
-            final long rowHi = frame.getRowHi() - 1;
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Row backward scan");
+        sink.attr("filter").val(filter);
+    }
 
-            recordA.jumpTo(frame.getPartitionIndex(), rowHi);
-            for (long row = rowHi; row >= rowLo; row--) {
-                recordA.setRecordIndex(row);
-                if (filter.getBool(recordA)) {
-                    MapKey key = map.withKey();
-                    key.put(recordA, recordSink);
-                    if (key.create()) {
-                        rows.add(Rows.toRowID(partitionIndex, row));
+    @Override
+    protected void buildTreeMap() {
+        final Function javaFilter = scanner.getJavaFilter();
+        PageFrame frame;
+        while ((frame = frameCursor.next()) != null) {
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            final int frameIndex = frameCount;
+            frameAddressCache.add(frameCount, frame);
+            frameMemoryPool.navigateTo(frameCount++, recordA);
+            scanner.of(frameIndex, frame.getPartitionHi() - frame.getPartitionLo());
+            while (scanner.nextBatch(circuitBreaker)) {
+                final DirectLongList matches = scanner.getMatches();
+                if (matches == null) {
+                    for (long row = scanner.getRowCount() - 1; row >= 0; row--) {
+                        recordA.setRowIndex(row);
+                        if (javaFilter.getBool(recordA)) {
+                            addRow(frameIndex, row);
+                        }
+                    }
+                } else {
+                    final long batchLo = scanner.getBatchLo();
+                    for (long i = matches.size() - 1; i >= 0; i--) {
+                        final long row = matches.get(i) + batchLo;
+                        recordA.setRowIndex(row);
+                        addRow(frameIndex, row);
                     }
                 }
             }
         }
         map.clear();
+    }
+
+    private void addRow(int frameIndex, long row) {
+        MapKey key = map.withKey();
+        key.put(recordA, recordSink);
+        if (key.create()) {
+            rows.add(Rows.toRowID(frameIndex, row));
+        }
     }
 }

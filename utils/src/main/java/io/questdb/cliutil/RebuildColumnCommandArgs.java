@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,9 +27,13 @@ package io.questdb.cliutil;
 import io.questdb.std.Files;
 
 public class RebuildColumnCommandArgs {
-    String tablePath;
-    String partition;
     String column;
+    String partition;
+    String tablePath;
+
+    private static void printUsage(String command) {
+        System.out.println("usage: " + command + " <table_path> [-p <partition_name>] [-c <column_name>]");
+    }
 
     static RebuildColumnCommandArgs parseCommandArgs(String[] args, String command) {
 
@@ -67,9 +71,5 @@ public class RebuildColumnCommandArgs {
         }
 
         return res;
-    }
-
-    private static void printUsage(String command) {
-        System.out.println("usage: " + command + " <table_path> [-p <partition_name>] [-c <column_name>]");
     }
 }

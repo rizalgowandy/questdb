@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,49 +24,60 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
 import io.questdb.cairo.EmptyRowCursor;
-import io.questdb.cairo.TableReader;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PageFrameMemory;
+import io.questdb.cairo.sql.RowCursor;
+import io.questdb.cairo.sql.RowCursorFactory;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.std.Misc;
 
 public class LatestByValueDeferredIndexedRowCursorFactory implements RowCursorFactory {
     private final int columnIndex;
-    private final Function symbolFunc;
-    private final boolean cachedIndexReaderCursor;
     private final LatestByValueIndexedRowCursor cursor = new LatestByValueIndexedRowCursor();
+    private final Function symbolFunc;
     private int symbolKey;
 
-    public LatestByValueDeferredIndexedRowCursorFactory(int columnIndex, Function symbolFunc, boolean cachedIndexReaderCursor) {
+    public LatestByValueDeferredIndexedRowCursorFactory(int columnIndex, Function symbolFunc) {
         this.columnIndex = columnIndex;
         this.symbolFunc = symbolFunc;
-        this.symbolKey = SymbolTable.VALUE_NOT_FOUND;
-        this.cachedIndexReaderCursor = cachedIndexReaderCursor;
+        symbolKey = SymbolTable.VALUE_NOT_FOUND;
     }
 
     @Override
-    public RowCursor getCursor(DataFrame dataFrame) {
-        if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
-            RowCursor cursor =
-                    dataFrame
-                            .getBitmapIndexReader(columnIndex, BitmapIndexReader.DIR_BACKWARD)
-                            .getCursor(cachedIndexReaderCursor, symbolKey, dataFrame.getRowLo(), dataFrame.getRowHi() - 1);
+    public void close() {
+        Misc.free(symbolFunc);
+    }
 
-            if (cursor.hasNext()) {
-                this.cursor.of(cursor.next());
-                return this.cursor;
+    @Override
+    public RowCursor getCursor(PageFrame pageFrame, PageFrameMemory pageFrameMemory) {
+        if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
+            try (RowCursor indexReaderCursor = pageFrame
+                    .getIndexReader(columnIndex, IndexReader.DIR_BACKWARD)
+                    .getCursor(TableUtils.toIndexKey(symbolKey), pageFrame.getIndexRowLo(), pageFrame.getIndexRowHi() - 1)) {
+                if (indexReaderCursor.hasNext()) {
+                    cursor.of(indexReaderCursor.next());
+                    return cursor;
+                }
             }
         }
         return EmptyRowCursor.INSTANCE;
     }
 
     @Override
-    public void prepareCursor(TableReader tableReader, SqlExecutionContext sqlExecutionContext) {
-        final CharSequence symbol = symbolFunc.getStr(null);
-        symbolKey = tableReader.getSymbolMapReader(columnIndex).keyOf(symbol);
-        if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
-            symbolKey++;
-        }
+    public void init(PageFrameCursor pageFrameCursor, SqlExecutionContext sqlExecutionContext) throws SqlException {
+        // Rebind symbolFunc to the executing statement's bind variable service. Without this
+        // a cached factory keeps the bind variable function of whichever execution compiled
+        // it, so prepareCursor() below resolves a stale value into symbolKey and the query
+        // returns the latest row of some previously queried key.
+        symbolFunc.init(pageFrameCursor, sqlExecutionContext);
     }
 
     @Override
@@ -77,5 +88,16 @@ public class LatestByValueDeferredIndexedRowCursorFactory implements RowCursorFa
     @Override
     public boolean isUsingIndex() {
         return true;
+    }
+
+    @Override
+    public void prepareCursor(PageFrameCursor pageFrameCursor) {
+        symbolKey = pageFrameCursor.getSymbolTable(columnIndex).keyOf(symbolFunc.getStrA(null), symbolKey);
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Index ").type(IndexReader.NAME_BACKWARD).type(" scan").meta("on").putBaseColumnName(columnIndex).meta("deferred").val(true);
+        sink.attr("filter").putBaseColumnName(columnIndex).val('=').val(symbolFunc);
     }
 }

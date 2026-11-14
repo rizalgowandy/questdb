@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cairo.vm.MemoryCMARWImpl;
 import io.questdb.cairo.vm.MemoryCMRImpl;
 import io.questdb.cairo.vm.api.MemoryCMARW;
@@ -36,90 +37,93 @@ import io.questdb.std.MemoryTag;
 public class RecoverVarIndex extends RebuildColumnBase {
     private static final Log LOG = LogFactory.getLog(RecoverVarIndex.class);
 
-    protected boolean checkColumnType(TableReaderMetadata metadata, int rebuildColumnIndex) {
-        return metadata.getColumnType(rebuildColumnIndex) == ColumnType.STRING;
+    public RecoverVarIndex(CairoConfiguration configuration) {
+        super(configuration);
     }
 
     @Override
-    protected void rebuildColumn(
-            CharSequence columnName,
-            CharSequence partitionName,
-            int indexValueBlockCapacity,
-            long partitionSize,
+    protected void doReindex(
             FilesFacade ff,
             ColumnVersionReader columnVersionReader,
-            int columnIndex,
+            int columnWriterIndex,
+            CharSequence columnName,
+            long partitionNameTxn,
+            long partitionSize,
             long partitionTimestamp,
-            long partitionNameTxn
+            int timestampType,
+            int partitionBy,
+            int indexValueBlockCapacity,
+            byte indexType,
+            io.questdb.cairo.sql.RecordMetadata metadata,
+            int columnIndex
     ) {
-        long columnNameTxn = columnVersionReader.getColumnNameTxn(partitionTimestamp, columnIndex);
-        long columnAddedPartition = columnVersionReader.getColumnTopPartitionTimestamp(columnIndex);
-        long columnTop = columnVersionReader.getColumnTop(partitionTimestamp, columnIndex);
+        long columnNameTxn = columnVersionReader.getColumnNameTxn(partitionTimestamp, columnWriterIndex);
+        long columnTop = columnVersionReader.getColumnTop(partitionTimestamp, columnWriterIndex);
 
-        if (columnTop == 0 && partitionTimestamp < columnAddedPartition) {
-            LOG.info().$("not rebuilding column ").$(columnName).$(" in partition ").$ts(partitionTimestamp).$(", column not added to partition").$();
+        if (columnTop == -1L) {
+            LOG.info().$("not rebuilding column ").$safe(columnName)
+                    .$(" in partition ").$ts(ColumnType.getTimestampDriver(timestampType), partitionTimestamp)
+                    .$(", column not added to partition")
+                    .$();
             return;
         }
 
-        path.trimTo(rootLen).concat(partitionName);
-        TableUtils.txnPartitionConditionally(path, partitionNameTxn);
-        path.concat(columnName);
-        int colNameLen = path.length();
-        path.put(".d");
-        if (columnNameTxn != -1L) {
-            path.put('.').put(columnNameTxn);
-        }
-        LOG.info().$("reading: ").$(path).$();
+        int trimTo = path.size();
+        TableUtils.setPathForNativePartition(path, timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
 
-        long maxOffset = ff.length(path.$());
-
-        try (MemoryCMR roMem = new MemoryCMRImpl(
-                ff,
-                path.$(),
-                maxOffset,
-                MemoryTag.NATIVE_DEFAULT
-        )) {
-
-            path.trimTo(colNameLen).put(".i");
+        try {
+            path.concat(columnName);
+            int colNameLen = path.size();
+            path.put(".d");
             if (columnNameTxn != -1L) {
                 path.put('.').put(columnNameTxn);
             }
-            LOG.info().$("writing: ").$(path).$();
+            LOG.info().$("reading: ").$(path).$();
 
-            try (MemoryCMARW rwMem = new MemoryCMARWImpl(
-                    ff,
-                    path.$(),
-                    8 * 1024 * 1024,
-                    0,
-                    MemoryTag.NATIVE_DEFAULT,
-                    0
-            )) {
-                long expectedRowCount = partitionSize - columnTop;
-                LOG.info().$("data file length: ").$(maxOffset).$(", expected record count: ").$(expectedRowCount).$();
+            long maxOffset = ff.length(path.$());
 
-                // index
-                long offset = 0;
-                int rows = 0;
-                while (rows < expectedRowCount && offset + 3 < maxOffset) {
-                    int len = roMem.getInt(offset);
-                    rwMem.putLong(offset);
+            try (MemoryCMR roMem = new MemoryCMRImpl(ff, path.$(), maxOffset, MemoryTag.MMAP_DEFAULT)) {
+                path.trimTo(colNameLen).put(".i");
+                if (columnNameTxn != -1L) {
+                    path.put('.').put(columnNameTxn);
+                }
+                LOG.info().$("writing: ").$(path).$();
 
-                    if (len > -1) {
-                        offset += 4 + len * 2L;
-                    } else {
-                        offset += 4;
+                try (MemoryCMARW rwMem = new MemoryCMARWImpl(ff, path.$(), 8 * 1024 * 1024, 0, MemoryTag.MMAP_DEFAULT, 0)) {
+                    long expectedRowCount = partitionSize - columnTop;
+                    LOG.info().$("data file length: ").$(maxOffset).$(", expected record count: ").$(expectedRowCount).$();
+
+                    // index
+                    long offset = 0;
+                    int rows = 0;
+                    while (rows < expectedRowCount && offset + 3 < maxOffset) {
+                        int len = roMem.getInt(offset);
+                        rwMem.putLong(offset);
+
+                        if (len > -1) {
+                            offset += 4 + len * 2L;
+                        } else {
+                            offset += 4;
+                        }
+                        rows++;
                     }
-                    rows++;
+                    if (rows != expectedRowCount) {
+                        throw CairoException.critical(0)
+                                .put(" rebuild var index file failed [path=").put(path)
+                                .put(", expectedRows=").put(expectedRowCount)
+                                .put(", actualRows=").put(rows).put(']');
+                    }
+                    rwMem.putLong(offset);
+                    LOG.info().$("write complete. Index file length: ").$(rwMem.getAppendOffset()).$();
                 }
-                if (rows != expectedRowCount) {
-                    throw CairoException.instance(0)
-                            .put(" rebuild var index file failed [path=").put(path)
-                            .put(", expectedRows=").put(expectedRowCount)
-                            .put(", actualRows=").put(rows).put(']');
-                }
-                rwMem.putLong(offset);
-                LOG.info().$("write complete. Index file length: ").$(rwMem.getAppendOffset()).$();
             }
+        } finally {
+            path.trimTo(trimTo);
         }
+    }
+
+    @Override
+    protected boolean isSupportedColumn(RecordMetadata metadata, int columnIndex) {
+        return metadata.getColumnType(columnIndex) == ColumnType.STRING;
     }
 }

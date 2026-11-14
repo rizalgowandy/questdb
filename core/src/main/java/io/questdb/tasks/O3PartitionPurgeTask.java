@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,20 +24,28 @@
 
 package io.questdb.tasks;
 
+import io.questdb.cairo.TableToken;
+
 public class O3PartitionPurgeTask {
-    private String tableName;
     private int partitionBy;
+    private TableToken tableToken;
+    private int timestampType;
 
     public int getPartitionBy() {
         return partitionBy;
     }
 
-    public String getTableName() {
-        return tableName;
+    public TableToken getTableToken() {
+        return tableToken;
     }
 
-    public void of(String tableName, int partitionBy) {
-        this.tableName = tableName;
+    public int getTimestampType() {
+        return timestampType;
+    }
+
+    public void of(TableToken tableToken, int timestampType, int partitionBy) {
+        this.tableToken = tableToken;
+        this.timestampType = timestampType;
         this.partitionBy = partitionBy;
     }
 }

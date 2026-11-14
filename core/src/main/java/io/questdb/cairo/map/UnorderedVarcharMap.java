@@ -1,0 +1,1116 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cairo.map;
+
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.Reopenable;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.griffin.engine.LimitOverflowException;
+import io.questdb.griffin.engine.groupby.FastGroupByAllocator;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
+import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Hash;
+import io.questdb.std.Interval;
+import io.questdb.std.Long256;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.Transient;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
+import io.questdb.std.bytes.Bytes;
+import io.questdb.std.bytes.DirectByteSink;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.Nullable;
+
+import static io.questdb.std.Numbers.MAX_SAFE_INT_POW_2;
+
+/**
+ * UnorderedVarcharMap is an off-heap hash table with single varchar key used
+ * to store intermediate data of group by, sample by queries. It provides {@link MapKey} and
+ * {@link MapValue}, as well as {@link RecordCursor} interfaces for data access and modification.
+ * The preferred way to create an UnorderedVarcharMap is {@link MapFactory}.
+ * <p>
+ * Map iteration provided by {@link RecordCursor} does not preserve the key insertion order, hence
+ * the unordered map name.
+ * <strong>Important!</strong>
+ * Key and value structures must match the ones provided via lists of columns ({@link ColumnTypes})
+ * to the map constructor. Later put* calls made on {@link MapKey} and {@link MapValue} must match
+ * the declared column types to guarantee memory access safety.
+ * <p>
+ * Key must be single varchar. Only insertions and updates operations are
+ * supported meaning that a key can't be removed from the map once it was inserted.
+ * <p>
+ * The hash table is organized in off-heap memory for key-value pairs. It's a hash table with
+ * open addressing. The hash table uses linear probing.
+ * <p>
+ * Key-value pairs stored in the hash table may have the following layout:
+ * <pre>
+ * | Hash code 32 LSBs |    Size    | Varchar pointer | Value columns 0..V |
+ * +-------------------+------------+-----------------+--------------------+
+ * |       4 bytes     |  4 bytes   |     8 bytes     |         -          |
+ * +-------------------+------------+-----------------+--------------------+
+ * </pre>
+ * Length is a 30-bit integer, the top 2 bits are reserved for flags. The flags are:
+ * <ul>
+ *     <li>Bit 31 (the highest bit, indexing from zero): ascii flag, this is also set for empty and null sequences</li>
+ *     <li>Bit 30: null bit</li>
+ * </ul>
+ * The highest bit of the varchar pointer is set when the pointer is unstable, i.e. it points to our own arena
+ * memory. The lower 63 bits are the actual pointer value.
+ */
+public class UnorderedVarcharMap implements Map, Reopenable {
+    static final byte FLAG_IS_ASCII = (byte) (1 << 7);
+    static final byte FLAG_IS_NULL = (byte) (1 << 6);
+    static final long KEY_SIZE = 2 * Long.BYTES;
+    static final int MASK_FLAGS_FROM_SIZE = 0x3FFFFFFF; // clear top 2 bits: ascii and null
+    static final long PTR_UNSTABLE_MASK = 0x8000000000000000L; // 63 bits
+    static final long PTR_MASK = ~PTR_UNSTABLE_MASK;
+    static final int SIZE_IS_NULL = 1 << 30;
+    private static final int KEY_SINK_INITIAL_CAPACITY = 16;
+    private static final int MIN_KEY_CAPACITY = 16;
+    private final GroupByAllocator allocator;
+    private final UnorderedVarcharMapCursor cursor;
+    private final long entrySize;
+    private final boolean isDeferredKeyCopy;
+    private final Key key;
+    private final DirectByteSink keySink; // Used to copy keys with unstable pointers.
+    private final double loadFactor;
+    private final int maxResizes;
+    private final int memoryTag;
+    private final UnorderedVarcharMapRecord record;
+    private final FlyweightPackedMapValue value;
+    private final FlyweightPackedMapValue value2;
+    private final FlyweightPackedMapValue value3;
+    private final long valueSize;
+    private long batchEmptyValueStart;
+    private int free;
+    private int initialKeyCapacity;
+    private int keyCapacity;
+    private long mask;
+    private long memLimit; // Hash table memory limit pointer.
+    private long memStart; // Hash table memory start pointer.
+    // Per-query native memory tracker bound by the owning factory at cursor start.
+    // Null when no per-query limit applies; all Unsafe.{malloc,realloc,free} calls
+    // degrade to the global-only overloads in that case. setMemoryTracker() also
+    // binds the key-byte arena (allocator); only the tiny keySink scratch buffer is not.
+    @Nullable
+    private MemoryTracker memoryTracker;
+    private int nResizes;
+    private int size = 0;
+
+    public UnorderedVarcharMap(
+            @Transient @Nullable ColumnTypes valueTypes,
+            int keyCapacity,
+            double loadFactor,
+            int maxResizes,
+            long allocatorDefaultChunkSize,
+            long allocatorMaxChunkSize
+    ) {
+        this(valueTypes, keyCapacity, loadFactor, maxResizes, MemoryTag.NATIVE_UNORDERED_MAP, allocatorDefaultChunkSize, allocatorMaxChunkSize, false, true);
+    }
+
+    public UnorderedVarcharMap(
+            @Transient @Nullable ColumnTypes valueTypes,
+            int keyCapacity,
+            double loadFactor,
+            int maxResizes,
+            long allocatorDefaultChunkSize,
+            long allocatorMaxChunkSize,
+            boolean isDeferredKeyCopy
+    ) {
+        this(valueTypes, keyCapacity, loadFactor, maxResizes, MemoryTag.NATIVE_UNORDERED_MAP, allocatorDefaultChunkSize, allocatorMaxChunkSize, isDeferredKeyCopy, true);
+    }
+
+    public UnorderedVarcharMap(
+            @Transient @Nullable ColumnTypes valueTypes,
+            int keyCapacity,
+            double loadFactor,
+            int maxResizes,
+            long allocatorDefaultChunkSize,
+            long allocatorMaxChunkSize,
+            boolean isDeferredKeyCopy,
+            boolean openOnInit
+    ) {
+        this(valueTypes, keyCapacity, loadFactor, maxResizes, MemoryTag.NATIVE_UNORDERED_MAP, allocatorDefaultChunkSize, allocatorMaxChunkSize, isDeferredKeyCopy, openOnInit);
+    }
+
+    UnorderedVarcharMap(
+            @Nullable @Transient ColumnTypes valueTypes,
+            int keyCapacity,
+            double loadFactor,
+            int maxResizes,
+            int memoryTag,
+            long allocatorDefaultChunkSize,
+            long allocatorMaxChunkSize,
+            boolean isDeferredKeyCopy,
+            boolean openOnInit
+    ) {
+        assert loadFactor > 0 && loadFactor < 1d;
+
+        try {
+            this.isDeferredKeyCopy = isDeferredKeyCopy;
+            this.memoryTag = memoryTag;
+            this.loadFactor = loadFactor;
+            this.initialKeyCapacity = Math.max(Numbers.ceilPow2((int) (keyCapacity / loadFactor)), MIN_KEY_CAPACITY);
+            this.maxResizes = maxResizes;
+            nResizes = 0;
+
+            long valueOffset = 0;
+            long[] valueOffsets = null;
+            long valueSize = 0;
+            if (valueTypes != null) {
+                int valueColumnCount = valueTypes.getColumnCount();
+                valueOffsets = new long[valueColumnCount];
+
+                for (int i = 0; i < valueColumnCount; i++) {
+                    valueOffsets[i] = valueOffset;
+                    final int columnType = valueTypes.getColumnType(i);
+                    final int size = ColumnType.sizeOf(columnType);
+                    if (size <= 0) {
+                        throw CairoException.nonCritical().put("value type is not supported: ").put(ColumnType.nameOf(columnType));
+                    }
+                    valueOffset += size;
+                    valueSize += size;
+                }
+            }
+            this.valueSize = valueSize;
+
+            this.entrySize = Bytes.align8b(KEY_SIZE + valueSize);
+            // Validate against initialKeyCapacity so both eager and lazy modes catch the
+            // overflow up front, before any cursor opens.
+            validateBatchAddressable(entrySize * this.initialKeyCapacity);
+            // Honor the lazy contract: when openOnInit is false the key arena stays
+            // unallocated until the first reopen() (which inflates it via
+            // restoreInitialCapacity), so a never-opened map allocates nothing.
+            keySink = new DirectByteSink(KEY_SINK_INITIAL_CAPACITY, memoryTag, !openOnInit);
+
+            if (openOnInit) {
+                this.keyCapacity = this.initialKeyCapacity;
+                mask = this.keyCapacity - 1;
+                free = (int) (this.keyCapacity * loadFactor);
+                final long sizeBytes = entrySize * this.keyCapacity;
+                memStart = Unsafe.malloc(sizeBytes, memoryTag, memoryTracker);
+                Vect.memset(memStart, sizeBytes, 0);
+                memLimit = memStart + sizeBytes;
+            }
+            // else: memStart / memLimit stay 0, keyCapacity stays 0; first reopen()
+            // allocates initial backing under whatever MemoryTracker is bound at that
+            // time. keySink retains its initial capacity across the close/reopen cycle.
+
+            value = new FlyweightPackedMapValue(valueSize, valueOffsets);
+            value2 = new FlyweightPackedMapValue(valueSize, valueOffsets);
+            value3 = new FlyweightPackedMapValue(valueSize, valueOffsets);
+
+            record = new UnorderedVarcharMapRecord(valueSize, valueOffsets, value, valueTypes);
+            cursor = new UnorderedVarcharMapCursor(record, this);
+            key = new Key();
+            // Honor the lazy contract: when openOnInit is false the allocator's chunk
+            // index stays unallocated until the first reopen(), so a never-opened map
+            // (e.g. a hash-join factory built at codegen but never executed) leaks
+            // nothing when its owner skips close() for an unopened cursor.
+            allocator = new FastGroupByAllocator(allocatorDefaultChunkSize, allocatorMaxChunkSize, false, openOnInit);
+        } catch (Throwable th) {
+            close();
+            throw th;
+        }
+    }
+
+    // public for testing
+    public static long packHashSizeFlags(long hash, int size, byte flags) {
+        // size must be within 30 bits
+        assert size < (1 << 30);
+        // flags must have lower 6 bits clear
+        assert (flags & 0x3f) == 0;
+
+        int sizeAndFlags = size | (flags << 24);
+        return ((long) sizeAndFlags << 32) | (hash & 0xffffffffL);
+    }
+
+    // public for testing
+    public static long unpackHash(long hashSizeFlags) {
+        return hashSizeFlags & 0xffffffffL;
+    }
+
+    @Override
+    public void clear() {
+        free = (int) (keyCapacity * loadFactor);
+        size = 0;
+        nResizes = 0;
+        Vect.memset(memStart, memLimit - memStart, 0);
+        Misc.clear(allocator);
+    }
+
+    @Override
+    public void close() {
+        if (memStart != 0) {
+            memLimit = memStart = Unsafe.free(memStart, memLimit - memStart, memoryTag, memoryTracker);
+            free = 0;
+            size = 0;
+        }
+        if (batchEmptyValueStart != 0) {
+            batchEmptyValueStart = Unsafe.free(batchEmptyValueStart, valueSize, memoryTag, memoryTracker);
+        }
+        Misc.free(keySink);
+        Misc.free(allocator);
+    }
+
+    @Override
+    public MapRecordCursor getCursor() {
+        return cursor.init(memStart, memLimit, size);
+    }
+
+    @Override
+    public long getHeapSize() {
+        return memLimit - memStart + allocator.allocated();
+    }
+
+    @Override
+    public int getKeyCapacity() {
+        return keyCapacity;
+    }
+
+    @Override
+    public MapRecord getRecord() {
+        return record;
+    }
+
+    @Override
+    public void initCursor(MapRecordCursor cursor) {
+        ((UnorderedVarcharMapCursor) cursor).init(memStart, memLimit, size);
+    }
+
+    @Override
+    public boolean isOpen() {
+        return memStart != 0;
+    }
+
+    @Override
+    public void merge(Map srcMap, MapValueMergeFunction mergeFunc) {
+        assert this != srcMap;
+        long srcMapSize = srcMap.size();
+        if (srcMapSize == 0) {
+            return;
+        }
+        UnorderedVarcharMap srcVarcharMap = (UnorderedVarcharMap) srcMap;
+
+        OUTER:
+        for (long srcAddr = srcVarcharMap.memStart; srcAddr < srcVarcharMap.memLimit; srcAddr += entrySize) {
+            long srcHashSizeFlags = Unsafe.getLong(srcAddr);
+            if (srcHashSizeFlags == 0) {
+                continue;
+            }
+
+            long srcPtrWithUnstableFlags = Unsafe.getLong(srcAddr + 8);
+            int srcSize = unpackSize(srcHashSizeFlags);
+
+            // mask is guaranteed to have 32 or fewer bits sets -> we can use the stored 32 LSBs of the
+            // hash since the higher bits will be masked out and won't contribute to destAddr calculation
+            long srcHash = unpackHash(srcHashSizeFlags);
+            long destAddr = getStartAddress(srcHash & mask);
+
+            for (; ; ) {
+                long dstHashSizeFlags = Unsafe.getLong(destAddr);
+                if (dstHashSizeFlags == 0) {
+                    break;
+                } else if (makePackComparable(dstHashSizeFlags) == makePackComparable(srcHashSizeFlags)) {
+                    // lower 32 bits of hash, size, and flags match, let's compare keys.
+                    long dstPtrWithUnstableFlags = Unsafe.getLong(destAddr + 8);
+
+                    if (Vect.memeq(srcPtrWithUnstableFlags & PTR_MASK, dstPtrWithUnstableFlags & PTR_MASK, srcSize)) {
+                        // Match found, merge values.
+                        mergeFunc.merge(
+                                valueAt(destAddr),
+                                srcVarcharMap.valueAt(srcAddr)
+                        );
+                        continue OUTER;
+                    }
+                }
+                destAddr = getNextAddress(destAddr);
+            }
+            // dst key not found, insert src key-value pair
+            if ((srcPtrWithUnstableFlags & PTR_UNSTABLE_MASK) == 0) {
+                // stable pointer
+                Unsafe.copyMemory(srcAddr, destAddr, entrySize);
+            } else {
+                // unstable pointer, copy key to our memory
+                long arenaPtr = allocator.malloc(srcSize);
+                Unsafe.copyMemory(srcPtrWithUnstableFlags & PTR_MASK, arenaPtr, srcSize);
+                long arenaPtrWithUnstableFlags = arenaPtr | PTR_UNSTABLE_MASK;
+                Unsafe.putLong(destAddr, srcHashSizeFlags);
+                Unsafe.putLong(destAddr + 8, arenaPtrWithUnstableFlags);
+
+                // copy value
+                Unsafe.copyMemory(srcAddr + KEY_SIZE, destAddr + KEY_SIZE, entrySize - KEY_SIZE);
+            }
+            size++;
+            if (--free == 0) {
+                try {
+                    rehash();
+                } catch (CairoException e) {
+                    free = 1;
+                    throw e;
+                }
+            }
+        }
+    }
+
+    @Override
+    public MapRecordCursor newCursor() {
+        UnorderedVarcharMapCursor c = new UnorderedVarcharMapCursor(record.clone(), this);
+        return c.init(memStart, memLimit, size);
+    }
+
+    @Override
+    public long probeBatch(
+            PageFrameMemoryRecord record,
+            RecordSink mapSink,
+            long batchStart,
+            long batchEnd,
+            long batchAddr
+    ) {
+        // Caller must have pre-reserved at least (batchEnd - batchStart) free slots via
+        // reserveCapacity(). A mid-batch rehash reallocates memStart and reindexes entries,
+        // which would invalidate offsets already packed into batchAddr for earlier rows.
+        assert free > batchEnd - batchStart;
+
+        final int directColumnIndex = mapSink.getDirectColumnIndex();
+        if (directColumnIndex >= 0) {
+            return probeBatchUnsafe(record, directColumnIndex, batchStart, batchEnd, batchAddr);
+        }
+
+        for (long r = batchStart; r < batchEnd; r++) {
+            record.setRowIndex(r);
+            mapSink.copy(record, key);
+            final FlyweightPackedMapValue v = (FlyweightPackedMapValue) key.createValue();
+            if (v.isNew() && batchEmptyValueStart != 0) {
+                v.copyRawValue(batchEmptyValueStart);
+            }
+            long encoded = Map.encodeBatchEntry(r, v.getStartAddress() + KEY_SIZE - memStart, v.isNew());
+            Unsafe.putLong(batchAddr, encoded);
+            batchAddr += Long.BYTES;
+        }
+        return memStart;
+    }
+
+    @Override
+    public long probeBatchFiltered(
+            PageFrameMemoryRecord record,
+            RecordSink mapSink,
+            long rowIdsAddr,
+            long batchStart,
+            long batchEnd,
+            long batchAddr
+    ) {
+        assert free > batchEnd - batchStart;
+
+        final int directColumnIndex = mapSink.getDirectColumnIndex();
+        if (directColumnIndex >= 0) {
+            return probeBatchFilteredUnsafe(record, directColumnIndex, rowIdsAddr, batchStart, batchEnd, batchAddr);
+        }
+
+        for (long p = batchStart; p < batchEnd; p++) {
+            final long r = Unsafe.getLong(rowIdsAddr + (p << 3));
+            record.setRowIndex(r);
+            mapSink.copy(record, key);
+            final FlyweightPackedMapValue v = (FlyweightPackedMapValue) key.createValue();
+            if (v.isNew() && batchEmptyValueStart != 0) {
+                v.copyRawValue(batchEmptyValueStart);
+            }
+            long encoded = Map.encodeBatchEntry(r, v.getStartAddress() + KEY_SIZE - memStart, v.isNew());
+            Unsafe.putLong(batchAddr, encoded);
+            batchAddr += Long.BYTES;
+        }
+        return memStart;
+    }
+
+    @Override
+    public void reopen(int keyCapacity, long heapSize) {
+        if (memStart == 0) {
+            keyCapacity = (int) (keyCapacity / loadFactor);
+            initialKeyCapacity = Math.max(Numbers.ceilPow2(keyCapacity), MIN_KEY_CAPACITY);
+            restoreInitialCapacity();
+        }
+        allocator.reopen();
+    }
+
+    @Override
+    public void reopen() {
+        if (memStart == 0) {
+            // handles both mem and offsets
+            restoreInitialCapacity();
+        }
+        allocator.reopen();
+    }
+
+    @Override
+    public void reserveCapacity(long additionalKeys) {
+        // +1: guarantee free > additionalKeys on return so that asNew's --free == 0
+        // rehash never fires on the last insertion within a probeBatch.
+        if (free <= additionalKeys) {
+            long required = keyCapacity + (long) Math.ceil((additionalKeys - free + 1) / loadFactor);
+            rehash(Numbers.ceilPow2(required));
+        }
+    }
+
+    @Override
+    public void restoreInitialCapacity() {
+        if (memStart == 0 || keyCapacity != initialKeyCapacity) {
+            final long sizeBytes = entrySize * initialKeyCapacity;
+            long newMemStart;
+            if (memStart == 0) {
+                newMemStart = Unsafe.malloc(sizeBytes, memoryTag, memoryTracker);
+            } else {
+                newMemStart = Unsafe.realloc(memStart, memLimit - memStart, sizeBytes, memoryTag, memoryTracker);
+            }
+            memStart = newMemStart;
+            memLimit = memStart + sizeBytes;
+            keyCapacity = initialKeyCapacity;
+            mask = keyCapacity - 1;
+
+            keySink.reopen();
+        }
+
+        clear();
+    }
+
+    @Override
+    public void setBatchEmptyValue(GroupByFunctionsUpdater updater) {
+        if (batchEmptyValueStart != 0) {
+            batchEmptyValueStart = Unsafe.free(batchEmptyValueStart, valueSize, memoryTag, memoryTracker);
+        }
+        if (updater == null || valueSize == 0) {
+            return;
+        }
+        final long buf = Unsafe.malloc(valueSize, memoryTag, memoryTracker);
+        try {
+            Vect.memset(buf, valueSize, 0);
+            // Populate the empty value into the scratch buffer using value as a flyweight.
+            // updateEmpty() only writes to value addresses (valueAddress + offset), so the
+            // entry address is irrelevant here.
+            value.of(buf);
+            updater.updateEmpty(value);
+            // If the resulting value region is all zeros, we don't need a per-entry memcpy
+            // since fresh slots are already zeroed by clear().
+            boolean allZero = true;
+            for (long p = buf, end = buf + valueSize; p < end; p++) {
+                if (Unsafe.getByte(p) != 0) {
+                    allZero = false;
+                    break;
+                }
+            }
+            if (allZero) {
+                Unsafe.free(buf, valueSize, memoryTag, memoryTracker);
+            } else {
+                batchEmptyValueStart = buf;
+            }
+        } catch (Throwable th) {
+            if (batchEmptyValueStart != buf) {
+                Unsafe.free(buf, valueSize, memoryTag, memoryTracker);
+            }
+            throw th;
+        }
+    }
+
+    @Override
+    public void setKeyCapacity(int newKeyCapacity) {
+        long requiredCapacity = (long) (newKeyCapacity / loadFactor);
+        if (requiredCapacity > MAX_SAFE_INT_POW_2) {
+            throw CairoException.nonCritical().put("map capacity overflow");
+        }
+        rehash(Numbers.ceilPow2((int) requiredCapacity));
+    }
+
+    @Override
+    public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+        this.memoryTracker = tracker;
+        // Bind the key-byte arena too -- for a high-cardinality GROUP BY <varchar>
+        // it holds the dominant allocation. setMemoryTracker() precedes reopen(), so
+        // its malloc/free accounting stays symmetric.
+        allocator.setMemoryTracker(tracker);
+    }
+
+    @Override
+    public long size() {
+        return size;
+    }
+
+    @Override
+    public MapValue valueAt(long startAddress) {
+        return valueOf(startAddress, false, value);
+    }
+
+    @Override
+    public MapKey withKey() {
+        return key.init();
+    }
+
+    /**
+     * When comparing hash and size for equality, we want to ignore ascii vs non-ascii flag, since it doesn't affect hash collisions or key equality checks.
+     */
+    private static long makePackComparable(long packedHashSizeFlags) {
+        return packedHashSizeFlags & 0x7fffffffffffffffL;
+    }
+
+    private static void validateBatchAddressable(long sizeBytes) {
+        // A silent truncation here would feed corrupted offsets into every batched
+        // probe; fail loudly instead of producing wrong aggregation results.
+        if (sizeBytes > Map.BATCH_OFFSET_MASK) {
+            throw CairoException.nonCritical()
+                    .put("UnorderedVarcharMap heap size exceeds batched probe addressable range [heapBytes=").put(sizeBytes)
+                    .put(", maxAddressable=").put(Map.BATCH_OFFSET_MASK)
+                    .put(']');
+        }
+    }
+
+    private FlyweightPackedMapValue asNew(
+            long startAddress,
+            long hash,
+            long keyPtrWithUnstableFlag,
+            int keySize,
+            long keyHashSizeFlags,
+            FlyweightPackedMapValue value
+    ) {
+        Unsafe.putLong(startAddress, keyHashSizeFlags);
+        if ((keyPtrWithUnstableFlag & PTR_UNSTABLE_MASK) == 0) {
+            // stable pointer
+            Unsafe.putLong(startAddress + 8L, keyPtrWithUnstableFlag);
+        } else {
+            // unstable pointer, copy key to our memory
+            long arenaPtr = allocator.malloc(keySize);
+            Unsafe.copyMemory(keyPtrWithUnstableFlag & PTR_MASK, arenaPtr, keySize);
+            long arenaPtrWithUnstableFlags = arenaPtr | PTR_UNSTABLE_MASK;
+            Unsafe.putLong(startAddress + 8, arenaPtrWithUnstableFlags);
+        }
+        if (--free == 0) {
+            try {
+                rehash();
+            } catch (CairoException e) {
+                free = 1;
+                throw e;
+            }
+            // Index may have changed after rehash, so we need to find the key.
+            startAddress = getStartAddress(hash & mask);
+            long ptr = keyPtrWithUnstableFlag & PTR_MASK;
+            for (; ; ) {
+                long loadedHashSizeFlags = Unsafe.getLong(startAddress);
+                if (makePackComparable(loadedHashSizeFlags) == makePackComparable(keyHashSizeFlags)) {
+                    long entryPtrWithUnstableFlag = Unsafe.getLong(startAddress + 8);
+                    if (Vect.memeq(entryPtrWithUnstableFlag & PTR_MASK, ptr, keySize)) {
+                        break;
+                    }
+                }
+                startAddress = getNextAddress(startAddress);
+            }
+        }
+        size++;
+        return valueOf(startAddress, true, value);
+    }
+
+    // Advance through the map data structure sequentially,
+    // avoiding multiplication and pseudo-random access.
+    private long getNextAddress(long entryAddress) {
+        entryAddress += entrySize;
+        if (entryAddress < memLimit) {
+            return entryAddress;
+        }
+        return memStart;
+    }
+
+    private long getStartAddress(long memStart, long index) {
+        return memStart + entrySize * index;
+    }
+
+    private long getStartAddress(long index) {
+        return getStartAddress(memStart, index);
+    }
+
+    private FlyweightPackedMapValue probe0(
+            long startAddress,
+            long hash,
+            long ptrWithUnstableFlag,
+            int size,
+            long packedHashSizeFlagsToFind,
+            FlyweightPackedMapValue value
+    ) {
+        long ptr = ptrWithUnstableFlag & PTR_MASK;
+        final long comparablePackedHashSizeFlagsToFind = makePackComparable(packedHashSizeFlagsToFind);
+        for (; ; ) {
+            startAddress = getNextAddress(startAddress);
+            long loadedHashSizeFlags = Unsafe.getLong(startAddress);
+            if (loadedHashSizeFlags == 0) {
+                return asNew(startAddress, hash, ptrWithUnstableFlag, size, packedHashSizeFlagsToFind, value);
+            }
+            if (makePackComparable(loadedHashSizeFlags) == comparablePackedHashSizeFlagsToFind) {
+                long currentEntryPtr = Unsafe.getLong(startAddress + 8) & PTR_MASK;
+                if (Vect.memeq(currentEntryPtr, ptr, size)) {
+                    return valueOf(startAddress, false, value);
+                }
+            }
+        }
+    }
+
+    private long probeBatchFilteredUnsafe(
+            PageFrameMemoryRecord record,
+            int columnIndex,
+            long rowIdsAddr,
+            long batchStart,
+            long batchEnd,
+            long batchAddr
+    ) {
+        for (long p = batchStart; p < batchEnd; p++) {
+            final long r = Unsafe.getLong(rowIdsAddr + (p << 3));
+            record.setRowIndex(r);
+            key.putVarchar(record.getVarcharA(columnIndex));
+            final FlyweightPackedMapValue v = (FlyweightPackedMapValue) key.createValue();
+            if (v.isNew() && batchEmptyValueStart != 0) {
+                v.copyRawValue(batchEmptyValueStart);
+            }
+            long encoded = Map.encodeBatchEntry(r, v.getStartAddress() + KEY_SIZE - memStart, v.isNew());
+            Unsafe.putLong(batchAddr, encoded);
+            batchAddr += Long.BYTES;
+        }
+        return memStart;
+    }
+
+    private long probeBatchUnsafe(
+            PageFrameMemoryRecord record,
+            int columnIndex,
+            long batchStart,
+            long batchEnd,
+            long batchAddr
+    ) {
+        for (long r = batchStart; r < batchEnd; r++) {
+            record.setRowIndex(r);
+            key.putVarchar(record.getVarcharA(columnIndex));
+            final FlyweightPackedMapValue v = (FlyweightPackedMapValue) key.createValue();
+            if (v.isNew() && batchEmptyValueStart != 0) {
+                v.copyRawValue(batchEmptyValueStart);
+            }
+            long encoded = Map.encodeBatchEntry(r, v.getStartAddress() + KEY_SIZE - memStart, v.isNew());
+            Unsafe.putLong(batchAddr, encoded);
+            batchAddr += Long.BYTES;
+        }
+        return memStart;
+    }
+
+    private FlyweightPackedMapValue probeReadOnly(long startAddress, long ptr, long size, long packedHashSizeFlagsToFind, FlyweightPackedMapValue value) {
+        long comparablePackedHashSizeFlagsToFind = makePackComparable(packedHashSizeFlagsToFind);
+        for (; ; ) {
+            startAddress = getNextAddress(startAddress);
+            long loadedHashSizeFlags = Unsafe.getLong(startAddress);
+            if (loadedHashSizeFlags == 0) {
+                return null;
+            }
+            if (makePackComparable(loadedHashSizeFlags) == comparablePackedHashSizeFlagsToFind) {
+                long currentEntryPtr = Unsafe.getLong(startAddress + 8) & PTR_MASK;
+                if (Vect.memeq(currentEntryPtr, ptr, size)) {
+                    return valueOf(startAddress, false, value);
+                }
+            }
+        }
+    }
+
+    private void rehash() {
+        rehash((long) keyCapacity << 1);
+    }
+
+    private void rehash(long newKeyCapacity) {
+        if (nResizes == maxResizes) {
+            throw LimitOverflowException.instance().put("limit of ").put(maxResizes).put(" resizes exceeded in unordered map");
+        }
+        if (newKeyCapacity > MAX_SAFE_INT_POW_2) {
+            throw CairoException.nonCritical().put("map capacity overflow");
+        }
+        if (newKeyCapacity <= keyCapacity) {
+            return;
+        }
+
+        final long newSizeBytes = entrySize * newKeyCapacity;
+        validateBatchAddressable(newSizeBytes);
+        final long newMemStart = Unsafe.malloc(newSizeBytes, memoryTag, memoryTracker);
+        final long newMemLimit = newMemStart + newSizeBytes;
+        Vect.memset(newMemStart, newSizeBytes, 0);
+        final int newMask = (int) newKeyCapacity - 1;
+
+        for (long addr = memStart; addr < memLimit; addr += entrySize) {
+            long packedHashSizeFlags = Unsafe.getLong(addr);
+            if (packedHashSizeFlags == 0) {
+                continue;
+            }
+
+            int hash = Unsafe.getInt(addr);
+            long newAddr = getStartAddress(newMemStart, hash & newMask);
+            while (Unsafe.getLong(newAddr) != 0) {
+                newAddr += entrySize;
+                if (newAddr >= newMemLimit) {
+                    newAddr = newMemStart;
+                }
+            }
+            Unsafe.copyMemory(addr, newAddr, entrySize);
+        }
+
+        Unsafe.free(memStart, memLimit - memStart, memoryTag, memoryTracker);
+
+        memStart = newMemStart;
+        memLimit = newMemStart + newSizeBytes;
+        mask = newMask;
+        free += (int) ((newKeyCapacity - keyCapacity) * loadFactor);
+        keyCapacity = (int) newKeyCapacity;
+        nResizes++;
+    }
+
+    private FlyweightPackedMapValue valueOf(long startAddress, boolean newValue, FlyweightPackedMapValue value) {
+        return value.of(startAddress, startAddress + KEY_SIZE, newValue);
+    }
+
+    static boolean isAscii(byte flags) {
+        return (flags & FLAG_IS_ASCII) != 0;
+    }
+
+    static boolean isNull(byte flags) {
+        return (flags & FLAG_IS_NULL) != 0;
+    }
+
+    static boolean isSizeNull(int sizeAndFlags) {
+        return (sizeAndFlags & SIZE_IS_NULL) != 0;
+    }
+
+    static byte unpackFlags(long packedHashSizeFlags) {
+        return (byte) (packedHashSizeFlags >>> 56);
+    }
+
+    static int unpackSize(long packedHashSizeFlags) {
+        int sizeAndFlags = (int) (packedHashSizeFlags >>> 32);
+
+        // clear top 2 bits
+        return sizeAndFlags & MASK_FLAGS_FROM_SIZE;
+    }
+
+    long entrySize() {
+        return entrySize;
+    }
+
+    boolean isZeroKey(long startAddress) {
+        long packedHashAndSize = Unsafe.getLong(startAddress);
+        return packedHashAndSize == 0;
+    }
+
+    class Key implements MapKey {
+        private byte flags;
+        private long ptrWithUnstableFlag;
+        private int size;
+
+        @Override
+        public long commit() {
+            return KEY_SIZE; // we don't need to track the actual key size
+        }
+
+        @Override
+        public void copyFrom(MapKey srcKey) {
+            Key srcVarcharKey = (Key) srcKey;
+            size = srcVarcharKey.size;
+            flags = srcVarcharKey.flags;
+            if ((srcVarcharKey.ptrWithUnstableFlag & PTR_UNSTABLE_MASK) == 0 || isDeferredKeyCopy) {
+                // stable pointer, or deferred mode: copy the ptr reference as-is
+                ptrWithUnstableFlag = srcVarcharKey.ptrWithUnstableFlag;
+            } else {
+                // unstable pointer, copy key to key memory
+                keySink.clear();
+                long srcPtr = srcVarcharKey.ptrWithUnstableFlag & PTR_MASK;
+                keySink.put(srcPtr, srcPtr + size);
+                long ptr = keySink.ptr();
+                ptrWithUnstableFlag = ptr | PTR_UNSTABLE_MASK;
+            }
+        }
+
+        @Override
+        public MapValue createValue() {
+            long hash = Hash.hashMem64(ptrWithUnstableFlag & PTR_MASK, size);
+            return createValue(hash);
+        }
+
+        @Override
+        public MapValue createValue(long hashCode) {
+            long index = hashCode & mask;
+            long startAddress = getStartAddress(index);
+
+            long loadedHashSizeFlags = Unsafe.getLong(startAddress);
+            long currentHashSizeFlags = packHashSizeFlags(hashCode, size, flags);
+            if (loadedHashSizeFlags == 0) {
+                return asNew(startAddress, hashCode, ptrWithUnstableFlag, size, currentHashSizeFlags, value);
+            }
+            if (makePackComparable(loadedHashSizeFlags) == makePackComparable(currentHashSizeFlags)) {
+                long currentPtr = Unsafe.getLong(startAddress + 8) & PTR_MASK;
+                if (Vect.memeq(currentPtr, ptrWithUnstableFlag & PTR_MASK, size)) {
+                    return valueOf(startAddress, false, value);
+                }
+            }
+            return probe0(startAddress, hashCode, ptrWithUnstableFlag, size, currentHashSizeFlags, value);
+        }
+
+        @Override
+        public MapValue findValue() {
+            return findValue(ptrWithUnstableFlag, size, flags, value);
+        }
+
+        @Override
+        public MapValue findValue2() {
+            return findValue(ptrWithUnstableFlag, size, flags, value2);
+        }
+
+        @Override
+        public MapValue findValue3() {
+            return findValue(ptrWithUnstableFlag, size, flags, value3);
+        }
+
+        @Override
+        public long hash() {
+            return Hash.hashMem64(ptrWithUnstableFlag & PTR_MASK, size);
+        }
+
+        public Key init() {
+            // no-op since all fields are set in putVarchar().
+            // Q: What if a user does not call putVarchar()?
+            // A: It's illegal to use an uninitialized key and will result in undefined behavior.
+            return this;
+        }
+
+        @Override
+        public void put(Record record, RecordSink sink) {
+            sink.copy(record, this);
+        }
+
+        @Override
+        public void putArray(ArrayView view) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putBin(BinarySequence value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putBool(boolean value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putByte(byte value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putChar(char value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putDate(long value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putDecimal128(Decimal128 decimal128) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putDecimal256(Decimal256 decimal256) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putDouble(double value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putFloat(float value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putIPv4(int value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putInt(int value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putInterval(Interval interval) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putLong(long value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putLong128(long lo, long hi) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putLong256(Long256 value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putLong256(long l0, long l1, long l2, long l3) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putRecord(Record value) {
+            // no-op
+        }
+
+        @Override
+        public void putShort(short value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putStr(CharSequence value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putStr(CharSequence value, int lo, int hi) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putTimestamp(long value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putVarchar(Utf8Sequence value) {
+            if (value == null) {
+                size = 0;
+                ptrWithUnstableFlag = 0;
+                // set the 2 top bits to indicate null value (+ascii flag)
+                flags = FLAG_IS_NULL | FLAG_IS_ASCII;
+            } else {
+                size = value.size();
+                if (value.isStable()) {
+                    ptrWithUnstableFlag = value.ptr();
+                } else if (isDeferredKeyCopy && value.ptr() != -1) {
+                    // deferred mode: store the original unstable pointer directly,
+                    // asNew() will copy it to the arena later
+                    ptrWithUnstableFlag = value.ptr() | PTR_UNSTABLE_MASK;
+                } else {
+                    // defensive copy to keySink
+                    keySink.clear();
+                    if (value.ptr() != -1) {
+                        keySink.put(value.ptr(), value.ptr() + size);
+                    } else {
+                        keySink.put(value);
+                    }
+                    long ptr = keySink.ptr();
+                    ptrWithUnstableFlag = ptr | PTR_UNSTABLE_MASK;
+                }
+                // An empty varchar is ASCII by definition (it has no non-ASCII bytes), but the
+                // Utf8Sequence contract only guarantees that isAscii() == true means ASCII, not
+                // the converse: a producer is free to report isAscii() == false for an empty
+                // value. The map packs hash, size and flags into a single long and relies on
+                // empty keys carrying the ASCII flag, otherwise an empty non-ASCII key packs to
+                // 0 (zero hash, zero size, no flags) -- indistinguishable from an empty slot,
+                // which silently corrupts the map. Force the flag for empty keys.
+                flags = (value.isAscii() || size == 0) ? FLAG_IS_ASCII : 0;
+            }
+
+            // Empty string must have the ascii flag set to true, otherwise we won't be able to differentiate
+            // between a missing entry and an empty string.
+            // The flags are encoded into the high bits in the size field so an empty string will still have a non-zero size stored.
+            assert size > 0 || (flags & FLAG_IS_ASCII) != 0;
+        }
+
+        @Override
+        public void skip(int bytes) {
+            // no-op
+        }
+
+        private MapValue findValue(long ptrWithUnstableFlag, int size, byte flags, FlyweightPackedMapValue value) {
+            long ptr = ptrWithUnstableFlag & PTR_MASK;
+            long hash = Hash.hashMem64(ptr, size);
+            long index = hash & mask;
+            long startAddress = getStartAddress(index);
+
+            long loadedHashSizeFlags = Unsafe.getLong(startAddress);
+            if (loadedHashSizeFlags == 0) {
+                return null;
+            }
+            long packedHashSizeFlags = packHashSizeFlags(hash, size, flags);
+            if (makePackComparable(loadedHashSizeFlags) == makePackComparable(packedHashSizeFlags)) {
+                long currentPtr = Unsafe.getLong(startAddress + 8) & PTR_MASK;
+                if (Vect.memeq(currentPtr, ptr, size)) {
+                    return valueOf(startAddress, false, value);
+                }
+            }
+            return probeReadOnly(startAddress, ptr, size, packedHashSizeFlags, value);
+        }
+
+        void copyFromStartAddress(long address) {
+            long srcPackedHashAndSize = Unsafe.getLong(address);
+            byte srcFlags = UnorderedVarcharMap.unpackFlags(srcPackedHashAndSize);
+            int srcSize = UnorderedVarcharMap.unpackSize(srcPackedHashAndSize);
+            long srcPtrWithUnstableFlag = Unsafe.getLong(address + Long.BYTES);
+
+            if ((srcPtrWithUnstableFlag & PTR_UNSTABLE_MASK) == 0) {
+                // stable pointer
+                ptrWithUnstableFlag = srcPtrWithUnstableFlag;
+            } else {
+                // unstable pointer, copy key to key memory
+                keySink.clear();
+                long srcPtr = srcPtrWithUnstableFlag & PTR_MASK;
+                keySink.put(srcPtr, srcPtr + srcSize);
+                long ptr = keySink.ptr();
+                ptrWithUnstableFlag = ptr | PTR_UNSTABLE_MASK;
+            }
+
+            size = srcSize;
+            flags = srcFlags;
+        }
+    }
+}

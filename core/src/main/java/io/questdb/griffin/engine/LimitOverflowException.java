@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,22 +25,15 @@
 package io.questdb.griffin.engine;
 
 import io.questdb.cairo.CairoException;
-import io.questdb.std.ThreadLocal;
+import io.questdb.std.FiberLocal;
 
 public class LimitOverflowException extends CairoException {
-    private static final long serialVersionUID = 1L;
-    private static final ThreadLocal<LimitOverflowException> tlException = new ThreadLocal<>(LimitOverflowException::new);
+    private static final FiberLocal<LimitOverflowException> tlException = new FiberLocal<>(LimitOverflowException::new);
 
     public static LimitOverflowException instance() {
         LimitOverflowException ex = tlException.get();
         ex.message.clear();
+        ex.errno = NON_CRITICAL;
         return ex;
     }
-
-    public static LimitOverflowException instance(long limit) {
-        LimitOverflowException ex = instance();
-        ex.put("limit of ").put(limit).put(" exceeded").setCacheable(true);
-        return ex;
-    }
-
 }

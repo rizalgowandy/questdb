@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,22 +25,29 @@
 package io.questdb.griffin;
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.std.FiberLocal;
 import io.questdb.std.FlyweightMessageContainer;
-import io.questdb.std.Sinkable;
-import io.questdb.std.ThreadLocal;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public class SqlException extends Exception implements Sinkable, FlyweightMessageContainer {
-
+    public static final int EXCEPTION_TABLE_DOES_NOT_EXIST = -105;
     private static final StackTraceElement[] EMPTY_STACK_TRACE = {};
-
-    private static final ThreadLocal<SqlException> tlException = new ThreadLocal<>(SqlException::new);
+    private static final int EXCEPTION_VIEW_DOES_NOT_EXIST = EXCEPTION_TABLE_DOES_NOT_EXIST - 1;
+    private static final int EXCEPTION_MAT_VIEW_DOES_NOT_EXIST = EXCEPTION_VIEW_DOES_NOT_EXIST - 1;
+    private static final int EXCEPTION_WAL_RECOVERABLE = EXCEPTION_MAT_VIEW_DOES_NOT_EXIST - 1;
+    private static final int EXCEPTION_FUNCTION_NOT_ALLOWED = EXCEPTION_WAL_RECOVERABLE - 1;
+    private static final int EXCEPTION_MATERIALIZATION_EXPIRY_CONFLICT = EXCEPTION_FUNCTION_NOT_ALLOWED - 1;
+    private static final FiberLocal<SqlException> tlException = new FiberLocal<>(SqlException::new);
     private final StringSink message = new StringSink();
+    private final StringSink tableName = new StringSink();
+    private int error;
+    private boolean isTableBusy;
     private int position;
-
-    protected SqlException() {
-    }
 
     public static SqlException $(int position, CharSequence message) {
         return position(position).put(message);
@@ -50,11 +57,41 @@ public class SqlException extends Exception implements Sinkable, FlyweightMessag
         return position(position).put(addrLo, addrHi);
     }
 
-    public static SqlException ambiguousColumn(int position) {
-        return position(position).put("Ambiguous column name");
+    public static SqlException ambiguousColumn(int position, CharSequence columnName) {
+        return position(position).put("Ambiguous column [name=").put(columnName).put(']');
     }
 
-    public static SqlException inconvertibleTypes(int position, int fromType, CharSequence fromName, int toType, CharSequence toName) {
+    public static SqlException duplicateColumn(int position, CharSequence colName) {
+        return duplicateColumn(position, colName, null);
+    }
+
+    public static SqlException duplicateColumn(int position, CharSequence colName, CharSequence additionalMessage) {
+        SqlException exception = SqlException.$(position, "Duplicate column [name=").put(colName).put(']');
+        if (additionalMessage != null) {
+            exception.put(' ').put(additionalMessage);
+        }
+        return exception;
+    }
+
+    public static SqlException emptyWindowContext(int position) {
+        return SqlException.$(position, "window function called in non-window context, make sure to add OVER clause");
+    }
+
+    /**
+     * The function exists, but the compile may not use it where it stands, e.g. in a materialized
+     * view, see {@link SqlExecutionRequirements#checkStoredView}.
+     */
+    public static SqlException functionNotAllowed(int position) {
+        return position(position).errorCode(EXCEPTION_FUNCTION_NOT_ALLOWED);
+    }
+
+    public static SqlException inconvertibleTypes(
+            int position,
+            int fromType,
+            CharSequence fromName,
+            int toType,
+            CharSequence toName
+    ) {
         return $(position, "inconvertible types: ")
                 .put(ColumnType.nameOf(fromType))
                 .put(" -> ")
@@ -63,57 +100,108 @@ public class SqlException extends Exception implements Sinkable, FlyweightMessag
                 .put(", to=").put(toName).put(']');
     }
 
-    public static SqlException inconvertibleValue(int columnNumber, double value, int fromType, int toType) {
-        return $(-1, "inconvertible value: ")
-                .put(value)
-                .put(" [")
+    public static SqlException inconvertibleTypes(
+            int position,
+            int fromType,
+            int toType
+    ) {
+        return $(position, "inconvertible types: ")
                 .put(ColumnType.nameOf(fromType))
                 .put(" -> ")
-                .put(ColumnType.nameOf(toType))
-                .put(']')
-                .put(" in target column number: ")
-                .put(columnNumber);
-    }
-
-    public static SqlException inconvertibleValue(int columnNumber, long value, int fromType, int toType) {
-        return $(-1, "inconvertible value: ")
-                .put(value)
-                .put(" [")
-                .put(ColumnType.nameOf(fromType))
-                .put(" -> ")
-                .put(ColumnType.nameOf(toType))
-                .put(']')
-                .put(" in target column number: ")
-                .put(columnNumber);
+                .put(ColumnType.nameOf(toType));
     }
 
     public static SqlException invalidColumn(int position, CharSequence column) {
         return position(position).put("Invalid column: ").put(column);
     }
 
+    public static SqlException invalidDate(CharSequence str, int position) {
+        return position(position).put("Invalid date [str=").put(str).put(']');
+    }
+
+    public static SqlException invalidDate(Utf8Sequence str, int position) {
+        return position(position).put("Invalid date [str=").put(str).put(']');
+    }
+
     public static SqlException invalidDate(int position) {
         return position(position).put("Invalid date");
+    }
+
+    public static SqlException matViewDoesNotExist(int position, CharSequence tableName) {
+        return position(position).errorCode(EXCEPTION_MAT_VIEW_DOES_NOT_EXIST).put("materialized view does not exist [view=").put(tableName).put(']');
+    }
+
+    public static SqlException materializationExpiryConflict(
+            int position,
+            CharSequence dependentName,
+            CharSequence sourceName
+    ) {
+        return position(position)
+                .errorCode(EXCEPTION_MATERIALIZATION_EXPIRY_CONFLICT)
+                .put("cannot materialize view '").put(dependentName)
+                .put("': source materialized view '").put(sourceName)
+                .put("' has an active EXPIRE ROWS policy");
+    }
+
+    public static SqlException nonDeterministicColumn(int position, CharSequence column, CharSequence objectKind) {
+        return position(position).put("non-deterministic function cannot be used in ").put(objectKind).put(": ").put(column);
+    }
+
+    public static SqlException parserErr(int position, @Nullable CharSequence tok, @NotNull CharSequence msg) {
+        return tok == null ?
+                SqlException.$(position, msg)
+                :
+                SqlException.$(position, "found [tok='")
+                        .put(tok)
+                        .put("', len=")
+                        .put(tok.length())
+                        .put("] ")
+                        .put(msg);
     }
 
     public static SqlException position(int position) {
         SqlException ex = tlException.get();
         // This is to have correct stack trace in local debugging with -ea option
         assert (ex = new SqlException()) != null;
-        ex.message.clear();
-        ex.position = position;
-        return ex;
+        return ex.reset(position);
     }
 
-    @Override
-    public StackTraceElement[] getStackTrace() {
-        StackTraceElement[] result = EMPTY_STACK_TRACE;
-        // This is to have correct stack trace reported in CI 
-        assert (result = super.getStackTrace()) != null;
-        return result;
+    public static SqlException tableDoesNotExist(int position, CharSequence tableName) {
+        final SqlException ex = position(position).errorCode(EXCEPTION_TABLE_DOES_NOT_EXIST);
+        // Cleared at the write, not remotely in position(): the sink is written in exactly one
+        // place, so clearing it here is what makes it impossible for a name left by an earlier
+        // throw on this carrier to be appended to. Copied, not referenced, because callers hand
+        // over a lexer flyweight that parsing goes on reusing.
+        ex.tableName.clear();
+        ex.tableName.put(tableName);
+        return ex.put("table does not exist [table=").put(tableName).put(']');
     }
 
     public static SqlException unexpectedToken(int position, CharSequence token) {
-        return position(position).put("unexpected token: ").put(token);
+        return position(position).put("unexpected token [").put(token).put(']');
+    }
+
+    public static SqlException unexpectedToken(int position, CharSequence token, @NotNull CharSequence extraMessage) {
+        return position(position).put("unexpected token [").put(token).put("] - ").put(extraMessage);
+    }
+
+    public static SqlException unsupportedCast(int position, CharSequence columnName, int fromType, int toType) {
+        return SqlException.$(position, "unsupported cast [column=").put(columnName)
+                .put(", from=").put(ColumnType.nameOf(fromType))
+                .put(", to=").put(ColumnType.nameOf(toType))
+                .put(']');
+    }
+
+    public static SqlException viewDoesNotExist(int position, CharSequence viewName) {
+        return position(position).errorCode(EXCEPTION_VIEW_DOES_NOT_EXIST).put("view does not exist [view=").put(viewName).put(']');
+    }
+
+    public static SqlException walRecoverable(int position) {
+        return position(position).errorCode(EXCEPTION_WAL_RECOVERABLE);
+    }
+
+    public int getErrorCode() {
+        return error;
     }
 
     @Override
@@ -130,8 +218,72 @@ public class SqlException extends Exception implements Sinkable, FlyweightMessag
         return position;
     }
 
-    public SqlException put(CharSequence cs) {
-        message.put(cs);
+    @Override
+    public StackTraceElement[] getStackTrace() {
+        StackTraceElement[] result = EMPTY_STACK_TRACE;
+        // This is to have correct stack trace reported in CI
+        assert (result = super.getStackTrace()) != null;
+        return result;
+    }
+
+    /**
+     * Returns the name of the table this exception says does not exist, or an empty sequence when
+     * the exception names no table. WAL apply reads it to tell the statement's own target apart
+     * from another table the statement references: only the former can be recovered by refreshing
+     * the target's token.
+     * <p>
+     * The sequence is a flyweight over this exception, which is itself a per-carrier flyweight, so
+     * read it before the carrier throws again - same contract as {@link #getFlyweightMessage()}.
+     */
+    public CharSequence getTableName() {
+        // Gated on the error code rather than trusting the sink to have been reset: with assertions
+        // off the instance is reused across throws, and only tableDoesNotExist ever writes the
+        // sink, so an exception that names no table must not be able to hand back the name the
+        // previous one left there.
+        return isTableDoesNotExist() ? tableName : "";
+    }
+
+    public boolean isFunctionNotAllowed() {
+        return error == EXCEPTION_FUNCTION_NOT_ALLOWED;
+    }
+
+    /**
+     * Identifies a wrapped pool acquisition failure without changing the SQL error code.
+     */
+    public boolean isTableBusy() {
+        return isTableBusy;
+    }
+
+    public boolean isTableDoesNotExist() {
+        return error == EXCEPTION_TABLE_DOES_NOT_EXIST;
+    }
+
+    public boolean isMaterializationExpiryConflict() {
+        return error == EXCEPTION_MATERIALIZATION_EXPIRY_CONFLICT;
+    }
+
+    public boolean isWalRecoverable() {
+        return error == EXCEPTION_WAL_RECOVERABLE;
+    }
+
+    public SqlException put(@Nullable CharSequence cs) {
+        if (cs != null) {
+            message.put(cs);
+        }
+        return this;
+    }
+
+    public SqlException put(@Nullable CharSequence cs, int lo, int hi) {
+        if (cs != null) {
+            message.put(cs, lo, hi);
+        }
+        return this;
+    }
+
+    public SqlException put(@Nullable Utf8Sequence cs) {
+        if (cs != null) {
+            message.put(cs);
+        }
         return this;
     }
 
@@ -165,8 +317,30 @@ public class SqlException extends Exception implements Sinkable, FlyweightMessag
         return this;
     }
 
+    public void setPosition(int position) {
+        this.position = position;
+    }
+
+    public SqlException setTableBusy(boolean isTableBusy) {
+        this.isTableBusy = isTableBusy;
+        return this;
+    }
+
     @Override
-    public void toSink(CharSink sink) {
-        sink.put('[').put(position).put("]: ").put(message);
+    public void toSink(@NotNull CharSink<?> sink) {
+        sink.putAscii('[').put(position).putAscii("]: ").put(message);
+    }
+
+    SqlException reset(int position) {
+        message.clear();
+        this.position = position;
+        error = 0;
+        isTableBusy = false;
+        return this;
+    }
+
+    private SqlException errorCode(int errorCode) {
+        this.error = errorCode;
+        return this;
     }
 }

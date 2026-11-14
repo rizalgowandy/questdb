@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.DoubleFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
@@ -42,16 +42,21 @@ public class PowDoubleFunctionFactory implements FunctionFactory {
 
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration1, SqlExecutionContext sqlExecutionContext) {
-        return new SubtractIntVVFunc(args.getQuick(0), args.getQuick(1));
+        return new Func(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class SubtractIntVVFunc extends DoubleFunction implements BinaryFunction {
+    private static class Func extends DoubleFunction implements ArithmeticBinaryFunction {
         final Function left;
         final Function right;
 
-        public SubtractIntVVFunc(Function left, Function right) {
+        public Func(Function left, Function right) {
             this.left = left;
             this.right = right;
+        }
+
+        @Override
+        public int getComplexity() {
+            return Function.addComplexity(4, Function.addComplexity(getLeft().getComplexity(), getRight().getComplexity()));
         }
 
         @Override
@@ -69,6 +74,11 @@ public class PowDoubleFunctionFactory implements FunctionFactory {
         @Override
         public Function getRight() {
             return right;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("power(").val(left).val(',').val(right).val(')');
         }
     }
 }

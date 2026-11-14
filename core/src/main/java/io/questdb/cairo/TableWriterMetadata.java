@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,144 +24,331 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.TableMetadata;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMR;
 import io.questdb.std.Chars;
-import io.questdb.std.LowerCaseCharSequenceIntHashMap;
-import io.questdb.std.ObjList;
+import io.questdb.std.IntList;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
 
-public class TableWriterMetadata extends BaseRecordMetadata {
-    private final int id;
-    private final int metaFileSize;
-    private int symbolMapCount;
-    private int version;
+import static io.questdb.cairo.TableUtils.META_OFFSET_PARTITION_BY;
+
+public class TableWriterMetadata extends AbstractRecordMetadata implements TableMetadata {
+    private int dedupMode;
+    private long expiryCleanupIntervalMicros;
+    private String expiryPredicate;
     private int maxUncommittedRows;
-    private long commitLag;
-    private long structureVersion;
+    private long metadataVersion;
+    private long o3MaxLag;
+    private int partitionBy;
+    private int storageVersion;
+    private int symbolMapCount;
+    private int tableFormat;
+    private int tableId;
+    private TableToken tableToken;
+    private int ttlHoursOrMonths;
+    private TxReader txReader;
+    private boolean walEnabled;
 
-    public TableWriterMetadata(MemoryMR metaMem) {
-        this.columnCount = metaMem.getInt(TableUtils.META_OFFSET_COUNT);
-        this.columnNameIndexMap = new LowerCaseCharSequenceIntHashMap(columnCount);
-        this.version = metaMem.getInt(TableUtils.META_OFFSET_VERSION);
-        this.id = metaMem.getInt(TableUtils.META_OFFSET_TABLE_ID);
-        this.maxUncommittedRows = metaMem.getInt(TableUtils.META_OFFSET_MAX_UNCOMMITTED_ROWS);
-        this.commitLag = metaMem.getLong(TableUtils.META_OFFSET_COMMIT_LAG);
-        TableUtils.validate(metaMem, columnNameIndexMap, ColumnType.VERSION);
-        this.timestampIndex = metaMem.getInt(TableUtils.META_OFFSET_TIMESTAMP_INDEX);
-        this.columnMetadata = new ObjList<>(this.columnCount);
-        this.structureVersion = metaMem.getLong(TableUtils.META_OFFSET_STRUCTURE_VERSION);
-
-        long offset = TableUtils.getColumnNameOffset(columnCount);
-        this.symbolMapCount = 0;
-        columnNameIndexMap.clear();
-        // don't create strings in this loop, we already have them in columnNameIndexMap
-        for (int i = 0; i < columnCount; i++) {
-            CharSequence name = metaMem.getStr(offset);
-            assert name != null;
-            int type = TableUtils.getColumnType(metaMem, i);
-            String nameStr = Chars.toString(name);
-            columnMetadata.add(
-                    new TableColumnMetadata(
-                            nameStr,
-                            TableUtils.getColumnHash(metaMem, i),
-                            type,
-                            TableUtils.isColumnIndexed(metaMem, i),
-                            TableUtils.getIndexBlockCapacity(metaMem, i),
-                            true,
-                            null,
-                            i
-                    )
-            );
-            columnNameIndexMap.put(nameStr, i);
-            if (ColumnType.isSymbol(type)) {
-                symbolMapCount++;
-            }
-            offset += Vm.getStorageLength(name);
-        }
-        metaFileSize = (int) offset;
+    public TableWriterMetadata(TableToken tableToken) {
+        this.tableToken = tableToken;
     }
 
-    public long getCommitLag() {
-        return commitLag;
+    @Override
+    public void close() {
+        // nothing to release
     }
 
-    public int getDenseColumnCount() {
-        int count = 0;
-        for (int i = 0; i < columnCount; i++) {
-            if (columnMetadata.getQuick(i).getType() > 0) {
-                count++;
-            }
-        }
-        return count;
+    @Override
+    public IntList getCoveringColumnIndices(int columnIndex) {
+        return getColumnMetadata(columnIndex).getCoveringColumnIndices();
     }
 
-    public void setCommitLag(long micros) {
-        this.commitLag = micros;
+    @Override
+    public int getDedupMode() {
+        return dedupMode;
     }
 
-    public int getFileDataSize() {
-        return metaFileSize;
+    @Override
+    public long getExpiryCleanupIntervalMicros() {
+        return expiryCleanupIntervalMicros;
     }
 
-    public int getId() {
-        return id;
+    @Override
+    public String getExpiryPredicate() {
+        return expiryPredicate;
     }
 
+    @Override
+    public int getIndexBlockCapacity(int columnIndex) {
+        return getColumnMetadata(columnIndex).getIndexValueBlockCapacity();
+    }
+
+    @Override
+    public byte getIndexType(int columnIndex) {
+        return getColumnMetadata(columnIndex).getIndexType();
+    }
+
+    @Override
     public int getMaxUncommittedRows() {
         return maxUncommittedRows;
     }
 
-    public void setMaxUncommittedRows(int rows) {
-        this.maxUncommittedRows = rows;
+    @Override
+    public long getMetadataVersion() {
+        return metadataVersion;
     }
 
-    public long getStructureVersion() {
-        return structureVersion;
+    @Override
+    public long getO3MaxLag() {
+        return o3MaxLag;
     }
 
-    public void setStructureVersion(long value) {
-        this.structureVersion = value;
+    @Override
+    public int getParquetEncodingConfig(int columnIndex) {
+        return getColumnMetadata(columnIndex).getParquetEncodingConfig();
+    }
+
+    @Override
+    public int getPartitionBy() {
+        return partitionBy;
+    }
+
+    public int getReplacingColumnIndex(int columnIndex) {
+        return columnMetadata.get(columnIndex).getReplacingIndex();
+    }
+
+    /**
+     * The storage version stamped into {@code _meta} at {@link TableUtils#META_OFFSET_VERSION}.
+     * {@link ColumnType#VERSION} for an ordinary table, {@link ColumnType#MAX_STORAGE_VERSION}
+     * while the table holds composite partitions.
+     */
+    public int getStorageVersion() {
+        return storageVersion;
+    }
+
+    @Override
+    public boolean getSymbolCacheFlag(int columnIndex) {
+        return getColumnMetadata(columnIndex).isSymbolCacheFlag();
+    }
+
+    @Override
+    public int getSymbolCapacity(int columnIndex) {
+        return getColumnMetadata(columnIndex).getSymbolCapacity();
     }
 
     public int getSymbolMapCount() {
         return symbolMapCount;
     }
 
-    public int getTableVersion() {
-        return version;
+    @Override
+    public int getTableFormat() {
+        return tableFormat;
     }
 
-    public void setTableVersion() {
-        version = ColumnType.VERSION;
+    @Override
+    public int getTableId() {
+        return tableId;
     }
 
-    public GenericRecordMetadata copyDense() {
-        GenericRecordMetadata metadata = new GenericRecordMetadata();
+    @Override
+    public CharSequence getTableName() {
+        return tableToken.getTableName();
+    }
+
+    @Override
+    public TableToken getTableToken() {
+        return tableToken;
+    }
+
+    @Override
+    public int getTtlHoursOrMonths() {
+        return ttlHoursOrMonths;
+    }
+
+    @Override
+    public boolean hasParquetPartitions() {
+        return txReader != null && txReader.hasParquetPartitions();
+    }
+
+    @Override
+    public boolean isWalEnabled() {
+        return walEnabled;
+    }
+
+    public final void reload(@NotNull Utf8Sequence metaPath, MemoryMR metaMem) {
+        this.partitionBy = metaMem.getInt(META_OFFSET_PARTITION_BY);
+        this.columnCount = metaMem.getInt(TableUtils.META_OFFSET_COUNT);
+        this.columnNameIndexMap.clear();
+        this.tableId = metaMem.getInt(TableUtils.META_OFFSET_TABLE_ID);
+        this.maxUncommittedRows = metaMem.getInt(TableUtils.META_OFFSET_MAX_UNCOMMITTED_ROWS);
+        this.o3MaxLag = metaMem.getLong(TableUtils.META_OFFSET_O3_MAX_LAG);
+        TableUtils.validateMeta(metaPath, metaMem, columnNameIndexMap, ColumnType.VERSION);
+        this.timestampIndex = metaMem.getInt(TableUtils.META_OFFSET_TIMESTAMP_INDEX);
+        this.columnMetadata.clear();
+        this.metadataVersion = metaMem.getLong(TableUtils.META_OFFSET_METADATA_VERSION);
+        this.storageVersion = metaMem.getInt(TableUtils.META_OFFSET_VERSION);
+        this.walEnabled = metaMem.getBool(TableUtils.META_OFFSET_WAL_ENABLED);
+        this.ttlHoursOrMonths = TableUtils.getTtlHoursOrMonths(metaMem);
+        this.expiryPredicate = null;
+        this.expiryCleanupIntervalMicros = 0;
+        this.tableFormat = TableUtils.getTableFormat(metaMem);
+        this.dedupMode = TableUtils.getDedupMode(metaMem);
+
+        long offset = TableUtils.getColumnNameOffset(columnCount);
+        this.symbolMapCount = 0;
+        columnNameIndexMap.clear();
+        boolean hasParquetEncodingConfig = TableUtils.hasParquetEncodingConfig(metaMem);
+        // don't create strings in this loop, we already have them in columnNameIndexMap
         for (int i = 0; i < columnCount; i++) {
-            TableColumnMetadata column = columnMetadata.getQuick(i);
-            if (column.getType() >= 0) {
-                metadata.add(column);
-                if (i == timestampIndex) {
-                    metadata.setTimestampIndex(metadata.getColumnCount() - 1);
+            CharSequence name = metaMem.getStrA(offset);
+            assert name != null;
+            int type = TableUtils.getColumnType(metaMem, i);
+            String nameStr = Chars.toString(name);
+            int replacingIndex = TableUtils.getReplacingColumnIndex(metaMem, i);
+            int origWriterIndex = TableUtils.getReplacingChainHead(metaMem, i);
+            WriterTableColumnMetadata colMeta = new WriterTableColumnMetadata(
+                    nameStr,
+                    type,
+                    TableUtils.getColumnIndexType(metaMem, i),
+                    TableUtils.getIndexBlockCapacity(metaMem, i),
+                    true,
+                    null,
+                    i,
+                    TableUtils.getSymbolCapacity(metaMem, i),
+                    TableUtils.isColumnDedupKey(metaMem, i),
+                    replacingIndex,
+                    TableUtils.isSymbolCached(metaMem, i),
+                    origWriterIndex
+            );
+            colMeta.setParquetEncodingConfig(hasParquetEncodingConfig ? TableUtils.getParquetEncodingConfig(metaMem, i) : 0);
+            columnMetadata.add(colMeta);
+            if (type > -1) {
+                columnNameIndexMap.put(nameStr, i);
+                if (ColumnType.isSymbol(type)) {
+                    symbolMapCount++;
+                }
+            }
+            offset += Vm.getStorageLength(name);
+        }
+        long metaSize = metaMem.size();
+        if (offset < metaSize) {
+            for (int i = 0; i < columnCount; i++) {
+                if (TableUtils.isColumnCovering(metaMem, i)) {
+                    if (offset + Integer.BYTES > metaSize) {
+                        break;
+                    }
+                    int includeCount = metaMem.getInt(offset);
+                    offset += Integer.BYTES;
+                    if (includeCount > 0 && offset + (long) includeCount * Integer.BYTES <= metaSize) {
+                        IntList indices = new IntList(includeCount);
+                        for (int j = 0; j < includeCount; j++) {
+                            indices.add(metaMem.getInt(offset));
+                            offset += Integer.BYTES;
+                        }
+                        columnMetadata.getQuick(i).setCoveringColumnIndices(indices);
+                    } else if (includeCount > 0) {
+                        break;
+                    }
                 }
             }
         }
-        return metadata;
+
+        // Trailing row-expiry policy section. Use the shared offset + predicate-length helpers so this
+        // stays byte-identical with TableReaderMetadata's reader, independent of the covering-population
+        // loop above.
+        if (TableUtils.isMetaFormatAtLeast(metaMem, TableUtils.META_FORMAT_MINOR_VERSION_EXPIRE_ROWS)) {
+            long policyOffset = TableUtils.getMetaExpiryPolicyOffset(metaMem, columnCount);
+            if (policyOffset >= 0 && policyOffset + Integer.BYTES <= metaSize) {
+                long predicateStorageLength = TableUtils.getMetaExpiryPredicateStorageLength(metaMem, policyOffset, metaSize);
+                if (predicateStorageLength >= 0) {
+                    CharSequence pred = metaMem.getStrA(policyOffset);
+                    if (pred != null && pred.length() > 0) {
+                        this.expiryPredicate = Chars.toString(pred);
+                    }
+                    policyOffset += predicateStorageLength;
+                    if (policyOffset + Long.BYTES <= metaSize) {
+                        this.expiryCleanupIntervalMicros = metaMem.getLong(policyOffset);
+                    }
+                }
+            }
+        }
     }
 
-    void addColumn(CharSequence name, long hash, int type, boolean indexFlag, int indexValueBlockCapacity, int columnIndex) {
+    public void setDedupMode(int dedupMode) {
+        this.dedupMode = dedupMode;
+    }
+
+    public void setMaxUncommittedRows(int rows) {
+        this.maxUncommittedRows = rows;
+    }
+
+    public void setMetadataVersion(long value) {
+        this.metadataVersion = value;
+    }
+
+    public void setO3MaxLag(long o3MaxLagUs) {
+        this.o3MaxLag = o3MaxLagUs;
+    }
+
+    public void setStorageVersion(int storageVersion) {
+        this.storageVersion = storageVersion;
+    }
+
+    public void setTableFormat(int tableFormat) {
+        this.tableFormat = tableFormat;
+    }
+
+    public void setTtlHoursOrMonths(int ttlHoursOrMonths) {
+        this.ttlHoursOrMonths = ttlHoursOrMonths;
+    }
+
+    public void setExpiry(String predicate, long cleanupIntervalMicros) {
+        this.expiryPredicate = predicate;
+        this.expiryCleanupIntervalMicros = cleanupIntervalMicros;
+    }
+
+    public void setTxReader(TxReader txReader) {
+        this.txReader = txReader;
+    }
+
+    public void updateTableToken(TableToken tableToken) {
+        this.tableToken = tableToken;
+    }
+
+    void addColumn(
+            CharSequence name,
+            int type,
+            byte indexType,
+            int indexValueBlockCapacity,
+            int columnIndex,
+            int symbolCapacity,
+            boolean isDedupKey,
+            int replacingIndex,
+            boolean isSymbolCached
+    ) {
+        int origWriterIndex = columnIndex;
+        if (replacingIndex >= 0 && replacingIndex < columnMetadata.size()) {
+            origWriterIndex = columnMetadata.get(replacingIndex).getOriginalWriterIndex();
+        }
         String str = name.toString();
         columnNameIndexMap.put(str, columnMetadata.size());
         columnMetadata.add(
-                new TableColumnMetadata(
+                new WriterTableColumnMetadata(
                         str,
-                        hash,
                         type,
-                        indexFlag,
+                        indexType,
                         indexValueBlockCapacity,
                         true,
                         null,
-                        columnIndex
+                        columnIndex,
+                        symbolCapacity,
+                        isDedupKey,
+                        replacingIndex,
+                        isSymbolCached,
+                        origWriterIndex
                 )
         );
         columnCount++;
@@ -170,34 +357,87 @@ public class TableWriterMetadata extends BaseRecordMetadata {
         }
     }
 
+    void clearTimestampIndex() {
+        this.timestampIndex = -1;
+    }
+
     void removeColumn(int columnIndex) {
         TableColumnMetadata deletedMeta = columnMetadata.getQuick(columnIndex);
-        if (ColumnType.isSymbol(deletedMeta.getType())) {
+        if (ColumnType.isSymbol(deletedMeta.getColumnType())) {
             symbolMapCount--;
         }
         deletedMeta.markDeleted();
-        columnNameIndexMap.remove(deletedMeta.getName());
-
-        // enumerate columns that would have moved up after column deletion
-        for (int i = columnIndex + 1; i < columnCount; i++) {
-            TableColumnMetadata columnMeta = columnMetadata.getQuick(i);
-            if (columnMeta.getType() > 0) {
-                columnNameIndexMap.put(columnMeta.getName(), i);
-            }
-        }
+        columnNameIndexMap.remove(deletedMeta.getColumnName());
     }
 
     void renameColumn(CharSequence name, CharSequence newName) {
-        int index = columnNameIndexMap.keyIndex(name);
-        int columnIndex = columnNameIndexMap.valueAt(index);
-        columnNameIndexMap.removeAt(index);
-        columnNameIndexMap.putAt(columnNameIndexMap.keyIndex(newName), newName, columnIndex);
-        //
+        final int columnIndex = columnNameIndexMap.removeEntry(name);
+        String newNameStr = Chars.toString(newName);
+        columnNameIndexMap.put(newNameStr, columnIndex);
+
         TableColumnMetadata oldColumnMetadata = columnMetadata.get(columnIndex);
-        oldColumnMetadata.setName(Chars.toString(newName));
+        oldColumnMetadata.rename(newNameStr);
     }
 
-    void setTimestampIndex(int index) {
-        this.timestampIndex = index;
+    void updateColumnSymbolCapacity(int columnIndex, int newSymbolCapacity) {
+        TableColumnMetadata oldMeta = columnMetadata.getQuick(columnIndex);
+        assert oldMeta.getColumnType() == ColumnType.SYMBOL;
+
+        var newColumnMetadata = new WriterTableColumnMetadata(
+                oldMeta.getColumnName(),
+                ColumnType.SYMBOL,
+                oldMeta.getIndexType(),
+                oldMeta.getIndexValueBlockCapacity(),
+                oldMeta.isSymbolTableStatic(),
+                null,
+                columnIndex,
+                newSymbolCapacity,
+                oldMeta.isDedupKeyFlag(),
+                oldMeta.getReplacingIndex(),
+                oldMeta.isSymbolCacheFlag(),
+                oldMeta.getOriginalWriterIndex()
+        );
+        newColumnMetadata.setParquetEncodingConfig(oldMeta.getParquetEncodingConfig());
+        // Preserve the covering-index schema across a symbol-capacity change.
+        // The covering column indices (and, derived from them, the column's
+        // covering flag) live on the column metadata; rebuilding the column to
+        // change its capacity must carry them over, otherwise the next
+        // rewriteAndSwapMetadata() persists a _meta with no covering flag/section
+        // and every reader thereafter sees the posting index as non-covering.
+        newColumnMetadata.setCoveringColumnIndices(oldMeta.getCoveringColumnIndices());
+        columnMetadata.set(columnIndex, newColumnMetadata);
+    }
+
+    protected static class WriterTableColumnMetadata extends TableColumnMetadata {
+
+        public WriterTableColumnMetadata(
+                String nameStr,
+                int type,
+                byte indexType,
+                int indexBlockCapacity,
+                boolean symbolTableStatic,
+                RecordMetadata parent,
+                int writerIndex,
+                int symbolCapacity,
+                boolean isDedupKey,
+                int replacingIndex,
+                boolean symbolCached,
+                int originalWriterIndex
+        ) {
+            super(
+                    nameStr,
+                    type,
+                    indexType,
+                    indexBlockCapacity,
+                    symbolTableStatic,
+                    parent,
+                    writerIndex,
+                    isDedupKey,
+                    replacingIndex,
+                    symbolCached,
+                    symbolCapacity,
+                    originalWriterIndex
+            );
+        }
     }
 }

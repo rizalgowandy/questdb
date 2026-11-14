@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@ import io.questdb.mp.WorkerPool;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 public class LineUdpReceiver extends AbstractLineProtoUdpReceiver {
     private final int bufLen;
     private long buf;
@@ -38,25 +40,53 @@ public class LineUdpReceiver extends AbstractLineProtoUdpReceiver {
             CairoEngine engine,
             WorkerPool workerPool
     ) {
-        super(configuration, engine, workerPool);
-        this.buf = Unsafe.malloc(this.bufLen = configuration.getMsgBufferSize(), MemoryTag.NATIVE_DEFAULT);
-        start();
+        this(configuration, engine, workerPool, new AtomicBoolean(true));
+    }
+
+    public LineUdpReceiver(
+            LineUdpReceiverConfiguration configuration,
+            CairoEngine engine,
+            WorkerPool workerPool,
+            AtomicBoolean acceptOpen
+    ) {
+        super(configuration, engine, workerPool, acceptOpen);
+        // Wrap the post-super allocation and start() in try/catch so a failure (thread
+        // alloc, affinity bind, or buf malloc OOM) releases what the super already opened.
+        // close() releases the fd and any allocated buf; matches the LineTcpReceiver pattern.
+        try {
+            this.buf = Unsafe.malloc(this.bufLen = configuration.getMsgBufferSize(), MemoryTag.NATIVE_ILP_RSS);
+            start();
+        } catch (Throwable t) {
+            try {
+                close();
+            } catch (Throwable s) {
+                t.addSuppressed(s);
+            }
+            throw t;
+        }
     }
 
     @Override
     public void close() {
         super.close();
         if (buf != 0) {
-            Unsafe.free(buf, bufLen, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(buf, bufLen, MemoryTag.NATIVE_ILP_RSS);
             buf = 0;
         }
     }
 
     @Override
     protected boolean runSerially() {
+        if (!acceptOpen.get()) {
+            // Mirror the worker-path acceptOpen gate (AbstractLineProtoUdpReceiver.run)
+            // so the own-thread driver also quiesces after switchRole publishes
+            // acceptOpen=false. close() does not depend on runSerially() flowing
+            // post-close, so placement at the top is safe.
+            return false;
+        }
         boolean ran = false;
         int count;
-        while ((count = nf.recv(fd, buf, bufLen)) > 0) {
+        while ((count = nf.recvRaw(fd, buf, bufLen)) > 0) {
             lexer.parse(buf, buf + count);
             lexer.parseLast();
 
@@ -64,7 +94,7 @@ public class LineUdpReceiver extends AbstractLineProtoUdpReceiver {
 
             if (totalCount > commitRate) {
                 totalCount = 0;
-                parser.commitAll(commitMode);
+                parser.commitAll();
             }
 
             if (ran) {
@@ -73,7 +103,7 @@ public class LineUdpReceiver extends AbstractLineProtoUdpReceiver {
 
             ran = true;
         }
-        parser.commitAll(commitMode);
+        parser.commitAll();
         return ran;
     }
 }

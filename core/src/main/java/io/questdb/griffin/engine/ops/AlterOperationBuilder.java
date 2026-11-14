@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,151 +24,387 @@
 
 package io.questdb.griffin.engine.ops;
 
-import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
 import io.questdb.std.LongList;
+import io.questdb.std.Mutable;
 import io.questdb.std.ObjList;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import static io.questdb.griffin.engine.ops.AlterOperation.*;
+import static io.questdb.tasks.TableWriterTask.CMD_ALTER_TABLE;
 
-public class AlterOperationBuilder {
-    private final ObjList<CharSequence> objCharList = new ObjList<>();
-    private final LongList longList = new LongList();
-    private final AlterOperation resultInstance;
-    // This is only used to serialize Partition name in form 2020-02-12 or 2020-02 or 2020
-    // to exception message using TableUtils.setSinkForPartition
+public class AlterOperationBuilder implements Mutable {
+    private final LongList extraInfo = new LongList();
+    private final ObjList<CharSequence> extraStrInfo = new ObjList<>();
+    private final AlterOperation op;
     private short command;
-    private String tableName;
-    private int tableId;
-    private int tableNamePosition;
+    private int tableId = -1;
+    private int tableNamePosition = -1;
+    private TableToken tableToken;
 
+    // the builder and the operation it builds share the extraInfo list
     public AlterOperationBuilder() {
-        this.resultInstance = new AlterOperation(longList, objCharList);
+        this.op = createAlterOperation(extraInfo, extraStrInfo);
     }
 
-    public void clear() {
-        resultInstance.clear();
-        objCharList.clear();
-        longList.clear();
+    public void addColumnToList(
+            CharSequence columnName,
+            int columnNamePosition,
+            int type,
+            int symbolCapacity,
+            boolean cache,
+            byte indexType,
+            int indexValueBlockCapacity,
+            boolean dedupKey
+    ) {
+        assert columnName != null && !columnName.isEmpty();
+        extraStrInfo.add(columnName);
+        extraInfo.add(type);
+        extraInfo.add(symbolCapacity);
+        extraInfo.add(cache ? 1 : -1);
+        extraInfo.add(getFlags(indexType, dedupKey));
+        extraInfo.add(indexValueBlockCapacity);
+        extraInfo.add(columnNamePosition);
+    }
+
+    public void addPartitionToList(long timestamp, int timestampPosition) {
+        extraInfo.add(timestamp);
+        if (command != FORCE_DROP_PARTITION) {
+            extraInfo.add(timestampPosition);
+        }
     }
 
     public AlterOperation build() {
-        return resultInstance.of(command, tableName, tableId, tableNamePosition);
+        return build(CMD_ALTER_TABLE);
     }
 
-    public AlterOperationBuilder ofAddColumn(int tableNamePosition, String tableName, int tableId) {
+    public AlterOperation build(int cmdType) {
+        return op.of(cmdType, command, tableToken, tableId, tableNamePosition);
+    }
+
+    @Override
+    public void clear() {
+        op.clear();
+        extraStrInfo.clear();
+        extraInfo.clear();
+        command = DO_NOTHING;
+        tableToken = null;
+        tableId = -1;
+        tableNamePosition = -1;
+    }
+
+    public ObjList<CharSequence> getExtraStrInfo() {
+        return extraStrInfo;
+    }
+
+    public AlterOperationBuilder ofAddColumn(int tableNamePosition, TableToken tableToken, int tableId) {
         this.command = ADD_COLUMN;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
+        this.tableToken = tableToken;
         this.tableId = tableId;
         return this;
     }
 
-    public AlterOperationBuilder ofAddIndex(int tableNamePosition, String tableName, int tableId, CharSequence columnName, int indexValueBlockSize) {
+    public void ofAddColumn(CharSequence columnName, int columnNamePosition, int type, int symbolCapacity, boolean cache, byte indexType, int indexValueBlockCapacity) {
+        assert columnName != null && !columnName.isEmpty();
+        extraStrInfo.add(columnName);
+        extraInfo.add(type);
+        extraInfo.add(symbolCapacity);
+        extraInfo.add(cache ? 1 : -1);
+        extraInfo.add(getFlags(indexType, false));
+        extraInfo.add(indexValueBlockCapacity);
+        extraInfo.add(columnNamePosition);
+    }
+
+    public void ofAddIndex(int tableNamePosition, TableToken tableToken, int tableId, CharSequence columnName, int indexValueBlockSize, byte indexType, @Nullable ObjList<CharSequence> coveringColumnNames) {
         this.command = ADD_INDEX;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
+        this.tableToken = tableToken;
         this.tableId = tableId;
-        this.objCharList.add(columnName);
-        this.longList.add(indexValueBlockSize);
-        return this;
+        this.extraStrInfo.add(columnName);
+        this.extraInfo.add(indexValueBlockSize);
+        this.extraInfo.add(indexType);
+        // Covering column count followed by names (0 means no covering)
+        int coverCount = coveringColumnNames != null ? coveringColumnNames.size() : 0;
+        this.extraInfo.add(coverCount);
+        if (coverCount > 0) {
+            for (int i = 0; i < coverCount; i++) {
+                this.extraStrInfo.add(coveringColumnNames.get(i));
+            }
+        }
     }
 
-    public AlterOperationBuilder ofAttachPartition(int tableNamePosition, String tableName, int tableId) {
+    public AlterOperationBuilder ofAttachPartition(int tableNamePosition, TableToken tableToken, int tableId) {
         this.command = ATTACH_PARTITION;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
+        this.tableToken = tableToken;
         this.tableId = tableId;
         return this;
     }
 
-    public AlterOperationBuilder ofCacheSymbol(int tableNamePosition, String tableName, int tableId, CharSequence columnName) {
+    public void ofCacheSymbol(int tableNamePosition, TableToken tableToken, int tableId, CharSequence columnName) {
         this.command = ADD_SYMBOL_CACHE;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
+        this.tableToken = tableToken;
         this.tableId = tableId;
-        this.objCharList.add(columnName);
+        this.extraStrInfo.add(columnName);
+    }
+
+    public AlterOperationBuilder ofColumnChangeType(int tableNamePosition, TableToken tableToken, int tableId) {
+        this.command = CHANGE_COLUMN_TYPE;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
         return this;
     }
 
-    public AlterOperationBuilder ofRemoveCacheSymbol(int tableNamePosition, String tableName, int tableId, CharSequence columnName) {
-        assert columnName != null && columnName.length() > 0;
-        this.command = REMOVE_SYMBOL_CACHE;
+    public AlterOperationBuilder ofConvertPartition(int tableNamePosition, TableToken tableToken, int tableId, boolean toParquet) {
+        this.command = toParquet ? CONVERT_PARTITION_TO_PARQUET : CONVERT_PARTITION_TO_NATIVE;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
+        this.tableToken = tableToken;
         this.tableId = tableId;
-        this.objCharList.add(columnName);
+        return this;
+    }
+
+    public AlterOperationBuilder ofDedupDisable(int tableNamePosition, TableToken tableToken) {
+        this.command = SET_DEDUP_DISABLE;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableToken.getTableId();
+        return this;
+    }
+
+    /**
+     * Starts building ALTER TABLE DEDUP ENABLE, follow it up with {@link #setDedupKeyFlag(int)} calls.
+     * The UPSERT mode keeps the SET_DEDUP_ENABLE encoding, which versions that predate the dedup mode
+     * can apply. Other modes need SET_DEDUP_ENABLE_WITH_MODE.
+     *
+     * @param dedupMode {@code TableUtils.DEDUP_MODE_UPSERT} or {@code TableUtils.DEDUP_MODE_SKIP}
+     */
+    public AlterOperationBuilder ofDedupEnable(int tableNamePosition, TableToken tableToken, int dedupMode) {
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableToken.getTableId();
+        if (dedupMode == TableUtils.DEDUP_MODE_UPSERT) {
+            this.command = SET_DEDUP_ENABLE;
+        } else {
+            this.command = SET_DEDUP_ENABLE_WITH_MODE;
+            // the mode goes first, the dedup key writer indexes follow
+            this.extraInfo.add(dedupMode);
+        }
+        return this;
+    }
+
+    public AlterOperationBuilder ofDetachPartition(int tableNamePosition, TableToken tableToken, int tableId) {
+        this.command = DETACH_PARTITION;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
         return this;
     }
 
     public AlterOperationBuilder ofDropColumn(CharSequence columnName) {
-        assert columnName != null && columnName.length() > 0;
-        this.objCharList.add(columnName);
+        assert columnName != null && !columnName.isEmpty();
+        this.extraStrInfo.add(columnName);
         return this;
     }
 
-    public AlterOperationBuilder ofDropColumn(int tableNamePosition, String tableName, int tableId) {
+    public AlterOperationBuilder ofDropColumn(int tableNamePosition, TableToken tableToken, int tableId) {
         this.command = DROP_COLUMN;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
+        this.tableToken = tableToken;
         this.tableId = tableId;
         return this;
     }
 
-    public AlterOperationBuilder ofDropPartition(int tableNamePosition, String tableName, int tableId) {
+    public void ofDropIndex(int tableNamePosition, TableToken tableToken, int tableId, CharSequence columnName, int columnNamePosition) {
+        this.command = DROP_INDEX;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
+        this.extraStrInfo.add(columnName);
+        this.extraInfo.add(columnNamePosition);
+    }
+
+    public AlterOperationBuilder ofDropPartition(int tableNamePosition, TableToken tableToken, int tableId) {
         this.command = DROP_PARTITION;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
+        this.tableToken = tableToken;
         this.tableId = tableId;
         return this;
     }
 
-    public AlterOperationBuilder ofRenameColumn(int tableNamePosition, String tableName, int tableId) {
+    public AlterOperationBuilder ofForceDropPartition(int tableNamePosition, TableToken tableToken, int tableId) {
+        this.command = FORCE_DROP_PARTITION;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
+        return this;
+    }
+
+    /**
+     * {@code ALTER TABLE t FORCE REINDEX PARQUET [COLUMN c] [PARTITION LIST ...]}. The partitions follow through
+     * {@link #addPartitionToList}; no partition means every parquet partition.
+     */
+    public AlterOperationBuilder ofForceReindex(int tableNamePosition, TableToken tableToken, int tableId, @Nullable CharSequence columnName) {
+        this.command = FORCE_REINDEX;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
+        if (columnName != null) {
+            this.extraStrInfo.add(columnName);
+        }
+        return this;
+    }
+
+    public void ofRemoveCacheSymbol(int tableNamePosition, TableToken tableToken, int tableId, CharSequence columnName) {
+        assert columnName != null && !columnName.isEmpty();
+        this.command = REMOVE_SYMBOL_CACHE;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
+        this.extraStrInfo.add(columnName);
+    }
+
+    public AlterOperationBuilder ofRenameColumn(int tableNamePosition, TableToken tableToken, int tableId) {
         this.command = RENAME_COLUMN;
         this.tableNamePosition = tableNamePosition;
-        this.tableName = tableName;
-        this.tableId = tableId;
-        return this;
-    }
-
-    public AlterOperationBuilder ofSetParamCommitLag(String tableName, int tableId, long commitLag) {
-        this.command = SET_PARAM_COMMIT_LAG;
-        this.tableName = tableName;
-        this.longList.add(commitLag);
-        this.tableId = tableId;
-        return this;
-    }
-
-    public AlterOperationBuilder ofSetParamUncommittedRows(String tableName, int tableId, int maxUncommittedRows) {
-        this.command = SET_PARAM_MAX_UNCOMMITTED_ROWS;
-        this.tableName = tableName;
-        this.longList.add(maxUncommittedRows);
+        this.tableToken = tableToken;
         this.tableId = tableId;
         return this;
     }
 
     public void ofRenameColumn(CharSequence columnName, CharSequence newName) {
-        objCharList.add(columnName);
-        objCharList.add(newName);
+        extraStrInfo.add(columnName);
+        extraStrInfo.add(newName);
     }
 
-    public void ofPartition(long timestamp) {
-        longList.add(timestamp);
-    }
-
-    public void ofAddColumn(
-            CharSequence columnName,
-            int type,
-            int symbolCapacity,
-            boolean cache,
-            boolean indexed,
-            int indexValueBlockCapacity
+    public AlterOperationBuilder ofSetMatViewRefresh(
+            int matViewNamePosition,
+            @NotNull TableToken matViewToken,
+            int tableId,
+            int refreshType,
+            int timerInterval,
+            char timerUnit,
+            long timerStartUs,
+            @Nullable CharSequence timerTimeZone,
+            int periodLength,
+            char periodLengthUnit,
+            int periodDelay,
+            char periodDelayUnit
     ) {
-        assert columnName != null && columnName.length() > 0;
-        objCharList.add(columnName);
-        longList.add(type);
-        longList.add(symbolCapacity);
-        longList.add(cache ? 1 : -1);
-        longList.add(indexed ? 1 : -1);
-        longList.add(indexValueBlockCapacity);
+        this.command = SET_MAT_VIEW_REFRESH;
+        this.tableNamePosition = matViewNamePosition;
+        this.tableToken = matViewToken;
+        this.extraInfo.add(refreshType);
+        this.extraInfo.add(timerInterval);
+        this.extraInfo.add(timerUnit);
+        this.extraInfo.add(timerStartUs);
+        this.extraInfo.add(periodLength);
+        this.extraInfo.add(periodLengthUnit);
+        this.extraInfo.add(periodDelay);
+        this.extraInfo.add(periodDelayUnit);
+        this.extraStrInfo.add(timerTimeZone);
+        this.tableId = tableId;
+        return this;
+    }
+
+    public AlterOperationBuilder ofSetMatViewRefreshLimit(int matViewNamePosition, TableToken matViewToken, int tableId, int limitHoursOrMonths) {
+        this.command = SET_MAT_VIEW_REFRESH_LIMIT;
+        this.tableNamePosition = matViewNamePosition;
+        this.tableToken = matViewToken;
+        this.extraInfo.add(limitHoursOrMonths);
+        this.tableId = tableId;
+        return this;
+    }
+
+    public AlterOperationBuilder ofSetO3MaxLag(int tableNamePosition, TableToken tableToken, int tableId, long o3MaxLag) {
+        this.command = SET_PARAM_COMMIT_LAG;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.extraInfo.add(o3MaxLag);
+        this.tableId = tableId;
+        return this;
+    }
+
+    public AlterOperationBuilder ofSetParamUncommittedRows(int tableNamePosition, TableToken tableToken, int tableId, int maxUncommittedRows) {
+        this.command = SET_PARAM_MAX_UNCOMMITTED_ROWS;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.extraInfo.add(maxUncommittedRows);
+        this.tableId = tableId;
+        return this;
+    }
+
+    public AlterOperationBuilder ofSetParquetEncoding(int tableNamePosition, TableToken tableToken, int tableId, CharSequence columnName, int parquetEncodingConfig) {
+        this.command = SET_PARQUET_ENCODING;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
+        this.extraStrInfo.add(columnName);
+        this.extraInfo.add(parquetEncodingConfig);
+        return this;
+    }
+
+    public AlterOperationBuilder ofSetExpire(int tableNamePosition, TableToken tableToken, int tableId, CharSequence predicate, long cleanupIntervalMicros) {
+        this.command = SET_EXPIRE;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        // Predicate rides extraStrInfo so it serializes/deserializes (and replicates via the
+        // metadata-change log) the same way as other string-carrying ALTER ops (RENAME/ADD COLUMN).
+        // An empty string encodes "no policy" (DROP EXPIRE), since extraStrInfo cannot carry null.
+        this.extraStrInfo.add(predicate == null ? "" : predicate);
+        this.extraInfo.add(cleanupIntervalMicros);
+        this.tableId = tableId;
+        return this;
+    }
+
+    public AlterOperationBuilder ofSetTableFormat(int tableNamePosition, TableToken tableToken, int tableId, int tableFormat) {
+        this.command = SET_TABLE_FORMAT;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.extraInfo.add(tableFormat);
+        this.tableId = tableId;
+        return this;
+    }
+
+    public AlterOperationBuilder ofSetTtl(int tableNamePosition, TableToken tableToken, int tableId, int ttlHoursOrMonths) {
+        this.command = SET_TTL;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.extraInfo.add(ttlHoursOrMonths);
+        this.tableId = tableId;
+        return this;
+    }
+
+    public AlterOperationBuilder ofSquashPartitions(int tableNamePosition, TableToken tableToken) {
+        this.command = SQUASH_PARTITIONS;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableToken.getTableId();
+        return this;
+    }
+
+    public AlterOperationBuilder ofSymbolCapacityChange(int tableNamePosition, TableToken tableToken, int tableId) {
+        this.command = CHANGE_SYMBOL_CAPACITY;
+        this.tableNamePosition = tableNamePosition;
+        this.tableToken = tableToken;
+        this.tableId = tableId;
+        return this;
+    }
+
+    public void setDedupKeyFlag(int writerColumnIndex) {
+        extraInfo.add(writerColumnIndex);
+    }
+
+    public void setParquetConversionOptions(@Nullable CharSequence bloomFilterColumns, double fpp) {
+        extraStrInfo.add(bloomFilterColumns);
+        extraInfo.add(Double.doubleToLongBits(fpp));
+    }
+
+    protected AlterOperation createAlterOperation(LongList extraInfo, ObjList<CharSequence> extraStrInfo) {
+        return new AlterOperation(extraInfo, extraStrInfo);
     }
 }

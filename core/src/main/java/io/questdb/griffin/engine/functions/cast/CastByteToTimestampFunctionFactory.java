@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,11 +29,11 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.AbstractUnaryTimestampFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
 public class CastByteToTimestampFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "cast(Bn)";
@@ -47,12 +47,13 @@ public class CastByteToTimestampFunctionFactory implements FunctionFactory {
             CairoConfiguration configuration,
             SqlExecutionContext sqlExecutionContext
     ) {
-        return new Func(args.getQuick(0));
+        return new Func(args.getQuick(0), args.getQuick(1).getType());
     }
 
-    private static class Func extends AbstractUnaryTimestampFunction {
-        public Func(Function arg) {
-            super(arg);
+    public static class Func extends AbstractCastToTimestampFunction {
+
+        public Func(Function arg, int timestampType) {
+            super(arg, timestampType);
         }
 
         @Override

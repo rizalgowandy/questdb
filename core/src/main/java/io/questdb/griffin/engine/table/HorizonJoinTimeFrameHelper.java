@@ -1,0 +1,1350 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.table;
+
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.SingleColumnType;
+import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.MapFactory;
+import io.questdb.cairo.map.MapKey;
+import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.TimeFrame;
+import io.questdb.cairo.sql.TimeFrameCursor;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.Misc;
+import io.questdb.std.QuietCloseable;
+import io.questdb.std.Rows;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
+
+import static io.questdb.griffin.engine.join.AbstractAsOfJoinFastRecordCursor.scaleTimestamp;
+
+/**
+ * Helper for navigating and searching through time frames for ASOF join lookups
+ * in HORIZON JOIN queries.
+ * <p>
+ * Wraps a {@link TimeFrameCursor} and provides efficient ASOF-style lookups
+ * (finding the last row with timestamp less or equal to target) using a combination of
+ * linear scan and binary search. Maintains bookmarks for efficient subsequent lookups.
+ * <p>
+ * Also supports forward and backward scanning to build key-to-rowId maps for keyed ASOF JOIN.
+ * Watermarks are maintained internally to track scanning progress within a frame.
+ * <p>
+ * The keyed lookup switches from backward-only mode to forward scan mode by the checks of
+ * {@link #shouldSwitchToForwardScan}. A helper built with the window switch enabled also runs
+ * {@link #shouldSwitchToForwardScanOverWindow}, and in forward scan mode it restarts the forward
+ * scan at a position that {@link #isForwardScanTooLong} finds too far ahead, see the constructor.
+ * In backward-only mode, it drops the key cache at a new position as a restart does, see
+ * {@link #dropKeyCache}.
+ * <p>
+ * An optional borrowed filter excludes rows before choosing the latest match. Its
+ * factory or atom owns, initializes and closes it; this helper never frees it.
+ */
+public class HorizonJoinTimeFrameHelper implements QuietCloseable {
+    private static final int CIRCUIT_BREAKER_CHECK_INTERVAL = 64;
+    private static final int LINEAR_SCAN_LIMIT = 64;
+    // Key cache slots per entry that a drop of the key cache clears at most, see dropKeyCache()
+    private static final int MAX_CLEARED_SLOTS_PER_KEY = 8;
+    private static final long UNRESOLVED_ROW_ID = -1;
+    // Adaptive scan thresholds (set at construction, used by findKeyedAsOfMatch)
+    private final long bwdScanAbsoluteThreshold;
+    private final long bwdScanMinGap;
+    private final long bwdScanSwitchFactor;
+    private final @Nullable Function filter;
+    // Whether the switch check also covers runs of gaps below the min gap, whether the lookup
+    // restarts a forward scan over a long gap, and whether a new position in backward-only mode
+    // may keep key cache entries, see the constructor
+    private final boolean isWindowSwitchEnabled;
+    // Join key -> position with no qualifying row for the key at or below it, valid for the whole cursor.
+    private final @Nullable Map keyMissMap;
+    private final long lookahead;
+    // Scale factor for slave timestamps to normalize to nanoseconds (1 if no scaling needed)
+    private final long slaveTsScale;
+    // Backward scan row counter, used by the adaptive switching logic
+    private long backwardScanRows;
+    // Backward watermark: lowest rowId we've backward-scanned (inclusive)
+    private long backwardWatermark = Long.MAX_VALUE;
+    // Bookmark position: where to start the next findAsOfRow search (optimization for sequential access)
+    private int bookmarkedFrameIndex = -1;
+    private long bookmarkedRowIndex = Long.MIN_VALUE;
+    // Adaptive scan state (managed by findKeyedAsOfMatch, reset by toTop).
+    // Backward scan row counter at the last drop of the key cache: the start of a position in
+    // backward-only mode, a restart of the forward scan in forward scan mode
+    private long bwdScanRowsAtPositionStart;
+    // Backward scan row counter at the first position of the current window of small gaps
+    private long bwdScanRowsAtWindowStart;
+    // Distance in rows that the current window of small gaps covers
+    private long bwdScanWindowGap;
+    // findAsOfRow() returns cachedAsOfRowId for targets in [cachedTargetLo, cachedNextRowTs).
+    // Long.MIN_VALUE in cachedNextRowTs empties the cache; in cachedAsOfRowId it caches "no row".
+    private long cachedAsOfRowId = Long.MIN_VALUE;
+    private long cachedNextRowTs = Long.MIN_VALUE;
+    private long cachedTargetLo = Long.MAX_VALUE;
+    private long filteredAsOfRowId = Long.MIN_VALUE;
+    private long filteredMatchRowId = Long.MIN_VALUE;
+    // No qualifying row at or below this position, valid for the whole cursor.
+    private long filterMissWatermark = Long.MIN_VALUE;
+    // Forward watermark: highest rowId we've forward-scanned (inclusive)
+    private long forwardWatermark = Long.MIN_VALUE;
+    private boolean isFilterAlwaysFalse;
+    private boolean isForwardScanMode;
+    // Highest bound in keyMissMap. A scan above it cannot benefit from a miss lookup.
+    private long keyMissWatermark = Long.MIN_VALUE;
+    private long prevAsOfRowId = Long.MIN_VALUE;
+    private Record record;
+    // ASOF position of the last drop of the key cache since toTop() that may have kept entries, or
+    // Long.MIN_VALUE: key cache entries at or below it may predate the drop, see dropKeyCache()
+    private long restartRowId = Long.MIN_VALUE;
+    private TimeFrame timeFrame;
+    private TimeFrameCursor timeFrameCursor;
+    private int timestampIndex;
+
+    public HorizonJoinTimeFrameHelper(
+            CairoConfiguration configuration,
+            long lookahead,
+            long slaveTsScale,
+            long bwdScanAbsoluteThreshold,
+            long bwdScanMinGap,
+            long bwdScanSwitchFactor,
+            @Nullable Function filter,
+            @Nullable ColumnTypes asOfJoinKeyTypes
+    ) {
+        this(
+                configuration,
+                lookahead,
+                slaveTsScale,
+                bwdScanAbsoluteThreshold,
+                bwdScanMinGap,
+                bwdScanSwitchFactor,
+                filter,
+                asOfJoinKeyTypes,
+                false
+        );
+    }
+
+    /**
+     * @param isWindowSwitchEnabled whether the switch to forward scan mode also checks runs of
+     *                              gaps below the min gap, see {@link #shouldSwitchToForwardScanOverWindow}.
+     *                              Without a filter, forward scan mode is sticky until
+     *                              {@link #toTop()}, and a short burst of closely spaced positions
+     *                              can pass the window check. A sparse stretch after the burst, or
+     *                              the distance to the next offset of a batch of horizon
+     *                              timestamps, would then cost a forward scan of every row in
+     *                              between where backward scans read a few. A helper with the
+     *                              window switch therefore also bounds its forward scans: in
+     *                              forward scan mode, the lookup drops the key cache and restarts
+     *                              the forward scan at a position that {@link #isForwardScanTooLong}
+     *                              finds too far ahead. A toTop() before every batch does not bound
+     *                              them, since one batch already spans all offsets. Only
+     *                              {@link HorizonJoinMatcher} enables it. The aggregating HORIZON
+     *                              JOIN factories keep a helper's epoch for a whole page frame or
+     *                              query and leave it disabled: after a switch, they scan every gap
+     *                              forward unless the right-hand table has a filter. With a filter,
+     *                              the lookup of any helper, with or without the window switch,
+     *                              returns to backward-only mode at a position ahead when a lower
+     *                              bound of the rows in between exceeds both the min gap and the
+     *                              rows that backward scans read since the last clear or drop of
+     *                              the key cache, see {@link #findKeyedAsOfMatch}.
+     *                              In backward-only mode, a helper with the window switch drops
+     *                              the key cache at a new position as a restart does, so that a
+     *                              cache that one deep lookup grew does not cost a clear of its
+     *                              whole capacity at every later position, see {@link #dropKeyCache}.
+     */
+    public HorizonJoinTimeFrameHelper(
+            CairoConfiguration configuration,
+            long lookahead,
+            long slaveTsScale,
+            long bwdScanAbsoluteThreshold,
+            long bwdScanMinGap,
+            long bwdScanSwitchFactor,
+            @Nullable Function filter,
+            @Nullable ColumnTypes asOfJoinKeyTypes,
+            boolean isWindowSwitchEnabled
+    ) {
+        this.filter = filter;
+        // Projection batches reset scan watermarks, but a key miss remains valid for the slave
+        // cursor. Keep its bound so later batches scan only rows above it, as filtered joins do.
+        this.keyMissMap = (filter != null || isWindowSwitchEnabled) && asOfJoinKeyTypes != null
+                ? MapFactory.createUnorderedMap(configuration, asOfJoinKeyTypes, new SingleColumnType(ColumnType.LONG), false, false)
+                : null;
+        this.lookahead = lookahead;
+        this.slaveTsScale = slaveTsScale;
+        this.bwdScanAbsoluteThreshold = bwdScanAbsoluteThreshold;
+        this.bwdScanMinGap = bwdScanMinGap;
+        this.bwdScanSwitchFactor = bwdScanSwitchFactor;
+        this.isWindowSwitchEnabled = isWindowSwitchEnabled;
+    }
+
+    /**
+     * Decides whether backward scan cost justifies switching to forward scan mode.
+     * Uses a relative check (cost vs gap * factor) with overflow protection via
+     * {@link Math#multiplyExact}, plus an absolute threshold for cross-frame gaps
+     * where the relative check can't trigger (gap encodes frame index bits, >= 2^44).
+     *
+     * @return true if forward scan mode should be activated
+     */
+    public static boolean shouldSwitchToForwardScan(
+            long bwdScanCost,
+            long gap,
+            long bwdScanMinGap,
+            long bwdScanSwitchFactor,
+            long bwdScanAbsoluteThreshold
+    ) {
+        boolean relativeSwitch = false;
+        if (gap > bwdScanMinGap) {
+            try {
+                relativeSwitch = bwdScanCost > Math.multiplyExact(gap, bwdScanSwitchFactor);
+            } catch (ArithmeticException ignore) {
+                // overflow: gap is huge, relative switch won't help
+            }
+        }
+        return relativeSwitch || bwdScanCost > bwdScanAbsoluteThreshold;
+    }
+
+    /**
+     * Backward scan from current backward watermark toward smaller rowIds, looking for a matching key.
+     * <p>
+     * Adds all keys encountered to the map (only if not already present, since we want
+     * the latest/highest rowId for each key, or if the map holds an older row for the key, which
+     * only an entry that a drop of the key cache kept can be). Stops when the target key is found.
+     * <p>
+     * This is used for the "dense ASOF" algorithm: when a key is not in the cache,
+     * we scan backward from the current position to find earlier occurrences.
+     * <p>
+     * Updates the internal backward watermark after scanning.
+     *
+     * @param startRowId              starting position for backward scan (inclusive), typically the ASOF position
+     * @param masterRecord            master record containing the target key
+     * @param masterAsOfJoinMapSink   copier for master's join key columns
+     * @param slaveAsOfJoinMapSink    copier for slave's join key columns
+     * @param keyToRowIdMap           map to update with (key -> rowId) entries
+     * @param symbolTranslatingRecord nullable; when non-null, used to skip scan for non-existent slave symbols
+     * @return the rowId where target key was found, or Long.MIN_VALUE if not found
+     */
+    public long backwardScanForKeyMatch(
+            long startRowId,
+            Record masterRecord,
+            RecordSink masterAsOfJoinMapSink,
+            RecordSink slaveAsOfJoinMapSink,
+            Map keyToRowIdMap,
+            @Nullable SymbolTranslatingRecord symbolTranslatingRecord,
+            SqlExecutionCircuitBreaker circuitBreaker
+    ) {
+        if (startRowId == Long.MIN_VALUE) {
+            return Long.MIN_VALUE;
+        }
+
+        // Fast path: skip backward scan for keys with non-existent slave symbols
+        if (symbolTranslatingRecord != null && symbolTranslatingRecord.hasNonExistentKey()) {
+            return Long.MIN_VALUE;
+        }
+
+        long effectiveStart;
+        if (backwardWatermark != Long.MAX_VALUE) {
+            // We've done backward scanning before. Check the cache first —
+            // the key might have been added by a previous backward or forward scan.
+            MapKey targetKey = keyToRowIdMap.withKey();
+            targetKey.put(masterRecord, masterAsOfJoinMapSink);
+            MapValue targetValue = targetKey.findValue();
+            if (targetValue != null) {
+                final long targetRowId = targetValue.getLong(0);
+                if (isKeyCacheEntryValid(targetRowId)) {
+                    return targetRowId;
+                }
+            }
+
+            if (backwardWatermark == 0) {
+                // We've scanned all the way to the beginning; key doesn't exist.
+                return Long.MIN_VALUE;
+            }
+
+            // Continue scanning below the backward watermark into unvisited territory.
+            // Start at BWM so that the first loop iteration re-checks BWM (harmless,
+            // since it's already cached) and then moves to BWM-1.
+            effectiveStart = backwardWatermark;
+        } else {
+            effectiveStart = startRowId;
+        }
+
+        MapValue missValue = null;
+        long missRowId = keyMissWatermark;
+        if (effectiveStart <= missRowId) {
+            missValue = findKeyMiss(masterRecord, masterAsOfJoinMapSink);
+            missRowId = missValue != null ? missValue.getLong(0) : Long.MIN_VALUE;
+            if (effectiveStart <= missRowId) {
+                recordKeyMiss(missValue, masterRecord, masterAsOfJoinMapSink, startRowId);
+                return Long.MIN_VALUE;
+            }
+        }
+
+        int frameIndex = Rows.toPartitionIndex(effectiveStart);
+        long rowIndex = Rows.toLocalRowID(effectiveStart);
+
+        // Jump to the starting frame
+        timeFrameCursor.jumpTo(frameIndex);
+        if (timeFrameCursor.open() == 0) {
+            return Long.MIN_VALUE;
+        }
+        timeFrameCursor.recordAt(record, frameIndex, rowIndex);
+
+        // Pre-compute master key hash once (avoids re-hashing on every iteration)
+        final MapKey masterKey = keyToRowIdMap.withKey();
+        masterKey.put(masterRecord, masterAsOfJoinMapSink);
+        masterKey.commit();
+        final long masterHash = masterKey.hash();
+
+        final boolean isPolling = filter != null;
+        int rowVisitCount = 0;
+        while (true) {
+            if (isPolling && (++rowVisitCount & (CIRCUIT_BREAKER_CHECK_INTERVAL - 1)) == 0) {
+                circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            }
+            final long currentRowId = Rows.toRowID(frameIndex, rowIndex);
+            if (currentRowId <= missRowId) {
+                // Defer copying and hashing the key until a miss bound can stop the scan.
+                // Successful scans above every known bound need no miss-map lookup.
+                if (missValue == null) {
+                    missValue = findKeyMiss(masterRecord, masterAsOfJoinMapSink);
+                    missRowId = missValue != null ? missValue.getLong(0) : Long.MIN_VALUE;
+                }
+                if (currentRowId <= missRowId) {
+                    break;
+                }
+            }
+            backwardScanRows++;
+
+            // Update backward watermark
+            if (backwardWatermark == Long.MAX_VALUE || currentRowId < backwardWatermark) {
+                backwardWatermark = currentRowId;
+            }
+
+            // Position record at current row
+            timeFrameCursor.recordAtRowIndex(record, rowIndex);
+
+            // Add key to map only if not already present (we want latest/highest rowId), or over
+            // an older row that a drop of the key cache kept
+            final MapKey slaveKey = keyToRowIdMap.withKey();
+            slaveKey.put(record, slaveAsOfJoinMapSink);
+            slaveKey.commit();
+            final long slaveHash = slaveKey.hash();
+            final MapValue value = slaveKey.createValue(slaveHash);
+            final boolean isKeyResolved;
+            if (filter == null) {
+                if (value.isNew() || value.getLong(0) < currentRowId) {
+                    value.putLong(0, currentRowId);
+                }
+                isKeyResolved = true;
+            } else if (!value.isNew() && value.getLong(0) >= currentRowId) {
+                // The entry holds a qualifying row at or above the current one. An unresolved
+                // entry, or an older row that a drop of the key cache kept, falls through to the
+                // filter.
+                isKeyResolved = true;
+            } else {
+                isKeyResolved = filter.getBool(record);
+                if (isKeyResolved || value.isNew()) {
+                    value.putLong(0, isKeyResolved ? currentRowId : UNRESOLVED_ROW_ID);
+                }
+            }
+
+            if (isKeyResolved) {
+                // Fast path: only check for master key match when hashes match
+                // This eliminates N-1 redundant master key lookups
+                if (slaveHash == masterHash) {
+                    // Hashes match - verify with actual map lookup (handles rare hash collisions)
+                    final MapKey targetKey = keyToRowIdMap.withKey();
+                    targetKey.put(masterRecord, masterAsOfJoinMapSink);
+                    final MapValue targetValue = targetKey.findValue();
+                    if (targetValue != null) {
+                        // Found the target key in the map; on a hash collision, its entry may
+                        // be unresolved or predate a drop of the key cache
+                        final long targetRowId = targetValue.getLong(0);
+                        if (isKeyCacheEntryValid(targetRowId)) {
+                            return targetRowId;
+                        }
+                    }
+                }
+            }
+
+            // Move backward
+            rowIndex--;
+            if (rowIndex < timeFrame.getRowLo()) {
+                // Move to previous frame, skipping empty frames
+                boolean found = false;
+                while (frameIndex > 0) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    frameIndex--;
+                    timeFrameCursor.jumpTo(frameIndex);
+                    if (timeFrameCursor.open() > 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    // No more frames, update watermark to indicate we've scanned everything
+                    backwardWatermark = 0;
+                    break;
+                }
+                rowIndex = timeFrame.getRowHi() - 1;
+                timeFrameCursor.recordAt(record, frameIndex, rowIndex);
+            }
+        }
+
+        recordKeyMiss(missValue, masterRecord, masterAsOfJoinMapSink, startRowId);
+        return Long.MIN_VALUE;
+    }
+
+    @Override
+    public void close() {
+        Misc.free(keyMissMap);
+        keyMissWatermark = Long.MIN_VALUE;
+    }
+
+    /**
+     * Finds the row with the largest timestamp less or equal to targetTimestamp (ASOF semantics).
+     * Returns the row ID, or Long.MIN_VALUE if not found.
+     * <p>
+     * After a successful call, the helper is positioned at the found row.
+     *
+     * @param targetTimestamp the target timestamp to search for
+     * @return rowId if found, Long.MIN_VALUE otherwise
+     */
+    public long findAsOfRow(long targetTimestamp, SqlExecutionCircuitBreaker circuitBreaker) {
+        if (isFilterAlwaysFalse) {
+            return Long.MIN_VALUE;
+        }
+        if (targetTimestamp < cachedNextRowTs && targetTimestamp >= cachedTargetLo) {
+            return cachedAsOfRowId;
+        }
+        cachedNextRowTs = Long.MIN_VALUE;
+
+        // Start from bookmarked position if available
+        long rowLo = Long.MIN_VALUE;
+
+        // Track the best ASOF match found so far
+        int bestFrameIndex = -1;
+        long bestRowIndex = Long.MIN_VALUE;
+
+        if (bookmarkedFrameIndex != -1) {
+            timeFrameCursor.jumpTo(bookmarkedFrameIndex);
+            if (timeFrameCursor.open() > 0) {
+                long frameTsHi = scaleTimestamp(timeFrame.getTimestampHi() - 1, slaveTsScale); // timestampHi is exclusive
+                if (frameTsHi <= targetTimestamp) {
+                    // Bookmarked frame is entirely <= target, record as candidate
+                    // and continue scanning forward for closer matches
+                    bestFrameIndex = timeFrame.getFrameIndex();
+                    bestRowIndex = timeFrame.getRowHi() - 1;
+                    bookmarkCurrentFrame(0);
+                } else if (scaleTimestamp(timeFrame.getTimestampLo(), slaveTsScale) <= targetTimestamp) {
+                    // Target is within this frame. Validate bookmark: if the row at
+                    // bookmarkedRowIndex has timestamp > target (stale bookmark from a
+                    // previous page frame), fall back to searching from frame start.
+                    if (bookmarkedRowIndex < timeFrame.getRowHi()) {
+                        timeFrameCursor.recordAt(record, bookmarkedFrameIndex, bookmarkedRowIndex);
+                        if (scaleTimestamp(record.getTimestamp(timestampIndex), slaveTsScale) <= targetTimestamp) {
+                            // Fast path: if the next row's timestamp > target, the bookmark
+                            // is already the ASOF answer. Avoids full linear scan.
+                            final long nextRowIndex = bookmarkedRowIndex + 1;
+                            if (nextRowIndex < timeFrame.getRowHi()) {
+                                timeFrameCursor.recordAtRowIndex(record, nextRowIndex);
+                                final long nextRowTs = scaleTimestamp(record.getTimestamp(timestampIndex), slaveTsScale);
+                                if (nextRowTs > targetTimestamp) {
+                                    final long result = Rows.toRowID(timeFrame.getFrameIndex(), bookmarkedRowIndex);
+                                    cacheAsOfRow(result, Long.MIN_VALUE, nextRowTs);
+                                    return result;
+                                }
+                            }
+                            // Slow path: bookmark is the last row in this frame or its ts <= target.
+                            // Need to check if the next frame has rows <= target too,
+                            // so fall through to the normal search.
+                            rowLo = bookmarkedRowIndex;
+                        } else {
+                            rowLo = timeFrame.getRowLo();
+                        }
+                    } else {
+                        rowLo = timeFrame.getRowLo();
+                    }
+                } else {
+                    // Target is before bookmarked frame. Scan backward from the bookmark
+                    // to find the frame containing or just before the target. This handles
+                    // non-monotonic horizon timestamps across master page frames.
+                    int frameIndex = bookmarkedFrameIndex;
+                    while (--frameIndex >= 0) {
+                        circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                        timeFrameCursor.jumpTo(frameIndex);
+                        if (timeFrameCursor.open() == 0) {
+                            continue;
+                        }
+                        final long tsLo = scaleTimestamp(timeFrame.getTimestampLo(), slaveTsScale);
+                        final long tsHi = scaleTimestamp(timeFrame.getTimestampHi() - 1, slaveTsScale);
+                        if (tsHi <= targetTimestamp) {
+                            // Frame is entirely <= target, use as candidate
+                            bestFrameIndex = timeFrame.getFrameIndex();
+                            bestRowIndex = timeFrame.getRowHi() - 1;
+                            bookmarkCurrentFrame(0);
+                            break;
+                        } else if (tsLo <= targetTimestamp) {
+                            // Target is within this frame
+                            rowLo = timeFrame.getRowLo();
+                            break;
+                        }
+                        // Frame is entirely after target, keep scanning backward
+                    }
+                }
+            }
+        }
+
+        if (rowLo == Long.MIN_VALUE) {
+            // Use seekEstimate to binary-search to the target's vicinity, avoiding O(N) linear scan through all
+            // preceding frames. Only seek when there was no bookmark — when we had a bookmark, the cursor is already
+            // positioned at the bookmarked frame (via jumpTo), so next() will correctly continue from frame F+1.
+            if (bookmarkedFrameIndex == -1) {
+                final long nativeTargetTimestamp = slaveTsScale == 1 ? targetTimestamp : targetTimestamp / slaveTsScale;
+                timeFrameCursor.seekEstimate(nativeTargetTimestamp);
+            }
+            if (timeFrame.getFrameIndex() >= 0 && timeFrameCursor.open() > 0) {
+                final long frameTsHi = scaleTimestamp(timeFrame.getTimestampHi() - 1, slaveTsScale);
+                if (frameTsHi <= targetTimestamp) {
+                    // Seeked frame is entirely <= target, record as best candidate
+                    bestFrameIndex = timeFrame.getFrameIndex();
+                    bestRowIndex = timeFrame.getRowHi() - 1;
+                    bookmarkCurrentFrame(0);
+                } else {
+                    final long frameTsLo = scaleTimestamp(timeFrame.getTimestampLo(), slaveTsScale);
+                    if (frameTsLo <= targetTimestamp) {
+                        // Target is within the seeked frame
+                        rowLo = timeFrame.getRowLo();
+                    }
+                }
+            }
+
+            if (rowLo == Long.MIN_VALUE) {
+                // Each return below caches its answer up to where the next frame can start, so a
+                // run of targets between two frames walks the frames once, not once per target.
+                // A "no row" answer qualifies only when the walk starts before the first frame: the
+                // walk then opens every frame below the one that ends it and finds them all empty.
+                final boolean isWalkFromFirstFrame = timeFrame.getFrameIndex() < 0;
+                // Navigate through remaining frames to find one containing or before the target
+                while (timeFrameCursor.next()) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    final long frameEstimateHi = scaleTimestamp(timeFrame.getTimestampEstimateHi(), slaveTsScale);
+                    if (frameEstimateHi <= targetTimestamp) {
+                        // Frame is entirely before target, record as candidate
+                        if (timeFrameCursor.open() > 0) {
+                            bestFrameIndex = timeFrame.getFrameIndex();
+                            bestRowIndex = timeFrame.getRowHi() - 1;
+                            bookmarkCurrentFrame(0);
+                        }
+                        continue;
+                    }
+
+                    // Frame may contain or straddle the target
+                    final long frameEstimateLo = scaleTimestamp(timeFrame.getTimestampEstimateLo(), slaveTsScale);
+                    if (frameEstimateLo <= targetTimestamp) {
+                        if (timeFrameCursor.open() == 0) {
+                            continue;
+                        }
+
+                        // Scale slave frame timestamps to common unit
+                        final long frameTsLo = scaleTimestamp(timeFrame.getTimestampLo(), slaveTsScale);
+                        final long frameTsHi = scaleTimestamp(timeFrame.getTimestampHi() - 1, slaveTsScale);
+
+                        if (frameTsHi <= targetTimestamp) {
+                            // Entire frame is <= target
+                            bestFrameIndex = timeFrame.getFrameIndex();
+                            bestRowIndex = timeFrame.getRowHi() - 1;
+                            bookmarkCurrentFrame(0);
+                            continue;
+                        }
+
+                        if (frameTsLo <= targetTimestamp) {
+                            // Target is within this frame, need to search
+                            rowLo = timeFrame.getRowLo();
+                            break;
+                        }
+
+                        // Frame is entirely after target, return best found so far. It also answers
+                        // every larger target below the first row of this frame.
+                        if (bestRowIndex != Long.MIN_VALUE) {
+                            return bookmarkAndCacheBest(bestFrameIndex, bestRowIndex, targetTimestamp, frameTsLo);
+                        }
+                        // Bookmark current frame so subsequent searches with larger timestamps can find it
+                        bookmarkCurrentFrame(0);
+                        if (isWalkFromFirstFrame) {
+                            cacheAsOfRow(Long.MIN_VALUE, targetTimestamp, frameTsLo);
+                        }
+                        return Long.MIN_VALUE;
+                    }
+
+                    // Frame is entirely after target. A walk for any larger target below this
+                    // frame's estimate ends here as well, so best holds up to the estimate. The
+                    // estimate bounds the rows of later frames only when this frame has rows, so a
+                    // "no row" answer opens the frame and caches up to its first row instead.
+                    if (bestRowIndex != Long.MIN_VALUE) {
+                        return bookmarkAndCacheBest(bestFrameIndex, bestRowIndex, targetTimestamp, frameEstimateLo);
+                    }
+                    // Bookmark current frame so subsequent searches with larger timestamps can find it
+                    bookmarkCurrentFrame(0);
+                    if (isWalkFromFirstFrame && timeFrameCursor.open() > 0) {
+                        cacheAsOfRow(Long.MIN_VALUE, targetTimestamp, scaleTimestamp(timeFrame.getTimestampLo(), slaveTsScale));
+                    }
+                    return Long.MIN_VALUE;
+                }
+
+                if (rowLo == Long.MIN_VALUE) {
+                    // No more frames, return best found. Every frame after best is empty, so best
+                    // also answers every larger target.
+                    if (bestRowIndex != Long.MIN_VALUE) {
+                        return bookmarkAndCacheBest(bestFrameIndex, bestRowIndex, targetTimestamp, Long.MAX_VALUE);
+                    }
+                    if (isWalkFromFirstFrame) {
+                        cacheAsOfRow(Long.MIN_VALUE, targetTimestamp, Long.MAX_VALUE);
+                    }
+                    return Long.MIN_VALUE;
+                }
+            }
+        }
+
+        // Search within the current frame for the ASOF row
+        bookmarkCurrentFrame(rowLo);
+        timeFrameCursor.recordAt(record, timeFrame.getFrameIndex(), timeFrame.getRowLo());
+
+        // Try linear scan first
+        long scanResult = linearScanAsOf(targetTimestamp, rowLo, circuitBreaker);
+        if (scanResult >= 0) {
+            return bookmarkAndCache(scanResult);
+        } else if (scanResult == Long.MIN_VALUE) {
+            // All rows in scan range are > target, check if we have a previous best
+            if (bestRowIndex != Long.MIN_VALUE) {
+                bookmarkedFrameIndex = bestFrameIndex;
+                bookmarkedRowIndex = bestRowIndex;
+                return Rows.toRowID(bestFrameIndex, bestRowIndex);
+            }
+            return Long.MIN_VALUE;
+        }
+
+        // Need binary search
+        final long searchStart = -scanResult - 1;
+        final long searchResult = binarySearchAsOf(targetTimestamp, searchStart);
+        if (searchResult != Long.MIN_VALUE) {
+            return bookmarkAndCache(searchResult);
+        }
+
+        // Binary search found no rows <= target from searchStart onward.
+        // The linear scan confirmed all rows in [rowLo, searchStart) were <= target,
+        // so the ASOF match is the last one: searchStart - 1.
+        return bookmarkAndCache(searchStart - 1);
+    }
+
+    /**
+     * Keyed ASOF match with adaptive backward/forward scanning.
+     * <p>
+     * Manages position tracking and scan mode switching internally.
+     * Call {@link #toTop()} before processing a new frame to reset state.
+     *
+     * @param asOfRowId               the ASOF position (from {@link #findAsOfRow}), or Long.MIN_VALUE if none
+     * @param masterKeyRecord         master record containing the target key
+     * @param masterAsOfJoinMapSink   copier for master's join key columns
+     * @param slaveAsOfJoinMapSink    copier for slave's join key columns
+     * @param keyToRowIdMap           map to update with (key -> rowId) entries
+     * @param symbolTranslatingRecord nullable; when non-null, used to skip scan for non-existent slave symbols
+     * @return the rowId where the target key was found, or Long.MIN_VALUE if not found
+     */
+    public long findKeyedAsOfMatch(
+            long asOfRowId,
+            Record masterKeyRecord,
+            RecordSink masterAsOfJoinMapSink,
+            RecordSink slaveAsOfJoinMapSink,
+            Map keyToRowIdMap,
+            @Nullable SymbolTranslatingRecord symbolTranslatingRecord,
+            SqlExecutionCircuitBreaker circuitBreaker
+    ) {
+        if (asOfRowId == Long.MIN_VALUE) {
+            return Long.MIN_VALUE;
+        }
+
+        if (asOfRowId != prevAsOfRowId) {
+            if (isForwardScanMode && filter != null && asOfRowId > prevAsOfRowId
+                    && rowGapLowerBound(prevAsOfRowId, asOfRowId) > Math.max(backwardScanRows - bwdScanRowsAtPositionStart, bwdScanMinGap)) {
+                isForwardScanMode = false;
+                forwardWatermark = Long.MIN_VALUE;
+                bwdScanRowsAtPositionStart = backwardScanRows;
+                // Backward-only mode starts over, and so does the window of small gaps.
+                bwdScanWindowGap = 0;
+                bwdScanRowsAtWindowStart = backwardScanRows;
+            }
+            if (!isForwardScanMode) {
+                long bwdScanCost = backwardScanRows - bwdScanRowsAtPositionStart;
+                if (prevAsOfRowId != Long.MIN_VALUE) {
+                    final long gap = asOfRowId - prevAsOfRowId;
+                    long switchGap = gap;
+                    long minGap = bwdScanMinGap;
+                    if (filter != null && gap > 0) {
+                        // A filter repeats a deep scan at every position, so a small gap also
+                        // switches at the cost the minimum gap implies.
+                        minGap = 0;
+                        switchGap = Math.max(gap, bwdScanMinGap);
+                    }
+                    if (shouldSwitchToForwardScan(
+                            bwdScanCost,
+                            switchGap,
+                            minGap,
+                            bwdScanSwitchFactor,
+                            bwdScanAbsoluteThreshold
+                    ) || (isWindowSwitchEnabled && shouldSwitchToForwardScanOverWindow(gap))) {
+                        isForwardScanMode = true;
+                        initForwardWatermark(prevAsOfRowId);
+                    }
+                }
+                if (!isForwardScanMode) {
+                    if (!isWindowSwitchEnabled || prevAsOfRowId == Long.MIN_VALUE) {
+                        // Without the window switch, the lookup clears the cache at every new
+                        // position. With it, this is the first lookup since toTop(), and an entry
+                        // of an earlier walk may hold a row above this position. The clear keeps
+                        // the capacity, see HorizonJoinMatcher#toTop(). restartRowId already holds
+                        // Long.MIN_VALUE here: only dropKeyCache() sets it, which neither a helper
+                        // without the window switch nor the first lookup since toTop() reaches,
+                        // and toTop() resets it.
+                        keyToRowIdMap.clear();
+                    } else {
+                        dropKeyCache(keyToRowIdMap, asOfRowId);
+                    }
+                    resetBackwardWatermark();
+                    bwdScanRowsAtPositionStart = backwardScanRows;
+                }
+            }
+            if (isForwardScanMode) {
+                if (isWindowSwitchEnabled && isForwardScanTooLong(asOfRowId, circuitBreaker)) {
+                    // Restart the forward scan at this position: the backward scan below
+                    // rebuilds the key cache from here, as it did before the switch.
+                    dropKeyCache(keyToRowIdMap, asOfRowId);
+                    resetBackwardWatermark();
+                    bwdScanRowsAtPositionStart = backwardScanRows;
+                    initForwardWatermark(asOfRowId);
+                } else {
+                    forwardScanToPosition(asOfRowId, slaveAsOfJoinMapSink, keyToRowIdMap, circuitBreaker);
+                }
+            }
+            prevAsOfRowId = asOfRowId;
+        }
+
+        return backwardScanForKeyMatch(
+                asOfRowId,
+                masterKeyRecord,
+                masterAsOfJoinMapSink,
+                slaveAsOfJoinMapSink,
+                keyToRowIdMap,
+                symbolTranslatingRecord,
+                circuitBreaker
+        );
+    }
+
+    public long findNotKeyedAsOfMatch(long asOfRowId, SqlExecutionCircuitBreaker circuitBreaker) {
+        return filter == null || asOfRowId == Long.MIN_VALUE ? asOfRowId : findFilteredAsOfMatch(asOfRowId, circuitBreaker);
+    }
+
+    /**
+     * Forward scan from current forward watermark to targetRowId, updating the map with all keys encountered.
+     * <p>
+     * This method is used for efficient sorted horizon timestamp processing. Since horizon
+     * timestamps are processed in ascending order, the ASOF positions also generally increase.
+     * By scanning forward and caching all keys, we ensure each slave row is scanned at most once.
+     * <p>
+     * The map is updated with (key -> rowId), with later positions overwriting earlier ones.
+     * This means after scanning, the map contains the LATEST position for each key up to targetRowId.
+     * <p>
+     * Updates the internal forward watermark to targetRowId after successful scan.
+     *
+     * @param targetRowId          the ASOF position to scan up to (inclusive)
+     * @param slaveAsOfJoinMapSink copier for slave's join key columns
+     * @param keyToRowIdMap        map to update with (key -> rowId) entries
+     */
+    public void forwardScanToPosition(
+            long targetRowId,
+            RecordSink slaveAsOfJoinMapSink,
+            Map keyToRowIdMap,
+            SqlExecutionCircuitBreaker circuitBreaker
+    ) {
+        if (targetRowId == Long.MIN_VALUE) {
+            return;
+        }
+
+        // If target is at or before forward watermark, no scanning needed
+        if (forwardWatermark != Long.MIN_VALUE && targetRowId <= forwardWatermark) {
+            return;
+        }
+
+        // Determine starting position
+        int startFrameIndex;
+        long startRowIndex;
+        if (forwardWatermark == Long.MIN_VALUE) {
+            // Start from the beginning
+            timeFrameCursor.toTop();
+            if (!timeFrameCursor.next()) {
+                return;
+            }
+            if (timeFrameCursor.open() == 0) {
+                // Try to find first non-empty frame
+                while (timeFrameCursor.next()) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    if (timeFrameCursor.open() > 0) {
+                        break;
+                    }
+                }
+                if (timeFrame.getRowHi() <= timeFrame.getRowLo()) {
+                    return;
+                }
+            }
+            startFrameIndex = timeFrame.getFrameIndex();
+            startRowIndex = timeFrame.getRowLo();
+        } else {
+            // Start from just after forward watermark
+            startFrameIndex = Rows.toPartitionIndex(forwardWatermark);
+            startRowIndex = Rows.toLocalRowID(forwardWatermark) + 1;
+
+            timeFrameCursor.jumpTo(startFrameIndex);
+            if (timeFrameCursor.open() == 0 || startRowIndex >= timeFrame.getRowHi()) {
+                // Current frame is empty or exhausted, find next non-empty frame
+                boolean found = false;
+                while (timeFrameCursor.next()) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    if (timeFrameCursor.open() > 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    return;
+                }
+                startFrameIndex = timeFrame.getFrameIndex();
+                startRowIndex = timeFrame.getRowLo();
+            }
+        }
+
+        int frameIndex = startFrameIndex;
+        long rowIndex = startRowIndex;
+        timeFrameCursor.recordAt(record, frameIndex, rowIndex);
+
+        final boolean isPolling = filter != null;
+        int rowVisitCount = 0;
+        while (true) {
+            long currentRowId = Rows.toRowID(frameIndex, rowIndex);
+
+            // Check if we've reached the target
+            if (currentRowId > targetRowId) {
+                break;
+            }
+
+            if (isPolling && (++rowVisitCount & (CIRCUIT_BREAKER_CHECK_INTERVAL - 1)) == 0) {
+                circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            }
+            // Position record and cache the key
+            timeFrameCursor.recordAtRowIndex(record, rowIndex);
+            if (filter == null || filter.getBool(record)) {
+                MapKey key = keyToRowIdMap.withKey();
+                key.put(record, slaveAsOfJoinMapSink);
+                MapValue value = key.createValue();
+                // Always update (overwrite) - we want the LATEST position for each key
+                value.putLong(0, currentRowId);
+            }
+
+            // Update forward watermark
+            forwardWatermark = currentRowId;
+
+            // Check if we've reached the target
+            if (currentRowId == targetRowId) {
+                break;
+            }
+
+            // Move forward
+            rowIndex++;
+            if (rowIndex >= timeFrame.getRowHi()) {
+                // Move to next frame, skipping empty frames
+                boolean found = false;
+                while (timeFrameCursor.next()) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    if (timeFrameCursor.open() > 0) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    break;
+                }
+                frameIndex = timeFrame.getFrameIndex();
+                rowIndex = timeFrame.getRowLo();
+                timeFrameCursor.recordAt(record, frameIndex, rowIndex);
+            }
+        }
+    }
+
+    public Record getRecord() {
+        return record;
+    }
+
+    /**
+     * Initialize the forward watermark. Called after the first backward scan
+     * to set the starting point for subsequent forward scans.
+     */
+    public void initForwardWatermark(long rowId) {
+        this.forwardWatermark = rowId;
+    }
+
+    /**
+     * Tells whether the keyed lookup has left backward-only mode in the current epoch.
+     */
+    @TestOnly
+    public boolean isForwardScanMode() {
+        return isForwardScanMode;
+    }
+
+    public void of(TimeFrameCursor timeFrameCursor, @Nullable MemoryTracker memoryTracker) {
+        if (keyMissMap != null) {
+            keyMissMap.close();
+            keyMissMap.setMemoryTracker(memoryTracker);
+        }
+        keyMissWatermark = Long.MIN_VALUE;
+        this.timeFrameCursor = timeFrameCursor;
+        this.record = timeFrameCursor.getRecord();
+        this.timeFrame = timeFrameCursor.getTimeFrame();
+        this.timestampIndex = timeFrameCursor.getTimestampIndex();
+        // The owner initializes the filter before this call.
+        isFilterAlwaysFalse = filter != null && filter.isConstantOrRuntimeConstant() && !filter.getBool(null);
+        filterMissWatermark = Long.MIN_VALUE;
+        filteredAsOfRowId = Long.MIN_VALUE;
+        filteredMatchRowId = Long.MIN_VALUE;
+        // Reset all state for new query
+        bookmarkedFrameIndex = -1;
+        bookmarkedRowIndex = Long.MIN_VALUE;
+        toTop();
+    }
+
+    public void recordAt(long rowId) {
+        timeFrameCursor.recordAt(record, rowId);
+    }
+
+    /**
+     * Reset the backward watermark so the next backward scan starts from scratch.
+     * Called at a new ASOF position, after the lookup clears or drops the key cache. A drop may
+     * keep entries, and the lookup returns a kept entry only once the backward scans from the
+     * position reach its row, see {@link #isKeyCacheEntryValid}.
+     */
+    public void resetBackwardWatermark() {
+        backwardWatermark = Long.MAX_VALUE;
+    }
+
+    /**
+     * Reset state for processing a new master page frame.
+     * <p>
+     * Resets navigation and keyed-scan state. The unkeyed filtered interval and the keyed
+     * misses stay valid for the slave cursor. Bookmarks are reset because workers process
+     * master page frames in non-deterministic order (dispatched via ring queue). A stale
+     * bookmark from a previously processed frame could point to a slave position far from
+     * the current target, causing findAsOfRow() to linearly scan through O(N) slave frames
+     * instead of using seekEstimate's O(log N) binary search. Resetting bookmarks forces
+     * seekEstimate on the first findAsOfRow() call per frame, which is fast and eliminates
+     * the jitter caused by out-of-order frame processing.
+     */
+    public void toTop() {
+        if (timeFrameCursor != null) {
+            timeFrameCursor.toTop();
+        }
+        bookmarkedFrameIndex = -1;
+        bookmarkedRowIndex = Long.MIN_VALUE;
+        bwdScanRowsAtPositionStart = 0;
+        bwdScanRowsAtWindowStart = 0;
+        bwdScanWindowGap = 0;
+        forwardWatermark = Long.MIN_VALUE;
+        backwardWatermark = Long.MAX_VALUE;
+        cachedAsOfRowId = Long.MIN_VALUE;
+        cachedNextRowTs = Long.MIN_VALUE;
+        cachedTargetLo = Long.MAX_VALUE;
+        backwardScanRows = 0;
+        isForwardScanMode = false;
+        prevAsOfRowId = Long.MIN_VALUE;
+        restartRowId = Long.MIN_VALUE;
+    }
+
+    // Scan startRowId (inclusive) to stopRowId (exclusive), crossing empty frames.
+    private long backwardScanForFilterMatch(long startRowId, long stopRowId, SqlExecutionCircuitBreaker circuitBreaker) {
+        int frameIndex = Rows.toPartitionIndex(startRowId);
+        long rowIndex = Rows.toLocalRowID(startRowId);
+        timeFrameCursor.jumpTo(frameIndex);
+        if (timeFrameCursor.open() == 0) {
+            return Long.MIN_VALUE;
+        }
+        timeFrameCursor.recordAt(record, frameIndex, rowIndex);
+        int rowVisitCount = 0;
+        while (true) {
+            final long currentRowId = Rows.toRowID(frameIndex, rowIndex);
+            if (currentRowId <= stopRowId) {
+                return Long.MIN_VALUE;
+            }
+            if ((++rowVisitCount & (CIRCUIT_BREAKER_CHECK_INTERVAL - 1)) == 0) {
+                circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            }
+            timeFrameCursor.recordAtRowIndex(record, rowIndex);
+            if (filter.getBool(record)) {
+                return currentRowId;
+            }
+            if (--rowIndex < timeFrame.getRowLo()) {
+                boolean hasFrame = false;
+                while (frameIndex > 0) {
+                    circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                    timeFrameCursor.jumpTo(--frameIndex);
+                    if (timeFrameCursor.open() > 0) {
+                        hasFrame = true;
+                        break;
+                    }
+                }
+                if (!hasFrame) {
+                    filterMissWatermark = Math.max(filterMissWatermark, startRowId);
+                    return Long.MIN_VALUE;
+                }
+                rowIndex = timeFrame.getRowHi() - 1;
+                timeFrameCursor.recordAt(record, frameIndex, rowIndex);
+            }
+        }
+    }
+
+    /**
+     * Binary search for the last row with timestamp <= targetTimestamp.
+     */
+    private long binarySearchAsOf(long targetTimestamp, long rowLo) {
+        long low = rowLo;
+        long high = timeFrame.getRowHi() - 1;
+        long result = Long.MIN_VALUE;
+
+        while (high - low > LINEAR_SCAN_LIMIT) {
+            long mid = (low + high) >>> 1;
+            timeFrameCursor.recordAtRowIndex(record, mid);
+            long midTimestamp = scaleTimestamp(record.getTimestamp(timestampIndex), slaveTsScale);
+
+            if (midTimestamp <= targetTimestamp) {
+                result = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        // Linear scan for small range
+        for (long r = low; r <= high; r++) {
+            timeFrameCursor.recordAtRowIndex(record, r);
+            long timestamp = scaleTimestamp(record.getTimestamp(timestampIndex), slaveTsScale);
+            if (timestamp <= targetTimestamp) {
+                result = r;
+            } else {
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Bookmark the result row and populate the ASOF cache for the ultra-fast path.
+     * Reads the next row's timestamp to determine how long the cached result stays valid.
+     */
+    private long bookmarkAndCache(long resultRowIndex) {
+        bookmarkCurrentFrame(resultRowIndex);
+        final long result = Rows.toRowID(timeFrame.getFrameIndex(), resultRowIndex);
+        final long nextRow = resultRowIndex + 1;
+        if (nextRow < timeFrame.getRowHi()) {
+            timeFrameCursor.recordAtRowIndex(record, nextRow);
+            cacheAsOfRow(result, Long.MIN_VALUE, scaleTimestamp(record.getTimestamp(timestampIndex), slaveTsScale));
+        }
+        return result;
+    }
+
+    /**
+     * Bookmark the last row of the best frame and cache it for targets from targetTimestamp
+     * up to nextFrameTsLo, where the next frame with rows can start.
+     */
+    private long bookmarkAndCacheBest(int bestFrameIndex, long bestRowIndex, long targetTimestamp, long nextFrameTsLo) {
+        bookmarkedFrameIndex = bestFrameIndex;
+        bookmarkedRowIndex = bestRowIndex;
+        final long result = Rows.toRowID(bestFrameIndex, bestRowIndex);
+        cacheAsOfRow(result, targetTimestamp, nextFrameTsLo);
+        return result;
+    }
+
+    private void bookmarkCurrentFrame(long rowIndex) {
+        bookmarkedFrameIndex = timeFrame.getFrameIndex();
+        bookmarkedRowIndex = rowIndex;
+    }
+
+    // An answer found inside a frame passes no lower bound, as before: targets do not decrease
+    // between toTop() calls. An answer at a frame boundary holds from the target that found it.
+    private void cacheAsOfRow(long rowId, long targetLo, long nextRowTs) {
+        cachedAsOfRowId = rowId;
+        cachedTargetLo = targetLo;
+        cachedNextRowTs = nextRowTs;
+    }
+
+    /**
+     * Drops the key cache at an ASOF position: for a restart of the forward scan, and in a helper
+     * with the window switch also at every new position in backward-only mode after the first one
+     * since {@link #toTop()}. A clear writes every slot of the cache, and the cache keeps the
+     * capacity it grew to: one deep backward scan or one long forward scan can leave it far larger
+     * than what the lookup puts into it between two drops, and a clear at every drop would then
+     * cost all of that capacity each time, which neither {@link #isForwardScanTooLong} nor the
+     * switch checks count. The drop therefore clears the cache only while its entries fill at
+     * least one slot in {@link #MAX_CLEARED_SLOTS_PER_KEY}, so that a clear costs at most that many
+     * slots per entry that a scan paid a row for. Otherwise it keeps the entries, and the lookup
+     * trusts one only once the scans after the drop have confirmed it, see
+     * {@link #isKeyCacheEntryValid}. A kept entry holds no row above the position, since positions
+     * do not decrease between toTop() calls.
+     *
+     * @param keyToRowIdMap the key cache
+     * @param restartRowId  the ASOF position of the drop
+     */
+    private void dropKeyCache(Map keyToRowIdMap, long restartRowId) {
+        if (keyToRowIdMap.size() * MAX_CLEARED_SLOTS_PER_KEY >= keyToRowIdMap.getKeyCapacity()) {
+            keyToRowIdMap.clear();
+        }
+        this.restartRowId = restartRowId;
+    }
+
+    private long findFilteredAsOfMatch(long asOfRowId, SqlExecutionCircuitBreaker circuitBreaker) {
+        // Master frames can arrive out of order. The cached interval contains no
+        // later qualifying row, so it also answers lookups that move backwards.
+        if (asOfRowId <= filteredAsOfRowId && asOfRowId >= filteredMatchRowId) {
+            return filteredMatchRowId;
+        }
+        final boolean isIncremental = filteredAsOfRowId != Long.MIN_VALUE && asOfRowId > filteredAsOfRowId;
+        final long stopRowId = isIncremental ? Math.max(filteredAsOfRowId, filterMissWatermark) : filterMissWatermark;
+        long matchRowId = backwardScanForFilterMatch(asOfRowId, stopRowId, circuitBreaker);
+        if (matchRowId == Long.MIN_VALUE && isIncremental && filteredAsOfRowId > filterMissWatermark) {
+            matchRowId = filteredMatchRowId;
+        }
+        filteredAsOfRowId = asOfRowId;
+        filteredMatchRowId = matchRowId;
+        return matchRowId;
+    }
+
+    private @Nullable MapValue findKeyMiss(Record masterRecord, RecordSink masterAsOfJoinMapSink) {
+        if (keyMissMap == null || !keyMissMap.isOpen()) {
+            return null;
+        }
+        final MapKey key = keyMissMap.withKey();
+        key.put(masterRecord, masterAsOfJoinMapSink);
+        return key.findValue();
+    }
+
+    /**
+     * Tells whether the forward scan from the forward watermark to an ASOF position would read
+     * more rows than the key cache is worth. The scan only keeps the cache current: the lookup
+     * can drop the cache instead and rebuild it at the position with backward scans. The cache is
+     * worth the rows that backward scans read into it since it was last dropped, times the switch
+     * factor, by which backward scans have to outweigh a gap before the lookup switches to forward
+     * scan mode. It is worth no less than the min gap, so the lookup scans a gap of that size
+     * forward however little the cache cost.
+     * <p>
+     * Row ids of different frames lie 2^44 or more apart, so the method counts the rows of a scan
+     * that crosses frames frame by frame, until they exceed the worth of the cache.
+     *
+     * @param targetRowId    the ASOF position that the forward scan would stop at
+     * @param circuitBreaker polled on every frame that the count crosses
+     * @return true if the lookup should restart the forward scan at the position
+     */
+    private boolean isForwardScanTooLong(long targetRowId, SqlExecutionCircuitBreaker circuitBreaker) {
+        if (targetRowId - forwardWatermark <= bwdScanMinGap) {
+            return false;
+        }
+        long maxRows;
+        try {
+            maxRows = Math.max(
+                    bwdScanMinGap,
+                    Math.multiplyExact(backwardScanRows - bwdScanRowsAtPositionStart, bwdScanSwitchFactor)
+            );
+        } catch (ArithmeticException ignore) {
+            // overflow: no forward scan reads that many rows
+            return false;
+        }
+        int frameIndex = Rows.toPartitionIndex(forwardWatermark);
+        final int targetFrameIndex = Rows.toPartitionIndex(targetRowId);
+        if (frameIndex == targetFrameIndex) {
+            return targetRowId - forwardWatermark > maxRows;
+        }
+        // The watermark's frame holds the watermark row, so it is not empty.
+        timeFrameCursor.jumpTo(frameIndex);
+        timeFrameCursor.open();
+        long rows = timeFrame.getRowHi() - 1 - Rows.toLocalRowID(forwardWatermark);
+        while (rows <= maxRows && ++frameIndex <= targetFrameIndex) {
+            circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            timeFrameCursor.jumpTo(frameIndex);
+            if (timeFrameCursor.open() > 0) {
+                rows += (frameIndex < targetFrameIndex ? timeFrame.getRowHi() : Rows.toLocalRowID(targetRowId) + 1) - timeFrame.getRowLo();
+            }
+        }
+        return rows > maxRows;
+    }
+
+    /**
+     * Tells whether a key cache entry holds the latest row of its key at or before the current
+     * ASOF position. Every entry does until a drop of the key cache keeps entries, see
+     * {@link #dropKeyCache}. After such a drop, the forward scan writes rows above the drop
+     * position, and a backward scan writes the first row of each key it reads, overwriting an older
+     * one, so the entries that the scans wrote since the drop hold the latest row. An entry that the
+     * drop kept holds a row at or below the forward watermark or the ASOF position of the time, and
+     * a later row of its key may lie in the rows between that row and the drop position, which no
+     * scan read. Once the backward scans pass the entry's own row, they have read all those rows:
+     * an entry still unchanged is the latest row.
+     * <p>
+     * With a filter, an entry may also hold {@link #UNRESOLVED_ROW_ID}: a backward scan read rows
+     * of the key, and none of them passed the filter. Such an entry holds no row to return.
+     *
+     * @param rowId the row id that the entry holds
+     * @return true if the lookup can return the entry's row
+     */
+    private boolean isKeyCacheEntryValid(long rowId) {
+        return rowId != UNRESOLVED_ROW_ID && (rowId > restartRowId || rowId >= backwardWatermark);
+    }
+
+    /**
+     * Linear scan for the last row with timestamp <= targetTimestamp.
+     * Returns:
+     * - >= 0: found row index
+     * - Long.MIN_VALUE: all rows > targetTimestamp
+     * - negative value: need binary search, encoded as -(last scanned row) - 1
+     */
+    private long linearScanAsOf(long targetTimestamp, long rowLo, SqlExecutionCircuitBreaker circuitBreaker) {
+        long scanHi = Math.min(rowLo + lookahead, timeFrame.getRowHi());
+        long result = Long.MIN_VALUE;
+
+        if (lookahead <= CIRCUIT_BREAKER_CHECK_INTERVAL) {
+            for (long r = rowLo; r < scanHi; r++) {
+                timeFrameCursor.recordAtRowIndex(record, r);
+                long timestamp = scaleTimestamp(record.getTimestamp(timestampIndex), slaveTsScale);
+                if (timestamp <= targetTimestamp) {
+                    result = r;
+                } else {
+                    return result;
+                }
+            }
+            return scanHi < timeFrame.getRowHi() ? -scanHi - 1 : result;
+        }
+
+        long r = rowLo;
+        long chunkHi = Math.min(rowLo + CIRCUIT_BREAKER_CHECK_INTERVAL, scanHi);
+        while (true) {
+            for (; r < chunkHi; r++) {
+                timeFrameCursor.recordAtRowIndex(record, r);
+                // Scale slave timestamp to common unit for cross-resolution support
+                long timestamp = scaleTimestamp(record.getTimestamp(timestampIndex), slaveTsScale);
+                if (timestamp <= targetTimestamp) {
+                    result = r;
+                } else {
+                    // Found first row > target, return previous row if any
+                    return result;
+                }
+            }
+            if (r >= scanHi) {
+                break;
+            }
+            circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+            chunkHi = Math.min(chunkHi + CIRCUIT_BREAKER_CHECK_INTERVAL, scanHi);
+        }
+
+        // Reached scan limit
+        if (scanHi < timeFrame.getRowHi()) {
+            // More rows to search, need binary search
+            return -scanHi - 1;
+        }
+
+        // Scanned entire frame
+        return result;
+    }
+
+    // The caller has established that the key has no qualifying row at or below rowId.
+    private void recordKeyMiss(@Nullable MapValue missValue, Record masterRecord, RecordSink masterAsOfJoinMapSink, long rowId) {
+        if (keyMissMap == null) {
+            return;
+        }
+        if (missValue == null) {
+            keyMissMap.reopen();
+            final MapKey key = keyMissMap.withKey();
+            key.put(masterRecord, masterAsOfJoinMapSink);
+            missValue = key.createValue();
+            missValue.putLong(0, rowId);
+        } else if (missValue.getLong(0) < rowId) {
+            missValue.putLong(0, rowId);
+        }
+        keyMissWatermark = Math.max(keyMissWatermark, rowId);
+    }
+
+    private long rowGapLowerBound(long fromRowId, long toRowId) {
+        final int toFrameIndex = Rows.toPartitionIndex(toRowId);
+        if (Rows.toPartitionIndex(fromRowId) == toFrameIndex) {
+            return toRowId - fromRowId;
+        }
+        timeFrameCursor.jumpTo(toFrameIndex);
+        return timeFrameCursor.open() > 0 ? Rows.toLocalRowID(toRowId) - timeFrame.getRowLo() : 0;
+    }
+
+    /**
+     * Applies the relative switch check to a run of ASOF positions that sit at most the min gap
+     * apart. No single gap of such a run passes the min gap test of
+     * {@link #shouldSwitchToForwardScan}, so backward-only mode would re-scan for the key at every
+     * position however long the run is. The gaps and the backward scan cost at the positions they
+     * connect accumulate into a window instead. Once the window covers more than the min gap, the
+     * check compares the window's cost with the rows a forward scan would have read over the same
+     * distance, and the next window starts. Runs only when the window switch is enabled, see the
+     * constructor.
+     *
+     * @param gap distance in rows from the previous ASOF position to the current one
+     * @return true if forward scan mode should be activated
+     */
+    private boolean shouldSwitchToForwardScanOverWindow(long gap) {
+        boolean isSwitch = false;
+        boolean isWindowOpen = gap > 0 && gap <= bwdScanMinGap;
+        if (isWindowOpen) {
+            bwdScanWindowGap += gap;
+            if (bwdScanWindowGap > bwdScanMinGap) {
+                isSwitch = shouldSwitchToForwardScan(
+                        backwardScanRows - bwdScanRowsAtWindowStart,
+                        bwdScanWindowGap,
+                        bwdScanMinGap,
+                        bwdScanSwitchFactor,
+                        Long.MAX_VALUE
+                );
+                isWindowOpen = false;
+            }
+        }
+        if (!isWindowOpen) {
+            // The window is spent, or the gap is above the min gap and had its own check; a
+            // cross-frame gap is far above it. Either way, a new window starts at the current position.
+            bwdScanWindowGap = 0;
+            bwdScanRowsAtWindowStart = backwardScanRows;
+        }
+        return isSwitch;
+    }
+}

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,32 +24,59 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.sql.Record;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
+import io.questdb.std.Misc;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8StringSink;
 
 public interface RecordSinkSPI {
+    void putArray(ArrayView view);
+
     void putBin(BinarySequence value);
 
     void putBool(boolean value);
 
     void putByte(byte value);
 
+    void putChar(char value);
+
     void putDate(long value);
+
+    void putDecimal128(Decimal128 value);
+
+    void putDecimal256(Decimal256 value);
 
     void putDouble(double value);
 
     void putFloat(float value);
 
+    void putIPv4(int value);
+
     void putInt(int value);
+
+    // Used in RecordSinkFactory
+    @SuppressWarnings("unused")
+    void putInterval(Interval interval);
 
     void putLong(long value);
 
+    void putLong128(long lo, long hi);
+
     void putLong256(Long256 value);
 
-    void putShort(short value);
+    void putLong256(long l0, long l1, long l2, long l3);
 
-    void putChar(char value);
+    // Used in RecordSinkFactory
+    @SuppressWarnings("unused")
+    void putRecord(Record value);
+
+    void putShort(short value);
 
     void putStr(CharSequence value);
 
@@ -63,9 +90,30 @@ public interface RecordSinkSPI {
         throw new UnsupportedOperationException();
     }
 
-    void putRecord(Record value);
-
     void putTimestamp(long value);
 
+    void putVarchar(Utf8Sequence value);
+
+    default void putVarchar(CharSequence value) {
+        if (value == null) {
+            putVarchar((Utf8Sequence) null);
+        } else {
+            Utf8StringSink sink = Misc.getThreadLocalUtf8Sink();
+            sink.put(value);
+            putVarchar(sink);
+        }
+    }
+
     void skip(int bytes);
+
+    /**
+     * Steps past a variable-size column that the sink does not copy, the way
+     * {@link #skip(int)} steps past a fixed-size one. {@link RecordChain} gives each
+     * var-size column a positional slot, so its implementation has to consume one.
+     * Only window cursors build sinks that skip columns: they write the window outputs
+     * into the chain themselves, after the copy.
+     */
+    default void skipVarSize() {
+        throw new UnsupportedOperationException();
+    }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,15 +25,42 @@
 package io.questdb.cairo.map;
 
 import io.questdb.cairo.sql.Record;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
 import io.questdb.std.Long256;
 
+/**
+ * Represents a single value holding a set of slots reserved by aggregate functions.
+ * All implementations of this interface must be backed with off-heap memory.
+ */
 public interface MapValue extends Record {
 
-    long getAddress();
+    void addByte(int index, byte value);
+
+    void addDouble(int index, double value);
+
+    void addFloat(int index, float value);
+
+    void addInt(int index, int value);
+
+    void addLong(int index, long value);
+
+    void addLong256(int index, Long256 value);
+
+    void addShort(int index, short value);
+
+    void copyFrom(MapValue value);
+
+    /**
+     * Returns memory address for the given slot.
+     */
+    long getAddress(int index);
 
     boolean getBool(int index);
 
     byte getByte(int index);
+
+    char getChar(int index);
 
     long getDate(int index);
 
@@ -41,7 +68,7 @@ public interface MapValue extends Record {
 
     float getFloat(int index);
 
-    char getChar(int index);
+    int getIPv4(int index);
 
     int getInt(int index);
 
@@ -49,45 +76,66 @@ public interface MapValue extends Record {
 
     short getShort(int index);
 
+    /**
+     * Depending on Map implementation, returns either the key-value pair start address (OrderedMap)
+     * or the value address (other Maps).
+     * <p>
+     * In any case, the returned value can be used to make a {@link Map#valueAt(long)} call.
+     */
+    long getStartAddress();
+
     long getTimestamp(int index);
 
     boolean isNew();
+
+    void maxInt(int index, int value);
+
+    void maxLong(int index, long value);
+
+    void minInt(int index, int value);
+
+    void minLong(int index, long value);
 
     void putBool(int index, boolean value);
 
     void putByte(int index, byte value);
 
-    void addByte(int index, byte value);
+    void putChar(int index, char value);
 
     void putDate(int index, long value);
 
-    void putDouble(int index, double value);
+    void putDecimal128(int index, Record record, int colIndex);
 
-    void addDouble(int index, double value);
+    void putDecimal128(int index, Decimal128 decimal128);
+
+    void putDecimal128Null(int index);
+
+    void putDecimal256(int index, Record record, int colIndex);
+
+    void putDecimal256(int index, Decimal256 decimal256);
+
+    void putDecimal256Null(int index);
+
+    void putDouble(int index, double value);
 
     void putFloat(int index, float value);
 
-    void addFloat(int index, float value);
-
     void putInt(int index, int value);
-
-    void addInt(int index, int value);
 
     void putLong(int index, long value);
 
-    void addLong(int index, long value);
+    default void putLong128(int index, Record record, int colIndex) {
+        putLong128(index, record.getLong128Lo(colIndex), record.getLong128Hi(colIndex));
+    }
+
+    void putLong128(int index, long lo, long hi);
+
+    void putLong256(int index, Long256 value);
 
     void putShort(int index, short value);
 
-    void addShort(int index, short value);
-
-    void putChar(int index, char value);
-
     void putTimestamp(int index, long value);
 
-    void setMapRecordHere();
-
-    void addLong256(int index, Long256 value);
-
-    void putLong256(int index, Long256 value);
+    default void setNew(boolean isNew) {
+    }
 }

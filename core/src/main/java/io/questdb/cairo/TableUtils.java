@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,87 +25,195 @@
 package io.questdb.cairo;
 
 import io.questdb.MessageBus;
+import io.questdb.Telemetry;
+import io.questdb.TelemetryEvent;
+import io.questdb.TelemetryOrigin;
+import io.questdb.cairo.file.BlockFileWriter;
+import io.questdb.cairo.lv.LiveViewDefinition;
+import io.questdb.cairo.lv.LiveViewState;
+import io.questdb.cairo.mv.MatViewDefinition;
+import io.questdb.cairo.mv.MatViewState;
+import io.questdb.cairo.pool.WriterPool;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.TableMetadata;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.cairo.view.ViewDefinition;
 import io.questdb.cairo.vm.Vm;
-import io.questdb.cairo.vm.api.*;
+import io.questdb.cairo.vm.api.MemoryA;
+import io.questdb.cairo.vm.api.MemoryARW;
+import io.questdb.cairo.vm.api.MemoryCMR;
+import io.questdb.cairo.vm.api.MemoryMA;
+import io.questdb.cairo.vm.api.MemoryMAR;
+import io.questdb.cairo.vm.api.MemoryMARW;
+import io.questdb.cairo.vm.api.MemoryMR;
+import io.questdb.cairo.vm.api.MemoryMW;
+import io.questdb.cairo.vm.api.MemoryR;
+import io.questdb.griffin.AnyRecordMetadata;
+import io.questdb.griffin.FunctionParser;
 import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.table.parquet.MappedMemoryPartitionDescriptor;
+import io.questdb.griffin.engine.table.parquet.ParquetCompression;
+import io.questdb.griffin.engine.table.parquet.PartitionDescriptor;
+import io.questdb.griffin.engine.table.parquet.PartitionEncoder;
+import io.questdb.griffin.model.ExpressionNode;
+import io.questdb.griffin.model.IQueryModel;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import io.questdb.log.LogRecord;
 import io.questdb.mp.MPSequence;
-import io.questdb.std.*;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.Chars;
+import io.questdb.std.Decimals;
+import io.questdb.std.DirectIntList;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.IntList;
+import io.questdb.std.LowerCaseCharSequenceIntHashMap;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjList;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
+import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.std.str.CharSink;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8s;
 import io.questdb.tasks.O3PartitionPurgeTask;
+import io.questdb.tasks.TelemetryTask;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
+import static io.questdb.ParanoiaState.VM_PARANOIA_MODE;
 import static io.questdb.cairo.MapWriter.createSymbolMapFiles;
+import static io.questdb.cairo.wal.WalUtils.CONVERT_FILE_NAME;
+import static io.questdb.tasks.TableWriterTask.CMD_COMPOSITE_PARTITION_SWAP;
+import static io.questdb.tasks.TableWriterTask.CMD_PARQUET_PARTITION_SWAP;
+import static io.questdb.tasks.TableWriterTask.CMD_STORAGE_POLICY;
+import static io.questdb.tasks.TableWriterTask.getCommandName;
 
 public final class TableUtils {
-    public static final int TABLE_EXISTS = 0;
-    public static final int TABLE_DOES_NOT_EXIST = 1;
-    public static final int TABLE_RESERVED = 2;
-    public static final String META_FILE_NAME = "_meta";
-    public static final String TXN_FILE_NAME = "_txn";
-    public static final String COLUMN_VERSION_FILE_NAME = "_cv";
-    public static final String TXN_SCOREBOARD_FILE_NAME = "_txn_scoreboard";
-    public static final String UPGRADE_FILE_NAME = "_upgrade.d";
-    public static final String DETACHED_DIR_MARKER = ".detached";
-    public static final String TAB_INDEX_FILE_NAME = "_tab_index.d";
-    public static final String SNAPSHOT_META_FILE_NAME = "_snapshot";
-    public static final int INITIAL_TXN = 0;
-    public static final int NULL_LEN = -1;
-    public static final int ANY_TABLE_ID = -1;
     public static final int ANY_TABLE_VERSION = -1;
-    public static final long META_OFFSET_COUNT = 0;
-    public static final long META_OFFSET_TIMESTAMP_INDEX = 8;
-    public static final long META_OFFSET_VERSION = 12;
-    public static final long META_OFFSET_TABLE_ID = 16;
-    public static final long META_OFFSET_MAX_UNCOMMITTED_ROWS = 20; // LONG
-    public static final long META_OFFSET_COMMIT_LAG = 24; // LONG
-    public static final long META_OFFSET_STRUCTURE_VERSION = 32; // LONG
-    public static final String FILE_SUFFIX_I = ".i";
+    public static final String ATTACHABLE_DIR_MARKER = ".attachable";
+    public static final String CHECKPOINT_DIRECTORY = ".checkpoint";
+    public static final String CHECKPOINT_LEGACY_META_FILE_NAME = "_snapshot";
+    public static final String CHECKPOINT_LEGACY_META_FILE_NAME_TXT = "_snapshot.txt";
+    public static final String CHECKPOINT_META_FILE_NAME = "_checkpoint_meta.d";
+    public static final String CHECKPOINT_SEQ_TXN_FILE_NAME = "_txn";
+    public static final long COLUMN_NAME_TXN_NONE = -1L;
+    public static final String COLUMN_VERSION_FILE_NAME = "_cv";
+    /**
+     * Marks a composite-partition REWRITE built off a {@link io.questdb.cairo.TableReader} snapshot, staged next to the
+     * source directory before the writer has agreed to swap it in - see {@code PartitionCompactionScanJob}.
+     */
+    public static final String COMPACTING_DIR_MARKER = ".compacting";
+    // Dedup modes, stored in the _meta header at META_OFFSET_DEDUP_MODE. The mode matters only when
+    // deduplication is enabled, i.e. when the designated timestamp is a dedup key.
+    // SKIP: a new row is discarded when a row with the same dedup key values already exists,
+    // the earliest write wins.
+    public static final int DEDUP_MODE_SKIP = 1;
+    // UPSERT: a new row replaces the existing row with the same dedup key values, the latest write wins.
+    public static final int DEDUP_MODE_UPSERT = 0;
+    public static final String DEFAULT_PARTITION_NAME = "default";
+    public static final String DETACHED_DIR_MARKER = ".detached";
+    // A DETACH's temporary name, <partition>.<txn of its commit>.detaching, until the commit is final.
+    public static final String DETACHING_DIR_MARKER = ".detaching";
+    public static final long ESTIMATED_VAR_COL_SIZE = 28;
     public static final String FILE_SUFFIX_D = ".d";
+    public static final String FILE_SUFFIX_I = ".i";
+    /**
+     * Suffix of {@code <partition>.<nameTxn>.generating}, the staging dir of a native partition's parquet copy.
+     */
+    public static final String GENERATING_DIR_MARKER = ".generating";
+    public static final int INITIAL_TXN = 0;
+    public static final String LEGACY_CHECKPOINT_DIRECTORY = "snapshot";
     public static final int LONGS_PER_TX_ATTACHED_PARTITION = 4;
     public static final int LONGS_PER_TX_ATTACHED_PARTITION_MSB = Numbers.msb(LONGS_PER_TX_ATTACHED_PARTITION);
-    public static final String DEFAULT_PARTITION_NAME = "default";
-    public static final long META_OFFSET_COLUMN_TYPES = 128;
+    public static final int MAX_SYMBOL_NULL_SCAN_ROWS = 1 << 20;
     public static final long META_COLUMN_DATA_SIZE = 32;
-    static final int MIN_INDEX_VALUE_BLOCK_SIZE = Numbers.ceilPow2(4);
-    static final byte TODO_RESTORE_META = 2;
-    static final byte TODO_TRUNCATE = 1;
-    static final int COLUMN_VERSION_FILE_HEADER_SIZE = 40;
-
-    // transaction file structure
-    public static final int TX_BASE_HEADER_SECTION_PADDING = 12; // Add some free space into header for future use
-    public static final long TX_BASE_OFFSET_VERSION_64 = 0;
-
-    public static final long TX_BASE_OFFSET_A_32 = TX_BASE_OFFSET_VERSION_64 + 8;
-    public static final long TX_BASE_OFFSET_SYMBOLS_SIZE_A_32 = TX_BASE_OFFSET_A_32 + 4;
-    public static final long TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 = TX_BASE_OFFSET_SYMBOLS_SIZE_A_32 + 4;
-
-    public static final long TX_BASE_OFFSET_B_32 = TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 + 4 + TX_BASE_HEADER_SECTION_PADDING;
-    public static final long TX_BASE_OFFSET_SYMBOLS_SIZE_B_32 = TX_BASE_OFFSET_B_32 + 4;
-    public static final long TX_BASE_OFFSET_PARTITIONS_SIZE_B_32 = TX_BASE_OFFSET_SYMBOLS_SIZE_B_32 + 4;
-
-    public static final int TX_BASE_HEADER_SIZE = (int) Math.max(TX_BASE_OFFSET_PARTITIONS_SIZE_B_32 + 4 + TX_BASE_HEADER_SECTION_PADDING, 64);
-
-    public static final long TX_OFFSET_TXN_64 = 0;
-    public static final long TX_OFFSET_TRANSIENT_ROW_COUNT_64 = TX_OFFSET_TXN_64 + 8;
-    public static final long TX_OFFSET_FIXED_ROW_COUNT_64 = TX_OFFSET_TRANSIENT_ROW_COUNT_64 + 8;
-    public static final long TX_OFFSET_MIN_TIMESTAMP_64 = TX_OFFSET_FIXED_ROW_COUNT_64 + 8;
-    public static final long TX_OFFSET_MAX_TIMESTAMP_64 = TX_OFFSET_MIN_TIMESTAMP_64 + 8;
-    public static final long TX_OFFSET_STRUCT_VERSION_64 = TX_OFFSET_MAX_TIMESTAMP_64 + 8;
-    public static final long TX_OFFSET_DATA_VERSION_64 = TX_OFFSET_STRUCT_VERSION_64 + 8;
-    public static final long TX_OFFSET_PARTITION_TABLE_VERSION_64 = TX_OFFSET_DATA_VERSION_64 + 8;
-    public static final long TX_OFFSET_COLUMN_VERSION_64 = TX_OFFSET_PARTITION_TABLE_VERSION_64 + 8;
-    public static final long TX_OFFSET_TRUNCATE_VERSION_64 = TX_OFFSET_COLUMN_VERSION_64 + 8;
-    public static final long TX_OFFSET_MAP_WRITER_COUNT_32 = 128;
-    public static final int TX_RECORD_HEADER_SIZE = (int) TX_OFFSET_MAP_WRITER_COUNT_32 + Integer.BYTES;
-
-    public static final long COLUMN_NAME_TXN_NONE = -1L;
-
+    public static final String META_FILE_NAME = "_meta";
+    // The dedup mode header field came after the EXPIRE ROWS trailing section (v3), so a v3 _meta that a
+    // release without the field wrote reads as UPSERT by version gate, whatever its header bytes hold.
+    public static final short META_FORMAT_MINOR_VERSION_DEDUP_MODE = 4;
+    public static final short META_FORMAT_MINOR_VERSION_LATEST = 4;
+    public static final short META_FORMAT_MINOR_VERSION_PARQUET_ENCODING_CONFIG = 1;
+    // Trustworthy inline symbol capacity in _meta was introduced at minor version 1 (#5242); gate the fast
+    // hydration read on THIS, not LATEST, so a later LATEST bump never forces v1 tables onto the slow path.
+    public static final short META_FORMAT_MINOR_VERSION_SYMBOL_CAPACITY = 1;
+    public static final short META_FORMAT_MINOR_VERSION_TABLE_FORMAT = 2;
+    public static final short META_FORMAT_MINOR_VERSION_TTL = 1;
+    /**
+     * Marks a whole LOGICAL partition's merge - every folder of one period, the main directory and all its splits,
+     * copied into one - staged next to the source directories before the writer has agreed to swap it in. Named
+     * {@code <logicalPartition>.<firstFolderNameTxn>.merging<folderCount>}; see {@code PartitionCompactionScanJob}.
+     */
+    public static final String MERGING_DIR_MARKER = ".merging";
+    // EXPIRE ROWS trailing section was added after TABLE_FORMAT (v2). It lives at v3 so a master-written
+    // v2 _meta (table_format, no policy) is read as "no policy" by version gate rather than relying on
+    // EOF-bounds handling of the absent trailing section.
+    public static final short META_FORMAT_MINOR_VERSION_EXPIRE_ROWS = 3;
+    public static final long META_OFFSET_COLUMN_TYPES = 128;
+    public static final long META_OFFSET_COUNT = 0;
+    public static final long META_OFFSET_MAX_UNCOMMITTED_ROWS = 20; // INT
+    public static final long META_OFFSET_METADATA_VERSION = 32; // LONG
+    public static final long META_OFFSET_O3_MAX_LAG = 24; // LONG
+    // INT - symbol map count, this is a variable part of transaction file
+    // below this offset we will have INT values for symbol map size
+    public static final long META_OFFSET_PARTITION_BY = 4;
+    public static final long META_OFFSET_TABLE_ID = 16;
+    public static final long META_OFFSET_TIMESTAMP_INDEX = 8;
+    public static final long META_OFFSET_VERSION = 12;
+    public static final long META_OFFSET_WAL_ENABLED = 40; // BOOLEAN
+    public static final long META_OFFSET_META_FORMAT_MINOR_VERSION = META_OFFSET_WAL_ENABLED + 1; // INT
+    public static final long META_OFFSET_TTL_HOURS_OR_MONTHS = META_OFFSET_META_FORMAT_MINOR_VERSION + 4; // INT
+    public static final long META_OFFSET_TABLE_FORMAT = META_OFFSET_TTL_HOURS_OR_MONTHS + 4; // INT
+    public static final long META_OFFSET_DEDUP_MODE = META_OFFSET_TABLE_FORMAT + 4; // INT
+    public static final String META_PREV_FILE_NAME = "_meta.prev";
+    public static final String META_SWAP_FILE_NAME = "_meta.swp";
+    public static final int MIN_INDEX_VALUE_BLOCK_SIZE = Numbers.ceilPow2(2);
+    // 24-byte header left empty for possible future use
+    // in case we decide to support ALTER MAT VIEW, and modify mat view metadata
+    public static final int NULL_LEN = -1;
+    public static final String PARQUET_METADATA_FILE_NAME = "_pm";
+    public static final String PARQUET_METADATA_STAGING_FILE_NAME = "_pm.staging";
+    public static final String PARQUET_PARTITION_NAME = "data.parquet";
+    public static final String PARQUET_PARTITION_STAGING_NAME = "data.parquet.staging";
+    public static final String PARTITION_GEOMETRY_FILE_NAME = "_geometry";
+    public static final String PARTITION_LAST_SQUASH_TIMESTAMP_FILE = ".squash_ts";
+    public static final String RESTORE_FROM_CHECKPOINT_TRIGGER_FILE_NAME = "_restore";
+    public static final String SYMBOL_KEY_REMAP_FILE_SUFFIX = ".r";
+    public static final char SYSTEM_TABLE_NAME_SUFFIX = '~';
+    // Writer lock reason used by internal system jobs (partition/posting-seal purge,
+    // CSV copy status) when they acquire a TableWriter on behalf of the engine itself.
+    public static final String SYSTEM_WRITER_LOCK_REASON = "QuestDB system";
+    public static final int TABLE_DOES_NOT_EXIST = 1;
+    public static final int TABLE_EXISTS = 0;
+    public static final int TABLE_FORMAT_NATIVE = 0;
+    public static final int TABLE_FORMAT_PARQUET = 1;
+    // Regular data table kind
+    public static final int TABLE_KIND_REGULAR_TABLE = 0;
+    // Parquet export table kind - allows table creation in read-only mode for parquet exports
+    public static final int TABLE_KIND_TEMP_PARQUET_EXPORT = 2;
+    public static final String TABLE_NAME_FILE = "_name";
+    public static final int TABLE_RESERVED = 2;
+    public static final int TABLE_TYPE_LIVE_VIEW = 4;
+    public static final int TABLE_TYPE_MAT = 2;
+    public static final int TABLE_TYPE_NON_WAL = 0;
+    public static final int TABLE_TYPE_VIEW = 3;
+    public static final int TABLE_TYPE_WAL = 1;
+    public static final String TAB_INDEX_FILE_NAME = "_tab_index.d";
+    // Dot-prefixed db-root staging dir for ALTER TABLE ... REBASE WAL (mirrors ".download"/".checkpoint").
+    // The startup table-dir scans only consider immediate db-root children that are complete tables and
+    // never recurse, so the in-progress clone built inside here is invisible until renamed into place.
+    public static final String REBASE_TMP_DIR = ".rebase";
+    public static final String TODO_FILE_NAME = "_todo_";
     /**
      * TXN file structure
      * struct {
@@ -122,38 +230,583 @@ public final class TableUtils {
      * <p>
      * TableUtils.resetTxn() writes to this file, it could be using different offsets, beware
      */
-
-    static final String META_SWAP_FILE_NAME = "_meta.swp";
-    static final String META_PREV_FILE_NAME = "_meta.prev";
-    // INT - symbol map count, this is a variable part of transaction file
-    // below this offset we will have INT values for symbol map size
-    static final long META_OFFSET_PARTITION_BY = 4;
+    public static final String TXN_FILE_NAME = "_txn";
+    public static final String TXN_SCOREBOARD_FILE_NAME = "_txn_scoreboard";
+    // Magic of the save point file header (_epoch.manifest.0/1), at its start and again before the header
+    // checksum. Spells "EPOCHKSM" in little-endian order.
+    public static final long SNAPSHOT_CHECKSUM_MAGIC = 0x4D534B4843504F45L;
+    // transaction file structure
+    // @formatter:off
+    public static final int TX_BASE_HEADER_SECTION_PADDING = 12; // Add some free space into header for future use
+    public static final long TX_BASE_OFFSET_VERSION_64 = 0;
+    public static final long TX_BASE_OFFSET_A_32 = TX_BASE_OFFSET_VERSION_64 + 8;
+    public static final long TX_BASE_OFFSET_SYMBOLS_SIZE_A_32 = TX_BASE_OFFSET_A_32 + 4;
+    public static final long TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 = TX_BASE_OFFSET_SYMBOLS_SIZE_A_32 + 4;
+    // geometryVersion moved into the per-slot base-header padding when the record-body checksum claimed
+    // bytes [116,128). The txn-derived stamp distinguishes this layout from files written by older binaries.
+    public static final long TX_BASE_OFFSET_GEOMETRY_VERSION_A_32 = TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 + 4;
+    public static final long TX_BASE_OFFSET_GEOMETRY_VERSION_STAMP_A_32 = TX_BASE_OFFSET_GEOMETRY_VERSION_A_32 + 4;
+    public static final long TX_BASE_OFFSET_B_32 = TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 + 4 + TX_BASE_HEADER_SECTION_PADDING;
+    public static final long TX_BASE_OFFSET_SYMBOLS_SIZE_B_32 = TX_BASE_OFFSET_B_32 + 4;
+    public static final long TX_BASE_OFFSET_PARTITIONS_SIZE_B_32 = TX_BASE_OFFSET_SYMBOLS_SIZE_B_32 + 4;
+    public static final long TX_BASE_OFFSET_GEOMETRY_VERSION_B_32 = TX_BASE_OFFSET_PARTITIONS_SIZE_B_32 + 4;
+    public static final long TX_BASE_OFFSET_GEOMETRY_VERSION_STAMP_B_32 = TX_BASE_OFFSET_GEOMETRY_VERSION_B_32 + 4;
+    public static final int TX_BASE_HEADER_SIZE = (int) Math.max(TX_BASE_OFFSET_PARTITIONS_SIZE_B_32 + 4 + TX_BASE_HEADER_SECTION_PADDING, 64);
+    public static final long TX_OFFSET_MAP_WRITER_COUNT_32 = 128;
+    public static final long TX_OFFSET_TXN_64 = 0;
+    public static final long TX_OFFSET_TRANSIENT_ROW_COUNT_64 = TX_OFFSET_TXN_64 + 8;
+    public static final long TX_OFFSET_FIXED_ROW_COUNT_64 = TX_OFFSET_TRANSIENT_ROW_COUNT_64 + 8;
+    public static final long TX_OFFSET_MIN_TIMESTAMP_64 = TX_OFFSET_FIXED_ROW_COUNT_64 + 8;
+    public static final long TX_OFFSET_MAX_TIMESTAMP_64 = TX_OFFSET_MIN_TIMESTAMP_64 + 8;
+    public static final long TX_OFFSET_STRUCT_VERSION_64 = TX_OFFSET_MAX_TIMESTAMP_64 + 8;
+    public static final long TX_OFFSET_DATA_VERSION_64 = TX_OFFSET_STRUCT_VERSION_64 + 8;
+    public static final long TX_OFFSET_PARTITION_TABLE_VERSION_64 = TX_OFFSET_DATA_VERSION_64 + 8;
+    public static final long TX_OFFSET_COLUMN_VERSION_64 = TX_OFFSET_PARTITION_TABLE_VERSION_64 + 8;
+    public static final long TX_OFFSET_TRUNCATE_VERSION_64 = TX_OFFSET_COLUMN_VERSION_64 + 8;
+    public static final long TX_OFFSET_SEQ_TXN_64 = TX_OFFSET_TRUNCATE_VERSION_64 + 8;
+    public static final long TX_OFFSET_CHECKSUM_32 = TX_OFFSET_SEQ_TXN_64 + 8;
+    public static final long TX_OFFSET_LAG_TXN_COUNT_32 = TX_OFFSET_CHECKSUM_32 + 4;
+    public static final long TX_OFFSET_LAG_ROW_COUNT_32 = TX_OFFSET_LAG_TXN_COUNT_32 + 4;
+    public static final long TX_OFFSET_LAG_MIN_TIMESTAMP_64 = TX_OFFSET_LAG_ROW_COUNT_32 + 4;
+    public static final long TX_OFFSET_LAG_MAX_TIMESTAMP_64 = TX_OFFSET_LAG_MIN_TIMESTAMP_64 + 8;
+    // Legacy location used by binaries that introduced composite geometry before body checksums. A merged writer
+    // stores geometryVersion in the per-slot base-header padding and uses this range for checksum data instead.
+    // Releases before 10.1.0 never write [116,128), so a released record can hold stale bytes of an older record
+    // here; TxReader folds a negative value to 0 instead of reading it as tearing.
+    public static final long TX_OFFSET_GEOMETRY_VERSION_32 = TX_OFFSET_LAG_MAX_TIMESTAMP_64 + 8;
+    public static final long TX_OFFSET_BODY_CHECKSUM_64 = TX_OFFSET_GEOMETRY_VERSION_32;
+    public static final long TX_OFFSET_BODY_CHECKSUM_STAMP_32 = TX_OFFSET_BODY_CHECKSUM_64 + Long.BYTES;
+    // The pre-geometry adaptive branch used the legacy XOR. New records use a distinct stamp so a missing
+    // base-header geometry slot is detectable rather than being mistaken for a pre-merge record.
+    public static final int TX_BODY_CHECKSUM_LEGACY_STAMP_XOR = 0x8000_0000;
+    public static final int TX_BODY_CHECKSUM_STAMP_XOR = 0xA13F_7C29;
+    public static final int TX_GEOMETRY_VERSION_STAMP_XOR = 0x4745_4F4D;
+    // @formatter:on
+    public static final int TX_RECORD_HEADER_SIZE = (int) TX_OFFSET_MAP_WRITER_COUNT_32 + Integer.BYTES;
+    // Magic of the 16-byte checksum trailer after each _cv area; spells " CVCHKSM" little-endian.
+    public static final long CV_CHECKSUM_MAGIC = 0x4D534B4843564320L;
+    public static final int CV_CHECKSUM_TRAILER_SIZE = 2 * Long.BYTES;
+    public static final String UPGRADE_FILE_NAME = "_upgrade.d";
+    public static final String WAL_2_TABLE_RESUME_REASON = "Resume WAL Data Application";
+    public static final String WAL_2_TABLE_WRITE_REASON = "WAL Data Application";
+    static final int COLUMN_VERSION_FILE_HEADER_SIZE = 40;
+    // Column flag bit layout (on-disk in _meta).
+    // Bits 0, 2, 3 match the pre-posting-index layout, so tables written by
+    // older versions keep meaning when read by new binaries, and tables
+    // written by this version that have no POSTING/COVERING columns are
+    // bit-identical to the old layout (downgrade-safe when no new features
+    // are used).
+    //
+    //   bit 0: INDEXED                 (legacy META_FLAG_BIT_INDEXED)
+    //   bit 1: IS_POSTING              (0 = BITMAP, 1 = posting variant)
+    //   bit 2: SYMBOL_CACHE            (legacy)
+    //   bit 3: DEDUP_KEY               (legacy)
+    //   bit 4: POSTING_VARIANT low     (2-bit variant selector, bits 4-5)
+    //   bit 5: POSTING_VARIANT high
+    //   bit 6: COVERING
+    //
+    // Posting variant encoding (bits 4-5, valid only when IS_POSTING=1):
+    //   00 = POSTING (adaptive)
+    //   01 = POSTING_DELTA
+    //   10 = POSTING_EF
+    //   11 = reserved
     static final int META_FLAG_BIT_INDEXED = 1;
-    static final int META_FLAG_BIT_SEQUENTIAL = 1 << 1;
-    static final String TODO_FILE_NAME = "_todo_";
-    private static final int MIN_SYMBOL_CAPACITY = 2;
+    static final int META_FLAG_BIT_IS_POSTING = 1 << 1;
+    static final int META_FLAG_BIT_SYMBOL_CACHE = 1 << 2;
+    static final int META_FLAG_BIT_DEDUP_KEY = 1 << 3;
+    static final int META_FLAG_BIT_POSTING_VARIANT_LO = 1 << 4;
+    static final int META_FLAG_BIT_POSTING_VARIANT_HI = 1 << 5;
+    static final int META_FLAG_BIT_COVERING = 1 << 6;
+    static final int META_FLAG_POSTING_VARIANT_MASK = META_FLAG_BIT_POSTING_VARIANT_LO | META_FLAG_BIT_POSTING_VARIANT_HI;
+    // Offset of the _meta.prev index in a TODO_RESTORE_META _todo_ entry, see TableWriter.writeRestoreMetaTodo().
+    static final int TODO_META_INDEX_OFFSET = 48;
+    static final byte TODO_RESTORE_META = 2;
+    static final byte TODO_TRUNCATE = 1;
+    private static final int EMPTY_TABLE_LAG_CHECKSUM = calculateTxnLagChecksum(0, 0, 0, Long.MAX_VALUE, Long.MIN_VALUE, 0);
+    // Polynomial multiplier for the _txn and _cv checksums, copied from Hash.hashMem64 so that the on-disk
+    // checksum stays stable whatever happens to the std Hash helpers.
+    private static final long HASH_MEM_M2 = 0x517cc1b727220a95L;
+    private static final long HASH_MEM_M2_POW2 = HASH_MEM_M2 * HASH_MEM_M2;
+    private static final long HASH_MEM_M2_POW3 = HASH_MEM_M2_POW2 * HASH_MEM_M2;
+    private static final long HASH_MEM_M2_POW4 = HASH_MEM_M2_POW2 * HASH_MEM_M2_POW2;
+    private static final Log LOG = LogFactory.getLog(TableUtils.class);
+    private static final int MAX_INDEX_VALUE_BLOCK_SIZE = Numbers.ceilPow2(8 * 1024 * 1024);
     private static final int MAX_SYMBOL_CAPACITY = Numbers.ceilPow2(Integer.MAX_VALUE);
     private static final int MAX_SYMBOL_CAPACITY_CACHED = Numbers.ceilPow2(30_000_000);
-    private static final int MAX_INDEX_VALUE_BLOCK_SIZE = Numbers.ceilPow2(8 * 1024 * 1024);
-    private final static Log LOG = LogFactory.getLog(TableUtils.class);
+    private static final int MIN_SYMBOL_CAPACITY = 2;
+    // Bit layout for the packed per-column parquet encoding config (32-bit integer).
+    // Must stay in sync with the Rust constants in parquet_write/schema.rs.
+    private static final int PARQUET_CONFIG_BLOOM_FILTER_FLAG = 1 << 25;
+    private static final int PARQUET_CONFIG_COMPRESSION_MASK = 0xFF;
+    private static final int PARQUET_CONFIG_COMPRESSION_SHIFT = 8;
+    private static final int PARQUET_CONFIG_ENCODING_MASK = 0xFF;
+    private static final int PARQUET_CONFIG_EXPLICIT_FLAG = 1 << 24;
+    private static final int PARQUET_CONFIG_LEVEL_MASK = 0xFF;
+    private static final int PARQUET_CONFIG_LEVEL_SHIFT = 16;
+    private static final long XXH3_PRIME_MX1 = 0x165667919E3779F9L;
+    // Counts _txn partition-table hash terms; TxnBodyChecksumCacheTest relies on it. It lives in TableUtils
+    // because every partition-table hash passes through this class, whatever the caller: a full hash through
+    // hashTxnBodyPartitionTableRange(), a changed int through txnBodyPartitionTableIntDelta(). So the test sees
+    // a full hash on the commit path even from code that bypasses TxWriter.
+    @TestOnly
+    private static long txnBodyPartitionTableHashTermCount;
 
     private TableUtils() {
     }
 
-    public static void allocateDiskSpace(FilesFacade ff, long fd, long size) {
+    /**
+     * Rounds an allocation size up to a page on Linux. Growing a file that does not end on a page
+     * boundary can make XFS wait for a synchronous disk write. Other platforms keep the exact size.
+     */
+    public static long alignedSize(long size) {
+        return Os.isLinux() ? Files.ceilPageSize(size) : size;
+    }
+
+    /**
+     * Grows the file to at least {@code size} bytes, rounded up by {@link #alignedSize(long)}.
+     * Use it for files that are appended to later.
+     */
+    public static void allocateDiskSpaceAligned(FilesFacade ff, long fd, long size) {
+        allocateDiskSpaceAlignedFromLength(ff, fd, size, ff.length(fd));
+    }
+
+    /**
+     * Like {@link #allocateDiskSpaceAligned(FilesFacade, long, long)}, for a caller that grows the same
+     * file repeatedly: backs only from {@code min(allocatedHi, length)}, where {@code allocatedHi} is how
+     * far this caller's own earlier calls on this fd backed the file, 0 for none. The first growth thus
+     * backs the whole file from offset 0, holes below its length included, exactly as the plain variant
+     * does; later ones back only the new range. Re-backing from 0 costs time in proportion to the whole
+     * file: tmpfs walks every page, XFS opens a transaction per extent.
+     *
+     * @return the new {@code allocatedHi} for the next call
+     */
+    public static long allocateDiskSpaceAligned(FilesFacade ff, long fd, long allocatedHi, long size) {
+        return allocateDiskSpace(ff, fd, allocatedHi, size, alignedSize(size));
+    }
+
+    /**
+     * Grows the file to exactly {@code size} bytes if it is shorter. Use it for small files that never grow.
+     */
+    public static void allocateDiskSpaceUnaligned(FilesFacade ff, long fd, long size) {
         if (ff.length(fd) < size && !ff.allocate(fd, size)) {
-            throw CairoException.instance(ff.errno()).put("No space left [size=").put(size).put(", fd=").put(fd).put(']');
+            throw CairoException.critical(ff.errno()).put("No space left [size=").put(size).put(", fd=").put(fd).put(']');
         }
     }
 
-    public static void createTable(
-            CairoConfiguration configuration,
-            MemoryMARW memory,
-            Path path,
-            TableStructure structure,
-            int tableId
+    /**
+     * {@link #allocateDiskSpaceAligned(FilesFacade, long, long, long)} for exact sizes.
+     */
+    public static long allocateDiskSpaceUnaligned(FilesFacade ff, long fd, long allocatedHi, long size) {
+        return allocateDiskSpace(ff, fd, allocatedHi, size, size);
+    }
+
+    public static int calculateMetaFormatMinorVersionField(long metadataVersion, int columnCount) {
+        // Metadata Format Minor Version field is 2 shorts:
+        // - Low short is a checksum that changes with every update to _meta
+        // - High short is TableUtils.META_FORMAT_MINOR_VERSION_LATEST
+        // When reading the Metadata Format Minor Version field from the metadata record, use the checksum
+        // to decide whether to trust the version stored in this field.
+        return Numbers.encodeLowHighShorts(
+                checksumForMetaFormatMinorVersionField(metadataVersion, columnCount),
+                META_FORMAT_MINOR_VERSION_LATEST
+        );
+    }
+
+    public static int calculateTxRecordSize(int bytesSymbols, int bytesPartitions) {
+        // Note that 32 bit symbol length is included in TX_RECORD_HEADER_SIZE,
+        // hence the record size is head + symbol sizes + 32bit partition count + bytes to store partitions
+        return TX_RECORD_HEADER_SIZE + bytesSymbols + Integer.BYTES + bytesPartitions;
+    }
+
+    /**
+     * Computes a 64-bit checksum over the bytes of a committed {@code _txn} record that only a
+     * version-bumped commit changes, so a lock-free reader that re-reads the version after loading can
+     * verify every load without false positives. Covered:
+     * <ul>
+     *   <li>{@code [0, 40)} and {@code [48, 80)}: txn, row counts, min/max timestamp, and the data,
+     *       partition-table, column and truncate versions;</li>
+     *   <li>{@code [partitionTableStart, recordSize)}: the partition-table length int and the partition
+     *       records.</li>
+     * </ul>
+     * Excluded, because they change in place under a stable version:
+     * <ul>
+     *   <li>{@code [40, 48)}: structureVersion, reset by released converters and REBASE WAL;</li>
+     *   <li>{@code [80, 116)}: seqTxn, the lag fields and the lag checksum, overwritten by
+     *       {@link TxWriter#resetLagAppliedRows()} and {@link TxWriter#resetLagValuesUnsafe()};</li>
+     *   <li>{@code [116, 128)}: the body checksum and its stamp;</li>
+     *   <li>{@code [128, partitionTableStart)}: the symbol counts, whose transient halves
+     *       {@link TxWriter#writeTransientSymbolCount} overwrites per new distinct symbol.</li>
+     * </ul>
+     * The writer and the reader derive both bounds from the same helpers
+     * ({@link #calculateTxRecordSize(int, int)}, {@link #getPartitionTableSizeOffset(int)}). The hash is a
+     * polynomial over little-endian 8-byte words with an avalanche finish. A result of {@code 0} is
+     * remapped to {@code 1}, so a zeroed slot with a matching stamp always reads as torn.
+     *
+     * @param recordBaseAddr      native address of the record body (offset 0 of the active A/B area)
+     * @param recordSize          full committed record length in bytes
+     * @param partitionTableStart offset of the partition-table length int ({@code 132 + symbolCount*8})
+     * @return a non-zero 64-bit checksum
+     */
+    public static long calculateTxnBodyChecksum(long recordBaseAddr, long recordSize, long partitionTableStart) {
+        long h = hashTxnBodyRange(recordBaseAddr, 0, TX_OFFSET_STRUCT_VERSION_64, 0);
+        h = hashTxnBodyRange(recordBaseAddr, TX_OFFSET_DATA_VERSION_64, TX_OFFSET_SEQ_TXN_64, h);
+        // A record that ends at the partition table's start has no partition table to hash.
+        if (partitionTableStart < recordSize) {
+            h = hashTxnBodyPartitionTableRange(recordBaseAddr, recordSize, partitionTableStart, h);
+        }
+        h = xxh3Avalanche64(h);
+        // 0 is the "absent" sentinel; never emit it for a real record.
+        return h != 0 ? h : 1L;
+    }
+
+    /**
+     * Assembles {@link #calculateTxnBodyChecksum(long, long, long)} from its two independently computed
+     * parts. The pre-avalanche hash is a polynomial over the covered terms, so hashing the header and then
+     * the partition table equals {@code headerHash * m^K + partitionTableHash}, where {@code K} is the number
+     * of partition-table terms. For a record at {@code a} of size {@code s} whose partition table starts at
+     * {@code p}, combining {@code hashTxnBodyHeader(a)}, {@code txnBodyPartitionTablePower(s, p)} and
+     * {@code hashTxnBodyPartitionTable(a, s, p)} gives {@code calculateTxnBodyChecksum(a, s, p)} bit for bit.
+     * <p>
+     * The split lets {@code TxWriter} cache the partition-table part, which a fast-path commit leaves
+     * untouched, and pay only for the header on each commit.
+     *
+     * @param headerHash          {@link #hashTxnBodyHeader(long)} of the record
+     * @param partitionTablePower {@link #txnBodyPartitionTablePower(long, long)} of the record
+     * @param partitionTableHash  {@link #hashTxnBodyPartitionTable(long, long, long)} of the record
+     * @return the same non-zero checksum {@link #calculateTxnBodyChecksum(long, long, long)} returns
+     */
+    public static long combineTxnBodyChecksum(long headerHash, long partitionTablePower, long partitionTableHash) {
+        final long h = xxh3Avalanche64(headerHash * partitionTablePower + partitionTableHash);
+        return h != 0 ? h : 1L;
+    }
+
+    /**
+     * How many partition-table hash terms the {@code _txn} body checksum has folded in this process, by any
+     * caller: every term of a full partition-table hash, whether {@link #calculateTxnBodyChecksum(long, long, long)}
+     * or {@link #hashTxnBodyPartitionTable(long, long, long)} computes it, and one per changed int
+     * {@link #txnBodyPartitionTableIntDelta(int, long, int, int)} folds. Capture it before an operation and
+     * assert on the delta afterwards.
+     */
+    @TestOnly
+    public static long getTxnBodyPartitionTableHashTermCount() {
+        return txnBodyPartitionTableHashTermCount;
+    }
+
+    /**
+     * The pre-avalanche hash of the covered header ranges {@code [0, 40)} and {@code [48, 80)} of a
+     * {@code _txn} record, folded from 0. See {@link #combineTxnBodyChecksum(long, long, long)}.
+     */
+    public static long hashTxnBodyHeader(long recordBaseAddr) {
+        final long h = hashTxnBodyRange(recordBaseAddr, 0, TX_OFFSET_STRUCT_VERSION_64, 0);
+        return hashTxnBodyRange(recordBaseAddr, TX_OFFSET_DATA_VERSION_64, TX_OFFSET_SEQ_TXN_64, h);
+    }
+
+    /**
+     * The pre-avalanche hash of the partition-table range {@code [partitionTableStart, recordSize)} of a
+     * {@code _txn} record, folded from 0, or 0 when the range is empty. See
+     * {@link #combineTxnBodyChecksum(long, long, long)}.
+     */
+    public static long hashTxnBodyPartitionTable(long recordBaseAddr, long recordSize, long partitionTableStart) {
+        return partitionTableStart < recordSize ? hashTxnBodyPartitionTableRange(recordBaseAddr, recordSize, partitionTableStart, 0) : 0;
+    }
+
+    /**
+     * The change to {@link #hashTxnBodyPartitionTable(long, long, long)} of a {@code _txn} partition table when
+     * the 4-byte int at {@code offset} from the table's start changes from {@code oldValue} to {@code newValue}.
+     * The table is the size int followed by {@code longCount} longs, so the hash folds {@code longCount}
+     * 8-byte words, word {@code t} weighted {@code m^(longCount - t)}, then the last long's high int as a
+     * trailing term weighted 1. A word's low int enters unsigned and its high int shifted up by 32 bits; the
+     * trailing int enters sign-extended, as {@code Unsafe.getInt} reads it. Changes to different ints add up,
+     * so a long's change is the sum of the changes of its low int (at {@code 4 + 8i}) and its high int
+     * (at {@code 8 + 8i}).
+     */
+    public static long txnBodyPartitionTableIntDelta(int longCount, long offset, int oldValue, int newValue) {
+        assert (offset & (Integer.BYTES - 1)) == 0 && offset <= (long) longCount * Long.BYTES;
+        txnBodyPartitionTableHashTermCount++;
+        final long word = offset >>> 3;
+        if (word == longCount) {
+            return (long) newValue - oldValue;
+        }
+        final long delta = (offset & (Long.BYTES - 1)) == 0
+                ? Integer.toUnsignedLong(newValue) - Integer.toUnsignedLong(oldValue)
+                : ((long) newValue << 32) - ((long) oldValue << 32);
+        return delta * txnBodyHashPower(longCount - word);
+    }
+
+    /**
+     * {@code m^K}, where {@code K} is the number of terms {@code hashTxnBodyRange} folds over the
+     * partition-table range {@code [partitionTableStart, recordSize)}, or 1 when the range is empty. See
+     * {@link #combineTxnBodyChecksum(long, long, long)}.
+     */
+    public static long txnBodyPartitionTablePower(long recordSize, long partitionTableStart) {
+        return txnBodyHashPower(txnBodyPartitionTableTermCount(recordSize, partitionTableStart));
+    }
+
+    /**
+     * The number of terms {@code hashTxnBodyRange} folds over the partition-table range
+     * {@code [partitionTableStart, recordSize)}, 0 when the range is empty: the work one
+     * {@link #hashTxnBodyPartitionTable(long, long, long)} does.
+     */
+    public static long txnBodyPartitionTableTermCount(long recordSize, long partitionTableStart) {
+        if (partitionTableStart >= recordSize) {
+            return 0;
+        }
+        // hashTxnBodyRange folds one term per 8-byte word, then one for a trailing 4-byte int, then one per
+        // trailing byte.
+        final long len = recordSize - partitionTableStart;
+        final long tail = len & (Long.BYTES - 1);
+        return (len >>> 3) + (tail >= Integer.BYTES ? 1 + tail - Integer.BYTES : tail);
+    }
+
+    /**
+     * Computes a 64-bit checksum over a whole committed {@code _cv} area {@code [0, size)}, to detect a torn
+     * area that the A/B version protocol alone cannot catch. {@link ColumnVersionWriter#doCommit()} writes
+     * the whole area at a fresh offset on each commit and never changes a published area in place, so the
+     * checksum covers the area with no exclusions. It is stored in the trailer after the area (see
+     * {@link #CV_CHECKSUM_MAGIC}), and {@code OFFSET_SIZE_{A,B}} keeps recording the data size only. The hash
+     * is the one {@link #calculateTxnBodyChecksum(long, long, long)} uses. The trailer's magic, not the
+     * checksum value, decides presence; the {@code 0} to {@code 1} remap only keeps the two contracts alike.
+     *
+     * @param areaBaseAddr native address of the area body (offset 0 of the active A/B area, i.e. the
+     *                     mapped address of the on-disk {@code offset})
+     * @param size         the committed area length in bytes ({@code OFFSET_SIZE_{A,B}}; a multiple of 32)
+     * @return a non-zero 64-bit checksum
+     */
+    public static long calculateCvAreaChecksum(long areaBaseAddr, long size) {
+        long h = hashTxnBodyRange(areaBaseAddr, 0, size, 0);
+        h = xxh3Avalanche64(h);
+        return h != 0 ? h : 1L;
+    }
+
+    // the mig methods are deliberately standalone so that between old versions
+    // does not regress if the main code changes
+    public static int calculateTxnLagChecksum(long txn, long seqTxn, int lagRowCount, long lagMinTimestamp, long lagMaxTimestamp, int lagTxnCount) {
+        long checkSum = lagMinTimestamp;
+        checkSum = checkSum * 31 + lagMaxTimestamp;
+        checkSum = checkSum * 31 + txn;
+        checkSum = checkSum * 31 + seqTxn;
+        checkSum = checkSum * 31 + lagRowCount;
+        checkSum = checkSum * 31 + lagTxnCount;
+        //noinspection UseHashCodeMethodInspection
+        return (int) (checkSum ^ (checkSum >>> 32));
+    }
+
+    // Folds the non-empty partition-table range [partitionTableStart, recordSize) of a _txn record into h. Every
+    // full partition-table hash passes here.
+    private static long hashTxnBodyPartitionTableRange(long recordBaseAddr, long recordSize, long partitionTableStart, long h) {
+        txnBodyPartitionTableHashTermCount += txnBodyPartitionTableTermCount(recordSize, partitionTableStart);
+        return hashTxnBodyRange(recordBaseAddr, partitionTableStart, recordSize, h);
+    }
+
+    /**
+     * Folds the byte range {@code [lo, hi)} at {@code addr} into the running polynomial hash {@code h}:
+     * 8-byte words, then a trailing 4-byte int, then trailing bytes. The result depends only on the content
+     * of the range, not on the alignment of {@code lo}.
+     */
+    private static long hashTxnBodyRange(long addr, long lo, long hi, long h) {
+        final long m = HASH_MEM_M2;
+        long i = lo;
+        // Four words per step: h * m^4 + (w0 * m^3 + w1 * m^2) + (w2 * m + w3) is the same polynomial as four
+        // one-word steps, exactly, in wrapping arithmetic. The chain through h then carries one multiply-add
+        // per 32 bytes instead of four, so a long range hashes at multiply throughput, not multiply latency.
+        for (; i + 4 * Long.BYTES <= hi; i += 4 * Long.BYTES) {
+            final long p = addr + i;
+            h = h * HASH_MEM_M2_POW4 + ((Unsafe.getLong(p) * HASH_MEM_M2_POW3 + Unsafe.getLong(p + 8) * HASH_MEM_M2_POW2)
+                    + (Unsafe.getLong(p + 16) * m + Unsafe.getLong(p + 24)));
+        }
+        for (; i + Long.BYTES <= hi; i += Long.BYTES) {
+            h = h * m + Unsafe.getLong(addr + i);
+        }
+        if (i + Integer.BYTES <= hi) {
+            h = h * m + Unsafe.getInt(addr + i);
+            i += Integer.BYTES;
+        }
+        for (; i < hi; i++) {
+            h = h * m + Unsafe.getByte(addr + i);
+        }
+        return h;
+    }
+
+    // m^terms, the weight hashTxnBodyRange gives a term followed by `terms` more.
+    private static long txnBodyHashPower(long terms) {
+        long base = HASH_MEM_M2;
+        long power = 1L;
+        while (terms != 0) {
+            if ((terms & 1) != 0) {
+                power *= base;
+            }
+            base *= base;
+            terms >>>= 1;
+        }
+        return power;
+    }
+
+    /**
+     * xxh3 64-bit avalanche finalizer, copied from {@code Hash} so the on-disk checksums stay stable
+     * whatever happens to the std Hash helpers.
+     */
+    private static long xxh3Avalanche64(long h) {
+        h ^= h >>> 37;
+        h *= XXH3_PRIME_MX1;
+        return h ^ (h >>> 32);
+    }
+
+    public static int changeColumnTypeInMetadata(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            byte indexType,
+            int indexValueBlockCapacity,
+            LowerCaseCharSequenceIntHashMap columnNameIndexMap,
+            ObjList<TableColumnMetadata> columnMetadata
     ) {
-        createTable(configuration, memory, path, structure, ColumnType.VERSION, tableId);
+        int existingIndex = columnNameIndexMap.get(columnName);
+        if (existingIndex < 0) {
+            throw CairoException.nonCritical().put("cannot change type, column '").put(columnName).put("' does not exist");
+        }
+        TableColumnMetadata existingMeta = columnMetadata.getQuick(existingIndex);
+        String columnNameStr = existingMeta.getColumnName();
+        int columnIndex = columnMetadata.size();
+        columnMetadata.add(
+                new TableColumnMetadata(
+                        columnNameStr,
+                        columnType,
+                        indexType,
+                        indexValueBlockCapacity,
+                        false,
+                        null,
+                        columnIndex,
+                        false,
+                        existingIndex + 1, // replacing column index by convention can be 0 if not in use
+                        symbolCacheFlag,
+                        symbolCapacity,
+                        existingMeta.getOriginalWriterIndex()
+                )
+        );
+        columnMetadata.getQuick(existingIndex).markDeleted();
+        columnNameIndexMap.put(columnNameStr, columnIndex);
+        return existingIndex;
+    }
+
+    public static LPSZ charFileName(Path path, CharSequence columnName, long columnNameTxn) {
+        path.concat(columnName).put(".c");
+        if (columnNameTxn > COLUMN_NAME_TXN_NONE) {
+            path.put('.').put(columnNameTxn);
+        }
+        return path.$();
+    }
+
+    public static long checkMemSize(MemoryMR metaMem, long minSize) {
+        final long memSize = metaMem.size();
+        if (memSize < minSize) {
+            throw CairoException.fileTooSmall(memSize, minSize);
+        }
+        return memSize;
+    }
+
+    public static boolean checkStoragePolicyTtl(
+            TxReader txReader,
+            TimestampDriver timestampDriver,
+            long partitionTimestamp,
+            long maxTimestamp,
+            int ttl
+    ) {
+        assert ttl != 0 : "ttl cannot be 0, invalid value";
+        // Storage policies measure age from the partition's own floor (its start), not its
+        // ceiling like table TTL does. This shifts every threshold forward by one partition
+        // width relative to table TTL. For an interval up to one partition width, that means a
+        // partition becomes eligible as soon as the next (active) partition begins; for larger
+        // intervals it simply becomes eligible one partition width sooner than table TTL would.
+        final long partitionFloor = txReader.getPartitionFloor(partitionTimestamp);
+        return isOlderThanTtl(timestampDriver, partitionFloor, maxTimestamp, ttl);
+    }
+
+    public static boolean checkTtl(
+            TxReader txReader,
+            TimestampDriver timestampDriver,
+            long partitionTimestamp,
+            long maxTimestamp,
+            int ttl
+    ) {
+        assert ttl != 0 : "ttl cannot be 0, invalid value";
+        // Table TTL measures age from the partition ceiling (the start of the next logical
+        // partition), so a partition expires only once even its newest possible record is
+        // older than the TTL.
+        final long partitionCeiling = txReader.getNextLogicalPartitionTimestamp(partitionTimestamp);
+        return isOlderThanTtl(timestampDriver, partitionCeiling, maxTimestamp, ttl);
+    }
+
+    /**
+     * Rewrites {@code _meta}'s metadataVersion in place, e.g. when the table gets a fresh sequencer, and
+     * re-stamps the checksum in the meta-format minor-version field to match. Use this rather than writing
+     * {@link #META_OFFSET_METADATA_VERSION} directly: the two fields are coupled, and breaking the coupling
+     * fails silently.
+     *
+     * <p>{@link #isMetaFormatAtLeast} trusts the stored minor version only while the low short of
+     * {@link #META_OFFSET_META_FORMAT_MINOR_VERSION} matches a checksum over (metadataVersion, columnCount).
+     * A caller that resets the metadataVersion of a table it clones or converts ({@code REBASE WAL},
+     * {@code SET TYPE WAL}) would otherwise invalidate that checksum, and every version-gated field (TTL,
+     * table format, dedup mode, Parquet encoding config, EXPIRE ROWS policy) would read as absent: TTL
+     * becomes 0, the table format falls back to NATIVE, the dedup mode to UPSERT, and a materialized view
+     * loses its EXPIRE ROWS policy.
+     *
+     * <p>The stored minor version is kept, never raised to {@link #META_FORMAT_MINOR_VERSION_LATEST}:
+     * claiming a newer format than the bytes carry would make the reader interpret never-written tail bytes
+     * as values. So a trusted field stays trusted and an untrusted one stays untrusted: if the source's
+     * checksum does not match, e.g. because a release that predates the field, or one that does not maintain
+     * it, wrote the header, its tail fields are already ignored, and the field is left as it is: recomputing
+     * it would turn whatever those bytes hold into a valid claim.
+     *
+     * <p>The checksum goes before the version. Should the process die between the two writes, the file stays
+     * untrusted, and a repeated call with the same version, which the table type conversion makes when it
+     * runs again at the next startup, completes the stamp.
+     */
+    public static void resetMetadataVersion(MemoryARW metaMem, long metadataVersion) {
+        final int minorVersionField = metaMem.getInt(META_OFFSET_META_FORMAT_MINOR_VERSION);
+        if (isMetaFormatMinorVersionFieldValid(metaMem, minorVersionField)) {
+            metaMem.putInt(
+                    META_OFFSET_META_FORMAT_MINOR_VERSION,
+                    Numbers.encodeLowHighShorts(
+                            checksumForMetaFormatMinorVersionField(metadataVersion, metaMem.getInt(META_OFFSET_COUNT)),
+                            Numbers.decodeHighShort(minorVersionField)
+                    )
+            );
+        }
+        metaMem.putLong(META_OFFSET_METADATA_VERSION, metadataVersion);
+    }
+
+    public static short checksumForMetaFormatMinorVersionField(long metadataVersion, int columnCount) {
+        int metaVersionInt = Numbers.decodeLowInt(metadataVersion) ^ Numbers.decodeHighInt(metadataVersion);
+        int checksumInt = 13 * metaVersionInt + 37 * columnCount;
+        short checksum = (short) (Numbers.decodeLowShort(checksumInt) ^ Numbers.decodeHighShort(checksumInt));
+        if (checksum == 0) {
+            checksum = -1337;
+        }
+        return checksum;
+    }
+
+    public static void cleanupDirQuiet(FilesFacade ff, Utf8Sequence dir, Log log) {
+        try {
+            Path dirPath = Path.getThreadLocal(dir);
+            if (ff.exists(dirPath.slash$())) {
+                if (!ff.rmdir(dirPath)) {
+                    log.error().$("error during temp directory cleanup [path=").$(dir).$(" errno=").$(ff.errno()).$(']').$();
+                }
+            }
+        } catch (Throwable e) {
+            log.error().$("error during temp directory cleanup [path=").$(dir).$(" error=").$(e).$(']').$();
+        }
+    }
+
+    public static int compressColumnCount(RecordMetadata metadata) {
+        int count = 0;
+        for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+            if (metadata.getColumnType(i) > 0) {
+                count++;
+            }
+        }
+        return count;
     }
 
     public static void createColumnVersionFile(MemoryMARW mem) {
@@ -163,195 +816,407 @@ public final class TableUtils {
         mem.zero();
     }
 
-    public static Path charFileName(Path path, CharSequence columnName, long columnNameTxn) {
-        path.concat(columnName).put(".c");
-        if (columnNameTxn > COLUMN_NAME_TXN_NONE) {
-            path.put('.').put(columnNameTxn);
+    public static void createConvertFile(FilesFacade ff, Path path, byte walFlag) {
+        long addr = 0;
+        long fd = -1;
+        try {
+            fd = ff.openRW(path.concat(CONVERT_FILE_NAME).$(), CairoConfiguration.O_NONE);
+            if (fd < 1) {
+                throw CairoException.critical(ff.errno()).put("Could not open file [path=").put(path).put(']');
+            }
+            addr = Unsafe.malloc(Byte.BYTES, MemoryTag.NATIVE_TABLE_WAL_WRITER);
+            if (addr < 1) {
+                throw CairoException.critical(ff.errno()).put("Could not allocate 1 byte");
+            }
+            Unsafe.putByte(addr, walFlag);
+            ff.write(fd, addr, Byte.BYTES, 0);
+        } finally {
+            if (addr > 0) {
+                Unsafe.free(addr, Byte.BYTES, MemoryTag.NATIVE_TABLE_WAL_WRITER);
+            }
+            ff.close(fd);
         }
-        return path.$();
+    }
+
+    @NotNull
+    public static Function createCursorFunction(
+            FunctionParser functionParser,
+            @NotNull IQueryModel model,
+            @NotNull SqlExecutionContext executionContext
+    ) throws SqlException {
+        final ExpressionNode tableNameExpr = model.getTableNameExpr();
+        final SqlExecutionContext.TableFunctionView previousView = executionContext.getTableFunctionView();
+        final ExpressionNode viewNameExpr = model.getViewNameExpr();
+        if (viewNameExpr != null) {
+            executionContext.setTableFunctionView(getTableFunctionView(viewNameExpr, executionContext));
+        }
+        final Function function;
+        try {
+            function = functionParser.parseFunction(tableNameExpr, AnyRecordMetadata.INSTANCE, executionContext);
+        } finally {
+            if (viewNameExpr != null) {
+                executionContext.setTableFunctionView(previousView);
+            }
+        }
+        if (!ColumnType.isCursor(function.getType())) {
+            Misc.free(function);
+            throw SqlException.$(tableNameExpr.position, "function must return CURSOR");
+        }
+        return function;
+    }
+
+    public static void createDirsOrFail(FilesFacade ff, Path path, int mkDirMode) {
+        if (ff.mkdirs(path.slash(), mkDirMode) != 0) {
+            throw CairoException.critical(ff.errno()).put("could not create directories [file=").put(path).put(']');
+        }
     }
 
     public static void createTable(
             CairoConfiguration configuration,
             MemoryMARW memory,
+            @Nullable Telemetry<TelemetryTask> telemetry,
             Path path,
             TableStructure structure,
             int tableVersion,
-            int tableId
+            int tableId,
+            CharSequence dirName
     ) {
         final FilesFacade ff = configuration.getFilesFacade();
-        final CharSequence root = configuration.getRoot();
+        final CharSequence root = configuration.getDbRoot();
         final int mkDirMode = configuration.getMkDirMode();
-        LOG.debug().$("create table [name=").$(structure.getTableName()).$(']').$();
-        path.of(root).concat(structure.getTableName());
+        createTable(ff, root, telemetry, mkDirMode, memory, path, structure, tableVersion, tableId, dirName, configuration.getCommitMode());
+    }
 
-        if (ff.mkdirs(path.slash$(), mkDirMode) != 0) {
-            throw CairoException.instance(ff.errno()).put("could not create [dir=").put(path).put(']');
+    public static void createTable(
+            FilesFacade ff,
+            CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            int mkDirMode,
+            MemoryMARW memory,
+            Path path,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            CharSequence dirName,
+            int commitMode
+    ) {
+        createTable(ff, root, telemetry, mkDirMode, memory, path, dirName, structure, tableVersion, tableId, commitMode);
+    }
+
+    public static void createTable(
+            FilesFacade ff,
+            CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            int mkDirMode,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            CharSequence dirName,
+            int commitMode
+    ) {
+        try (
+                Path path = new Path();
+                MemoryMARW mem = Vm.getCMARWInstance()
+        ) {
+            createTable(ff, root, telemetry, mkDirMode, mem, path, dirName, structure, tableVersion, tableId, commitMode);
         }
+    }
 
-        final int rootLen = path.length();
+    public static void createTable(
+            FilesFacade ff,
+            CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            int mkDirMode,
+            MemoryMARW memory,
+            Path path,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            int commitMode
+    ) {
+        createTableOrViewOrMatView(ff, root, mkDirMode, telemetry, memory, null, path, tableDir, structure, tableVersion, tableId, commitMode);
+    }
 
-        final long dirFd = !ff.isRestrictedFileSystem() ? TableUtils.openRO(ff, path.$(), LOG) : 0;
+    public static void createTableNameFile(MemoryMAR mem, CharSequence charSequence) {
+        try {
+            mem.putStr(charSequence);
+            mem.putByte((byte) 0);
+            mem.sync(false);
+        } finally {
+            // The memory can be a long-lived one, a SQL compiler's: a failed flush must not leave the file open in it.
+            mem.close(true, Vm.TRUNCATE_TO_POINTER);
+        }
+    }
+
+    public static void createTableOrMatViewInVolume(
+            FilesFacade ff,
+            CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            int mkDirMode,
+            MemoryMARW memory,
+            Path path,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            int commitMode
+    ) {
+        createTableOrMatViewInVolume(ff, root, telemetry, mkDirMode, memory, null, path, tableDir, structure, tableVersion, tableId, commitMode);
+    }
+
+    public static void createTableOrMatViewInVolume(
+            FilesFacade ff,
+            CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            int mkDirMode,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            Path path,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            int commitMode
+    ) {
+        LOG.info().$("create table in volume [path=").$(path).I$();
+        Path normalPath = Path.getThreadLocal2(root).concat(tableDir);
+        assert normalPath != path;
+        if (ff.isDirOrSoftLinkDir(normalPath.$())) {
+            throw CairoException.critical(ff.errno()).put("table directory already exists [path=").put(normalPath).put(']');
+        }
+        // path has been set by CREATE TABLE ... [IN VOLUME 'path'].
+        // it is a valid directory, or link to a directory, checked at bootstrap
+        if (ff.isDirOrSoftLinkDir(path.$())) {
+            throw CairoException.critical(ff.errno()).put("table directory already exists in volume [path=").put(path).put(']');
+        }
+        int rootLen = path.size();
+        try {
+            if (ff.mkdirs(path.slash(), mkDirMode) != 0) {
+                throw CairoException.critical(ff.errno()).put("could not create [dir=").put(path).put(']');
+            }
+            if (ff.softLink(path.trimTo(rootLen).$(), normalPath.$()) != 0) {
+                if (!ff.rmdir(path.slash())) {
+                    LOG.error().$("cannot remove table directory in volume [errno=").$(ff.errno()).$(", path=").$(path.trimTo(rootLen).$()).I$();
+                }
+                throw CairoException.critical(ff.errno()).put("could not create soft link [src=").put(path.trimTo(rootLen).$()).put(", tableDir=").put(tableDir).put(']');
+            }
+            createTableOrViewOrMatViewFiles(ff, memory, blockFileWriter, telemetry, path, rootLen, tableDir, structure, tableVersion, tableId, commitMode);
+        } finally {
+            path.trimTo(rootLen);
+        }
+    }
+
+    public static void createTableOrViewOrMatView(
+            FilesFacade ff,
+            CharSequence root,
+            int mkDirMode,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            Path path,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            int commitMode
+    ) {
+        LOG.debug().$("create table [name=").$safe(tableDir).I$();
+        path.of(root).concat(tableDir).$();
+        if (ff.isDirOrSoftLinkDir(path.$())) {
+            throw CairoException.critical(ff.errno()).put("table directory already exists [path=").put(path).put(']');
+        }
+        int rootLen = path.size();
+        boolean dirCreated = false;
+        try {
+            if (ff.mkdirs(path.slash(), mkDirMode) != 0) {
+                throw CairoException.critical(ff.errno()).put("could not create [dir=").put(path.trimTo(rootLen).$()).put(']');
+            }
+            dirCreated = true;
+            createTableOrViewOrMatViewFiles(ff, memory, blockFileWriter, telemetry, path, rootLen, tableDir, structure, tableVersion, tableId, commitMode);
+        } catch (Throwable e) {
+            if (dirCreated) {
+                ff.rmdir(path.trimTo(rootLen).slash());
+            }
+            throw e;
+        } finally {
+            path.trimTo(rootLen);
+        }
+    }
+
+    public static void createTableOrViewOrMatViewFiles(
+            FilesFacade ff,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            Path path,
+            int rootLen,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            int commitMode
+    ) {
+        createTableOrViewOrMatViewFiles(ff, memory, blockFileWriter, telemetry, path, rootLen, tableDir, structure, tableVersion, tableId, TXN_FILE_NAME, commitMode);
+    }
+
+    public static void createTableOrViewOrMatViewFiles(
+            FilesFacade ff,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            Path path,
+            int rootLen,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            CharSequence txnFileName
+    ) {
+        createTableOrViewOrMatViewFiles(ff, memory, blockFileWriter, telemetry, path, rootLen, tableDir, structure, tableVersion, tableId, txnFileName, CommitMode.SYNC);
+    }
+
+    public static void createTableOrViewOrMatViewFiles(
+            FilesFacade ff,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            Path path,
+            int rootLen,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            CharSequence txnFileName,
+            int commitMode
+    ) {
+        final long dirFd = !ff.isRestrictedFileSystem() ? TableUtils.openRONoCache(ff, path.trimTo(rootLen).$(), LOG) : 0;
         try (MemoryMARW mem = memory) {
             mem.smallFile(ff, path.trimTo(rootLen).concat(META_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
             mem.jumpTo(0);
-            final int count = structure.getColumnCount();
             path.trimTo(rootLen);
-            mem.putInt(count);
-            mem.putInt(structure.getPartitionBy());
-            mem.putInt(structure.getTimestampIndex());
-            mem.putInt(tableVersion);
-            mem.putInt(tableId);
-            mem.putInt(structure.getMaxUncommittedRows());
-            mem.putLong(structure.getCommitLag());
-            mem.jumpTo(TableUtils.META_OFFSET_COLUMN_TYPES);
-
-            assert count > 0;
-
-            for (int i = 0; i < count; i++) {
-                mem.putInt(structure.getColumnType(i));
-                long flags = 0;
-                if (structure.isIndexed(i)) {
-                    flags |= META_FLAG_BIT_INDEXED;
-                }
-
-                if (structure.isSequential(i)) {
-                    flags |= META_FLAG_BIT_SEQUENTIAL;
-                }
-
-                mem.putLong(flags);
-                mem.putInt(structure.getIndexBlockCapacity(i));
-                mem.putLong(structure.getColumnHash(i));
-                // reserved
-                mem.skip(8);
-            }
-
-            for (int i = 0; i < count; i++) {
-                mem.putStr(structure.getColumnName(i));
-            }
+            writeMetadata(structure, tableVersion, tableId, mem);
+            mem.sync(false);
 
             // create symbol maps
             int symbolMapCount = 0;
-            for (int i = 0; i < count; i++) {
-                if (ColumnType.isSymbol(structure.getColumnType(i))) {
-                    createSymbolMapFiles(
-                            ff,
-                            mem,
-                            path.trimTo(rootLen),
-                            structure.getColumnName(i),
-                            COLUMN_NAME_TXN_NONE,
-                            structure.getSymbolCapacity(i),
-                            structure.getSymbolCacheFlag(i)
-                    );
-                    symbolMapCount++;
+            // Plain VIEWs read from their base table, so they don't own their own
+            // symbol maps or _cv. Live views are physical WAL-backed tables that
+            // own their data and DO need both, even though isLiveView() is true.
+            if (!structure.isView()) {
+                for (int i = 0, n = structure.getColumnCount(); i < n; i++) {
+                    int columnType = structure.getColumnType(i);
+                    if (ColumnType.isSymbol(columnType)) {
+                        createSymbolMapFiles(
+                                ff,
+                                mem,
+                                path.trimTo(rootLen),
+                                structure.getColumnName(i),
+                                COLUMN_NAME_TXN_NONE,
+                                structure.getSymbolCapacity(i),
+                                structure.getSymbolCacheFlag(i),
+                                commitMode
+                        );
+                        symbolMapCount++;
+                    }
+
+                    if (telemetry != null) {
+                        if (ColumnType.isTimestampNano(columnType)) {
+                            TelemetryTask.store(telemetry, TelemetryOrigin.NO_MATTERS, TelemetryEvent.USE_TIMESTAMP_NANOS);
+                        } else if (ColumnType.isArray(columnType)) {
+                            TelemetryTask.store(telemetry, TelemetryOrigin.NO_MATTERS, TelemetryEvent.USE_ARRAY);
+                        }
+                    }
+                }
+
+
+                mem.smallFile(ff, path.trimTo(rootLen).concat(COLUMN_VERSION_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
+                createColumnVersionFile(mem);
+                mem.sync(false);
+                mem.close();
+
+                resetTodoLog(ff, path, rootLen, mem);
+                // allocate txn scoreboard
+                path.trimTo(rootLen).concat(TXN_SCOREBOARD_FILE_NAME).$();
+            }
+
+            mem.smallFile(ff, path.trimTo(rootLen).concat(TABLE_NAME_FILE).$(), MemoryTag.MMAP_DEFAULT);
+            createTableNameFile(mem, getTableNameFromDirName(tableDir));
+
+            if (structure.isView()) {
+                assert blockFileWriter != null;
+                try (BlockFileWriter writer = blockFileWriter) {
+                    writer.of(path.trimTo(rootLen).concat(ViewDefinition.VIEW_DEFINITION_FILE_NAME).$());
+                    ViewDefinition.append(structure.getViewDefinition(), writer);
                 }
             }
-            mem.smallFile(ff, path.trimTo(rootLen).concat(TXN_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
-            createTxn(mem, symbolMapCount, 0L, INITIAL_TXN, 0L, 0L, 0L, 0L);
+            if (structure.isMatView()) {
+                assert blockFileWriter != null;
+                try (BlockFileWriter writer = blockFileWriter) {
+                    writer.of(path.trimTo(rootLen).concat(MatViewDefinition.MAT_VIEW_DEFINITION_FILE_NAME).$());
+                    MatViewDefinition.append(structure.getMatViewDefinition(), writer);
+                }
+            }
+            // _lv must land BEFORE _txn, like _view and _mv above. _txn is what exists() keys on,
+            // so writing _lv after it leaves a crash window whose directory looks like a plain WAL
+            // table: the loader types it TABLE (no _lv), and it squats the view's name. It also
+            // makes the "missing _lv means CREATE crashed" reap unreachable for its stated cause,
+            // while leaving it live for the opposite one - dropping a committed view whose _lv was
+            // lost, data included.
+            if (structure.isLiveView()) {
+                assert blockFileWriter != null;
+                try (BlockFileWriter writer = blockFileWriter) {
+                    writer.of(path.trimTo(rootLen).concat(LiveViewDefinition.LIVE_VIEW_DEFINITION_FILE_NAME).$());
+                    LiveViewDefinition.append(structure.getLiveViewDefinition(), writer);
+                }
+            }
 
-
-            mem.smallFile(ff, path.trimTo(rootLen).concat(COLUMN_VERSION_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
-            createColumnVersionFile(mem);
-            mem.close();
-
-            resetTodoLog(ff, path, rootLen, mem);
-            // allocate txn scoreboard
-            path.trimTo(rootLen).concat(TXN_SCOREBOARD_FILE_NAME).$();
+            // Create TXN file last, it is used to determine if table exists
+            mem.smallFile(ff, path.trimTo(rootLen).concat(txnFileName).$(), MemoryTag.MMAP_DEFAULT);
+            createTxn(mem, symbolMapCount, 0L, 0L, INITIAL_TXN, 0L, 0L, 0L, 0L);
+            mem.sync(false);
         } finally {
             if (dirFd > 0) {
-                if (ff.fsync(dirFd) != 0) {
-                    LOG.error()
-                            .$("could not fsync [fd=").$(dirFd)
-                            .$(", errno=").$(ff.errno())
-                            .$(']').$();
-                }
-                ff.close(dirFd);
+                ff.fsyncAndClose(dirFd);
             }
         }
     }
 
-    public static long createTransitionIndex(
-            MemoryR masterMeta,
-            BaseRecordMetadata slaveMeta
+    public static void createTxn(
+            MemoryMW txMem,
+            int symbolMapCount,
+            long txn,
+            long seqTxn,
+            long dataVersion,
+            long partitionTableVersion,
+            long structureVersion,
+            long columnVersion,
+            long truncateVersion
     ) {
-        int slaveColumnCount = slaveMeta.columnCount;
-        int masterColumnCount = masterMeta.getInt(META_OFFSET_COUNT);
-        final long pTransitionIndex;
-        final int size = 8 + masterColumnCount * 8;
-
-        long index = pTransitionIndex = Unsafe.calloc(size, MemoryTag.NATIVE_TABLE_READER);
-        Unsafe.getUnsafe().putInt(index, size);
-        index += 8;
-
-        // index structure is
-        // [action: int, copy from:int]
-
-        // action: if -1 then current column in slave is deleted or renamed, else it's reused
-        // "copy from" >= 0 indicates that column is to be copied from slave position
-        // "copy from" < 0  indicates that column is new and should be taken from updated metadata position
-        // "copy from" == Integer.MIN_VALUE  indicates that column is deleted for good and should not be re-added from any source
-
-        long offset = getColumnNameOffset(masterColumnCount);
-        int slaveIndex = 0;
-        int shiftLeft = 0;
-        for (int masterIndex = 0; masterIndex < masterColumnCount; masterIndex++) {
-            CharSequence name = masterMeta.getStr(offset);
-            offset += Vm.getStorageLength(name);
-            int masterColumnType = getColumnType(masterMeta, masterIndex);
-
-            if (slaveIndex < slaveColumnCount) {
-                int existingWriterIndex = slaveMeta.getWriterIndex(slaveIndex);
-                if (existingWriterIndex > masterIndex) {
-                    // This column must be deleted so existing dense columns do not contain it
-                    assert masterColumnType < 0;
-                    continue;
-                }
-                assert existingWriterIndex == masterIndex;
-            }
-
-            int outIndex = slaveIndex - shiftLeft;
-            if (masterColumnType < 0) {
-                shiftLeft++; // Deleted in master
-                if (slaveIndex < slaveColumnCount) {
-                    Unsafe.getUnsafe().putInt(index + slaveIndex * 8L, -1);
-                    Unsafe.getUnsafe().putInt(index + slaveIndex * 8L + 4, Integer.MIN_VALUE);
-                }
-            } else {
-                if (
-                        slaveIndex < slaveColumnCount
-                                && isColumnIndexed(masterMeta, masterIndex) == slaveMeta.isColumnIndexed(slaveIndex)
-                                && Chars.equals(name, slaveMeta.getColumnName(slaveIndex))
-                ) {
-                    // reuse
-                    Unsafe.getUnsafe().putInt(index + outIndex * 8L + 4, slaveIndex);
-                    if (slaveIndex > outIndex) {
-                        // mark to do nothing with existing column, this may be overwritten later
-                        Unsafe.getUnsafe().putInt(index + slaveIndex * 8L + 4, Integer.MIN_VALUE);
-                    }
-                } else {
-                    // new
-                    if (slaveIndex < slaveColumnCount) {
-                        // free
-                        Unsafe.getUnsafe().putInt(index + slaveIndex * 8L, -1);
-                    }
-                    Unsafe.getUnsafe().putInt(index + outIndex * 8L + 4, -masterIndex - 1);
-                }
-            }
-            slaveIndex++;
-        }
-        Unsafe.getUnsafe().putInt(pTransitionIndex + 4, slaveIndex - shiftLeft);
-        return pTransitionIndex;
-    }
-
-    public static void createTxn(MemoryMW txMem, int symbolMapCount, long txn, long dataVersion, long partitionTableVersion, long structureVersion, long columnVersion, long truncateVersion) {
         txMem.putInt(TX_BASE_OFFSET_A_32, TX_BASE_HEADER_SIZE);
         txMem.putInt(TX_BASE_OFFSET_SYMBOLS_SIZE_A_32, symbolMapCount * 8);
         txMem.putInt(TX_BASE_OFFSET_PARTITIONS_SIZE_A_32, 0);
-        resetTxn(txMem, TX_BASE_HEADER_SIZE, symbolMapCount, txn, dataVersion, partitionTableVersion, structureVersion, columnVersion, truncateVersion);
-        txMem.setTruncateSize(TX_BASE_HEADER_SIZE + TX_RECORD_HEADER_SIZE);
+        txMem.putInt(TX_BASE_OFFSET_GEOMETRY_VERSION_A_32, 0);
+        txMem.putInt(TX_BASE_OFFSET_GEOMETRY_VERSION_STAMP_A_32, 0);
+        txMem.putInt(TX_BASE_OFFSET_GEOMETRY_VERSION_B_32, 0);
+        txMem.putInt(TX_BASE_OFFSET_GEOMETRY_VERSION_STAMP_B_32, 0);
+        resetTxn(
+                txMem,
+                TX_BASE_HEADER_SIZE,
+                symbolMapCount,
+                txn,
+                seqTxn,
+                dataVersion,
+                partitionTableVersion,
+                0,
+                structureVersion,
+                columnVersion,
+                truncateVersion
+        );
+        txMem.setTruncateSize(TX_BASE_HEADER_SIZE + calculateTxRecordSize(symbolMapCount * Long.BYTES, 0));
     }
 
-    public static LPSZ dFile(Path path, CharSequence columnName, long columnTxn) {
+    public static LPSZ dFile(Path path, @NotNull CharSequence columnName, long columnTxn) {
         path.concat(columnName).put(FILE_SUFFIX_D);
         if (columnTxn > COLUMN_NAME_TXN_NONE) {
             path.put('.').put(columnTxn);
@@ -359,41 +1224,97 @@ public final class TableUtils {
         return path.$();
     }
 
-    public static Path offsetFileName(Path path, CharSequence columnName, long columnNameTxn) {
-        path.concat(columnName).put(".o");
-        if (columnNameTxn > COLUMN_NAME_TXN_NONE) {
-            path.put('.').put(columnNameTxn);
+    public static LPSZ dFile(Path path, CharSequence columnName) {
+        return dFile(path, columnName, COLUMN_NAME_TXN_NONE);
+    }
+
+    /**
+     * Derives the dense descriptor indexes of columns carrying the bloom-filter flag
+     * (bit 25, set by {@link #packParquetConfig}) in their per-column parquet encoding
+     * config, appending them to {@code indexes}.
+     * <p>
+     * The index space is the parquet encoder's dense column list: deleted columns are
+     * skipped, so the produced indexes line up with the columns added to the
+     * {@link io.questdb.griffin.engine.table.parquet.PartitionDescriptor PartitionDescriptor}
+     * by both {@link #produceParquetFromNative} (CONVERT) and
+     * {@code O3PartitionJob.writeFreshParquetFromO3} (fresh O3 partitions). The Rust encoder
+     * reads bloom columns solely from this explicit list, never from the per-column config,
+     * so every encoder path that wants config-driven bloom filters must build the list here.
+     * <p>
+     * Like {@link #parseBloomFilterColumnIndexes}, this method only appends; the caller clears
+     * {@code indexes} first when a fresh result is required.
+     *
+     * @param metadata table metadata whose per-column parquet encoding config flags are inspected
+     * @param indexes  reusable DirectIntList that receives the flagged columns' dense indexes
+     */
+    public static void deriveBloomFilterColumnIndexes(RecordMetadata metadata, DirectIntList indexes) {
+        final int columnCount = metadata.getColumnCount();
+        int descriptorIndex = 0;
+        for (int i = 0; i < columnCount; i++) {
+            final int columnType = metadata.getColumnType(i);
+            if (columnType <= 0) {
+                continue; // skip deleted columns
+            }
+            if (isParquetConfigBloomFilter(metadata.getColumnMetadata(i).getParquetEncodingConfig())) {
+                indexes.add(descriptorIndex);
+            }
+            descriptorIndex++;
         }
-        return path.$();
+    }
+
+    public static long estimateAvgRecordSize(RecordMetadata metadata) {
+        long recSize = 0;
+        for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+            int columnType = metadata.getColumnType(i);
+            if (ColumnType.isVarSize(columnType)) {
+                // Estimate size of variable length column as 28 bytes
+                recSize += ESTIMATED_VAR_COL_SIZE;
+            } else if (columnType > 0) {
+                recSize += ColumnType.sizeOf(columnType);
+            }
+        }
+        return recSize;
     }
 
     public static int exists(FilesFacade ff, Path path, CharSequence root, CharSequence name) {
-        return exists(ff, path, root, name, 0, name.length());
+        return exists(ff, path.of(root).concat(name));
     }
 
-    public static int exists(FilesFacade ff, Path path, CharSequence root, CharSequence name, int lo, int hi) {
-        path.of(root).concat(name, lo, hi).$();
-        if (ff.exists(path)) {
-            // prepare to replace trailing \0
-            if (ff.exists(path.chop$().concat(TXN_FILE_NAME).$())) {
-                return TABLE_EXISTS;
-            } else {
-                return TABLE_RESERVED;
-            }
-        } else {
-            return TABLE_DOES_NOT_EXIST;
-        }
+    public static int exists(FilesFacade ff, Path path, CharSequence root, Utf8Sequence name) {
+        return exists(ff, path.of(root).concat(name));
+    }
+
+    public static int existsInVolume(FilesFacade ff, Path volumePath, CharSequence name) {
+        return exists(ff, volumePath.concat(name));
     }
 
     public static void freeTransitionIndex(long address) {
         if (address == 0) {
             return;
         }
-        Unsafe.free(address, Unsafe.getUnsafe().getInt(address), MemoryTag.NATIVE_TABLE_READER);
+        Unsafe.free(address, Unsafe.getInt(address), MemoryTag.NATIVE_TABLE_READER);
     }
 
-    public static long getColumnHash(MemoryR metaMem, int columnIndex) {
-        return metaMem.getLong(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 16);
+    public static int getColumnCount(Utf8Sequence metaPath, MemoryMR metaMem, long offset) {
+        final int columnCount = metaMem.getInt(offset);
+        if (columnCount < 0) {
+            throw validationException().put("incorrect columnCount [path=")
+                    .put(metaPath)
+                    .put(", columnCount=").put(columnCount)
+                    .put(']');
+        }
+        return columnCount;
+    }
+
+    public static CharSequence getColumnName(Utf8Sequence metaPath, MemoryMR metaMem, long memSize, long offset, int columnIndex) {
+        final int strLength = getInt(metaMem, memSize, offset);
+        if (strLength == TableUtils.NULL_LEN) {
+            throw validationException()
+                    .put("NULL column name [path=").put(metaPath)
+                    .put(", columnIndex=").put(columnIndex)
+                    .put(']');
+        }
+        return getCharSequence(metaMem, memSize, offset, strLength);
     }
 
     public static long getColumnNameOffset(int columnCount) {
@@ -404,8 +1325,211 @@ public final class TableUtils {
         return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE);
     }
 
-    public static long getPartitionTableIndexOffset(int symbolWriterCount, int index) {
-        return getPartitionTableIndexOffset(getPartitionTableSizeOffset(symbolWriterCount), index);
+    public static int getColumnType(Utf8Sequence metaPath, MemoryMR metaMem, long memSize, long offset, int columnIndex) {
+        final int columnType = getInt(metaMem, memSize, offset);
+        if (columnType >= 0 && ColumnType.sizeOf(columnType) == -1) {
+            throw validationException()
+                    .put("invalid column type [path=").put(metaPath)
+                    .put(", columnType=").put(columnType)
+                    .put(", columnIndex=").put(columnIndex)
+                    .put(']');
+        }
+        return columnType;
+    }
+
+    public static int getInt(MemoryR metaMem, long memSize, long offset) {
+        if (memSize < offset + Integer.BYTES) {
+            throw CairoException.fileTooSmall(memSize, offset + Integer.BYTES);
+        }
+        return metaMem.getInt(offset);
+    }
+
+    public static long getMaxTimestamp(
+            TxReader txReader,
+            TimestampDriver timestampDriver,
+            long wallClockMicros,
+            boolean wallClockEnabled
+    ) {
+        long maxTimestamp = txReader.getMaxTimestamp();
+        // When wall clock mode is enabled (default), use the minimum of maxTimestamp and current wall clock time.
+        // This prevents accidental data loss when future timestamps are inserted into a table with TTL enabled.
+        if (wallClockEnabled) {
+            final long wallClockTimestamp = timestampDriver.fromMicros(wallClockMicros);
+            maxTimestamp = Math.min(maxTimestamp, wallClockTimestamp);
+        }
+        return maxTimestamp;
+    }
+
+    public static int getMaxUncommittedRows(TableRecordMetadata metadata, CairoEngine engine) {
+        if (!metadata.isWalEnabled() && metadata instanceof TableWriterMetadata) {
+            return ((TableWriterMetadata) metadata).getMaxUncommittedRows();
+        }
+        try (TableMetadata tableMetadata = engine.getTableMetadata(metadata.getTableToken())) {
+            return tableMetadata.getMaxUncommittedRows();
+        }
+    }
+
+    /**
+     * Computes the byte offset of the trailing row-expiry policy section: the offset just past the
+     * column-name section and the per-column covering-indices section. Returns -1 when the section is
+     * absent/truncated (older formats) or a column-name length prefix is out of range.
+     * <p>
+     * A column name has length in [1, 255] (the filename bound {@link #buildColumnListFromMetadataFile}
+     * enforces). Rejecting anything else keeps the name walk from moving the offset backward, which would
+     * otherwise dereference a wild native address; this walk runs before the names are validated in the
+     * MetadataCache startup path, so it cannot rely on a prior check.
+     * <p>
+     * This is the single source of truth for the _meta readers (TableReaderMetadata, TableWriterMetadata
+     * and MetadataCache), so the policy offset cannot drift between them.
+     */
+    public static long getMetaExpiryPolicyOffset(MemoryR metaMem, int columnCount) {
+        long memSize = metaMem.size();
+        long offset = getColumnNameOffset(columnCount);
+        for (int i = 0; i < columnCount; i++) {
+            if (offset + Integer.BYTES > memSize) {
+                return -1;
+            }
+            int strLen = metaMem.getInt(offset);
+            if (strLen < 1 || strLen > 255) {
+                return -1;
+            }
+            offset += Vm.getStorageLength(strLen);
+        }
+        for (int i = 0; i < columnCount; i++) {
+            if (isColumnCovering(metaMem, i)) {
+                if (offset + Integer.BYTES > memSize) {
+                    return -1;
+                }
+                int includeCount = metaMem.getInt(offset);
+                offset += Integer.BYTES;
+                if (includeCount > 0) {
+                    if (offset + (long) includeCount * Integer.BYTES > memSize) {
+                        return -1;
+                    }
+                    offset += (long) includeCount * Integer.BYTES;
+                }
+            }
+        }
+        return offset;
+    }
+
+    /**
+     * Validates the row-expiry predicate string stored at {@code policyOffset} and returns the number
+     * of bytes it occupies ({@link Vm#getStorageLength}), or -1 when the stored length is corrupt. A
+     * negative length would make the caller's offset move backward into a wild native read, and an
+     * out-of-file length would read past the mapping. Unlike a column name, the predicate is an
+     * arbitrary SQL expression, so length 0 (the "no policy" case) and lengths above 255 are both valid.
+     *
+     * @param policyOffset offset of the predicate's length prefix; the caller must have already checked
+     *                     that {@code policyOffset + Integer.BYTES <= memSize}
+     */
+    public static long getMetaExpiryPredicateStorageLength(MemoryR metaMem, long policyOffset, long memSize) {
+        int predicateLen = metaMem.getInt(policyOffset);
+        if (predicateLen < 0) {
+            return -1;
+        }
+        long storageLength = Vm.getStorageLength(predicateLen);
+        return policyOffset + storageLength <= memSize ? storageLength : -1;
+    }
+
+    public static long getNullLong(int columnType, int longIndex) {
+        // In theory, we can have a column type where `NULL` value will be different `LONG` values,
+        // then this should return different values on longIndex. At the moment there are no such types.
+        return switch (ColumnType.tagOf(columnType)) {
+            case ColumnType.BOOLEAN, ColumnType.BYTE, ColumnType.CHAR, ColumnType.SHORT -> 0L;
+            case ColumnType.SYMBOL -> Numbers.encodeLowHighInts(SymbolTable.VALUE_IS_NULL, SymbolTable.VALUE_IS_NULL);
+            case ColumnType.FLOAT ->
+                    Numbers.encodeLowHighInts(Float.floatToIntBits(Float.NaN), Float.floatToIntBits(Float.NaN));
+            case ColumnType.DOUBLE -> Double.doubleToLongBits(Double.NaN);
+            case ColumnType.INT -> Numbers.encodeLowHighInts(Numbers.INT_NULL, Numbers.INT_NULL);
+            case ColumnType.LONG256, ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.LONG128,
+                 ColumnType.UUID, ColumnType.INTERVAL ->
+                // Long128, UUID, and INTERVAL are null when all 2 longs are NaNs
+                // Long256 is null when all 4 longs are NaNs
+                    Numbers.LONG_NULL;
+            case ColumnType.GEOBYTE, ColumnType.GEOLONG, ColumnType.GEOSHORT, ColumnType.GEOINT -> GeoHashes.NULL;
+            case ColumnType.IPv4 -> Numbers.IPv4_NULL;
+            case ColumnType.VARCHAR, ColumnType.BINARY, ColumnType.ARRAY -> NULL_LEN;
+            case ColumnType.STRING -> Numbers.encodeLowHighInts(NULL_LEN, NULL_LEN);
+            case ColumnType.DECIMAL8 -> Decimals.DECIMAL8_NULL;
+            case ColumnType.DECIMAL16 -> Decimals.DECIMAL16_NULL;
+            case ColumnType.DECIMAL32 -> Decimals.DECIMAL32_NULL;
+            case ColumnType.DECIMAL64 -> Decimals.DECIMAL64_NULL;
+            case ColumnType.DECIMAL128 -> {
+                if (longIndex == 0) {
+                    yield Decimals.DECIMAL128_HI_NULL;
+                }
+                yield Decimals.DECIMAL128_LO_NULL;
+            }
+            case ColumnType.DECIMAL256 -> switch (longIndex) {
+                case 0 -> Decimals.DECIMAL256_HH_NULL;
+                case 1 -> Decimals.DECIMAL256_HL_NULL;
+                case 2 -> Decimals.DECIMAL256_LH_NULL;
+                default -> Decimals.DECIMAL256_LL_NULL;
+            };
+            default -> {
+                assert false : "Invalid column type: " + columnType;
+                yield 0;
+            }
+        };
+    }
+
+
+    public static long getO3MaxLag(TableRecordMetadata metadata, CairoEngine engine) {
+        if (!metadata.isWalEnabled()) {
+            if (metadata instanceof TableWriterMetadata) {
+                return ((TableWriterMetadata) metadata).getO3MaxLag();
+            }
+
+            try (TableMetadata tableMetadata = engine.getTableMetadata(metadata.getTableToken())) {
+                return tableMetadata.getO3MaxLag();
+            }
+        }
+        // Does not have effect for WAL enabled tables
+        return 0;
+    }
+
+    /**
+     * Extracts the compression codec id (bits 8-15) from a packed Parquet config.
+     */
+    public static int getParquetConfigCompression(int packed) {
+        return (packed >> PARQUET_CONFIG_COMPRESSION_SHIFT) & PARQUET_CONFIG_COMPRESSION_MASK;
+    }
+
+    /**
+     * Extracts the compression level (bits 16-23) from a packed Parquet config.
+     * The raw value uses +1 encoding: 0 = not set, 1 = level 0, 2 = level 1, etc.
+     * Callers that display the level to the user should subtract 1 from non-zero values.
+     */
+    public static int getParquetConfigCompressionLevel(int packed) {
+        return (packed >> PARQUET_CONFIG_LEVEL_SHIFT) & PARQUET_CONFIG_LEVEL_MASK;
+    }
+
+    /**
+     * Extracts the encoding id (bits 0-7) from a packed Parquet config.
+     * The id corresponds to a {@code ParquetEncoding.ENCODING_*} constant.
+     */
+    public static int getParquetConfigEncoding(int packed) {
+        return packed & PARQUET_CONFIG_ENCODING_MASK;
+    }
+
+    /**
+     * Reads the packed Parquet encoding config for a column from table metadata memory.
+     * See {@link #packParquetConfig(int, int, int, boolean)} for the bit layout.
+     */
+    public static int getParquetEncodingConfig(MemoryR metaMem, int columnIndex) {
+        // type(4) + flags(8) + indexBlockCapacity(4) + symbolCapacity(4)
+        final long META_COLUMN_PARQUET_ENCODING_CONFIG_OFFSET = 20;
+        return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + META_COLUMN_PARQUET_ENCODING_CONFIG_OFFSET);
+    }
+
+    public static int getPartitionBy(TableRecordMetadata metadata, CairoEngine engine) {
+        if (!metadata.isWalEnabled() && metadata instanceof TableWriterMetadata) {
+            return ((TableWriterMetadata) metadata).getPartitionBy();
+        }
+        try (TableMetadata tableMetadata = engine.getTableMetadata(metadata.getTableToken())) {
+            return tableMetadata.getPartitionBy();
+        }
     }
 
     public static long getPartitionTableIndexOffset(long partitionTableOffset, int index) {
@@ -416,12 +1540,158 @@ public final class TableUtils {
         return getSymbolWriterIndexOffset(symbolWriterCount);
     }
 
+    /**
+     * Returns the root of the replacing chain that starts at {@code writerIndex}. Every hop moves
+     * to a lower column, so the walk always ends.
+     */
+    public static int getReplacingChainHead(MemoryR metaMem, int writerIndex) {
+        int origWriterIndex = writerIndex;
+        int ri = getReplacingColumnIndex(metaMem, writerIndex);
+        while (ri >= 0) {
+            origWriterIndex = ri;
+            ri = getReplacingColumnIndex(metaMem, ri);
+        }
+        return origWriterIndex;
+    }
+
+    /**
+     * Returns the column that {@code columnIndex} replaces, or -1 for none. Stored 1-based, 0 means
+     * none.
+     * <p>
+     * Old versions left these bytes unwritten, so an old {@code _meta} can hold junk here. A real
+     * replacing column is always added after the column it replaces, and that column is left marked
+     * deleted. Anything else is junk and reads as -1. This also keeps the chain walks in bounds and
+     * loop free.
+     */
+    public static int getReplacingColumnIndex(MemoryR metaMem, int columnIndex) {
+        int replacingIndex = metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8 + 4 + 8) - 1;
+        if (replacingIndex < 0 || replacingIndex >= columnIndex || getColumnType(metaMem, replacingIndex) > -1) {
+            return -1;
+        }
+        return replacingIndex;
+    }
+
+    public static int getSymbolCapacity(MemoryR metaMem, int columnIndex) {
+        return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8 + 4);
+    }
+
     public static long getSymbolWriterIndexOffset(int index) {
-        return TX_OFFSET_MAP_WRITER_COUNT_32 + 4 + index * 8L;
+        return TX_OFFSET_MAP_WRITER_COUNT_32 + Integer.BYTES + (long) index * Long.BYTES;
     }
 
     public static long getSymbolWriterTransientIndexOffset(int index) {
         return getSymbolWriterIndexOffset(index) + Integer.BYTES;
+    }
+
+    @NotNull
+    public static String getTableDir(boolean mangleDirNames, @NotNull String tableName, int tableId, boolean isWal) {
+        String dirName = tableName;
+        if (isWal) {
+            dirName += TableUtils.SYSTEM_TABLE_NAME_SUFFIX;
+            dirName += tableId;
+        } else if (mangleDirNames) {
+            dirName += TableUtils.SYSTEM_TABLE_NAME_SUFFIX;
+        }
+        return dirName;
+    }
+
+    /**
+     * Returns the view that the table-name functions and tables of a model expanded from that view
+     * read through, see
+     * {@link SqlExecutionContext#isTableFunctionVisible(TableToken, SqlExecutionContext.TableFunctionView)}.
+     * That is the definition SqlParser expanded the model from, so that the objects the definition
+     * names are those of the model, even when another session changes the view during the compile.
+     * A view name that SqlParser did not stamp resolves to the current definition.
+     */
+    public static SqlExecutionContext.TableFunctionView getTableFunctionView(
+            @NotNull ExpressionNode viewNameExpr,
+            @NotNull SqlExecutionContext executionContext
+    ) throws SqlException {
+        if (viewNameExpr.tableFunctionView != null) {
+            return viewNameExpr.tableFunctionView;
+        }
+        final TableToken viewToken = executionContext.getTableTokenIfExists(viewNameExpr.token);
+        if (viewToken == null || !viewToken.isView()) {
+            throw SqlException.viewDoesNotExist(viewNameExpr.position, viewNameExpr.token);
+        }
+        final ViewDefinition viewDefinition = executionContext.getCairoEngine().getViewGraph().getViewDefinition(viewToken);
+        if (viewDefinition == null) {
+            throw SqlException.viewDoesNotExist(viewNameExpr.position, viewNameExpr.token);
+        }
+        return new SqlExecutionContext.TableFunctionView(viewDefinition);
+    }
+
+    public static int getTableIdFromTableDir(CharSequence dirName) throws NumericException {
+        int suffixIndex = Chars.indexOf(dirName, SYSTEM_TABLE_NAME_SUFFIX);
+        if (suffixIndex == -1) {
+            throw NumericException.instance()
+                    .put("cannot parse table id from table dir name [dirName=").put(dirName)
+                    .put(']');
+        }
+        return Numbers.parseInt(dirName, suffixIndex + 1, dirName.length());
+    }
+
+    public static CharSequence getTableNameFromDirName(CharSequence privateName) {
+        int suffixIndex = Chars.indexOf(privateName, SYSTEM_TABLE_NAME_SUFFIX);
+        if (suffixIndex == -1) {
+            return privateName;
+        }
+        return Chars.toString(privateName).substring(0, suffixIndex);
+    }
+
+    public static int getTimestampIndex(Utf8Sequence metaPath, MemoryMR metaMem, long offset, int columnCount) {
+        final int timestampIndex = metaMem.getInt(offset);
+        if (timestampIndex < -1 || timestampIndex >= columnCount) {
+            throw validationException()
+                    .put("timestamp index is outside of range, [path=").put(metaPath)
+                    .put(", timestampIndex=").put(timestampIndex)
+                    .put(", columnCount=").put(columnCount)
+                    .put(']');
+        }
+        return timestampIndex;
+    }
+
+    public static int getTimestampType(TableStructure structure) {
+        int timestampIndex = structure.getTimestampIndex();
+        if (timestampIndex < 0) {
+            return ColumnType.NULL;
+        }
+        return structure.getColumnType(timestampIndex);
+    }
+
+    public static void handleMetadataLoadException(
+            TableToken tableToken,
+            long deadline,
+            CairoException ex,
+            MillisecondClock millisecondClock,
+            long spinLockTimeout
+    ) {
+        // This is temporary solution until we can get multiple version of metadata not overwriting each other
+        if (ex.isFileCannotRead()) {
+            if (millisecondClock.getTicks() < deadline) {
+                LOG.info().$("error reloading metadata [table=").$(tableToken)
+                        .$(", msg=").$safe(ex.getFlyweightMessage())
+                        .$(", errno=").$(ex.getErrno())
+                        .I$();
+                Os.pause();
+            } else {
+                throw CairoException.critical(ex.getErrno()).put("Metadata read timeout [src=writer, timeout=").put(spinLockTimeout).put("ms, err=").put(ex.getFlyweightMessage()).put(']');
+            }
+        } else {
+            throw ex;
+        }
+    }
+
+    /**
+     * Returns true when the meta file's minor version is at least
+     * {@link #META_FORMAT_MINOR_VERSION_PARQUET_ENCODING_CONFIG}, i.e. the per-column parquet
+     * encoding config field at column-entry offset 20 can be read without picking up stale
+     * bytes from older meta layouts. Spelled separately from {@link #isMetaFormatUpToDate}
+     * because a future bump of {@code META_FORMAT_MINOR_VERSION_LATEST} must not silently
+     * invalidate this field for 9.3.4 / 9.3.5 tables that legitimately have it set.
+     */
+    public static boolean hasParquetEncodingConfig(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_PARQUET_ENCODING_CONFIG);
     }
 
     public static LPSZ iFile(Path path, CharSequence columnName, long columnTxn) {
@@ -432,9 +1702,115 @@ public final class TableUtils {
         return path.$();
     }
 
-    public static boolean isValidColumnName(CharSequence seq) {
-        for (int i = 0, l = seq.length(); i < l; i++) {
-            char c = seq.charAt(i);
+    public static LPSZ iFile(Path path, CharSequence columnName) {
+        return iFile(path, columnName, COLUMN_NAME_TXN_NONE);
+    }
+
+    /**
+     * Check is table name does not start with temp table prefix. Usually in case
+     * of table renames, table name can have temp prefix.
+     *
+     * @param tableName       name of the table
+     * @param tempTablePrefix the temp prefix
+     * @return true if table name is not pending table rename.
+     */
+    public static boolean isFinalTableName(String tableName, CharSequence tempTablePrefix) {
+        return !Chars.startsWith(tableName, tempTablePrefix);
+    }
+
+    public static boolean isLiveViewDefinitionFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(LiveViewDefinition.LIVE_VIEW_DEFINITION_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isLiveViewDropSentinelFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(LiveViewDefinition.LIVE_VIEW_DROP_SENTINEL_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isLiveViewStateFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(LiveViewState.LIVE_VIEW_STATE_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isMatViewDefinitionFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(MatViewDefinition.MAT_VIEW_DEFINITION_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isMatViewStateFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(MatViewState.MAT_VIEW_STATE_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    /*
+     * Checks that the minor version of the metadata format is up to date, i.e., at least the value
+     * of the TableUtils.META_FORMAT_MINOR_VERSION_LATEST constant.
+     *
+     * Metadata Format Minor Version field encodes 2 shorts:
+     * - Low short is a checksum that changes with every update to the metadata record
+     * - High short is set to TableUtils.META_FORMAT_MINOR_VERSION_LATEST
+     *
+     * The Metadata Format Minor Version field was not present in the initial version of the metadata format. This is
+     * why we need the checksum: when it doesn't match, we can't trust the version stored in it, and should assume
+     * the QuestDB version that wrote the metadata predates its introduction.
+     *
+     * Table storage itself is forward- and backward-compatible, so it's safe to read regardless of this version.
+     */
+    public static boolean isMetaFormatUpToDate(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_LATEST);
+    }
+
+    /**
+     * Returns true when bit 25 (the bloom filter flag) is set, meaning
+     * this column should have a bloom filter written when converted to parquet.
+     */
+    public static boolean isParquetConfigBloomFilter(int packed) {
+        return (packed & PARQUET_CONFIG_BLOOM_FILTER_FLAG) != 0;
+    }
+
+    /**
+     * Returns true when bit 24 (the explicit flag) is set, meaning the user
+     * explicitly configured encoding/compression for this column via ALTER TABLE.
+     */
+    public static boolean isParquetConfigExplicit(int packed) {
+        return (packed & PARQUET_CONFIG_EXPLICIT_FLAG) != 0;
+    }
+
+    public static boolean isSymbolCached(MemoryR metaMem, int columnIndex) {
+        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_SYMBOL_CACHE) != 0;
+    }
+
+    /**
+     * A lock reason the WAL apply machinery did not arrange itself is unsolicited - including {@link
+     * io.questdb.cairo.pool.WriterPool#OWNERSHIP_REASON_UNKNOWN}, reported while a holder is still constructing the
+     * writer and has not stamped its reason yet.
+     */
+    public static boolean isUnsolicitedTableLock(String lockReason) {
+        return !WAL_2_TABLE_WRITE_REASON.equals(lockReason)
+                && !WAL_2_TABLE_RESUME_REASON.equals(lockReason)
+                && !getCommandName(CMD_STORAGE_POLICY).equals(lockReason)
+                // The compaction sweep holds the writer to land its swap the same way STORAGE POLICY does.
+                && !getCommandName(CMD_COMPOSITE_PARTITION_SWAP).equals(lockReason)
+                && !getCommandName(CMD_PARQUET_PARTITION_SWAP).equals(lockReason)
+                // A publisher that finds the writer back in the pool ticks the queue under this reason.
+                && !WriterPool.OWNERSHIP_REASON_ASYNC_COMMAND.equals(lockReason);
+    }
+
+    public static boolean isValidColumnName(CharSequence columnName, int fsFileNameLimit) {
+        final int length = columnName.length();
+        if (length > fsFileNameLimit) {
+            // Most file systems do not support file names longer than 255 bytes
+            return false;
+        }
+
+        for (int i = 0; i < length; i++) {
+            char c = columnName.charAt(i);
             switch (c) {
                 case '?':
                 case '.':
@@ -443,7 +1819,6 @@ public final class TableUtils {
                 case '\"':
                 case '\\':
                 case '/':
-                case '\0':
                 case ':':
                 case ')':
                 case '(':
@@ -452,55 +1827,200 @@ public final class TableUtils {
                 case '*':
                 case '%':
                 case '~':
+                case '\u0000': // Control characters
+                case '\u0001':
+                case '\u0002':
+                case '\u0003':
+                case '\u0004':
+                case '\u0005':
+                case '\u0006':
+                case '\u0007':
+                case '\u0008':
+                case '	':
+                case '\u000B':
+                case '\u000c':
+                case '\n':
+                case '\r':
+                case '\u000e':
+                case '\u000f':
+                case '\u007f':
                 case 0xfeff: // UTF-8 BOM (Byte Order Mark) can appear at the beginning of a character stream
                     return false;
                 default:
                     break;
             }
         }
-        return true;
+        return length > 0;
     }
 
-    public static long lock(FilesFacade ff, Path path) {
-        long fd = ff.openRW(path, CairoConfiguration.O_NONE);
+    public static boolean isValidTableName(CharSequence tableName, int fsFileNameLimit) {
+        final int length = tableName.length();
+        if (length > fsFileNameLimit) {
+            // Most file systems do not support file names longer than 255 bytes
+            return false;
+        }
+
+        for (int i = 0; i < length; i++) {
+            char c = tableName.charAt(i);
+            switch (c) {
+                case '.':
+                    if (i == 0 || i == length - 1 || tableName.charAt(i - 1) == '.') {
+                        // Single dot in the middle is allowed only
+                        // Starting from . hides directory in Linux
+                        // Ending . can be trimmed by some Windows versions / file systems
+                        // Double, triple dot look suspicious
+                        // Single dot allowed as compatibility,
+                        // when someone uploads 'file_name.csv' the file name used as the table name
+                        return false;
+                    }
+                    break;
+                case '?':
+                case ',':
+                case '\'':
+                case '\"':
+                case '\\':
+                case '/':
+                case ':':
+                case ')':
+                case '(':
+                case '+':
+                case '*':
+                case '%':
+                case '~':
+                case '\u0000':  // Control characters
+                case '\u0001':
+                case '\u0002':
+                case '\u0003':
+                case '\u0004':
+                case '\u0005':
+                case '\u0006':
+                case '\u0007':
+                case '\u0008':
+                case '	':
+                case '\u000B':
+                case '\u000c':
+                case '\r':
+                case '\n':
+                case '\u000e':
+                case '\u000f':
+                case '\u007f':
+                case 0xfeff: // UTF-8 BOM (Byte Order Mark) can appear at the beginning of a character stream
+                    return false;
+            }
+        }
+        return length > 0 && tableName.charAt(0) != ' ' && tableName.charAt(length - 1) != ' ';
+    }
+
+    public static boolean isViewDefinitionFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(ViewDefinition.VIEW_DEFINITION_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static int lengthOf(@Nullable CharSequence columnValue) {
+        return columnValue != null ? columnValue.length() : NULL_LEN;
+    }
+
+    public static long lock(FilesFacade ff, LPSZ path, boolean logError) {
+        return lock(ff, path, logError, false);
+    }
+
+    public static long lock(FilesFacade ff, LPSZ path, boolean verbose, boolean logDebug) {
+        // workaround for https://github.com/docker/for-mac/issues/7004
+        boolean withLogging = verbose || logDebug;
+        if (Files.VIRTIO_FS_DETECTED) {
+            if (!ff.touch(path)) {
+                if (withLogging) {
+                    LogRecord log = logDebug ? LOG.debug() : LOG.error();
+                    log.$("cannot touch '").$(path).$("' to lock [errno=").$(ff.errno()).I$();
+                }
+                return -1;
+            }
+        }
+
+        long fd = ff.openRWNoCache(path, CairoConfiguration.O_NONE);
         if (fd == -1) {
-            LOG.error().$("cannot open '").utf8(path).$("' to lock [errno=").$(ff.errno()).$(']').$();
-            return -1L;
+            if (withLogging) {
+                LogRecord log = logDebug ? LOG.debug() : LOG.error();
+                log.$("cannot open '").$(path).$("' to lock [errno=").$(ff.errno()).I$();
+            }
+            return -1;
         }
-
         if (ff.lock(fd) != 0) {
-            LOG.error().$("cannot lock '").utf8(path).$("' [errno=").$(ff.errno()).$(", fd=").$(fd).$(']').$();
+            if (withLogging) {
+                LogRecord log = logDebug ? LOG.debug() : LOG.error();
+                log.$("cannot lock '").$(path).$("' [errno=").$(ff.errno()).$(", fd=").$(fd).I$();
+            }
             ff.close(fd);
-            return -1L;
+            return -1;
         }
 
+        if (withLogging) {
+            LOG.debug().$("locked '").$(path).$("' [fd=").$(fd).I$();
+        }
         return fd;
     }
 
-    public static void lockName(Path path) {
-        path.put(".lock").$();
+    public static long lock(FilesFacade ff, LPSZ path) {
+        return lock(ff, path, true);
+    }
+
+    public static LPSZ lockName(Path path) {
+        return path.put(".lock").$();
+    }
+
+    public static long mapAppendColumnBuffer(FilesFacade ff, long fd, long offset, long size, boolean rw, int memoryTag) {
+        assert !VM_PARANOIA_MODE || ff.length(fd) >= offset + size : "mmap ro buffer is beyond EOF";
+
+        // Linux requires the mmap offset to be page aligned
+        long alignedOffset = Files.floorPageSize(offset);
+        long alignedExtraLen = offset - alignedOffset;
+        long mapAddr = rw ?
+                mapRWNoAlloc(ff, fd, size + alignedExtraLen, alignedOffset, memoryTag) :
+                TableUtils.mapRO(ff, fd, size + alignedExtraLen, alignedOffset, memoryTag);
+        ff.madvise(mapAddr, size + alignedExtraLen, rw ? Files.POSIX_MADV_RANDOM : Files.POSIX_MADV_SEQUENTIAL);
+        return mapAddr + alignedExtraLen;
+    }
+
+    public static void mapAppendColumnBufferRelease(FilesFacade ff, long address, long offset, long size, int memoryTag) {
+        long alignedOffset = Files.floorPageSize(offset);
+        long alignedExtraLen = offset - alignedOffset;
+        long adjustedAddress = address - alignedExtraLen;
+        assert adjustedAddress > 0 : "address <= alignedExtraLen";
+        ff.munmap(adjustedAddress, size + alignedExtraLen, memoryTag);
     }
 
     public static long mapRO(FilesFacade ff, long fd, long size, int memoryTag) {
-        return mapRO(ff, fd, size, 0, memoryTag);
+        return TableUtils.mapRO(ff, fd, size, 0, memoryTag);
+    }
+
+    public static long mapRO(FilesFacade ff, LPSZ path, Log log, long size, int memoryTag) {
+        final long fd = openRO(ff, path, log);
+        try {
+            return mapRO(ff, fd, size, memoryTag);
+        } finally {
+            ff.close(fd);
+        }
     }
 
     /**
      * Maps a file in read-only mode.
      * <p>
      * Important note. Linux requires the offset to be page aligned.
-     * @param ff files facade, - intermediary to allow intercepting calls to the OS.
-     * @param fd file descriptor, previously provided by one of openFile() functions
-     * @param size size of the mapped file region
-     * @param offset offset in file to begin mapping
+     *
+     * @param ff        files facade - intermediary to allow intercepting calls to the OS.
+     * @param fd        file descriptor, previously provided by one of openFile() functions
+     * @param size      size of the mapped file region
+     * @param offset    offset in file to begin mapping
      * @param memoryTag bucket to trace memory allocation calls
      * @return read-only memory address
      */
     public static long mapRO(FilesFacade ff, long fd, long size, long offset, int memoryTag) {
-        assert offset % ff.getPageSize() == 0;
+        assert fd != -1;
+        assert offset % Files.PAGE_SIZE == 0;
         final long address = ff.mmap(fd, size, offset, Files.MAP_RO, memoryTag);
         if (address == FilesFacade.MAP_FAILED) {
-            throw CairoException.instance(ff.errno())
+            throw CairoException.critical(ff.errno())
                     .put("could not mmap ")
                     .put(" [size=").put(size)
                     .put(", offset=").put(offset)
@@ -512,6 +2032,38 @@ public final class TableUtils {
         return address;
     }
 
+    /**
+     * Maps a file in read-only mode without using the MmapCache.
+     * Useful for streaming reads where we want each mapping to be independent.
+     */
+    public static long mapRONoCache(FilesFacade ff, long fd, long size, int memoryTag) {
+        assert fd != -1;
+        final long address = ff.mmapNoCache(fd, size, 0, Files.MAP_RO, memoryTag);
+        if (address == FilesFacade.MAP_FAILED) {
+            throw CairoException.critical(ff.errno())
+                    .put("could not mmap (no cache) ")
+                    .put(" [size=").put(size)
+                    .put(", fd=").put(fd)
+                    .put(", memUsed=").put(Unsafe.getMemUsed())
+                    .put(", fileLen=").put(ff.length(fd))
+                    .put(']');
+        }
+        return address;
+    }
+
+    /**
+     * Maps a file in read-only mode without using the MmapCache.
+     * Opens the file, maps it, and closes the fd.
+     */
+    public static long mapRONoCache(FilesFacade ff, LPSZ path, Log log, long size, int memoryTag) {
+        final long fd = openRO(ff, path, log);
+        try {
+            return mapRONoCache(ff, fd, size, memoryTag);
+        } finally {
+            ff.close(fd);
+        }
+    }
+
     public static long mapRW(FilesFacade ff, long fd, long size, int memoryTag) {
         return mapRW(ff, fd, size, 0, memoryTag);
     }
@@ -521,30 +2073,46 @@ public final class TableUtils {
      * <p>
      * Important note. Linux requires the offset to be page aligned.
      *
-     * @param ff files facade, - intermediary to allow intercepting calls to the OS.
-     * @param fd file descriptor, previously provided by one of openFile() functions. File has to be opened read-write
-     * @param size size of the mapped file region
-     * @param offset offset in file to begin mapping
+     * @param ff        files facade, - intermediary to allow intercepting calls to the OS.
+     * @param fd        file descriptor, previously provided by one of openFile() functions. File has to be opened read-write
+     * @param size      size of the mapped file region
+     * @param offset    offset in file to begin mapping
      * @param memoryTag bucket to trace memory allocation calls
      * @return read-write memory address
      */
     public static long mapRW(FilesFacade ff, long fd, long size, long offset, int memoryTag) {
-        assert offset % ff.getPageSize() == 0;
-        allocateDiskSpace(ff, fd, size + offset);
-        long addr = ff.mmap(fd, size, offset, Files.MAP_RW, memoryTag);
-        if (addr > -1) {
-            return addr;
-        }
-        throw CairoException.instance(ff.errno()).put("could not mmap column [fd=").put(fd).put(", size=").put(size).put(']');
+        return mapRW(ff, fd, size, offset, memoryTag, ff.length(fd));
     }
 
-    public static long mapRWOrClose(FilesFacade ff, long fd, long size, int memoryTag) {
-        try {
-            return TableUtils.mapRW(ff, fd, size, memoryTag);
-        } catch (CairoException e) {
-            ff.close(fd);
-            throw e;
+    public static long mapRW(FilesFacade ff, long fd, long size, long offset, int memoryTag, long existingSize) {
+        assert fd != -1;
+        assert offset % Files.PAGE_SIZE == 0;
+        allocateDiskSpaceAlignedFromLength(ff, fd, size + offset, existingSize);
+        return mapRWNoAlloc(ff, fd, size, offset, memoryTag);
+    }
+
+    /**
+     * Maps a file in read-write mode without allocating the disk space.
+     * <p>
+     * Important note. Linux requires the offset to be page aligned.
+     *
+     * @param ff        files facade, - intermediary to allow intercepting calls to the OS.
+     * @param fd        file descriptor, previously provided by one of openFile() functions. File has to be opened read-write
+     * @param size      size of the mapped file region
+     * @param offset    offset in file to begin mapping
+     * @param memoryTag bucket to trace memory allocation calls
+     * @return read-write memory address
+     */
+    public static long mapRWNoAlloc(FilesFacade ff, long fd, long size, long offset, int memoryTag) {
+        long addr = ff.mmap(fd, size, offset, Files.MAP_RW, memoryTag);
+        if (addr != FilesFacade.MAP_FAILED) {
+            return addr;
         }
+        int errno = ff.errno();
+        if (Os.type != Os.WINDOWS || errno != 112) {
+            throw CairoException.critical(ff.errno()).put("could not mmap column [fd=").put(fd).put(", size=").put(size).put(']');
+        }
+        throw CairoException.critical(ff.errno()).put("No space left [size=").put(size).put(", fd=").put(fd).put(']');
     }
 
     public static long mremap(
@@ -554,53 +2122,667 @@ public final class TableUtils {
             long prevSize,
             long newSize,
             int mapMode,
-            int memoryTag) {
-        final long page = ff.mremap(fd, prevAddress, prevSize, newSize, 0, mapMode, memoryTag);
+            int memoryTag
+    ) {
+        return mremap(ff, fd, prevAddress, prevSize, newSize, 0L, mapMode, memoryTag);
+    }
+
+    public static long mremap(
+            FilesFacade ff,
+            long fd,
+            long prevAddress,
+            long prevSize,
+            long newSize,
+            long offset,
+            int mapMode,
+            int memoryTag
+    ) {
+        final long page = ff.mremap(fd, prevAddress, prevSize, newSize, offset, mapMode, memoryTag);
         if (page == FilesFacade.MAP_FAILED) {
             int errno = ff.errno();
             // Closing memory will truncate size to current append offset.
             // Since the failed resize can occur before append offset can be
             // explicitly set, we must assume that file size should be
             // equal to previous memory size
-            throw CairoException.instance(errno).put("could not remap file [previousSize=").put(prevSize).put(", newSize=").put(newSize).put(", fd=").put(fd).put(']');
+            throw CairoException.critical(errno).put("could not remap file [previousSize=").put(prevSize)
+                    .put(", newSize=").put(newSize)
+                    .put(", offset=").put(offset)
+                    .put(", fd=").put(fd)
+                    .put(']');
         }
         return page;
+    }
+
+    /**
+     * Remap memory without using the MmapCache. Useful for streaming reads.
+     */
+    public static long mremapNoCache(
+            FilesFacade ff,
+            long fd,
+            long prevAddress,
+            long prevSize,
+            long newSize,
+            int mapMode,
+            int memoryTag
+    ) {
+        final long page = ff.mremapNoCache(fd, prevAddress, prevSize, newSize, 0L, mapMode, memoryTag);
+        if (page == FilesFacade.MAP_FAILED) {
+            int errno = ff.errno();
+            throw CairoException.critical(errno).put("could not remap file (no cache) [previousSize=").put(prevSize)
+                    .put(", newSize=").put(newSize)
+                    .put(", fd=").put(fd)
+                    .put(']');
+        }
+        return page;
+    }
+
+    public static void msync(FilesFacade ff, long addr, long len, boolean async) {
+        // Linux requires the msync address to be page aligned
+        long alignedAddr = Files.floorPageSize(addr);
+        long alignedExtraLen = addr - alignedAddr;
+        ff.msync(alignedAddr, len + alignedExtraLen, async);
+    }
+
+    public static LPSZ offsetFileName(Path path, CharSequence columnName, long columnNameTxn) {
+        path.concat(columnName).put(".o");
+        if (columnNameTxn > COLUMN_NAME_TXN_NONE) {
+            path.put('.').put(columnNameTxn);
+        }
+        return path.$();
     }
 
     public static void oldPartitionName(Path path, long txn) {
         path.put("-x-").put(txn);
     }
 
-    public static long openFileRWOrFail(FilesFacade ff, LPSZ path, long opts) {
+    public static long openAppend(FilesFacade ff, LPSZ path, Log log) {
+        final long fd = ff.openAppend(path);
+        if (fd > -1) {
+            log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
+            return fd;
+        }
+        throw CairoException.critical(ff.errno()).put("could not open append [file=").put(path).put(']');
+    }
+
+    public static long openFileRWOrFail(FilesFacade ff, LPSZ path, int opts) {
         return openRW(ff, path, LOG, opts);
+    }
+
+    public static long openRO(FilesFacade ff, Path path, CharSequence fileName, Log log) {
+        final int rootLen = path.size();
+        path.concat(fileName);
+        try {
+            return TableUtils.openRO(ff, path.$(), log);
+        } finally {
+            path.trimTo(rootLen);
+        }
     }
 
     public static long openRO(FilesFacade ff, LPSZ path, Log log) {
         final long fd = ff.openRO(path);
         if (fd > -1) {
-            log.debug().$("open [file=").$(path).$(", fd=").$(fd).$(']').$();
+            log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
             return fd;
         }
-        throw CairoException.instance(ff.errno()).put("could not open read-only [file=").put(path).put(']');
+        int errno = ff.errno();
+        if (Files.isErrnoFileCannotRead(errno)) {
+            throw CairoException.critical(errno).put("could not open, file does not exist: ").put(path).put(']');
+        }
+        throw CairoException.critical(errno).put("could not open read-only [file=").put(path).put(']');
     }
 
-    public static long openRW(FilesFacade ff, LPSZ path, Log log, long opts) {
-        final long fd = ff.openRW(path, opts);
+    public static long openRONoCache(FilesFacade ff, Path path, CharSequence fileName, Log log) {
+        final int rootLen = path.size();
+        path.concat(fileName);
+        try {
+            return TableUtils.openRONoCache(ff, path.$(), log);
+        } finally {
+            path.trimTo(rootLen);
+        }
+    }
+
+    /**
+     * Fsyncs a directory so the names created or removed in it are durable.
+     * <p>
+     * On POSIX a rename or unlink survives a power loss only after the directory itself is fsynced;
+     * fsyncing the files inside it does not do that. Call this between publishing a new name and anything
+     * that makes a pointer to it durable, or that removes the name it replaced.
+     * <p>
+     * Fail-stop: an unopenable directory or a failed fsync throws ({@link #openRONoCache} and
+     * {@link FilesFacade#fsyncAndClose} both throw), because a silently skipped barrier cannot be told
+     * apart from a missing one. Skipped on a restricted (Windows) file system, which cannot open a
+     * directory for fsync.
+     */
+    public static void fsyncDirDurable(FilesFacade ff, LPSZ dirPath) {
+        if (ff.isRestrictedFileSystem()) {
+            return;
+        }
+        ff.fsyncAndClose(openRONoCache(ff, dirPath, LOG));
+    }
+
+    /**
+     * Fsyncs a file that a durable pointer is about to name, opening it only for the barrier.
+     * <p>
+     * The handle is opened read-write because Windows requires it: {@code fsync} there is
+     * {@code FlushFileBuffers}, which needs {@code GENERIC_WRITE} on the handle and returns
+     * {@code ERROR_ACCESS_DENIED} (errno 5) for the read-only handle {@link #openRONoCache} produces. A
+     * POSIX read-only fd fsyncs fine, so a read-only barrier would work on Linux and fail on Windows.
+     * <p>
+     * Unlike {@link #fsyncDirDurable} this runs on a restricted file system too: a directory barrier is
+     * impossible on Windows, a file barrier is not.
+     * <p>
+     * Fail-stop: a missing file, an unopenable one, or a failed fsync throws, because a silently skipped
+     * barrier cannot be told apart from a missing one. The open never creates the file, so a vanished data file
+     * fails here instead of coming back empty.
+     */
+    public static void fsyncFileDurable(FilesFacade ff, LPSZ path) {
+        final long fd = ff.openRWExisting(path);
+        if (fd < 0) {
+            final int errno = ff.errno();
+            if (Files.isErrnoFileDoesNotExist(errno)) {
+                throw CairoException.critical(errno).put("could not open, file does not exist: ").put(path).put(']');
+            }
+            throw CairoException.critical(errno).put("could not open read-write for fsync [file=").put(path).put(']');
+        }
+        ff.fsyncAndClose(fd);
+    }
+
+    public static long openRONoCache(FilesFacade ff, LPSZ path, Log log) {
+        final long fd = ff.openRONoCache(path);
         if (fd > -1) {
-            log.debug().$("open [file=").$(path).$(", fd=").$(fd).$(']').$();
+            log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
             return fd;
         }
-        throw CairoException.instance(ff.errno()).put("could not open read-write [file=").put(path).put(']');
+        int errno = ff.errno();
+        if (Files.isErrnoFileCannotRead(errno)) {
+            throw CairoException.critical(errno).put("could not open, file does not exist: ").put(path).put(']');
+        }
+        throw CairoException.critical(errno).put("could not open read-only [file=").put(path).put(']');
+    }
+
+    public static long openRW(FilesFacade ff, LPSZ path, Log log, int opts) {
+        final long fd = ff.openRW(path, opts);
+        if (fd > -1) {
+            log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
+            return fd;
+        }
+        throw CairoException.critical(ff.errno()).put("could not open read-write [file=").put(path).put(']');
+    }
+
+    /**
+     * Opens a file that is meant to be created, never reused: any file already at the path is removed first, see
+     * {@link #removeExistingOrFail}.
+     */
+    public static long openRWFresh(FilesFacade ff, LPSZ path, Log log, int opts) {
+        removeExistingOrFail(ff, path);
+        return openRW(ff, path, log, opts);
+    }
+
+    public static void openSmallFile(FilesFacade ff, Path path, int rootLen, MemoryMR metaMem, CharSequence fileName, int memoryTag) {
+        path.concat(fileName);
+        try {
+            metaMem.smallFile(ff, path.$(), memoryTag);
+        } finally {
+            path.trimTo(rootLen);
+        }
+    }
+
+    public static void overwriteTableNameFile(Path tablePath, MemoryMAR memory, FilesFacade ff, @NotNull CharSequence tableName) {
+        // Update name in _name file.
+        // This is potentially racy but the file only read on startup when the tables.d file is missing
+        // so very limited circumstances.
+        Path nameFilePath = tablePath.concat(TABLE_NAME_FILE);
+        memory.smallFile(ff, nameFilePath.$(), MemoryTag.MMAP_TABLE_WRITER);
+        try {
+            memory.jumpTo(0);
+            createTableNameFile(memory, tableName);
+        } finally {
+            memory.close(true, Vm.TRUNCATE_TO_POINTER);
+        }
+    }
+
+    /**
+     * Packs per-column Parquet encoding, compression codec, and compression level
+     * into a single 32-bit integer. Layout:
+     * <ul>
+     *   <li>bits 0-7: encoding id ({@code ParquetEncoding.ENCODING_*})</li>
+     *   <li>bits 8-15: compression codec id ({@code ParquetCompression} constants)</li>
+     *   <li>bits 16-23: compression level with +1 encoding (0 = not set, 1 = level 0, 2 = level 1, etc.)</li>
+     *   <li>bit 24: explicit flag (always set by this method)</li>
+     *   <li>bit 25: bloom filter flag</li>
+     * </ul>
+     * A packed value of 0 means "use defaults for everything".
+     * Both compression and level use +1 encoding so that 0 can serve as a "not set" sentinel
+     * while still allowing the user to specify level 0 (e.g., gzip store mode).
+     */
+    public static int packParquetConfig(int encoding, int compression, int level, boolean bloomFilter) {
+        int config = (encoding & PARQUET_CONFIG_ENCODING_MASK)
+                | ((compression & PARQUET_CONFIG_COMPRESSION_MASK) << PARQUET_CONFIG_COMPRESSION_SHIFT)
+                | ((level & PARQUET_CONFIG_LEVEL_MASK) << PARQUET_CONFIG_LEVEL_SHIFT)
+                | PARQUET_CONFIG_EXPLICIT_FLAG;
+        if (bloomFilter) {
+            config |= PARQUET_CONFIG_BLOOM_FILTER_FLAG;
+        }
+        return config;
+    }
+
+    public static void parseBloomFilterColumnIndexes(RecordMetadata metadata, CharSequence bloomFilterColumns, DirectIntList indexes) {
+        int start = 0;
+        int len = bloomFilterColumns.length();
+        for (int i = 0; i <= len; i++) {
+            if (i == len || bloomFilterColumns.charAt(i) == ',') {
+                int nameStart = start;
+                int nameEnd = i;
+                while (nameStart < nameEnd && Character.isWhitespace(bloomFilterColumns.charAt(nameStart))) {
+                    nameStart++;
+                }
+                while (nameEnd > nameStart && Character.isWhitespace(bloomFilterColumns.charAt(nameEnd - 1))) {
+                    nameEnd--;
+                }
+                if (nameStart < nameEnd) {
+                    CharSequence columnName = bloomFilterColumns.subSequence(nameStart, nameEnd);
+                    int metadataIndex = metadata.getColumnIndexQuiet(columnName);
+                    if (metadataIndex >= 0 && metadata.getColumnType(metadataIndex) > 0) {
+                        int descriptorIndex = 0;
+                        for (int j = 0; j < metadataIndex; j++) {
+                            if (metadata.getColumnType(j) > 0) {
+                                descriptorIndex++;
+                            }
+                        }
+                        boolean isDuplicate = false;
+                        for (long k = 0, sz = indexes.size(); k < sz; k++) {
+                            if (indexes.get(k) == descriptorIndex) {
+                                isDuplicate = true;
+                                break;
+                            }
+                        }
+                        if (!isDuplicate) {
+                            indexes.add(descriptorIndex);
+                        }
+                    } else {
+                        throw CairoException.nonCritical().put("bloom_filter_columns contains non-existent column: ").put(columnName);
+                    }
+                }
+                start = i + 1;
+            }
+        }
+    }
+
+    /**
+     * Produces a Parquet file from a native partition. Core method used by both TableReader and TableWriter callers.
+     *
+     * @param path                Path to the native partition directory (will be modified during execution)
+     * @param other               Path for the output parquet file (will be modified during execution)
+     * @param pathSize            Root path size for restoring paths after modifications
+     * @param partitionTimestamp  Timestamp of the partition
+     * @param partitionNameTxn    Partition name txn for the native source partition
+     * @param parquetNameTxn      Partition name txn for the parquet destination (may differ from partitionNameTxn
+     *                            when the partition version is upgraded during conversion)
+     * @param tableName           Name of the table
+     * @param partitionRowCount   Number of rows in the partition
+     * @param metadata            Table metadata
+     * @param columnVersionReader Column version reader (or writer, which extends reader)
+     * @param symbolTableProvider Symbol table provider
+     * @param configuration       Cairo configuration for parquet encoder options
+     * @param commitMode          effective commit mode of the owning table
+     * @param bloomFilterColumns  Comma-separated column names for bloom filters, or null
+     * @param bloomFilterFpp      Bloom filter false-positive probability, or NaN for default
+     * @param bloomFilterIndexes  Reusable DirectIntList for bloom filter column indexes. Must be non-null;
+     *                            callers should keep a single instance and pass it on every call to avoid
+     *                            per-invocation allocation. The function clears it on entry and leaves the
+     *                            allocation for the caller to free.
+     * @return The length of the produced Parquet file
+     */
+    public static long produceParquetFromNative(
+            Path path,
+            Path other,
+            int pathSize,
+            long partitionTimestamp,
+            long partitionNameTxn,
+            long parquetNameTxn,
+            String tableName,
+            long partitionRowCount,
+            TableMetadata metadata,
+            ColumnVersionReader columnVersionReader,
+            SymbolTableProvider symbolTableProvider,
+            CairoConfiguration configuration,
+            int commitMode,
+            @Nullable CharSequence bloomFilterColumns,
+            double bloomFilterFpp,
+            DirectIntList bloomFilterIndexes,
+            long squashTracker,
+            long seqTxn
+    ) {
+        try {
+            setPathForNativePartition(other.trimTo(pathSize), metadata.getTimestampType(), metadata.getPartitionBy(), partitionTimestamp, parquetNameTxn);
+            return produceParquetFromNativeInto(
+                    path,
+                    other,
+                    pathSize,
+                    partitionTimestamp,
+                    partitionNameTxn,
+                    tableName,
+                    partitionRowCount,
+                    metadata,
+                    columnVersionReader,
+                    symbolTableProvider,
+                    configuration,
+                    commitMode,
+                    bloomFilterColumns,
+                    bloomFilterFpp,
+                    bloomFilterIndexes,
+                    squashTracker,
+                    seqTxn
+            );
+        } finally {
+            other.trimTo(pathSize);
+        }
+    }
+
+    /**
+     * {@link #produceParquetFromNative} into the existing {@code dstPartitionDir}, trimmed back on return.
+     */
+    public static long produceParquetFromNativeInto(
+            Path path,
+            Path dstPartitionDir,
+            int pathSize,
+            long partitionTimestamp,
+            long partitionNameTxn,
+            String tableName,
+            long partitionRowCount,
+            TableMetadata metadata,
+            ColumnVersionReader columnVersionReader,
+            SymbolTableProvider symbolTableProvider,
+            CairoConfiguration configuration,
+            int commitMode,
+            @Nullable CharSequence bloomFilterColumns,
+            double bloomFilterFpp,
+            DirectIntList bloomFilterIndexes,
+            long squashTracker,
+            long seqTxn
+    ) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        final int partitionBy = metadata.getPartitionBy();
+        final int timestampType = metadata.getTimestampType();
+        final Path other = dstPartitionDir;
+        final int dstDirLen = other.size();
+
+        setPathForNativePartition(path.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
+        if (!ff.exists(path.$())) {
+            throw CairoException.nonCritical().put("partition directory does not exist [path=").put(path).put(']');
+        }
+        final int partitionDirLen = path.size();
+        final int pathRootSize = configuration.getDbRoot().length();
+
+        other.trimTo(dstDirLen).concat(PARQUET_PARTITION_NAME).$();
+        if (ff.exists(other.$())) {
+            LOG.info().$("parquet for native partition already present [path=").$substr(pathRootSize, path).I$();
+            final long length = ff.length(other.$());
+            other.trimTo(dstDirLen);
+            return length;
+        }
+
+        LOG.info().$("producing parquet for native partition [path=").$substr(pathRootSize, path).I$();
+        final int memoryTag = MemoryTag.MMAP_PARQUET_PARTITION_CONVERTER;
+        long parquetMetaFd = -1;
+        try {
+            try (PartitionDescriptor partitionDescriptor = new MappedMemoryPartitionDescriptor(ff)) {
+                final int readerTimestampIndex = metadata.getTimestampIndex();
+                // PartitionDescriptor.timestampIndex must be the writer column index (columnId),
+                // not the dense reader index, because the Rust encoder matches it against columnId values.
+                final int timestampIndex = readerTimestampIndex >= 0
+                        ? metadata.getColumnMetadata(readerTimestampIndex).getWriterIndex()
+                        : -1;
+                partitionDescriptor.of(tableName, partitionRowCount, timestampIndex);
+
+                final boolean useMetadataBloomFilters = bloomFilterColumns == null || bloomFilterColumns.isEmpty();
+                final int columnCount = metadata.getColumnCount();
+                for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+                    final int columnType = metadata.getColumnType(columnIndex);
+                    if (columnType <= 0) {
+                        continue; // skip deleted columns
+                    }
+
+                    final String columnName = metadata.getColumnName(columnIndex);
+                    final TableColumnMetadata tableColumnMetadata = metadata.getColumnMetadata(columnIndex);
+
+                    // Store the original writer index in the parquet file so that a later
+                    // parquet->native conversion can match columns by their original id even
+                    // after a column-type conversion has re-keyed the column.
+                    final int columnId = tableColumnMetadata.getOriginalWriterIndex();
+                    // _cv entries (name txn, column top, symbol table name txn) are keyed by the
+                    // current writer index, which diverges from the dense metadata index once a
+                    // column is dropped or re-keyed by ALTER COLUMN TYPE. Mirror TableReader.
+                    final int writerIndex = tableColumnMetadata.getWriterIndex();
+
+                    final int versionRecordIndex = columnVersionReader.getRecordIndex(partitionTimestamp, writerIndex);
+                    long columnNameTxn = columnVersionReader.getColumnNameTxnByIndex(versionRecordIndex);
+                    if (columnNameTxn == -1) {
+                        columnNameTxn = columnVersionReader.getDefaultColumnNameTxn(writerIndex);
+                    }
+                    final long columnTop = columnVersionReader.getColumnTopByIndexOrDefault(versionRecordIndex, partitionTimestamp, writerIndex, -1L);
+                    final long columnRowCount = (columnTop != -1) ? partitionRowCount - columnTop : 0;
+                    final int parquetEncodingConfig = tableColumnMetadata.getParquetEncodingConfig();
+
+                    if (columnRowCount > 0) {
+                        if (ColumnType.isSymbol(columnType)) {
+                            int encodeColumnType = columnType;
+                            if (!symbolTableProvider.containsNullValue(columnIndex)) {
+                                encodeColumnType |= Integer.MIN_VALUE;
+                            }
+
+                            partitionDescriptor.addColumn(
+                                    columnName,
+                                    encodeColumnType,
+                                    columnId,
+                                    columnTop,
+                                    parquetEncodingConfig
+                            );
+
+                            final long columnSize = columnRowCount * ColumnType.sizeOf(columnType);
+                            final long columnAddr = mapRONoCache(ff, dFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, columnSize, memoryTag);
+                            partitionDescriptor.setColumnAddr(columnAddr, columnSize);
+                            ff.madvise(columnAddr, columnSize, Files.POSIX_MADV_SEQUENTIAL);
+
+                            // root symbol files use separate txn
+                            final long symbolTableNameTxn = columnVersionReader.getSymbolTableNameTxn(writerIndex);
+
+                            offsetFileName(path.trimTo(pathSize), columnName, symbolTableNameTxn);
+                            if (!ff.exists(path.$())) {
+                                LOG.error().$(path).$(" is not found").$();
+                                throw CairoException.fileNotFound().put("offset file does not exist: ").put(path);
+                            }
+
+                            final long fileLength = ff.length(path.$());
+                            if (fileLength < SymbolMapWriter.HEADER_SIZE) {
+                                LOG.error().$(path).$(", symbol file is too small [fileLength=").$(fileLength).$(']').$();
+                                throw CairoException.critical(0).put("SymbolMap is too short: ").put(path);
+                            }
+
+                            final int symbolCount = symbolTableProvider.getSymbolCount(columnIndex);
+                            final long offsetsMemSize = SymbolMapWriter.keyToOffset(symbolCount + 1);
+                            final long symbolOffsetsAddr = mapRONoCache(ff, path.$(), LOG, offsetsMemSize, memoryTag);
+                            partitionDescriptor.setSymbolOffsetsAddr(symbolOffsetsAddr + SymbolMapWriter.HEADER_SIZE, symbolCount);
+                            ff.madvise(symbolOffsetsAddr, offsetsMemSize, Files.POSIX_MADV_SEQUENTIAL);
+
+                            final LPSZ charFileName = charFileName(path.trimTo(pathSize), columnName, symbolTableNameTxn);
+                            final long columnSecondarySize = ff.length(charFileName);
+                            final long columnSecondaryAddr = mapRONoCache(ff, charFileName, LOG, columnSecondarySize, memoryTag);
+                            partitionDescriptor.setSecondaryColumnAddr(columnSecondaryAddr, columnSecondarySize);
+                            ff.madvise(columnSecondaryAddr, columnSecondarySize, Files.POSIX_MADV_SEQUENTIAL);
+
+                            // recover the partition path
+                            setPathForNativePartition(path.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
+                        } else if (ColumnType.isVarSize(columnType)) {
+                            partitionDescriptor.addColumn(columnName, columnType, columnId, columnTop, parquetEncodingConfig);
+
+                            final ColumnTypeDriver columnTypeDriver = ColumnType.getDriver(columnType);
+                            final long auxVectorSize = columnTypeDriver.getAuxVectorSize(columnRowCount);
+                            final long auxVectorAddr = mapRONoCache(ff, iFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, auxVectorSize, memoryTag);
+                            ff.madvise(auxVectorAddr, auxVectorSize, Files.POSIX_MADV_SEQUENTIAL);
+                            partitionDescriptor.setSecondaryColumnAddr(auxVectorAddr, auxVectorSize);
+
+                            final long dataSize = columnTypeDriver.getDataVectorSizeAt(auxVectorAddr, columnRowCount - 1);
+                            if (dataSize < columnTypeDriver.getDataVectorMinEntrySize() || dataSize >= (1L << 40)) {
+                                LOG.critical().$("Invalid var len column size [column=").$safe(columnName)
+                                        .$(", size=").$(dataSize)
+                                        .$(", path=").$(path)
+                                        .I$();
+                                throw CairoException.critical(0).put("Invalid column size [column=").put(path)
+                                        .put(", size=").put(dataSize)
+                                        .put(']');
+                            }
+
+                            final long dataAddr;
+                            if (dataSize > 0) {
+                                dataAddr = mapRONoCache(ff, dFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, dataSize, memoryTag);
+                                ff.madvise(dataAddr, dataSize, Files.POSIX_MADV_SEQUENTIAL);
+                            } else {
+                                dataAddr = 0;
+                            }
+                            partitionDescriptor.setColumnAddr(dataAddr, dataSize);
+                        } else {
+                            final long mapBytes = columnRowCount * ColumnType.sizeOf(columnType);
+                            final long fixedAddr = mapRONoCache(ff, dFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, mapBytes, memoryTag);
+                            ff.madvise(fixedAddr, mapBytes, Files.POSIX_MADV_SEQUENTIAL);
+                            partitionDescriptor.addColumn(
+                                    columnName,
+                                    columnType,
+                                    columnId,
+                                    columnTop,
+                                    fixedAddr,
+                                    mapBytes,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    parquetEncodingConfig
+                            );
+                        }
+                    } else {
+                        // no rows in column
+                        partitionDescriptor.addColumn(
+                                columnName,
+                                columnType,
+                                columnId,
+                                partitionRowCount,
+                                parquetEncodingConfig
+                        );
+                    }
+                }
+
+                final int compressionCodec = configuration.getPartitionEncoderParquetCompressionCodec();
+                final int compressionLevel = configuration.getPartitionEncoderParquetCompressionLevel();
+                final int rowGroupSize = configuration.getPartitionEncoderParquetRowGroupSize();
+                final int dataPageSize = configuration.getPartitionEncoderParquetDataPageSize();
+                final boolean statisticsEnabled = configuration.isPartitionEncoderParquetStatisticsEnabled();
+                final boolean rawArrayEncoding = configuration.isPartitionEncoderParquetRawArrayEncoding();
+                final int parquetVersion = configuration.getPartitionEncoderParquetVersion();
+                final double minCompressionRatio = configuration.getPartitionEncoderParquetMinCompressionRatio();
+
+                long bloomFilterColumnIndexesPtr = 0;
+                int bloomFilterColumnCount = 0;
+                double fpp = Double.isNaN(bloomFilterFpp) ? configuration.getPartitionEncoderParquetBloomFilterFpp() : bloomFilterFpp;
+
+                // Open _pm file for the Rust encoder to write simultaneously.
+                other.trimTo(dstDirLen).concat(PARQUET_METADATA_FILE_NAME).$();
+                parquetMetaFd = TableUtils.openRWFresh(ff, other.$(), LOG, configuration.getWriterFileOpenOpts());
+
+                bloomFilterIndexes.clear();
+                if (useMetadataBloomFilters) {
+                    // Derive bloom filter columns from per-column metadata flags
+                    deriveBloomFilterColumnIndexes(metadata, bloomFilterIndexes);
+                } else {
+                    // Explicit bloom_filter_columns override from CONVERT PARTITION WITH clause
+                    parseBloomFilterColumnIndexes(metadata, bloomFilterColumns, bloomFilterIndexes);
+                }
+                if (bloomFilterIndexes.size() > 0) {
+                    bloomFilterColumnIndexesPtr = bloomFilterIndexes.getAddress();
+                    bloomFilterColumnCount = (int) bloomFilterIndexes.size();
+                }
+
+                // Restore parquet file path for encoding.
+                other.trimTo(dstDirLen).concat(PARQUET_PARTITION_NAME).$();
+
+                PartitionEncoder.encodeWithOptions(
+                        partitionDescriptor,
+                        other,
+                        ParquetCompression.packCompressionCodecLevel(compressionCodec, compressionLevel),
+                        statisticsEnabled,
+                        rawArrayEncoding,
+                        rowGroupSize,
+                        dataPageSize,
+                        parquetVersion,
+                        bloomFilterColumnIndexesPtr,
+                        bloomFilterColumnCount,
+                        fpp,
+                        minCompressionRatio,
+                        Files.toOsFd(parquetMetaFd),
+                        squashTracker,
+                        seqTxn
+                );
+                // Persist _pm before the caller commits _txn. _txn field 3 will reference
+                // a parquet_meta_file_size that resolves only if the _pm bytes survive a
+                // crash. fsync the parent dir too because _pm is a brand-new file in a
+                // brand-new partition directory.
+                if (commitMode != CommitMode.NOSYNC) {
+                    if (CommitMode.isPowerLossDurable(commitMode)) {
+                        // fsync data.parquet before _pm (data before metadata, mirrors syncColumns0 ordering)
+                        other.trimTo(dstDirLen).concat(PARQUET_PARTITION_NAME).$();
+                        fsyncFileDurable(ff, other.$());
+                    }
+                    ff.fsync(parquetMetaFd);
+                    if (!Os.isWindows()) {
+                        other.trimTo(dstDirLen).$();
+                        final long dirFd = TableUtils.openRONoCache(ff, other.$(), LOG);
+                        if (dirFd != -1) {
+                            ff.fsyncAndClose(dirFd);
+                        }
+                    }
+                }
+                other.trimTo(dstDirLen).concat(PARQUET_PARTITION_NAME).$();
+                return ff.length(other.$());
+            }
+        } catch (CairoException e) {
+            LOG.error().$("could not convert partition to parquet [table=").$(tableName)
+                    .$(", error=").$safe(e.getMessage()).I$();
+
+            // Rollback: remove the partial data.parquet AND its _pm sidecar, never the parent
+            // directory. Callers that allocate a fresh parquet-only directory handle that
+            // directory's cleanup in their own outer catch. Leaving _pm behind orphans a
+            // _pm-only partition dir that cold storage's structural scans misread as
+            // parquet-local/cold. Close the _pm fd first so the removal succeeds on Windows,
+            // and clear the handle so the finally does not double-close it.
+            if (parquetMetaFd > -1) {
+                ff.close(parquetMetaFd);
+                parquetMetaFd = -1;
+            }
+            other.trimTo(dstDirLen).concat(PARQUET_METADATA_FILE_NAME).$();
+            if (ff.exists(other.$()) && !ff.removeQuiet(other.$())) {
+                LOG.error().$("could not remove parquet _pm on rollback [path=").$(other).I$();
+            }
+            other.trimTo(dstDirLen).concat(PARQUET_PARTITION_NAME).$();
+            if (ff.exists(other.$()) && !ff.removeQuiet(other.$())) {
+                LOG.error().$("could not remove parquet file on rollback [path=").$(other).I$();
+            }
+            throw e;
+        } finally {
+            path.trimTo(pathSize);
+            other.trimTo(dstDirLen);
+            if (parquetMetaFd > -1) {
+                ff.close(parquetMetaFd);
+            }
+        }
     }
 
     public static int readIntOrFail(FilesFacade ff, long fd, long offset, long tempMem8b, Path path) {
         if (ff.read(fd, tempMem8b, Integer.BYTES, offset) != Integer.BYTES) {
-            throw CairoException.instance(ff.errno()).put("Cannot read: ").put(path);
+            throw CairoException.critical(ff.errno()).put("Cannot read: ").put(path);
         }
-        return Unsafe.getUnsafe().getInt(tempMem8b);
+        return Unsafe.getInt(tempMem8b);
     }
 
-    public static long readLongAtOffset(FilesFacade ff, Path path, long tempMem8b, long offset) {
+    public static long readLongAtOffset(FilesFacade ff, LPSZ path, long tempMem8b, long offset) {
         final long fd = TableUtils.openRO(ff, path, LOG);
         try {
             return readLongOrFail(ff, fd, offset, tempMem8b, path);
@@ -609,19 +2791,228 @@ public final class TableUtils {
         }
     }
 
-    public static long readLongOrFail(FilesFacade ff, long fd, long offset, long tempMem8b, @Nullable Path path) {
+    public static long readLongOrFail(FilesFacade ff, long fd, long offset, long tempMem8b, @Nullable LPSZ path) {
         if (ff.read(fd, tempMem8b, Long.BYTES, offset) != Long.BYTES) {
             if (path != null) {
-                throw CairoException.instance(ff.errno()).put("could not read long [path=").put(path).put(", fd=").put(fd).put(", offset=").put(offset);
+                throw CairoException.critical(ff.errno()).put("could not read long [path=").put(path).put(", fd=").put(fd).put(", offset=").put(offset);
             }
-            throw CairoException.instance(ff.errno()).put("could not read long [fd=").put(fd).put(", offset=").put(offset);
+            throw CairoException.critical(ff.errno()).put("could not read long [fd=").put(fd).put(", offset=").put(offset);
         }
-        return Unsafe.getUnsafe().getLong(tempMem8b);
+        return Unsafe.getLong(tempMem8b);
     }
 
-    public static void renameOrFail(FilesFacade ff, Path src, Path dst) {
-        if (!ff.rename(src, dst)) {
-            throw CairoException.instance(ff.errno()).put("could not rename ").put(src).put(" -> ").put(dst);
+    /**
+     * A plain folder's squash identity: its {@code _txn} squash count or, once that 16-bit count has saturated, the
+     * time of its last squash, which the writer records in {@link #PARTITION_LAST_SQUASH_TIMESTAMP_FILE} instead. A
+     * squash that appends a split back into the folder in place keeps its name txn, and under DEDUP its row count,
+     * so this is what tells a copy built before the squash from the folder after it.
+     *
+     * @param partitionDir the folder's directory, trimmed back on return
+     * @param squashCount  the folder's squash count in {@code _txn}
+     */
+    public static long readPartitionSquashTracker(FilesFacade ff, Path partitionDir, int squashCount) {
+        if (squashCount != TxReader.PARTITION_SQUASH_COUNTER_MAX) {
+            return squashCount;
+        }
+        final int partitionDirLen = partitionDir.size();
+        try {
+            final long fd = ff.openRO(partitionDir.concat(PARTITION_LAST_SQUASH_TIMESTAMP_FILE).$());
+            if (fd > -1) {
+                try {
+                    final long lastSquashTimestamp = ff.readNonNegativeLong(fd, 0);
+                    if (lastSquashTimestamp > -1) {
+                        return lastSquashTimestamp;
+                    }
+                } finally {
+                    ff.close(fd);
+                }
+            }
+            return TxReader.PARTITION_SQUASH_COUNTER_MAX;
+        } finally {
+            partitionDir.trimTo(partitionDirLen);
+        }
+    }
+
+    public static String readTableName(Path path, int rootLen, MemoryCMR mem, FilesFacade ff) {
+        long fd = -1;
+        try {
+            path.concat(TableUtils.TABLE_NAME_FILE);
+            LPSZ $path = path.$();
+            fd = ff.openRO($path);
+            if (fd < 1) {
+                return null;
+            }
+
+            long fileLen = ff.length(fd);
+            if (fileLen > Integer.BYTES) {
+                int charLen = ff.readNonNegativeInt(fd, 0);
+                if (charLen * 2L + Integer.BYTES != fileLen - 1) {
+                    LOG.error().$("invalid table name file [path=").$(path).$(", headerLen=").$(charLen).$(", fileLen=").$(fileLen).I$();
+                    return null;
+                }
+
+                mem.of(ff, $path, fileLen, fileLen, MemoryTag.MMAP_DEFAULT);
+                return Chars.toString(mem.getStrA(0));
+            } else {
+                LOG.error().$("invalid table name file [path=").$(path).$(", fileLen=").$(fileLen).I$();
+                return null;
+            }
+        } finally {
+            path.trimTo(rootLen);
+            ff.close(fd);
+        }
+    }
+
+    public static String readText(FilesFacade ff, LPSZ path1) {
+        long fd = ff.openRO(path1);
+        long bytes = 0;
+        long length = 0;
+        if (fd > -1) {
+            try {
+                length = ff.length(fd);
+                if (length > 0) {
+                    bytes = Unsafe.malloc(length, MemoryTag.NATIVE_DEFAULT);
+                    if (ff.read(fd, bytes, length, 0) == length) {
+                        return Utf8s.stringFromUtf8Bytes(bytes, bytes + length);
+                    }
+
+                }
+            } finally {
+                if (bytes != 0) {
+                    Unsafe.free(bytes, length, MemoryTag.NATIVE_DEFAULT);
+                }
+                ff.close(fd);
+            }
+        }
+        return null;
+    }
+
+    public static void removeColumnFromMetadata(
+            CharSequence columnName,
+            LowerCaseCharSequenceIntHashMap columnNameIndexMap,
+            ObjList<TableColumnMetadata> columnMetadata
+    ) {
+        final int columnIndex = columnNameIndexMap.get(columnName);
+        if (columnIndex < 0) {
+            throw CairoException.critical(0).put("Column not found: ").put(columnName);
+        }
+
+        columnNameIndexMap.remove(columnName);
+        final TableColumnMetadata deletedMeta = columnMetadata.getQuick(columnIndex);
+        deletedMeta.markDeleted();
+    }
+
+    /**
+     * Removes the file at the path, if there is one, before a writer creates it anew. A new partition directory
+     * version can hold hard links to the files of the live version, such as one a failed reindex could not remove.
+     * Opening such a link for write, or truncating it, would change the committed data that version and its readers
+     * still use; unlinking it first gives the writer a file of its own.
+     */
+    public static void removeExistingOrFail(FilesFacade ff, LPSZ path) {
+        if (!ff.removeQuiet(path) && ff.exists(path)) {
+            throw CairoException.critical(ff.errno()).put("could not remove existing file [path=").put(path).put(']');
+        }
+    }
+
+    public static void renameColumnInMetadata(
+            CharSequence columnName,
+            CharSequence newName,
+            LowerCaseCharSequenceIntHashMap columnNameIndexMap,
+            ObjList<TableColumnMetadata> columnMetadata
+    ) {
+        final int columnIndex = columnNameIndexMap.get(columnName);
+        if (columnIndex < 0) {
+            throw CairoException.critical(0).put("Column not found: ").put(columnName);
+        }
+        final String newNameStr = newName.toString();
+        columnMetadata.getQuick(columnIndex).rename(newNameStr);
+
+        columnNameIndexMap.removeEntry(columnName);
+        columnNameIndexMap.put(newNameStr, columnIndex);
+    }
+
+    public static void renameOrFail(FilesFacade ff, LPSZ src, LPSZ dst) {
+        if (ff.rename(src, dst) != Files.FILES_RENAME_OK) {
+            throw CairoException.critical(ff.errno()).put("could not rename ").put(src).put(" -> ").put(dst);
+        }
+    }
+
+    /**
+     * {@link FilesFacade#renameDurable(LPSZ, LPSZ)} under a commit mode that asks for durability, a plain rename
+     * under {@link CommitMode#NOSYNC}. Each publish site pairs its rename with a {@link #fsyncDirDurable} of the
+     * parent, which makes the new name durable on POSIX but is skipped on a restricted (Windows) file system; there
+     * the durable rename makes the move itself durable. Use at publish sites whose companion directory fsync is
+     * itself mode-conditional, so NOSYNC keeps costing nothing.
+     */
+    public static int renamePublish(FilesFacade ff, LPSZ src, LPSZ dst, int commitMode) {
+        return commitMode == CommitMode.NOSYNC ? ff.rename(src, dst) : ff.renameDurable(src, dst);
+    }
+
+    /**
+     * Replaces {@code dst}'s content with {@code src}'s. On POSIX this happens in place, so the destination
+     * keeps its identity: anything holding it open or mapped sees the new bytes, and it never stops
+     * existing. Windows takes an unlink-then-copy route instead (see the branch at the top of the method).
+     * <p>
+     * {@link FilesFacade#copy(LPSZ, LPSZ)} cannot do this portably: on POSIX it is {@code creat(O_TRUNC)}
+     * and replaces the destination, while on Windows it is {@code CopyFileW(.., bFailIfExists=TRUE)} and
+     * fails with {@link Files#WINDOWS_ERROR_FILE_EXISTS} when the destination exists.
+     * <p>
+     * Deleting the destination first (as {@code TableWriter#copyOverwrite} does) would open a window in
+     * which the file is absent, a crash state no recovery here handles. Truncate-then-transfer adds no new
+     * state: a crash mid-transfer leaves the destination short or torn, as the POSIX {@code creat(O_TRUNC)}
+     * copy does, and every caller re-derives it from its immutable source when it runs again.
+     * <p>
+     * Fail-stop throughout: a failed open, truncate or transfer throws, and both fds are closed on the way
+     * out.
+     */
+    @TestOnly
+    public static void replaceFileContent(FilesFacade ff, LPSZ src, LPSZ dst, int fileOpenOpts) {
+        if (Os.isWindows()) {
+            // Windows takes the unlink-then-copy route, because the in-place variant below is not safe there:
+            // a file cannot be shrunk while a mapping of it is live, and touching such a mapping afterwards is
+            // an access violation that kills the process rather than throwing. This loses the destination's
+            // identity, so a live mapping keeps the old bytes, and the file is absent for a moment.
+            // removeQuiet fails on an open or mapped file, so a destination someone holds fail-stops here
+            // rather than being replaced.
+            //
+            // Absence is checked with exists() rather than with errno, which a fault-injecting facade may pin
+            // to any value: an open, mapped or locked destination still exists after the failed remove, so it
+            // still throws.
+            if (!ff.removeQuiet(dst) && ff.exists(dst)) {
+                throw CairoException.critical(ff.errno())
+                        .put("could not remove copy destination [dst=").put(dst).put(']');
+            }
+            if (ff.copy(src, dst) < 0) {
+                throw CairoException.critical(ff.errno())
+                        .put("could not copy file [src=").put(src).put(", dst=").put(dst).put(']');
+            }
+            return;
+        }
+        final long srcFd = openRO(ff, src, LOG);
+        try {
+            final long size = ff.length(srcFd);
+            if (size < 0) {
+                throw CairoException.critical(ff.errno())
+                        .put("could not read size of copy source [src=").put(src).put(']');
+            }
+            final long dstFd = openRW(ff, dst, LOG, fileOpenOpts);
+            try {
+                // Truncate first so a stale tail cannot survive a shorter replacement, as O_TRUNC does.
+                if (!ff.truncate(dstFd, 0)) {
+                    throw CairoException.critical(ff.errno())
+                            .put("could not truncate copy destination [dst=").put(dst).put(']');
+                }
+                final long copied = size > 0 ? ff.copyData(srcFd, dstFd, 0, size) : 0;
+                if (copied != size) {
+                    throw CairoException.critical(ff.errno())
+                            .put("could not copy file content [src=").put(src).put(", dst=").put(dst)
+                            .put(", size=").put(size).put(", copied=").put(copied).put(']');
+                }
+            } finally {
+                ff.close(dstFd);
+            }
+        } finally {
+            ff.close(srcFd);
         }
     }
 
@@ -629,16 +3020,29 @@ public final class TableUtils {
         mem.smallFile(ff, path.trimTo(rootLen).concat(TODO_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
         mem.jumpTo(0);
         mem.putLong(24, 0); // txn check
-        Unsafe.getUnsafe().storeFence();
+        Unsafe.storeFence();
         mem.putLong(8, 0); // hashLo
         mem.putLong(16, 0); // hashHi
-        Unsafe.getUnsafe().storeFence();
+        Unsafe.storeFence();
         mem.putLong(0, 0); // txn
         mem.putLong(32, 0); // count
         mem.jumpTo(40);
+        mem.sync(false);
     }
 
-    public static void resetTxn(MemoryMW txMem, long baseOffset, int symbolMapCount, long txn, long dataVersion, long partitionTableVersion, long structureVersion, long columnVersion, long truncateVersion) {
+    public static void resetTxn(
+            MemoryMW txMem,
+            long baseOffset,
+            int symbolMapCount,
+            long txn,
+            long seqTxn,
+            long dataVersion,
+            long partitionTableVersion,
+            int geometryVersion,
+            long structureVersion,
+            long columnVersion,
+            long truncateVersion
+    ) {
         // txn to let readers know table is being reset
         txMem.putLong(baseOffset + TX_OFFSET_TXN_64, txn);
 
@@ -660,8 +3064,23 @@ public final class TableUtils {
         txMem.putLong(baseOffset + TX_OFFSET_COLUMN_VERSION_64, columnVersion);
         // truncate version
         txMem.putLong(baseOffset + TX_OFFSET_TRUNCATE_VERSION_64, truncateVersion);
+        // sequencer txn
+        txMem.putLong(baseOffset + TX_OFFSET_SEQ_TXN_64, seqTxn);
+        txMem.putInt(baseOffset + TX_OFFSET_GEOMETRY_VERSION_32, geometryVersion);
 
         txMem.putInt(baseOffset + TX_OFFSET_MAP_WRITER_COUNT_32, symbolMapCount);
+
+        txMem.putLong(baseOffset + TX_OFFSET_LAG_MIN_TIMESTAMP_64, Long.MAX_VALUE);
+        txMem.putLong(baseOffset + TX_OFFSET_LAG_MAX_TIMESTAMP_64, Long.MIN_VALUE);
+        txMem.putInt(baseOffset + TX_OFFSET_LAG_ROW_COUNT_32, 0);
+        txMem.putInt(baseOffset + TX_OFFSET_LAG_TXN_COUNT_32, 0);
+        txMem.putInt(baseOffset + TX_OFFSET_CHECKSUM_32, EMPTY_TABLE_LAG_CHECKSUM);
+
+        // This reset record uses the legacy in-body geometry field until finishABHeader() publishes the
+        // base-header geometry slot and a body checksum. Clear the body-checksum stamp so readers do not
+        // interpret the geometry bytes as a checksum.
+        txMem.putInt(baseOffset + TX_OFFSET_BODY_CHECKSUM_STAMP_32, 0);
+
         for (int i = 0; i < symbolMapCount; i++) {
             long offset = getSymbolWriterIndexOffset(i);
             txMem.putInt(baseOffset + offset, 0);
@@ -673,50 +3092,8 @@ public final class TableUtils {
         txMem.putInt(baseOffset + getPartitionTableSizeOffset(symbolMapCount), 0);
     }
 
-    public static boolean schedulePurgeO3Partitions(MessageBus messageBus, String tableName, int partitionBy) {
-        final MPSequence seq = messageBus.getO3PurgeDiscoveryPubSeq();
-        while (true) {
-            long cursor = seq.next();
-            if (cursor > -1) {
-                O3PartitionPurgeTask task = messageBus.getO3PurgeDiscoveryQueue().get(cursor);
-                task.of(tableName, partitionBy);
-                seq.done(cursor);
-                return true;
-            } else if (cursor == -1) {
-                return false;
-            }
-        }
-    }
-
-    /**
-     * Sets the path to the directory of a partition taking into account the timestamp and the partitioning scheme.
-     *
-     * @param path                  Set to the root directory for a table, this will be updated to the root directory of the partition
-     * @param partitionBy           Partitioning scheme
-     * @param timestamp             A timestamp in the partition
-     * @param calculatePartitionMax flag when caller is going to use the return value of this method
-     * @return The last timestamp in the partition
-     */
-    public static long setPathForPartition(Path path, int partitionBy, long timestamp, boolean calculatePartitionMax) {
-        return PartitionBy.setSinkForPartition(path.slash(), partitionBy, timestamp, calculatePartitionMax);
-    }
-
-    public static int toIndexKey(int symbolKey) {
-        return symbolKey == SymbolTable.VALUE_IS_NULL ? 0 : symbolKey + 1;
-    }
-
-    public static void txnPartition(CharSink path, long txn) {
-        path.put('.').put(txn);
-    }
-
-    public static void txnPartitionConditionally(CharSink path, long txn) {
-        if (txn > -1) {
-            txnPartition(path, txn);
-        }
-    }
-
-    public static void safeReadTxn(TxReader txReader, MicrosecondClock microsecondClock, long spinLockTimeoutUs) {
-        long deadline = microsecondClock.getTicks() + spinLockTimeoutUs;
+    public static void safeReadTxn(TxReader txReader, MillisecondClock clock, long spinLockTimeout) {
+        long deadline = clock.getTicks() + spinLockTimeout;
         if (txReader.unsafeReadVersion() == txReader.getVersion()) {
             LOG.debug().$("checked clean txn, version ").$(txReader.getVersion()).$(", txn=").$(txReader.getTxn()).$();
             return;
@@ -733,9 +3110,8 @@ public final class TableUtils {
             }
             // This is unlucky, sequences have changed while we were reading transaction data
             // We must discard and try again
-            if (microsecondClock.getTicks() > deadline) {
-                LOG.error().$("tx read timeout [timeout=").$(spinLockTimeoutUs).utf8("μs]").$();
-                throw CairoException.instance(0).put("Transaction read timeout");
+            if (clock.getTicks() > deadline) {
+                throw CairoException.critical(0).put("Transaction read timeout [src=writer, timeout=").put(spinLockTimeout).put("ms]");
             }
 
             LOG.debug().$("loaded __dirty__ txn, version ").$(txReader.getVersion()).$();
@@ -743,94 +3119,214 @@ public final class TableUtils {
         }
     }
 
-    public static void validate(
-            MemoryMR metaMem,
-            LowerCaseCharSequenceIntHashMap nameIndex,
-            int expectedVersion
-    ) {
-        try {
-            long memSize = metaMem.size();
-            if (memSize < META_OFFSET_COLUMN_TYPES) {
-                throw CairoException.instance(0).put(". File is too small ").put(memSize);
+    public static boolean schedulePurgeO3Partitions(MessageBus messageBus, TableToken tableName, int timestampType, int partitionBy) {
+        final MPSequence seq = messageBus.getO3PurgeDiscoveryPubSeq();
+        while (true) {
+            long cursor = seq.next();
+            if (cursor > -1) {
+                O3PartitionPurgeTask task = messageBus.getO3PurgeDiscoveryQueue().get(cursor);
+                task.of(tableName, timestampType, partitionBy);
+                seq.done(cursor);
+                return true;
+            } else if (cursor == -1) {
+                return false;
             }
-            final int metaVersion = metaMem.getInt(TableUtils.META_OFFSET_VERSION);
-            if (expectedVersion != metaVersion) {
-                throw validationException(metaMem)
-                        .put("Metadata version does not match runtime version [expected=").put(expectedVersion)
-                        .put(", actual=").put(metaVersion)
-                        .put(']');
-            }
-
-            final int columnCount = metaMem.getInt(META_OFFSET_COUNT);
-            if (columnCount < 0) {
-                throw validationException(metaMem).put("Incorrect columnCount: ").put(columnCount);
-            }
-
-            long offset = getColumnNameOffset(columnCount);
-            if (memSize < offset) {
-                throw validationException(metaMem).put("File is too small, column types are missing ").put(memSize);
-            }
-
-            final int timestampIndex = metaMem.getInt(META_OFFSET_TIMESTAMP_INDEX);
-            if (timestampIndex < -1 || timestampIndex >= columnCount) {
-                throw validationException(metaMem).put("Timestamp index is outside of columnCount");
-            }
-
-            if (timestampIndex != -1) {
-                int timestampType = getColumnType(metaMem, timestampIndex);
-                if (!ColumnType.isTimestamp(timestampType)) {
-                    throw validationException(metaMem).put("Timestamp column must be TIMESTAMP, but found ").put(ColumnType.nameOf(timestampType));
-                }
-            }
-
-            // validate column types and index attributes
-            for (int i = 0; i < columnCount; i++) {
-                int type = Math.abs(getColumnType(metaMem, i));
-                if (ColumnType.sizeOf(type) == -1) {
-                    throw validationException(metaMem).put("Invalid column type ").put(type).put(" at [").put(i).put(']');
-                }
-
-                if (isColumnIndexed(metaMem, i)) {
-                    if (!ColumnType.isSymbol(type)) {
-                        throw validationException(metaMem).put("Index flag is only supported for SYMBOL").put(" at [").put(i).put(']');
-                    }
-
-                    if (getIndexBlockCapacity(metaMem, i) < 2) {
-                        throw validationException(metaMem).put("Invalid index value block capacity ").put(getIndexBlockCapacity(metaMem, i)).put(" at [").put(i).put(']');
-                    }
-                }
-            }
-
-            // validate column names
-            int denseCount = 0;
-            for (int i = 0; i < columnCount; i++) {
-                if (offset + 4 > memSize) {
-                    throw validationException(metaMem).put("File is too small, column length for column ").put(i).put(" is missing");
-                }
-
-                int strLength = metaMem.getInt(offset);
-                if (strLength == TableUtils.NULL_LEN) {
-                    throw validationException(metaMem).put("NULL column name at [").put(i).put(']');
-                }
-                if (strLength < 1 || strLength > 255 || offset + Vm.getStorageLength(strLength) > memSize) {
-                    // EXT4 and many others do not allow file name length > 255 bytes
-                    throw validationException(metaMem)
-                            .put("Column name length of ")
-                            .put(strLength).put(" is invalid at offset ")
-                            .put(offset);
-                }
-
-                CharSequence name = metaMem.getStr(offset);
-                if (getColumnType(metaMem, i) < 0 || nameIndex.put(name, denseCount++)) {
-                    offset += Vm.getStorageLength(name);
-                } else {
-                    throw validationException(metaMem).put("Duplicate column: ").put(name).put(" at [").put(i).put(']');
-                }
-            }
-        } catch (Throwable e) {
-            nameIndex.clear();
-            throw e;
+            Os.pause();
         }
+    }
+
+    public static void setNull(int columnType, long addr, long count) {
+        switch (ColumnType.tagOf(columnType)) {
+            case ColumnType.BOOLEAN:
+            case ColumnType.BYTE:
+                Vect.memset(addr, count, 0);
+                break;
+            case ColumnType.GEOBYTE:
+                Vect.memset(addr, count, GeoHashes.BYTE_NULL);
+                break;
+            case ColumnType.CHAR:
+            case ColumnType.SHORT:
+                Vect.setMemoryShort(addr, (short) 0, count);
+                break;
+            case ColumnType.GEOSHORT:
+                Vect.setMemoryShort(addr, GeoHashes.SHORT_NULL, count);
+                break;
+            case ColumnType.INT:
+                Vect.setMemoryInt(addr, Numbers.INT_NULL, count);
+                break;
+            case ColumnType.IPv4:
+                Vect.setMemoryInt(addr, Numbers.IPv4_NULL, count);
+                break;
+            case ColumnType.GEOINT:
+                Vect.setMemoryInt(addr, GeoHashes.INT_NULL, count);
+                break;
+            case ColumnType.FLOAT:
+                Vect.setMemoryFloat(addr, Float.NaN, count);
+                break;
+            case ColumnType.SYMBOL:
+                Vect.setMemoryInt(addr, SymbolTable.VALUE_IS_NULL, count);
+                break;
+            case ColumnType.LONG:
+            case ColumnType.DATE:
+            case ColumnType.TIMESTAMP:
+                Vect.setMemoryLong(addr, Numbers.LONG_NULL, count);
+                break;
+            case ColumnType.GEOLONG:
+                Vect.setMemoryLong(addr, GeoHashes.NULL, count);
+                break;
+            case ColumnType.DOUBLE:
+                Vect.setMemoryDouble(addr, Double.NaN, count);
+                break;
+            case ColumnType.LONG256:
+                // Long256 is null when all 4 longs are NaNs
+                Vect.setMemoryLong(addr, Numbers.LONG_NULL, count * 4);
+                break;
+            case ColumnType.LONG128:
+                // fall through
+            case ColumnType.UUID:
+                // Long128 and UUID are null when all 2 longs are NaNs
+                Vect.setMemoryLong(addr, Numbers.LONG_NULL, count * 2);
+                break;
+            case ColumnType.INTERVAL:
+                Vect.setMemoryLong(addr, Numbers.LONG_NULL, count * 2);
+                break;
+            case ColumnType.DECIMAL8:
+                Vect.memset(addr, count, Decimals.DECIMAL8_NULL);
+                break;
+            case ColumnType.DECIMAL16:
+                Vect.setMemoryShort(addr, Decimals.DECIMAL16_NULL, count);
+                break;
+            case ColumnType.DECIMAL32:
+                Vect.setMemoryInt(addr, Decimals.DECIMAL32_NULL, count);
+                break;
+            case ColumnType.DECIMAL64:
+                Vect.setMemoryLong(addr, Decimals.DECIMAL64_NULL, count);
+                break;
+            case ColumnType.DECIMAL128:
+                Vect.setMemoryLong128(addr, Decimals.DECIMAL128_HI_NULL, Decimals.DECIMAL128_LO_NULL, count);
+                break;
+            case ColumnType.DECIMAL256:
+                Vect.setMemoryLong256(addr, Decimals.DECIMAL256_HH_NULL, Decimals.DECIMAL256_HL_NULL,
+                        Decimals.DECIMAL256_LH_NULL, Decimals.DECIMAL256_LL_NULL, count);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /**
+     * Sets the path to the directory of a native partition taking into account the timestamp, the partitioning scheme
+     * and the partition version.
+     *
+     * @param path          Set to the root directory for a table, this will be updated to the root directory of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
+     */
+    public static void setPathForNativePartition(Path path, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        setSinkForNativePartition(path.slash(), timestampType, partitionBy, timestamp, nameTxn);
+    }
+
+    /**
+     * Sets the path to the file of a Parquet partition taking into account the timestamp, the partitioning scheme
+     * and the partition version.
+     *
+     * @param path          Set to the root directory for a table, this will be updated to the file of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
+     */
+    public static void setPathForParquetPartition(Path path, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        setSinkForNativePartition(path.slash(), timestampType, partitionBy, timestamp, nameTxn);
+        path.concat(PARQUET_PARTITION_NAME);
+    }
+
+    /**
+     * Sets the path to the metadata file of a Parquet partition taking into account the timestamp, the partitioning
+     * scheme and the partition version.
+     *
+     * @param path          Set to the root directory for a table, this will be updated to the metadata file of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
+     */
+    public static void setPathForParquetPartitionMetadata(Path path, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        setSinkForNativePartition(path.slash(), timestampType, partitionBy, timestamp, nameTxn);
+        path.concat(PARQUET_METADATA_FILE_NAME);
+    }
+
+    /**
+     * Sets the sink to the directory of a native partition taking into account the timestamp, the partitioning scheme
+     * and the partition version.
+     *
+     * @param sink          Set to the root directory for a table, this will be updated to the root directory of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
+     */
+    public static void setSinkForNativePartition(CharSink<?> sink, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        PartitionBy.setSinkForPartition(sink, timestampType, partitionBy, timestamp);
+        if (nameTxn > -1L) {
+            sink.put('.').put(nameTxn);
+        }
+    }
+
+    public static void setTxReaderPath(@NotNull TxReader reader, @NotNull Path path, int timestampType, int partitionBy) {
+        reader.ofRO(path.concat(TXN_FILE_NAME).$(), timestampType, partitionBy);
+    }
+
+    /**
+     * Maps a table type code stored in {@code tables.d} onto its token type.
+     * <p>
+     * Unknown codes throw rather than falling back to {@link TableToken.Type#TABLE}. A newer binary
+     * can write a type this one does not know, and every view kind is implicitly WAL: silently
+     * degrading such an entry to a plain non-WAL table hands out a {@code TableWriter} where a
+     * {@code WalWriter} is required, which corrupts the directory. Refusing to load the entry is
+     * recoverable by upgrading the binary again; the corruption is not.
+     */
+    public static TableToken.Type tableTypeOf(int tableType) {
+        return switch (tableType) {
+            case TABLE_TYPE_NON_WAL, TABLE_TYPE_WAL -> TableToken.Type.TABLE;
+            case TABLE_TYPE_LIVE_VIEW -> TableToken.Type.LIVE_VIEW;
+            case TABLE_TYPE_MAT -> TableToken.Type.MAT_VIEW;
+            case TABLE_TYPE_VIEW -> TableToken.Type.VIEW;
+            default -> throw CairoException.critical(0)
+                    .put("unknown table type in name registry, table was created by a newer version [type=")
+                    .put(tableType)
+                    .put(']');
+        };
+    }
+
+    public static boolean symbolDataHasNulls(FilesFacade ff, long fd, long rowCount) {
+        final long size = rowCount * Integer.BYTES;
+        if (ff.length(fd) < size) {
+            return true;
+        }
+        final long address = mapRO(ff, fd, size, MemoryTag.MMAP_DEFAULT);
+        try {
+            return symbolDataHasNulls(address, rowCount);
+        } finally {
+            ff.munmap(address, size, MemoryTag.MMAP_DEFAULT);
+        }
+    }
+
+    public static boolean symbolDataHasNulls(long address, long rowCount) {
+        for (long lo = 0; lo < rowCount; lo += MAX_SYMBOL_NULL_SCAN_ROWS) {
+            final long count = Math.min(MAX_SYMBOL_NULL_SCAN_ROWS, rowCount - lo);
+            if (Vect.countInt(address + lo * Integer.BYTES, count) < count) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static int toIndexKey(int symbolKey) {
+        assert symbolKey != Integer.MAX_VALUE;
+        return symbolKey == SymbolTable.VALUE_IS_NULL ? 0 : symbolKey + 1;
     }
 
     public static void validateIndexValueBlockSize(int position, int indexValueBlockSize) throws SqlException {
@@ -839,6 +3335,111 @@ public final class TableUtils {
         }
         if (indexValueBlockSize > MAX_INDEX_VALUE_BLOCK_SIZE) {
             throw SqlException.$(position, "max index block capacity is ").put(MAX_INDEX_VALUE_BLOCK_SIZE);
+        }
+    }
+
+    public static void validateMeta(
+            Utf8Sequence metaPath,
+            MemoryMR metaMem,
+            LowerCaseCharSequenceIntHashMap nameIndex,
+            int expectedVersion
+    ) {
+        try {
+            final long memSize = checkMemSize(metaMem, META_OFFSET_COLUMN_TYPES);
+            validateMetaVersion(metaPath, metaMem, META_OFFSET_VERSION, expectedVersion, ColumnType.MAX_STORAGE_VERSION);
+            final int columnCount = getColumnCount(metaPath, metaMem, META_OFFSET_COUNT);
+
+            long offset = getColumnNameOffset(columnCount);
+            if (memSize < offset) {
+                throw validationException()
+                        .put("file is too small, column types are missing [path=").put(metaPath)
+                        .put(", memSize=").put(memSize)
+                        .put(']');
+            }
+
+            // validate designated timestamp column
+            final int timestampIndex = getTimestampIndex(metaPath, metaMem, META_OFFSET_TIMESTAMP_INDEX, columnCount);
+            if (timestampIndex != -1) {
+                final int timestampType = getColumnType(metaMem, timestampIndex);
+                if (!ColumnType.isTimestamp(timestampType)) {
+                    throw validationException()
+                            .put("timestamp column must be TIMESTAMP [path=").put(metaPath)
+                            .put(", columnType=").put(ColumnType.nameOf(timestampType))
+                            .put(", columnIndex=").put(timestampIndex)
+                            .put(']');
+                }
+            }
+
+            // validate column types and index attributes
+            for (int i = 0; i < columnCount; i++) {
+                final int type = Math.abs(getColumnType(metaMem, i));
+                if (ColumnType.sizeOf(type) == -1) {
+                    throw validationException()
+                            .put("invalid column type [path=").put(metaPath)
+                            .put(", columnType=").put(type)
+                            .put(", columnIndex=").put(i)
+                            .put(']');
+                }
+
+                if (isColumnIndexed(metaMem, i)) {
+                    if (!ColumnType.isSymbol(type)) {
+                        throw validationException()
+                                .put("index flag is only supported for SYMBOL column type [path=").put(metaPath)
+                                .put(", columnType=").put(ColumnType.nameOf(type))
+                                .put(", columnIndex=").put(i)
+                                .put(']');
+                    }
+
+                    if (getIndexBlockCapacity(metaMem, i) < 2) {
+                        throw validationException()
+                                .put("invalid index value block capacity [path=").put(metaPath)
+                                .put(", indexBlockCapacity=").put(getIndexBlockCapacity(metaMem, i))
+                                .put(", columnIndex=").put(i)
+                                .put(']');
+                    }
+                }
+            }
+
+            // validate column names
+            int denseCount = 0;
+            if (nameIndex != null) {
+                for (int i = 0; i < columnCount; i++) {
+                    final CharSequence columnName = getColumnName(metaPath, metaMem, memSize, offset, i);
+                    if (getColumnType(metaMem, i) < 0 || nameIndex.put(columnName, denseCount++)) {
+                        offset += Vm.getStorageLength(columnName);
+                    } else {
+                        throw validationException()
+                                .put("duplicate column [path=").put(metaPath)
+                                .put(", columnName=").put(columnName)
+                                .put(", columnIndex=").put(i)
+                                .put(']');
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            if (nameIndex != null) {
+                nameIndex.clear();
+            }
+            throw e;
+        }
+    }
+
+    public static void validateMetaVersion(Utf8Sequence metaPath, MemoryMR metaMem, long metaVersionOffset, int expectedVersion) {
+        // Exact-version check for metadata whose version has a single supported value, such as the
+        // sequencer WAL format version. Table metadata that may carry the composite storage marker
+        // must use the range overload below; do not widen this one, it also guards the WAL format.
+        validateMetaVersion(metaPath, metaMem, metaVersionOffset, expectedVersion, expectedVersion);
+    }
+
+    public static void validateMetaVersion(Utf8Sequence metaPath, MemoryMR metaMem, long metaVersionOffset, int expectedVersion, int maxVersion) {
+        final int metaVersion = metaMem.getInt(metaVersionOffset);
+        // A table that currently holds composite partitions carries ColumnType.MAX_STORAGE_VERSION
+        // rather than ColumnType.VERSION; both are readable by this binary, so accept the whole
+        // [expectedVersion, maxVersion] range. A version below expectedVersion is a table
+        // that predates a migration (migrations bring it up before it is opened), and a version
+        // above maxVersion comes from a newer binary this one cannot read.
+        if (metaVersion < expectedVersion || metaVersion > maxVersion) {
+            throw CairoException.metadataVersionMismatch(metaPath, expectedVersion, metaVersion);
         }
     }
 
@@ -851,16 +3452,27 @@ public final class TableUtils {
         }
     }
 
-    public static void validateSymbolCapacityCached(boolean cache, int symbolCapacity, int cacheKeywordPosition) throws SqlException {
-        if (cache && symbolCapacity > MAX_SYMBOL_CAPACITY_CACHED) {
+    public static void validateSymbolCapacityCached(boolean isCached, int symbolCapacity, int cacheKeywordPosition) throws SqlException {
+        if (isCached && symbolCapacity > MAX_SYMBOL_CAPACITY_CACHED) {
             throw SqlException.$(cacheKeywordPosition, "max cached symbol capacity is ").put(MAX_SYMBOL_CAPACITY_CACHED);
         }
     }
 
+    public static CairoException validationException() {
+        return CairoException.critical(CairoException.METADATA_VALIDATION);
+    }
+
+    public static CairoException validationException(MemoryR mem) {
+        if (mem instanceof MemoryMR) {
+            return CairoException.critical(CairoException.METADATA_VALIDATION).put("Invalid metadata at fd=").put(((MemoryMR) mem).getFd()).put(". ");
+        }
+        return CairoException.critical(CairoException.METADATA_VALIDATION).put("Invalid metadata. ");
+    }
+
     public static void writeIntOrFail(FilesFacade ff, long fd, long offset, int value, long tempMem8b, Path path) {
-        Unsafe.getUnsafe().putInt(tempMem8b, value);
+        Unsafe.putInt(tempMem8b, value);
         if (ff.write(fd, tempMem8b, Integer.BYTES, offset) != Integer.BYTES) {
-            throw CairoException.instance(ff.errno())
+            throw CairoException.critical(ff.errno())
                     .put("could not write 8 bytes [path=").put(path)
                     .put(", fd=").put(fd)
                     .put(", offset=").put(offset)
@@ -869,136 +3481,419 @@ public final class TableUtils {
         }
     }
 
+    /**
+     * Writes the durable {@code _lv.drop} sentinel into the live view's directory and fsyncs it
+     * before returning. Idempotent: a repeated DROP that finds an existing sentinel re-opens, fsyncs
+     * and closes - the file's existence is the signal, not its contents. Failure throws
+     * {@link CairoException} with the path, so a caller that stamps the sentinel first aborts before
+     * any teardown and leaves the view queryable.
+     * <p>
+     * Unlike the checkpoint segment writers, this deliberately does NOT tmp+rename. Recovery keys off
+     * existence alone, so a zero-byte or partially written {@code _lv.drop} still correctly triggers
+     * the reap branch in {@code CairoEngine.buildViewGraphs}; a tmp+rename scheme would instead lose a
+     * crash-before-rename drop intent. Existence-only is the stronger durability contract here, not an
+     * oversight.
+     * <p>
+     * What the fsync does NOT cover: the sentinel's parent directory entry. POSIX does not make a
+     * newly linked name durable until the containing directory is itself fsynced, and
+     * {@link FilesFacade} has no directory-fsync primitive (nothing in the engine does this today).
+     * So the guarantee this call actually provides is ordering across a PROCESS crash, not across a
+     * power loss: after a power loss the sentinel can be absent even though the drop had already
+     * begun, and the startup loader then sees a directory holding an {@code _lv} with no
+     * {@code _lv.drop} and re-registers it as a healthy live view. Callers should read the "durable"
+     * in the surrounding comments as that weaker property.
+     */
+    public static void writeLiveViewDropSentinel(CairoConfiguration configuration, TableToken token) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        try (Path path = new Path()) {
+            path.of(configuration.getDbRoot()).concat(token).concat(LiveViewDefinition.LIVE_VIEW_DROP_SENTINEL_FILE_NAME).$();
+            long fd = openFileRWOrFail(ff, path.$(), configuration.getWriterFileOpenOpts());
+            try {
+                ff.fsync(fd);
+            } finally {
+                ff.close(fd);
+            }
+        }
+    }
+
     public static void writeLongOrFail(FilesFacade ff, long fd, long offset, long value, long tempMem8b, Path path) {
-        Unsafe.getUnsafe().putLong(tempMem8b, value);
+        Unsafe.putLong(tempMem8b, value);
         if (ff.write(fd, tempMem8b, Long.BYTES, offset) != Long.BYTES) {
-            throw CairoException.instance(ff.errno())
+            throw CairoException.critical(ff.errno())
                     .put("could not write 8 bytes [path=").put(path)
                     .put(", fd=").put(fd)
                     .put(", offset=").put(offset)
                     .put(", value=").put(value)
                     .put(']');
         }
+    }
+
+    public static void writeMetadata(TableStructure tableStruct, int tableVersion, int tableId, MemoryA mem) {
+        int count = tableStruct.getColumnCount();
+        mem.putInt(count);
+        mem.putInt(tableStruct.getPartitionBy());
+        int timestampIndex = tableStruct.getTimestampIndex();
+        assert timestampIndex == -1 ||
+                (timestampIndex >= 0 && timestampIndex < count && ColumnType.isTimestamp(tableStruct.getColumnType(timestampIndex)))
+                : String.format("timestampIndex %d count %d columnType %d", timestampIndex, count, tableStruct.getColumnType(timestampIndex));
+        mem.putInt(timestampIndex);
+        mem.putInt(tableVersion);
+        mem.putInt(tableId);
+        mem.putInt(tableStruct.getMaxUncommittedRows());
+        mem.putLong(tableStruct.getO3MaxLag());
+        mem.putLong(0); // Metadata version.
+        mem.putBool(tableStruct.isWalEnabled());
+        mem.putInt(TableUtils.calculateMetaFormatMinorVersionField(0, count));
+        mem.putInt(tableStruct.getTtlHoursOrMonths());
+        mem.putInt(tableStruct.getTableFormat());
+        mem.putInt(tableStruct.getDedupMode());
+
+        mem.jumpTo(TableUtils.META_OFFSET_COLUMN_TYPES);
+        assert count > 0;
+
+        for (int i = 0; i < count; i++) {
+            mem.putInt(tableStruct.getColumnType(i));
+            long flags = encodeIndexTypeFlags(tableStruct.getIndexType(i));
+
+            if (tableStruct.getSymbolCacheFlag(i)) {
+                flags |= META_FLAG_BIT_SYMBOL_CACHE;
+            }
+
+            if (tableStruct.isDedupKey(i)) {
+                flags |= META_FLAG_BIT_DEDUP_KEY;
+            }
+
+            if (tableStruct.isCovering(i)) {
+                flags |= META_FLAG_BIT_COVERING;
+            }
+
+            mem.putLong(flags);
+            mem.putInt(tableStruct.getIndexBlockCapacity(i));
+            mem.putInt(tableStruct.getSymbolCapacity(i));
+            mem.putInt(tableStruct.getParquetEncodingConfig(i));
+            // reserved
+            mem.skip(8);
+        }
+
+        for (int i = 0; i < count; i++) {
+            mem.putStr(tableStruct.getColumnName(i));
+        }
+
+        for (int i = 0; i < count; i++) {
+            IntList coveringIndices = tableStruct.getCoveringColumnIndices(i);
+            if (coveringIndices != null && coveringIndices.size() > 0) {
+                mem.putInt(coveringIndices.size());
+                for (int ci = 0, cn = coveringIndices.size(); ci < cn; ci++) {
+                    mem.putInt(coveringIndices.getQuick(ci));
+                }
+            }
+        }
+
+        // Trailing row-expiry policy section (META_FORMAT_MINOR_VERSION_EXPIRE_ROWS). Always written,
+        // even when there's no policy (empty string + 0L), so the two _meta serializers stay symmetric.
+        mem.putStr(tableStruct.getExpiryPredicate() == null ? "" : tableStruct.getExpiryPredicate());
+        mem.putLong(tableStruct.getExpiryCleanupIntervalMicros());
+    }
+
+    private static long allocateDiskSpace(FilesFacade ff, long fd, long allocatedHi, long size, long allocateTo) {
+        final long length = ff.length(fd);
+        if (length < 0) {
+            throw CairoException.critical(ff.errno()).put("could not read file size [fd=").put(fd).put(']');
+        }
+        if (length >= size) {
+            return allocatedHi;
+        }
+        // Below min(allocatedHi, length) the file was backed by this caller; a shrink since leaves no holes.
+        if (!ff.allocate(fd, Math.min(allocatedHi, length), allocateTo)) {
+            throw CairoException.critical(ff.errno()).put("No space left [size=").put(size).put(", fd=").put(fd).put(']');
+        }
+        return allocateTo;
+    }
+
+    /**
+     * Like {@link #allocateDiskSpaceAligned(FilesFacade, long, long)}, with the file length the caller already sampled.
+     */
+    private static void allocateDiskSpaceAlignedFromLength(FilesFacade ff, long fd, long size, long existingSize) {
+        if (existingSize < size && !ff.allocate(fd, alignedSize(size))) {
+            throw CairoException.critical(ff.errno()).put("No space left [size=").put(size).put(", fd=").put(fd).put(']');
+        }
+    }
+
+    private static int exists(FilesFacade ff, Path path) {
+        if (ff.exists(path.$())) { // it can also be a file, for example created with touch
+            if (ff.exists(path.concat(TXN_FILE_NAME).$())) {
+                return TABLE_EXISTS;
+            } else {
+                return TABLE_RESERVED;
+            }
+        } else {
+            return TABLE_DOES_NOT_EXIST;
+        }
+    }
+
+    private static CharSequence getCharSequence(MemoryMR metaMem, long memSize, long offset, int strLength) {
+        if (strLength < 1 || strLength > 255) {
+            // EXT4 and many others do not allow file name length > 255 bytes
+            throw validationException().put("String length of ").put(strLength).put(" is invalid at offset ").put(offset);
+        }
+        final long storageLength = Vm.getStorageLength(strLength);
+        if (offset + storageLength > memSize) {
+            throw CairoException.fileTooSmall(memSize, offset + storageLength);
+        }
+        return metaMem.getStrA(offset);
+    }
+
+    public static boolean isMetaFormatAtLeast(MemoryR metaMem, short minorVersion) {
+        final int metaFormatMinorVersionField = metaMem.getInt(META_OFFSET_META_FORMAT_MINOR_VERSION);
+        return isMetaFormatMinorVersionFieldValid(metaMem, metaFormatMinorVersionField)
+                && Numbers.decodeHighShort(metaFormatMinorVersionField) >= minorVersion;
+    }
+
+    // The checksum in the low short of the Metadata Format Minor Version field matches the metadata version and
+    // the column count of the header only when a version that maintains the field wrote it.
+    private static boolean isMetaFormatMinorVersionFieldValid(MemoryR metaMem, int metaFormatMinorVersionField) {
+        return Numbers.decodeLowShort(metaFormatMinorVersionField) == checksumForMetaFormatMinorVersionField(
+                metaMem.getLong(META_OFFSET_METADATA_VERSION),
+                metaMem.getInt(META_OFFSET_COUNT)
+        );
+    }
+
+    private static boolean isOlderThanTtl(TimestampDriver timestampDriver, long partitionBoundary, long maxTimestamp, int ttl) {
+        // TTL < 0 means it's in months
+        if (ttl <= 0) {
+            return timestampDriver.monthsBetween(partitionBoundary, maxTimestamp) >= -ttl;
+        }
+        // The parser admits hour counts far past what a nanosecond timestamp can express:
+        // CommonUtils.toHoursOrMonths range-checks DAYS and WEEKS but passes the HOUR unit
+        // through untouched, and PartitionBy.validateTtlGranularity waives granularity for
+        // PARTITION BY HOUR, so anything up to TTL 2_147_483_647 HOURS reaches here - against this
+        // driver's getMaxUnitValue('h') of 2_562_047. fromHours() multiplies unchecked, so the
+        // product wraps: TTL 106_752 DAYS, the smallest DAYS value that trips it, gives
+        // 2_562_048 * 3_600_000_000_000 = Long.MAX_VALUE + 763_145_224_193 -> a negative span
+        // that every partition compares older than, dropping the whole table on the next
+        // commit. A TTL the timestamp type cannot express must expire nothing instead.
+        if (ttl > timestampDriver.getMaxUnitValue('h')) {
+            return false;
+        }
+        return maxTimestamp - partitionBoundary >= timestampDriver.fromHours(ttl);
+    }
+
+    // Utility method for debugging. This method is not used in production.
+    @SuppressWarnings("unused")
+    static boolean assertTimestampInOrder(long srcTimestampAddr, long srcDataMax) {
+        long prev = Long.MIN_VALUE;
+        for (long i = 0; i < srcDataMax; i++) {
+            long newTs = Unsafe.getLong(srcTimestampAddr + i * Long.BYTES);
+            if (newTs < prev) {
+                return false;
+            }
+            prev = newTs;
+        }
+        return true;
+    }
+
+    /**
+     * Creates a column list from the metadata file. Each entry of the list is a struct, but
+     * Java doesn't support structs you may say! Yes, this is open-array struct, 3 elements per entry.
+     * - writer index (will explain what this is later)
+     * - column name offset - pointer at the beginning of the string list
+     * - symbol map index
+     * <p>
+     * This list will be dense, e.g., it will not have deleted columns, not will it have extra columns that
+     * have changed types. The type change is what makes this loading tricky. When a column type is changed, a new
+     * entry is added to the metadata file on the disk. This new entry will reference the old column (type change) via
+     * replace index, which is also written to the file.
+     * <p>
+     * When we read the file from disk, we don't need the "old" columns in the output. For this reason, as we read
+     * new columns from the file, we might go back to the columns we already read, and replace them.
+     * <p>
+     * Writer index is the index of the column in the metadata file. The metadata file has "sparse" column list,
+     * writer index refers to this sparse list.
+     *
+     * @param metaMem     the memory mapped metadata file
+     * @param columnCount the column count in the file
+     * @param targetList  the destination list (out parameter)
+     */
+    static void buildColumnListFromMetadataFile(MemoryR metaMem, int columnCount, IntList targetList) {
+        int nameOffset = (int) TableUtils.getColumnNameOffset(columnCount);
+        targetList.clear();
+
+        int denseSymbolIndex = 0;
+        for (int i = 0; i < columnCount; i++) {
+            int strLen = TableUtils.getInt(metaMem, metaMem.size(), nameOffset);
+            if (strLen == TableUtils.NULL_LEN) {
+                throw validationException(metaMem).put("NULL column name at [").put(i).put(']');
+            }
+            if (strLen < 1 || strLen > 255) {
+                // EXT4 and many others do not allow file name length > 255 bytes
+                throw validationException(metaMem).put("String length of ").put(strLen).put(" is invalid at offset ").put(nameOffset);
+            }
+            int nameLen = (int) Vm.getStorageLength(strLen);
+            int replacingColumnIndex = TableUtils.getReplacingColumnIndex(metaMem, i);
+            boolean isSymbol = ColumnType.isSymbol(TableUtils.getColumnType(metaMem, i));
+
+            if (replacingColumnIndex > -1) {
+                // Find the slot where the replaced column currently lives.
+                // For a chain A→B→C, when C replaces B, B may already have been
+                // moved into A's slot by a prior replacement, and slot B holds a
+                // dead marker of the form (-prevReplacingIndex - 1). Decode the
+                // marker to hop directly to the next slot in the chain: the
+                // column that ended up at slot prevReplacingIndex is the one we
+                // need to follow. Continue until the slot is live (non-negative
+                // writer index); that slot holds the column we want to overwrite.
+                // This is O(chain length) instead of O(N) scan per replacement.
+                // replacingColumnIndex is below i and every hop goes lower, so the walk ends.
+                int targetSlot = replacingColumnIndex;
+                int marker = targetList.getQuick(3 * targetSlot);
+                while (marker < 0) {
+                    targetSlot = -marker - 1;
+                    marker = targetList.getQuick(3 * targetSlot);
+                }
+
+                // Replace the column index at the found slot
+                targetList.set(3 * targetSlot, i);
+                targetList.set(3 * targetSlot + 1, nameOffset);
+                targetList.set(3 * targetSlot + 2, isSymbol ? denseSymbolIndex : -1);
+
+                targetList.add(-replacingColumnIndex - 1);
+                targetList.add(0);
+                targetList.add(0);
+
+            } else {
+                targetList.add(i);
+                targetList.add(nameOffset);
+                targetList.add(isSymbol ? denseSymbolIndex : -1);
+            }
+            nameOffset += nameLen;
+            if (isSymbol) {
+                denseSymbolIndex++;
+            }
+        }
+    }
+
+    /**
+     * Decodes the index type from the column flags long. See the comment on
+     * META_FLAG_BIT_INDEXED for the bit layout.
+     */
+    static byte decodeIndexTypeFlags(long flags) {
+        if ((flags & META_FLAG_BIT_INDEXED) == 0) {
+            return IndexType.NONE;
+        }
+        if ((flags & META_FLAG_BIT_IS_POSTING) == 0) {
+            return IndexType.BITMAP;
+        }
+        long variant = flags & META_FLAG_POSTING_VARIANT_MASK;
+        if (variant == 0) {
+            return IndexType.POSTING;
+        }
+        if (variant == META_FLAG_BIT_POSTING_VARIANT_LO) {
+            return IndexType.POSTING_DELTA;
+        }
+        if (variant == META_FLAG_BIT_POSTING_VARIANT_HI) {
+            return IndexType.POSTING_EF;
+        }
+        throw CairoException.critical(0).put("unknown posting index variant in column metadata [flags=").put(flags).put(']');
+    }
+
+    /**
+     * Encodes the index type into flag bits for storage. See the comment on
+     * META_FLAG_BIT_INDEXED for the bit layout.
+     */
+    static long encodeIndexTypeFlags(byte indexType) {
+        return switch (indexType) {
+            case IndexType.NONE -> 0;
+            case IndexType.BITMAP -> META_FLAG_BIT_INDEXED;
+            case IndexType.POSTING -> META_FLAG_BIT_INDEXED | META_FLAG_BIT_IS_POSTING;
+            case IndexType.POSTING_DELTA ->
+                    META_FLAG_BIT_INDEXED | META_FLAG_BIT_IS_POSTING | META_FLAG_BIT_POSTING_VARIANT_LO;
+            case IndexType.POSTING_EF ->
+                    META_FLAG_BIT_INDEXED | META_FLAG_BIT_IS_POSTING | META_FLAG_BIT_POSTING_VARIANT_HI;
+            default -> throw CairoException.critical(0).put("unknown index type [type=").put(indexType).put(']');
+        };
     }
 
     static long getColumnFlags(MemoryR metaMem, int columnIndex) {
         return metaMem.getLong(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4);
     }
 
-    static boolean isColumnIndexed(MemoryR metaMem, int columnIndex) {
-        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_INDEXED) != 0;
+    public static byte getColumnIndexType(MemoryR metaMem, int columnIndex) {
+        return decodeIndexTypeFlags(getColumnFlags(metaMem, columnIndex));
     }
 
-    static boolean isSequential(MemoryR metaMem, int columnIndex) {
-        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_SEQUENTIAL) != 0;
+    /**
+     * Returns the dedup mode stored in the _meta header, one of the DEDUP_MODE_* constants. A _meta
+     * file written before the dedup mode field existed has no such field: deduplication on such a
+     * table, when enabled, is always UPSERT.
+     */
+    static int getDedupMode(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_DEDUP_MODE)
+                ? metaMem.getInt(TableUtils.META_OFFSET_DEDUP_MODE)
+                : DEDUP_MODE_UPSERT;
     }
 
     static int getIndexBlockCapacity(MemoryR metaMem, int columnIndex) {
         return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8);
     }
 
+    static int getTableFormat(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_TABLE_FORMAT)
+                ? metaMem.getInt(TableUtils.META_OFFSET_TABLE_FORMAT)
+                : TABLE_FORMAT_NATIVE;
+    }
+
+    static int getTtlHoursOrMonths(MemoryR metaMem) {
+        // Gate on the version that introduced TTL rather than LATEST: a future bump of
+        // META_FORMAT_MINOR_VERSION_LATEST must not silently zero out TTL for older tables
+        // that legitimately have it set (same rationale as hasParquetEncodingConfig).
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_TTL) ? metaMem.getInt(TableUtils.META_OFFSET_TTL_HOURS_OR_MONTHS) : 0;
+    }
+
+    static boolean isColumnCovering(MemoryR metaMem, int columnIndex) {
+        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_COVERING) != 0;
+    }
+
+    static boolean isColumnDedupKey(MemoryR metaMem, int columnIndex) {
+        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_DEDUP_KEY) != 0;
+    }
+
+    public static boolean isColumnIndexed(MemoryR metaMem, int columnIndex) {
+        return getColumnIndexType(metaMem, columnIndex) != IndexType.NONE;
+    }
+
     static int openMetaSwapFile(FilesFacade ff, MemoryMA mem, Path path, int rootLen, int retryCount) {
         try {
             path.concat(META_SWAP_FILE_NAME).$();
-            int l = path.length();
+            int l = path.size();
             int index = 0;
             do {
                 if (index > 0) {
                     path.trimTo(l).put('.').put(index);
-                    path.$();
                 }
 
-                if (!ff.exists(path) || ff.remove(path)) {
+                LPSZ lpsz = path.$();
+                if (ff.removeQuiet(lpsz)) {
                     try {
-                        mem.smallFile(ff, path, MemoryTag.MMAP_DEFAULT);
+                        mem.smallFile(ff, lpsz, MemoryTag.MMAP_DEFAULT);
                         mem.jumpTo(0);
                         return index;
                     } catch (CairoException e) {
                         // right, cannot open file for some reason?
                         LOG.error()
                                 .$("could not open swap [file=").$(path)
+                                .$(", msg=").$safe(e.getFlyweightMessage())
                                 .$(", errno=").$(e.getErrno())
-                                .$(']').$();
+                                .I$();
                     }
                 } else {
                     LOG.error()
                             .$("could not remove swap [file=").$(path)
                             .$(", errno=").$(ff.errno())
-                            .$(']').$();
+                            .I$();
                 }
             } while (++index < retryCount);
-            throw CairoException.instance(0).put("Cannot open indexed file. Max number of attempts reached [").put(index).put("]. Last file tried: ").put(path);
+            throw CairoException.critical(0).put("Cannot open indexed file. Max number of attempts reached [").put(index).put("]. Last file tried: ").put(path);
         } finally {
             path.trimTo(rootLen);
-        }
-    }
-
-    static void openMetaSwapFileByIndex(FilesFacade ff, MemoryMA mem, Path path, int rootLen, int swapIndex) {
-        try {
-            path.concat(META_SWAP_FILE_NAME);
-            if (swapIndex > 0) {
-                path.put('.').put(swapIndex);
-            }
-            path.$();
-            mem.smallFile(ff, path, MemoryTag.MMAP_DEFAULT);
-        } finally {
-            path.trimTo(rootLen);
-        }
-    }
-
-    private static CairoException validationException(MemoryMR mem) {
-        return CairoException.instance(CairoException.METADATA_VALIDATION).put("Invalid metadata at fd=").put(mem.getFd()).put(". ");
-    }
-
-    static void createDirsOrFail(FilesFacade ff, Path path, int mkDirMode) {
-        if (ff.mkdirs(path, mkDirMode) != 0) {
-            throw CairoException.instance(ff.errno()).put("could not create directories [file=").put(path).put(']');
-        }
-    }
-
-    // Scans timestamp file
-    // returns size of partition detected, e.g. size of monotonic increase
-    // of timestamp longs read from 0 offset to the end of the file
-    // It also writes min and max values found in tempMem16b
-    static long readPartitionSizeMinMax(FilesFacade ff, Path path, CharSequence columnName, long tempMem16b, long timestamp) {
-        int plen = path.chop$().length();
-        try {
-            if (ff.exists(path.concat(columnName).put(FILE_SUFFIX_D).$())) {
-                final long fd = TableUtils.openRO(ff, path, LOG);
-                try {
-                    long fileSize = ff.length(fd);
-                    long mappedMem = mapRO(ff, fd, fileSize, MemoryTag.MMAP_DEFAULT);
-                    try {
-                        long minTimestamp;
-                        long maxTimestamp = timestamp;
-                        long size = 0L;
-
-                        for (long ptr = mappedMem, hi = mappedMem + fileSize; ptr < hi; ptr += Long.BYTES) {
-                            long ts = Unsafe.getUnsafe().getLong(ptr);
-                            if (ts >= maxTimestamp) {
-                                maxTimestamp = ts;
-                                size++;
-                            } else {
-                                break;
-                            }
-                        }
-                        if (size > 0) {
-                            minTimestamp = Unsafe.getUnsafe().getLong(mappedMem);
-                            Unsafe.getUnsafe().putLong(tempMem16b, minTimestamp);
-                            Unsafe.getUnsafe().putLong(tempMem16b + Long.BYTES, maxTimestamp);
-                        }
-                        return size;
-                    } finally {
-                        ff.munmap(mappedMem, fileSize, MemoryTag.MMAP_DEFAULT);
-                    }
-                } finally {
-                    ff.close(fd);
-                }
-            } else {
-                throw CairoException.instance(0).put("Doesn't exist: ").put(path);
-            }
-        } finally {
-            path.trimTo(plen);
         }
     }
 
@@ -1006,43 +3901,82 @@ public final class TableUtils {
         void close(long prevSize);
     }
 
-    public static void setNull(int columnType, long addr, long count) {
-        switch (ColumnType.tagOf(columnType)) {
-            case ColumnType.BOOLEAN:
-            case ColumnType.BYTE:
-            case ColumnType.GEOBYTE:
-                Vect.memset(addr, count, 0);
-                break;
-            case ColumnType.CHAR:
-            case ColumnType.SHORT:
-            case ColumnType.GEOSHORT:
-                Vect.setMemoryShort(addr, (short) 0, count);
-                break;
-            case ColumnType.INT:
-            case ColumnType.GEOINT:
-                Vect.setMemoryInt(addr, Numbers.INT_NaN, count);
-                break;
-            case ColumnType.FLOAT:
-                Vect.setMemoryFloat(addr, Float.NaN, count);
-                break;
-            case ColumnType.SYMBOL:
-                Vect.setMemoryInt(addr, -1, count);
-                break;
-            case ColumnType.LONG:
-            case ColumnType.DATE:
-            case ColumnType.TIMESTAMP:
-            case ColumnType.GEOLONG:
-                Vect.setMemoryLong(addr, Numbers.LONG_NaN, count);
-                break;
-            case ColumnType.DOUBLE:
-                Vect.setMemoryDouble(addr, Double.NaN, count);
-                break;
-            case ColumnType.LONG256:
-                // Long256 is null when all 4 longs are NaNs
-                Vect.setMemoryLong(addr, Numbers.LONG_NaN, count * 4);
-                break;
-            default:
-                break;
+    public interface SymbolTableProvider {
+        boolean containsNullValue(int columnIndex);
+
+        int getSymbolCount(int columnIndex);
+
+        MemoryR getSymbolOffsetsMemory(int columnIndex);
+
+        MemoryR getSymbolValuesMemory(int columnIndex);
+    }
+
+    public static class SymbolTableProviderFromReader implements SymbolTableProvider {
+        private TableReader reader;
+
+        public void clear() {
+            reader = null;
         }
+
+        @Override
+        public boolean containsNullValue(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).containsNullValue();
+        }
+
+        @Override
+        public int getSymbolCount(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).getSymbolCount();
+        }
+
+        @Override
+        public MemoryR getSymbolOffsetsMemory(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).getSymbolOffsetsColumn();
+        }
+
+        @Override
+        public MemoryR getSymbolValuesMemory(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).getSymbolValuesColumn();
+        }
+
+        public void of(TableReader reader) {
+            this.reader = reader;
+        }
+    }
+
+    public static class SymbolTableProviderFromWriter implements SymbolTableProvider {
+        private TableWriter writer;
+
+        public void clear() {
+            writer = null;
+        }
+
+        @Override
+        public boolean containsNullValue(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getNullFlag();
+        }
+
+        @Override
+        public int getSymbolCount(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getSymbolCount();
+        }
+
+        @Override
+        public MemoryR getSymbolOffsetsMemory(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getSymbolOffsetsMemory();
+        }
+
+        @Override
+        public MemoryR getSymbolValuesMemory(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getSymbolValuesMemory();
+        }
+
+        public void of(TableWriter writer) {
+            this.writer = writer;
+        }
+    }
+
+    static {
+        //noinspection ConstantValue
+        assert TX_OFFSET_LAG_MAX_TIMESTAMP_64 + 8 <= TX_OFFSET_MAP_WRITER_COUNT_32;
     }
 }

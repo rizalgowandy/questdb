@@ -1,0 +1,1575 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin.fuzz;
+
+import io.questdb.Metrics;
+import io.questdb.PropertyKey;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.TextPlanSink;
+import io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl;
+import io.questdb.log.LogRecord;
+import io.questdb.mp.WorkerPool;
+import io.questdb.mp.WorkerPoolConfiguration;
+import io.questdb.mp.WorkerPoolMode;
+import io.questdb.mp.WorkerPoolUtils;
+import io.questdb.mp.continuation.FiberTask;
+import io.questdb.mp.continuation.LaunchResult;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.Rnd;
+import io.questdb.std.str.StringSink;
+import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.TestListener;
+import io.questdb.test.cairo.fuzz.FailureFileFacade;
+import io.questdb.test.griffin.fuzz.expr.BindContext;
+import io.questdb.test.mp.TestWorkerPool;
+import io.questdb.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+
+/**
+ * Seeded random query fuzzer. Generates 1..3 WAL tables with all supported
+ * scalar types plus DECIMAL and DOUBLE arrays, inserts rows that span
+ * multiple DAY partitions, then runs a budget of randomly generated
+ * SELECT / GROUP BY / SAMPLE BY / LATEST ON / ASOF-LT-SPLICE / HORIZON /
+ * WINDOW JOIN / equi-join GROUP BY
+ * queries and
+ * materializes every result row, additionally re-iterating each cursor
+ * after {@code toTop()} and cross-checking {@code size()} /
+ * {@code calculateSize()} against the materialized row count.
+ * <p>
+ * Oracle is crash-only: {@link SqlException} is swallowed (legitimate
+ * user-facing error); anything else, including {@link CairoException},
+ * is recorded as a failure, because a generated SELECT should never leak
+ * an internal exception. Failures are collected for the whole run and
+ * reported together at the end, so a single invocation surfaces every
+ * bug in one go. The driving seeds are printed so a failure can be
+ * reproduced deterministically.
+ * <p>
+ * Budget knobs:
+ * <ul>
+ *     <li>{@code -Dquestdb.fuzz.queries=N} &mdash; number of queries per
+ *         run (default 100). Crank up locally when hunting bugs.</li>
+ *     <li>{@code -Dquestdb.fuzz.diff.jit=true|false} &mdash; differential
+ *         JIT-on/off mode (default true). When enabled, every query is run
+ *         twice and the materializations are compared; any divergence is
+ *         reported as a failure.</li>
+ *     <li>{@code -Dquestdb.fuzz.diff.shadow=true|false} &mdash; differential
+ *         storage mode (default true). Each fuzz table has a shadow sibling
+ *         that holds identical data with independently random parquet/index
+ *         settings; every query is run against both and the materializations
+ *         compared. With both diffs enabled, three runs per query are
+ *         needed (primary @ JIT-on, primary @ JIT-off, shadow @ JIT-off)
+ *         and either divergence axis fails the query.</li>
+ *     <li>{@code -Dquestdb.fuzz.verify.cursor=true|false} &mdash; verify
+ *         per-cursor self-consistency (default true): every materialization
+ *         is re-iterated after {@code toTop()} and must reproduce the same
+ *         result set, {@code toTop()} must preserve {@code preComputedStateSize()},
+ *         and {@code size()} / {@code calculateSize()} must agree with the
+ *         materialized row count. These hold for every cursor, so a violation
+ *         is reported as a failure with no skip valves.</li>
+ *     <li>{@code -Dquestdb.fuzz.faults=true|false} &mdash; randomly enabled
+ *         fault injection (default true). On a fraction of queries
+ *         ({@code -Dquestdb.fuzz.fault.pct=N}, default 15) one fault is armed:
+ *         a failing filesystem op, a native allocation that trips the RSS
+ *         memory limit, or a thrown {@code test_fault()} woven into the query.
+ *         The runner then asserts the factory frees its resources on the error
+ *         path and that the same query runs cleanly once the fault is removed.
+ *         Fault queries bypass the differential oracle. All three fault types
+ *         run with parallel SQL execution enabled by default
+ *         ({@code -Dquestdb.fuzz.fault.parallel}, default true), so the parallel
+ *         filter / GROUP BY / top-K reduce error paths get exercised; pass false
+ *         to run them serially. The writer pool is halted for the whole query
+ *         loop, so no background job competes with the armed FILE / MALLOC fault
+ *         (which would otherwise fire on a background-job file op or trip the
+ *         process-global RSS ceiling on a background thread).</li>
+ *     <li>{@code -Dquestdb.fuzz.window=true|false} &mdash; generate
+ *         window-function shapes ({@code fn(...) OVER (PARTITION BY ...
+ *         ORDER BY ts [frame])}) on a fraction of queries (default true).
+ *         On by default like fault injection; it currently surfaces
+ *         still-unfixed window-function defects, so the run goes red on
+ *         the seeds that hit them. The WINDOW band is carved from the
+ *         SIMPLE range, so the other shapes' frequencies are unchanged;
+ *         pass {@code false} to drop window shapes and exercise the
+ *         rest.</li>
+ *     <li>{@code -Dquestdb.fuzz.lateston=true|false} &mdash; generate
+ *         LATEST ON shapes ({@code ... LATEST ON ts PARTITION BY col[, ...]},
+ *         the latest row per partition key) on a fraction of queries
+ *         (default true). The LATEST ON band is carved from the SIMPLE
+ *         range just below the WINDOW band, so the other shapes' frequencies
+ *         are unchanged; pass {@code false} to drop them and give the band
+ *         back to SIMPLE. The result is a stable multiset (timestamps are
+ *         unique), so the differential oracle compares result sets row for
+ *         row across JIT and the indexed-symbol storage shadow. On by
+ *         default like window.</li>
+ *     <li>{@code -Dquestdb.fuzz.horizonjoin=true|false} and
+ *         {@code -Dquestdb.fuzz.windowjoin=true|false} &mdash; generate
+ *         HORIZON JOIN (a keyed GROUP BY over offset-shifted ASOF matches)
+ *         and WINDOW JOIN (a per-master-row aggregate over a slave time
+ *         frame) shapes (both default true). They share the join band with
+ *         the ASOF/LT/SPLICE temporal joins, so enabling them splits that
+ *         band rather than widening it; with both off the band is
+ *         temporal-only and draws the original rnd stream. Their WHERE is
+ *         master-side only, so the FUNCTION fault is woven there like the
+ *         other shapes.</li>
+ *     <li>{@code -Dquestdb.fuzz.hashjoin=true|false} &mdash; generate
+ *         equi-join GROUP BY shapes (an INNER, LEFT, RIGHT or FULL join on one
+ *         or two of the shared key columns under a keyed or scalar aggregate),
+ *         the shape the fused hash join GROUP BY replaces (default true). Their band is carved from
+ *         the GROUP BY range, so the other shapes' frequencies are unchanged;
+ *         pass {@code false} to give the band back to GROUP BY.</li>
+ *     <li>{@code -Dquestdb.fuzz.diff.fused=true|false} &mdash; run every
+ *         equi-join GROUP BY query a second time with the fused hash join
+ *         GROUP BY disabled and compare the two materializations (default
+ *         true). The JIT, storage and bind axes run the fused plan on both of
+ *         their sides, so only this axis sees a fused plan that returns wrong
+ *         rows. The run asserts that the fused plan ran on enough of the
+ *         comparisons whose query compiled to rule out a planner that has
+ *         stopped selecting it.</li>
+ *     <li>{@code -Dquestdb.fuzz.diff.mappage=true|false} &mdash; run every
+ *         query once more, and an equi-join GROUP BY query several more times,
+ *         with {@code cairo.sql.small.map.page.size} cut to between 8 and 512
+ *         bytes, and compare each run with the default-page one (default
+ *         true). The tables are too small to grow a map with the
+ *         default page, so only this axis runs operators over maps that grow
+ *         while they hold cursors and flyweights into them.</li>
+ *     <li>{@code -Dquestdb.fuzz.hashjoin.payload=row_ids|copied} &mdash; force
+ *         every fused hash join GROUP BY to read its build's payload columns
+ *         where they live, or from the copy its build makes (default: neither,
+ *         the operator's own rule, which copies over the fuzz tables' equal
+ *         row counts unless an interval leaves the probe under half the
+ *         build).</li>
+ *     <li>{@code -Dquestdb.fuzz.s0=L -Dquestdb.fuzz.s1=L} - replay a
+ *         specific seed pair, as printed in the run's "random seeds: ..."
+ *         line. Use to reproduce a failure deterministically.</li>
+ * </ul>
+ * <p>
+ * Each query also has a small chance of running with parallel SQL
+ * execution disabled (parallel filter, GROUP BY, fused hash join GROUP BY,
+ * top-K, parquet read), so
+ * the serial code paths get exercised alongside the parallel ones. The
+ * coin flip pulls from the seeded rnd, so replaying with the same seeds
+ * reproduces the same on/off pattern.
+ * <p>
+ * On a smaller fraction of queries the runner also generates a
+ * bind-variable variant: the same query rewritten with a subset of
+ * bindable typed constants replaced by named {@code :bN::TYPE}
+ * placeholders, with values supplied through
+ * {@code BindVariableService.setStr(name, value)}. The variant runs at
+ * JIT-off and (when diff-JIT is enabled) at JIT-on, each compared
+ * against the literal form's pivot at the same JIT mode, since the JIT
+ * compiler has its own bind-variable handling that doesn't share code
+ * with the Java-filter path. Any divergence between the literal and bind
+ * paths (bind-time coercion vs constant fold) is reported as a fuzz
+ * failure.
+ */
+public class QueryFuzzTest extends AbstractCairoTest {
+    private static final int CONCURRENT_PAGE_FRAME_ROWS = 100;
+    private static final long CONCURRENT_STALL_NANOS = 60_000_000_000L;
+    // Per-constant chance, in percent, of substituting a bindable literal
+    // with a bind variable inside the bind variant.
+    private static final int CONSTANT_BIND_PROBABILITY_PCT = 50;
+    // Share of the fused on/off axis's completed comparisons (the pivot compiled and ran) that a
+    // working planner runs on the fused hash join GROUP BY, as runFuzz's guard models it. The share
+    // is well below 100% because the generator sends a minority of its queries through features the
+    // fused planner refuses, and a RIGHT join takes the fused plan only under the conditions that
+    // HashJoinGroupByClause describes. Sixty default runs, each on its own random schema, measured
+    // 44% over 1_872 completed comparisons, with per-run shares from 21% to 62% over 16 to 46
+    // comparisons that scatter around the mean as binomial draws do; eight 5_000-query runs measured
+    // 42% to 52%. The baseline sits below the measured share, so that a small drift in the
+    // generator's mix does not raise the guard's false-alarm rate.
+    private static final double FUSED_SHARE_BASELINE = 0.4;
+    // Chance, at FUSED_SHARE_BASELINE, that a run's fused count falls low enough for runFuzz's guard
+    // to fail it. No fixed percentage floor stays both safe and useful over the default budget's 20
+    // to 45 comparisons: the old 15% floor failed about one run in 3_000 at the measured share, and
+    // CI ran into it with 2 fused of 26. The exact binomial tail fails a run at the measured share
+    // less than once in a million, still fails every guarded run of a planner that stops fusing
+    // (0.6^25 = 2.8e-6 at the smallest guarded sample), and on a 5_000-query soak of about 170
+    // comparisons fails a share of 24% or less.
+    private static final double FUSED_SHARE_FALSE_ALARM = 1e-5;
+    // Lowest share, in percent, of a shape's differential queries that must actually run rather
+    // than be skipped on an expected error. Skips are normal - a fuzzed expression can overflow, a
+    // cast can be inconvertible - and how often they happen swings with the randomly generated
+    // tables, so this only catches a generator that has stopped producing compilable SQL at all:
+    // without it, a shape whose SQL drifts out of step with the engine leaves the run green with
+    // every one of its queries counted as skipped. Over a 1500-query run the shapes land between
+    // 66% (GROUP BY, WINDOW) and 100% (posting index) accepted, so 25% leaves wide headroom; read
+    // the per-shape line runFuzz logs to see where a shape actually sits.
+    private static final int MIN_ACCEPTED_PCT_PER_SHAPE = 25;
+    // Fault-injected queries a run needs before runFuzz asserts that at least one
+    // fault actually fired. Below this count a zero-fire run is a small-sample
+    // artifact (a fault arms at a random trigger point and a short query can run
+    // fewer ops than the trigger, so it never bites); at or above it, zero fired
+    // means the injector is disarmed. A default run injects ~15 (100 queries at a
+    // 15% fault probability), so the floor holds for every unshrunk run.
+    private static final int MIN_FAULT_QUERIES_FOR_FIRE_FLOOR = 5;
+    // Fault queries of ONE type a run needs before runFuzz holds that type to its own fire floor.
+    // Higher than the aggregate floor because a per-type zero-fire run is far likelier by chance:
+    // measured per-arm fire rates run 49-88% by type, so at a pessimistic 30% it takes 20 arms for
+    // an all-miss run to drop below 1e-3. See the guard in runFuzz.
+    private static final int MIN_FAULT_QUERIES_PER_TYPE_FOR_FIRE_FLOOR = 20;
+    // Differential queries a run needs before runFuzz asserts that a shape it could draw generated
+    // at least one query. The rarest such shape takes ~4% of the differential queries, so at this
+    // sample size an all-miss run sits below 1e-8; under it a zero is small-sample noise and
+    // runFuzz only logs. FuzzConfig's default budget leaves ~850 differential queries after fault
+    // injection takes its cut, so CI always guards. This floor is about the budget only: a shape
+    // whose per-run precondition the run never met is exempt whatever the budget, which
+    // describeUngeneratableShape decides.
+    private static final int MIN_QUERIES_FOR_ZERO_GUARD = 500;
+    // Differential queries a shape needs before runFuzz holds it to MIN_ACCEPTED_PCT_PER_SHAPE.
+    // Below this count the accepted rate is too noisy to assert on. FuzzConfig's default budget is
+    // sized so every shape the run can draw clears this - at the old 100-query default only
+    // SAMPLE_BY did, leaving the guard dormant for the other eight shapes. runFuzz logs any shape
+    // that still falls short, so a generator that goes rare cannot silently stop being guarded; it
+    // is logged rather than asserted because the rarest shape draws ~3.4% of a run, which at the
+    // default budget dips under the floor often enough by chance alone to make an assertion flaky.
+    // A shape that generated nothing at all is a different case and MIN_QUERIES_FOR_ZERO_GUARD
+    // guards it: no budget lifts POSTING off zero, because it needs the run's random schema to
+    // carry a posting-indexed SYMBOL.
+    private static final int MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR = 25;
+    // Per-query chance, in percent, of generating a bind-variable variant.
+    private static final int QUERY_BIND_PROBABILITY_PCT = 20;
+    // Name of the query (SQL) worker pool. Its worker threads are named
+    // QUERY_POOL_NAME + '_' + workerId, which the FILE fault's query-execution
+    // scope matches to admit reduce workers alongside the test thread.
+    private static final String QUERY_POOL_NAME = "fuzzQuery";
+    private static final boolean[] SERIAL_FLAGS = new boolean[7];
+    // Per-query chance, in percent, of running with parallel SQL execution disabled.
+    private static final int SERIAL_PROBABILITY_PCT = 5;
+
+    @Test
+    public void testBinomialLowerTail() {
+        // Exact rational arithmetic computed the expected values, outside the code under test.
+        assertBinomialLowerTail(2.84302880299297e-06, 0, 25);
+        assertBinomialLowerTail(5.022684218620914e-05, 1, 25);
+        assertBinomialLowerTail(2.7766914642564675e-04, 2, 26);
+        assertBinomialLowerTail(1.5917802375868418e-03, 3, 26);
+        assertBinomialLowerTail(9.416824245541328e-06, 41, 170);
+        assertBinomialLowerTail(1.9811797371565857e-05, 42, 170);
+        // The first term, 0.6^2000, underflows a double, and the terms near k carry the tail.
+        assertBinomialLowerTail(2.371628584995946e-06, 700, 2_000);
+        assertBinomialLowerTail(0.5097100085964106, 800, 2_000);
+        Assert.assertEquals(0.0, binomialLowerTail(0, 2_000, 0.4), 0.0);
+        Assert.assertEquals(1.0, binomialLowerTail(26, 26, 0.4), 1e-12);
+    }
+
+    @Test
+    public void testConcurrentFiberQueryFuzz() throws Exception {
+        assertMemoryLeak(() -> {
+            final Long s0 = Long.getLong("questdb.fuzz.s0");
+            final Long s1 = Long.getLong("questdb.fuzz.s1");
+            final Rnd rnd = s0 != null && s1 != null ? TestUtils.generateRandom(LOG, s0, s1) : TestUtils.generateRandom(LOG);
+            final FuzzConfig config = FuzzConfig.forConcurrency(rnd);
+            final int queryWorkerCount = 1 + rnd.nextInt(2);
+            final int ownerWorkerCount = 2 + rnd.nextInt(2);
+            final int ownerCount = ownerWorkerCount * (2 + rnd.nextInt(3));
+            LOG.info().$("concurrent fuzz config: tables=").$(config.getNumTables())
+                    .$(", rows=").$(config.getRowsPerTable())
+                    .$(", queries=").$(config.getNumQueries())
+                    .$(", queryWorkers=").$(queryWorkerCount)
+                    .$(", ownerWorkers=").$(ownerWorkerCount)
+                    .$(", owners=").$(ownerCount)
+                    .$();
+            if (config.getHashJoinPayloadLayout() != null) {
+                config.getHashJoinPayloadLayout().apply(node1.getConfigurationOverrides());
+            }
+            config.getHashJoinBuildMode().applyProperties(node1.getConfigurationOverrides());
+            setProperty(PropertyKey.CAIRO_SQL_LATEST_BY_JIT_ENABLED, Boolean.toString(rnd.nextBoolean()));
+
+            final WorkerPool queryPool = new TestWorkerPool(QUERY_POOL_NAME, queryWorkerCount, Metrics.DISABLED, WorkerPoolMode.FIBER_HOST);
+            WorkerPoolUtils.setupQueryJobs(queryPool, engine, true);
+            final WorkerPool writerPool = TestWorkerPool.createWithRandomMode(rnd, new WorkerPoolConfiguration() {
+                @Override
+                public String getPoolName() {
+                    return "fuzzWriter";
+                }
+
+                @Override
+                public int getWorkerCount() {
+                    return 2;
+                }
+            });
+            WorkerPoolUtils.setupWriterJobs(writerPool, engine);
+            final WorkerPool ownerPool = new TestWorkerPool("fuzzOwner", ownerWorkerCount, Metrics.DISABLED, WorkerPoolMode.FIBER_HOST);
+            queryPool.start(LOG);
+            writerPool.start(LOG);
+            ownerPool.start(LOG);
+            final ObjList<SqlExecutionContextImpl> contexts = new ObjList<>();
+            try {
+                final SqlExecutionContextImpl buildContext = newFuzzContext(queryWorkerCount);
+                contexts.add(buildContext);
+                final ObjList<FuzzTable> tables = createTables(rnd, config, buildContext);
+                engine.releaseInactive();
+                writerPool.halt();
+
+                final ObjList<GeneratedQuery> queries = new ObjList<>();
+                final boolean[] isSerial = new boolean[config.getNumQueries()];
+                for (int q = 0; q < config.getNumQueries(); q++) {
+                    final long preGenS0 = rnd.getSeed0();
+                    final long preGenS1 = rnd.getSeed1();
+                    GeneratedQuery query = generateConcurrentQuery(rnd, tables, null, config);
+                    if (rnd.nextInt(100) < QUERY_BIND_PROBABILITY_PCT) {
+                        final long bindS0 = rnd.nextLong();
+                        final long bindS1 = rnd.nextLong();
+                        rnd.reset(preGenS0, preGenS1);
+                        final BindContext bindContext = new BindContext(new Rnd(bindS0, bindS1), CONSTANT_BIND_PROBABILITY_PCT);
+                        final GeneratedQuery bindForm = generateConcurrentQuery(rnd, tables, bindContext, config);
+                        if (bindContext.getBindValues().size() > 0) {
+                            query = query.withBind(bindForm.sql(), bindContext.getBindNames(), bindContext.getBindValues());
+                        }
+                    }
+                    queries.add(query);
+                    isSerial[q] = rnd.nextInt(100) < SERIAL_PROBABILITY_PCT;
+                }
+
+                final CountDownLatch doneLatch = new CountDownLatch(ownerCount);
+                final AtomicInteger completedCount = new AtomicInteger();
+                final AtomicReferenceArray<String> runningSql = new AtomicReferenceArray<>(ownerCount);
+                final AtomicReference<Throwable> ownerError = new AtomicReference<>();
+                final ObjList<QueryRunner.Result> failures = new ObjList<>();
+                for (int o = 0; o < ownerCount; o++) {
+                    final int ownerIndex = o;
+                    final SqlExecutionContextImpl context = newFuzzContext(queryWorkerCount);
+                    contexts.add(context);
+                    context.changePageFrameSizes(CONCURRENT_PAGE_FRAME_ROWS, CONCURRENT_PAGE_FRAME_ROWS);
+                    final QueryRunner runner = new QueryRunner(
+                            engine,
+                            context,
+                            config.isDiffJitEnabled(),
+                            config.isDiffShadowEnabled(),
+                            config.isDiffFusedEnabled(),
+                            null,
+                            config.isVerifyCursorEnabled(),
+                            tables,
+                            QUERY_POOL_NAME + '_'
+                    );
+                    final FiberTask owner = new FiberTask() {
+                        @Override
+                        protected void onError(Throwable th) {
+                            ownerError.compareAndSet(null, th);
+                        }
+
+                        @Override
+                        protected boolean runStep() {
+                            try {
+                                final boolean[] parallelFlags = parallelFlags(context);
+                                for (int i = ownerIndex, n = queries.size(); i < n; i += ownerCount) {
+                                    final GeneratedQuery query = queries.getQuick(i);
+                                    runningSql.set(ownerIndex, query.sql());
+                                    final QueryRunner.Result result;
+                                    if (isSerial[i]) {
+                                        setParallelFlags(context, SERIAL_FLAGS);
+                                        try {
+                                            result = runner.run(query);
+                                        } finally {
+                                            setParallelFlags(context, parallelFlags);
+                                        }
+                                    } else {
+                                        result = runner.run(query);
+                                    }
+                                    if (result.isFailed()) {
+                                        synchronized (failures) {
+                                            failures.add(result);
+                                        }
+                                    }
+                                    completedCount.incrementAndGet();
+                                }
+                                runningSql.set(ownerIndex, null);
+                            } finally {
+                                doneLatch.countDown();
+                            }
+                            return true;
+                        }
+                    };
+                    Assert.assertSame(LaunchResult.LAUNCHED, ownerPool.getFiberRuntime().launch(owner));
+                }
+
+                int lastCompletedCount = -1;
+                long lastProgressNanos = System.nanoTime();
+                while (!doneLatch.await(100, TimeUnit.MILLISECONDS)) {
+                    final int completed = completedCount.get();
+                    if (completed != lastCompletedCount) {
+                        lastCompletedCount = completed;
+                        lastProgressNanos = System.nanoTime();
+                    } else if (System.nanoTime() - lastProgressNanos > CONCURRENT_STALL_NANOS) {
+                        TestListener.dumpThreadStacks();
+                        final StringBuilder running = new StringBuilder();
+                        for (int o = 0; o < ownerCount; o++) {
+                            final String sql = runningSql.get(o);
+                            if (sql != null) {
+                                running.append("\n  ").append(sql);
+                            }
+                        }
+                        Assert.fail("concurrent query fuzz stalled after " + completed + " of " + queries.size() + " queries, running:" + running);
+                    }
+                }
+                if (ownerError.get() != null) {
+                    throw new AssertionError("query owner failed", ownerError.get());
+                }
+                if (failures.size() > 0) {
+                    throw buildFailure(failures);
+                }
+            } finally {
+                haltQuietly(queryPool);
+                haltQuietly(ownerPool);
+                haltQuietly(writerPool);
+                Misc.freeObjList(contexts);
+            }
+        });
+    }
+
+    @Test
+    public void testDecimalAggregationOverflowToleratedByOracle() throws Exception {
+        // Bug from window-function fuzzing: a sum/avg over a high-precision
+        // DECIMAL (Decimal256-backed) whose running total exceeds Decimal256's
+        // 256-bit capacity raises a CairoException "... aggregation failed: an
+        // overflow occurred". This is a genuine, data-dependent arithmetic limit -
+        // the plain group-by sum/avg overflows identically on the same data, and
+        // WindowDecimalFunctionTest pins it - so the oracle must treat it as an
+        // accepted skip rather than reporting it as an engine defect. Drive the
+        // repro queries straight through QueryRunner.run() to exercise the real
+        // classification path.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, g SYMBOL, d DECIMAL(76, 3)) TIMESTAMP(ts) PARTITION BY HOUR");
+            // 73 integer nines + 3 fractional nines == DECIMAL(76, 3) maximum; two in
+            // one partition overflow the Decimal256 accumulator at add time.
+            String nearMax = "9".repeat(73) + ".999m";
+            execute("INSERT INTO t VALUES " +
+                    "('2024-01-01T00:00:00', 'a', " + nearMax + "), " +
+                    "('2024-01-01T00:01:00', 'a', " + nearMax + ")");
+
+            QueryRunner runner = new QueryRunner(engine, sqlExecutionContext, false, false, false, null, true, new ObjList<>(), null);
+
+            QueryRunner.Result avgResult = runner.run(
+                    new GeneratedQuery("SELECT avg(d) OVER (PARTITION BY g ORDER BY ts) c FROM t", true));
+            Assert.assertTrue("avg overflow must be tolerated, not failed: "
+                    + (avgResult.getFailure() != null ? avgResult.getFailure().getMessage() : ""), avgResult.isSkipped());
+            Assert.assertFalse(avgResult.isFailed());
+
+            QueryRunner.Result sumResult = runner.run(
+                    new GeneratedQuery("SELECT sum(d) OVER (PARTITION BY g ORDER BY ts) c FROM t", true));
+            Assert.assertTrue("sum overflow must be tolerated, not failed: "
+                    + (sumResult.getFailure() != null ? sumResult.getFailure().getMessage() : ""), sumResult.isSkipped());
+            Assert.assertFalse(sumResult.isFailed());
+
+            // A query that does not overflow still runs to completion: the carve-out
+            // is narrow and does not turn a clean run into a skip.
+            execute("CREATE TABLE small (ts TIMESTAMP, g SYMBOL, d DECIMAL(18, 2)) TIMESTAMP(ts) PARTITION BY HOUR");
+            execute("INSERT INTO small VALUES " +
+                    "('2024-01-01T00:00:00', 'a', 1.00m), ('2024-01-01T00:01:00', 'a', 2.00m)");
+            QueryRunner.Result okResult = runner.run(
+                    new GeneratedQuery("SELECT avg(d) OVER (PARTITION BY g ORDER BY ts) c FROM small", true));
+            Assert.assertFalse(okResult.isSkipped());
+            Assert.assertFalse(okResult.isFailed());
+        });
+    }
+
+    @Test
+    public void testFusedShareGuard() {
+        // A working planner drew 2 fused of 26 completed comparisons on CI, which the old 15% floor
+        // failed. Every share at or above the baseline passes.
+        Assert.assertFalse(isFusedShareImplausible(2, 26));
+        Assert.assertFalse(isFusedShareImplausible(1, 26));
+        Assert.assertFalse(isFusedShareImplausible(11, 26));
+        Assert.assertFalse(isFusedShareImplausible(26, 26));
+        // A planner that stops fusing fails at the smallest guarded sample.
+        Assert.assertTrue(isFusedShareImplausible(0, MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR));
+        Assert.assertFalse(isFusedShareImplausible(1, MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR));
+        // A soak's larger sample holds the share to more: 41 of 170 (24%) fails and 42 passes.
+        Assert.assertTrue(isFusedShareImplausible(41, 170));
+        Assert.assertFalse(isFusedShareImplausible(42, 170));
+    }
+
+    @Test
+    public void testFpTolerantRowSetComparison() {
+        final boolean[] fpMask = {false, true};
+        // Last-digit drift in the FP column, rows in a different order.
+        Assert.assertTrue(QueryRunner.rowsetEqualsWithFpTolerance(
+                line("a", "1.0") + '\n' + line("b", "2.0") + '\n',
+                line("b", "2.0000000000000004") + '\n' + line("a", "1.0000000000000002") + '\n',
+                fpMask
+        ));
+        // An exact cell differs.
+        Assert.assertFalse(QueryRunner.rowsetEqualsWithFpTolerance(
+                line("a", "1.0") + '\n' + line("b", "2.0") + '\n',
+                line("a", "1.0") + '\n' + line("c", "2.0") + '\n',
+                fpMask
+        ));
+        // The FP cell differs by more than drift.
+        Assert.assertFalse(QueryRunner.rowsetEqualsWithFpTolerance(
+                line("a", "1.0") + '\n',
+                line("a", "1.5") + '\n',
+                fpMask
+        ));
+        // Different row counts.
+        Assert.assertFalse(QueryRunner.rowsetEqualsWithFpTolerance(
+                line("a", "1.0") + '\n',
+                line("a", "1.0") + '\n' + line("a", "1.0") + '\n',
+                fpMask
+        ));
+        // Rows that share their exact cells pair up by their FP cells, in any order...
+        Assert.assertTrue(QueryRunner.rowsetEqualsWithFpTolerance(
+                line("a", "1.0") + '\n' + line("a", "2.0") + '\n',
+                line("a", "2.0000000000000004") + '\n' + line("a", "1.0000000000000002") + '\n',
+                fpMask
+        ));
+        // ...and each row pairs once: two different rows cannot both take the same row.
+        Assert.assertFalse(QueryRunner.rowsetEqualsWithFpTolerance(
+                line("a", "1.0") + '\n' + line("a", "2.0") + '\n',
+                line("a", "1.0") + '\n' + line("a", "1.0") + '\n',
+                fpMask
+        ));
+    }
+
+    // Comparing every row with every other row took over a minute at 125k rows and stalled
+    // testConcurrentFiberQueryFuzz. The timeout turns a return of that into a failure, not a hang.
+    @Test(timeout = 120_000)
+    public void testFpTolerantRowSetComparisonOfLargeResult() {
+        final int rowCount = 300_000;
+        final StringSink forward = new StringSink();
+        final StringSink reversed = new StringSink();
+        for (int i = 0; i < rowCount; i++) {
+            forward.put(line("k" + i, "1.0")).put('\n');
+            reversed.put(line("k" + (rowCount - 1 - i), "1.0000000000000002")).put('\n');
+        }
+        Assert.assertTrue(QueryRunner.rowsetEqualsWithFpTolerance(forward, reversed, new boolean[]{false, true}));
+        // One exact cell off in the last row.
+        reversed.put(line("k0", "1.0")).put('\n');
+        forward.put(line("k1", "1.0")).put('\n');
+        Assert.assertFalse(QueryRunner.rowsetEqualsWithFpTolerance(forward, reversed, new boolean[]{false, true}));
+    }
+
+    @Test
+    public void testSeparatorCellsKeepFpToleranceAligned() {
+        // Found by the fused on/off axis: in SELECT (l.lk)::CHAR e0, count(*), stddev_samp(...),
+        // count(), count(r.k) FROM l LEFT JOIN r ON l.vk = r.vk, one group's CHAR key was code 9. Printed raw, the tab split its row into one more cell, so
+        // the stddev_samp cell met the count column's exact rule, and its reduction-order drift
+        // failed the query. The materialized cells escape their separators, so the drift is tolerated.
+        final boolean[] fpMask = {false, false, true, false, false};
+        for (String key : new String[]{"\t", "\n", "\r", "\\", "\t\n", "a"}) {
+            Assert.assertTrue(key, QueryRunner.rowEqualsWithFpTolerance(
+                    line(key, "74", "35.52387071528208", "74", "71"),
+                    line(key, "74", "35.52387071528207", "74", "71"),
+                    fpMask
+            ));
+            // The count cells still compare exactly.
+            Assert.assertFalse(key, QueryRunner.rowEqualsWithFpTolerance(
+                    line(key, "74", "35.52387071528208", "74", "71"),
+                    line(key, "74", "35.52387071528208", "74", "72"),
+                    fpMask
+            ));
+        }
+        // An escaped separator stays distinct from the text of its escape.
+        Assert.assertNotEquals(line("\t"), line("\\t"));
+        Assert.assertNotEquals(line("\\", "t"), line("\t"));
+    }
+
+    @Test
+    public void testHorizonJoinFloatSumStorageReductionOrderToleratedByOracle() throws Exception {
+        // Bug from multi-table HORIZON JOIN fuzzing (storage diff): a non-keyed
+        // HORIZON JOIN that sums a FLOAT slave column diverged between a native
+        // master/slave and a parquet shadow - native returned 374.97897, parquet
+        // 374.98038 (one row each, ~32x FLOAT epsilon). The parallel non-keyed path
+        // accumulates a per-worker partial FLOAT sum per frame and merges the
+        // partials (SumFloatGroupByFunction.merge is FLOAT + FLOAT) in an order set
+        // by the worker/frame partition. Native page frames and parquet row groups
+        // have different boundaries, so the partials - and the merge order - differ,
+        // and FLOAT addition is not associative. The result is reduction-order noise,
+        // not a row-set difference: count(p.c6) and sum(p.c6::double) are bit-identical
+        // across the two storages, so every storage layout sums the same multiset of
+        // FLOAT values; only the single-precision accumulation order differs. The
+        // oracle's FLOAT tolerance was just under the drift on this path.
+        //
+        // Two regression guards below:
+        //  1. Engine row-set identity (deterministic): with parallel HORIZON JOIN off,
+        //     the single-threaded float sum is storage-independent (master-driven
+        //     accumulation order), so native and parquet agree bit for bit on count,
+        //     the FLOAT sum, and the DOUBLE sum. This confirms the frame row-set is
+        //     identical - not an off-by-one frame boundary - which is the premise
+        //     for tolerating the parallel divergence.
+        //  2. Oracle tolerance: the refined per-cell FLOAT tolerance accepts the
+        //     reported divergence and still rejects a real one.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE master_n (ts TIMESTAMP, sym SYMBOL) TIMESTAMP(ts) PARTITION BY HOUR");
+            execute("CREATE TABLE slave_n (ts TIMESTAMP, sym SYMBOL, c6 FLOAT) TIMESTAMP(ts) PARTITION BY HOUR");
+            execute("CREATE TABLE master_p (ts TIMESTAMP, sym SYMBOL) TIMESTAMP(ts) PARTITION BY HOUR");
+            execute("CREATE TABLE slave_p (ts TIMESTAMP, sym SYMBOL, c6 FLOAT) TIMESTAMP(ts) PARTITION BY HOUR");
+            // Master every 20s, slave every 3s, so each RANGE FROM -4m TO 6m STEP 2m
+            // offset finds an ASOF match and the sum runs over many FLOAT terms.
+            execute("INSERT INTO master_n SELECT generate_series, rnd_symbol('a','b','c') " +
+                    "FROM generate_series('2024-01-01', '2024-01-01T02', '20s')");
+            execute("INSERT INTO slave_n SELECT generate_series, rnd_symbol('a','b','c'), rnd_float(8) " +
+                    "FROM generate_series('2024-01-01', '2024-01-01T02', '3s')");
+            // Identical data into the parquet shadow, then convert.
+            execute("INSERT INTO master_p SELECT * FROM master_n");
+            execute("INSERT INTO slave_p SELECT * FROM slave_n");
+            execute("ALTER TABLE master_p CONVERT PARTITION TO PARQUET WHERE ts >= 0");
+            execute("ALTER TABLE slave_p CONVERT PARTITION TO PARQUET WHERE ts >= 0");
+
+            final boolean savedParallelHorizonJoin = sqlExecutionContext.isParallelHorizonJoinEnabled();
+            sqlExecutionContext.setParallelHorizonJoinEnabled(false);
+            try {
+                final String q = "SELECT count(p.c6) AS n, sum(p.c6) AS a0, sum(p.c6::double) AS d " +
+                        "FROM %s t HORIZON JOIN %s p ON (t.sym = p.sym) RANGE FROM -4m TO 6m STEP 2m AS h";
+                final StringSink nSink = new StringSink();
+                final StringSink pSink = new StringSink();
+                printSql(String.format(q, "master_n", "slave_n"), nSink);
+                printSql(String.format(q, "master_p", "slave_p"), pSink);
+                TestUtils.assertEquals("native vs parquet row-set must be identical", nSink, pSink);
+            } finally {
+                sqlExecutionContext.setParallelHorizonJoinEnabled(savedParallelHorizonJoin);
+            }
+
+            // The reported parallel storage divergence (~32x FLOAT epsilon, identical
+            // row set) is now tolerated; the pre-fix bottom-of-binade ulp * 32 bound
+            // rejected it (374.98 sits low in the [256, 512) binade, where the bare ulp
+            // runs ~1.5x tight), the relative FLOAT epsilon * 64 bound covers it. The
+            // single-column mask marks the cell FP-typed, so the tolerance applies.
+            final boolean[] fpMask = {true};
+            final boolean[] exactMask = {false};
+            Assert.assertTrue("reported FLOAT-sum reduction-order drift must be tolerated",
+                    QueryRunner.rowEqualsWithFpTolerance("374.97897", "374.98038", fpMask));
+            // A real row-set divergence - e.g. one storage dropped a whole FLOAT term -
+            // shifts the sum by thousands of FLOAT epsilons, far beyond reduction noise,
+            // and must still be flagged.
+            Assert.assertFalse("a real FLOAT-sum divergence must still be flagged",
+                    QueryRunner.rowEqualsWithFpTolerance("374.97897", "375.51", fpMask));
+            // An integer COUNT/SUM column must compare exactly: a one-unit divergence
+            // at scale (1000000 vs 1000001) is within the relative FLOAT tolerance
+            // (floatEps ~ 7.6 at this magnitude) and would be masked if the tolerance
+            // applied. Gating to FP columns flags it instead.
+            Assert.assertFalse("an integer-column divergence at scale must be flagged",
+                    QueryRunner.rowEqualsWithFpTolerance("1000000", "1000001", exactMask));
+            // The same drift on an FP-typed column is still tolerated, confirming the
+            // gate keys on column type rather than magnitude.
+            Assert.assertTrue("FP-column reduction drift at scale stays tolerated",
+                    QueryRunner.rowEqualsWithFpTolerance("1000000", "1000001", fpMask));
+
+            // The envelope is relative to the MAGNITUDE of the result, so a term much smaller than
+            // the sum fits inside it: for {1_000_000, 1_000_000, 1_000_000, 9} the tolerance at 3e6
+            // is roughly 23, and losing the 9 costs nothing. It cannot be tightened away either - a
+            // sum over a FLOAT column is typed DOUBLE, so the metadata cannot tell a
+            // float-precision accumulation from a double-precision one, and every FP aggregate has
+            // to keep the FLOAT-sized envelope.
+            // Characterizing the envelope as it stands, not requiring it: if the tolerance is ever
+            // tightened this assertion is the one to update.
+            Assert.assertTrue("the FP envelope currently absorbs a term far below the sum's magnitude",
+                    QueryRunner.rowEqualsWithFpTolerance("3000009", "3000000", fpMask));
+            // Which is why JoinClauseSupport.appendRowSetGuard projects an exact count of the
+            // matched slave rows next to every join aggregate: the count is an integer column,
+            // compared exactly, so the dropped row that hid in the sum is flagged by its neighbour.
+            // It does not catch a same-cardinality shift (one row dropped, one admitted) - that
+            // needs an absolute oracle.
+            final boolean[] sumAndCountMask = {true, false};
+            Assert.assertFalse("the exact matched-row count must flag the dropped term",
+                    QueryRunner.rowEqualsWithFpTolerance("3000009\t4", "3000000\t3", sumAndCountMask));
+            // ... while a genuine reduction-order difference over the SAME rows stays accepted, so
+            // the guard costs no tolerance.
+            Assert.assertTrue("reduction-order drift over an identical row set stays tolerated",
+                    QueryRunner.rowEqualsWithFpTolerance("3000009\t4", "3000009.5\t4", sumAndCountMask));
+
+            // The mask a reconcile uses must be the AND of the two projections it compares,
+            // not whichever side ran last. On the bind axis the two projections are not
+            // guaranteed identical - bind values are bound as STRINGs, so the bind form's
+            // overload resolution can type a projection column DOUBLE where the literal form
+            // types it INT. Reading the mask from the bind side alone would hand that integer
+            // column the FP tolerance and silently absorb the one-unit divergence asserted
+            // above.
+            final boolean[] literalMask = {false, true};
+            final boolean[] bindMask = {true, true};
+            final boolean[] reconcileMask = QueryRunner.intersectFpColumnMasks(literalMask, bindMask);
+            Assert.assertFalse("a column either side types as an integer must compare exactly", reconcileMask[0]);
+            Assert.assertTrue("a column both sides type as FP keeps the tolerance", reconcileMask[1]);
+            Assert.assertFalse("an integer column must not inherit the other side's FP tolerance",
+                    QueryRunner.rowEqualsWithFpTolerance("1000000\t1.0", "1000001\t1.0", reconcileMask));
+            Assert.assertTrue("the same drift on the shared FP column stays tolerated",
+                    QueryRunner.rowEqualsWithFpTolerance("5\t1000000", "5\t1000001", reconcileMask));
+        });
+    }
+
+    @Test
+    public void testHorizonJoinIndexedMasterToleratedByOracle() throws Exception {
+        // Bug from multi-table HORIZON JOIN fuzzing (storage diff): the
+        // single-threaded HORIZON JOIN path requires the master to support random
+        // access (it revisits master rows in sorted order). When the master filter
+        // is fully served by a POSTING covering index, the master access path is a
+        // bare CoveringIndex, which does not support random access, so the LHS is
+        // rejected at compile time with "left-hand side of HORIZON JOIN can only be
+        // a table with an optional filter". The non-indexed shadow sibling
+        // full-scans, supports random access, and compiles, returning rows. The two
+        // storage configs therefore diverge structurally (one compiles, one
+        // rejects), not in data. This is the same planner-sensitivity asymmetry the
+        // oracle already tolerates for the SPLICE/ASOF index-vs-scan rejections, so
+        // isPlannerSensitivityAsymmetry must classify it as a skip rather than a
+        // divergence. Drive the diverging pair straight through QueryRunner to
+        // exercise the real storage-axis classification path.
+        //
+        // Parallel HORIZON JOIN is disabled below so the planner takes the
+        // single-threaded path deterministically - the same path the engine uses
+        // whenever it has no shared query workers - regardless of how many workers
+        // the test pool happens to advertise. (With parallel HORIZON JOIN on, the
+        // covering index supplies a page-frame cursor and the parallel path
+        // accepts it; the rejection is specific to the single-threaded path.)
+        final String horizonJoin = "SELECT (h.offset / 1_000_000) AS e0, count(p.c5) AS a0 " +
+                "FROM master_%s t " +
+                "HORIZON JOIN slave_%s p LIST (-3m, -2m, -1m, 0m) AS h " +
+                "WHERE t.sym IS NULL " +
+                "GROUP BY e0 ORDER BY e0";
+        assertMemoryLeak(() -> {
+            // Primary master: sym not indexed -> page-frame full scan, random access.
+            execute("CREATE TABLE master_p (ts TIMESTAMP, sym SYMBOL, c2 FLOAT) TIMESTAMP(ts) PARTITION BY HOUR");
+            // Shadow master: identical rows, sym POSTING-EF indexed covering c2. The
+            // sym IS NULL filter is served entirely by the index, so the master
+            // access path is a bare CoveringIndex with no random access.
+            execute("CREATE TABLE master_s (ts TIMESTAMP, sym SYMBOL INDEX TYPE POSTING EF INCLUDE (c2), c2 FLOAT) TIMESTAMP(ts) PARTITION BY HOUR");
+            execute("CREATE TABLE slave_p (ts TIMESTAMP, sym SYMBOL, c5 LONG) TIMESTAMP(ts) PARTITION BY HOUR");
+            execute("CREATE TABLE slave_s (ts TIMESTAMP, sym SYMBOL, c5 LONG) TIMESTAMP(ts) PARTITION BY HOUR");
+            // Some master rows carry a NULL sym so the WHERE keeps them.
+            final String masterRows = " VALUES ('2024-01-01T00:00:00.000000Z', NULL, 1.0), " +
+                    "('2024-01-01T00:30:00.000000Z', 'a', 2.0), " +
+                    "('2024-01-01T01:00:00.000000Z', NULL, 3.0)";
+            execute("INSERT INTO master_p" + masterRows);
+            execute("INSERT INTO master_s" + masterRows);
+            final String slaveRows = " VALUES ('2024-01-01T00:00:00.000000Z', 'a', 10), " +
+                    "('2024-01-01T00:30:00.000000Z', 'b', 20)";
+            execute("INSERT INTO slave_p" + slaveRows);
+            execute("INSERT INTO slave_s" + slaveRows);
+
+            final boolean savedParallelHorizonJoin = sqlExecutionContext.isParallelHorizonJoinEnabled();
+            sqlExecutionContext.setParallelHorizonJoinEnabled(false);
+            try {
+                // Sanity: the indexed (shadow) master rejects the HORIZON JOIN LHS
+                // at compile time...
+                try (RecordCursorFactory ignore = engine.select(String.format(horizonJoin, "s", "s"), sqlExecutionContext)) {
+                    Assert.fail("indexed master must reject the HORIZON JOIN LHS");
+                } catch (SqlException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(),
+                            "left-hand side of HORIZON JOIN can only be a table with an optional filter");
+                }
+                // ...while the non-indexed (primary) master compiles and returns rows.
+                try (RecordCursorFactory factory = engine.select(String.format(horizonJoin, "p", "p"), sqlExecutionContext)) {
+                    try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                        int rows = 0;
+                        while (cursor.hasNext()) {
+                            rows++;
+                        }
+                        Assert.assertEquals(4, rows);
+                    }
+                }
+
+                // Wire the storage diff to rewrite master_p -> master_s, slave_p -> slave_s.
+                final FuzzTable masterShadow = new FuzzTable("master_s", new ObjList<>(), "ts");
+                final FuzzTable slaveShadow = new FuzzTable("slave_s", new ObjList<>(), "ts");
+                final FuzzTable master = new FuzzTable("master_p", new ObjList<>(), "ts", FuzzTableFactory.ParquetMode.NONE, null, null, masterShadow);
+                final FuzzTable slave = new FuzzTable("slave_p", new ObjList<>(), "ts", FuzzTableFactory.ParquetMode.NONE, null, null, slaveShadow);
+                final ObjList<FuzzTable> tables = new ObjList<>();
+                tables.add(master);
+                tables.add(slave);
+
+                // The storage-axis oracle tolerates the compile/reject asymmetry
+                // rather than reporting it as a divergence. run() swallows a
+                // tolerated per-axis skip into an overall ok result and only
+                // surfaces a failed axis, so the regression assertion is that the
+                // run is not failed; without isPlannerSensitivityAsymmetry the
+                // storage axis would report a divergence and the run would fail.
+                final QueryRunner runner = new QueryRunner(engine, sqlExecutionContext, false, true, false, null, false, tables, null);
+                final QueryRunner.Result result = runner.run(new GeneratedQuery(String.format(horizonJoin, "p", "p"), true));
+                Assert.assertFalse(
+                        "storage divergence must be tolerated, not failed: "
+                                + (result.getFailure() != null ? result.getFailure().getMessage() : ""),
+                        result.isFailed());
+            } finally {
+                sqlExecutionContext.setParallelHorizonJoinEnabled(savedParallelHorizonJoin);
+            }
+        });
+    }
+
+    @Test
+    public void testDecimalScaleAlignedComparisonNotSkipped() throws Exception {
+        // Comparing two decimals of different scale used to raise a bare
+        // NumericException whenever aligning the smaller-scale operand left the
+        // type's range, and the oracle swallowed it as an accepted skip.
+        // Decimal64/128/256.compareTo now derives the ordering from the sign, so
+        // the query completes. The oracle no longer accepts a bare
+        // NumericException either, so a regression is reported as a failure
+        // rather than skipped. Drive the query through QueryRunner.run() to
+        // exercise the real classification path.
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE cmp (a DECIMAL(76, 0), b DECIMAL(76, 1))");
+            // 76 nines is the DECIMAL(76, 0) maximum; scaling it up by 10 to
+            // meet b's scale is past what Decimal256 can hold.
+            final String nines = "9".repeat(76);
+            execute("INSERT INTO cmp VALUES (" + nines + "m, 1.0m), (-" + nines + "m, 1.0m)");
+
+            QueryRunner runner = new QueryRunner(engine, sqlExecutionContext, false, false, false, null, true, new ObjList<>(), null);
+            QueryRunner.Result result = runner.run(
+                    new GeneratedQuery("SELECT count() c FROM cmp WHERE a > b", true));
+            Assert.assertFalse("comparison must not be skipped: " + result.getSkipReason(), result.isSkipped());
+            Assert.assertFalse("comparison must not fail: "
+                    + (result.getFailure() != null ? result.getFailure().getMessage() : ""), result.isFailed());
+        });
+    }
+
+    @Test
+    public void testImplicitTimestampLimitTolerated() throws Exception {
+        // Bug from fault-injection fuzzing: SELECT max(ts) FROM t WHERE test_fault()
+        // swallowed the injected fault under parallel execution and was reported as a
+        // swallowed-error failure. The optimiser
+        // (SqlOptimiser.rewriteSingleFirstLastGroupBy) rewrites a lone
+        // min/max/first/last over the designated timestamp into an
+        // ORDER BY ts [DESC] LIMIT 1 scan, so a fault that fires on a frame past the
+        // single-row cutoff is legitimately discarded -- the same early termination
+        // an explicit LIMIT gives -- yet the SQL text carries no "limit" keyword. The
+        // swallow oracle keys off the rewritten plan's pushed-down limit marker
+        // instead. Pin that the rewrite still produces the marker for the four
+        // timestamp aggregates, and that aggregates which do not get the rewrite
+        // (and so must surface a fired fault) do not carry it.
+        setProperty(PropertyKey.DEV_MODE_ENABLED, "true");
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (c0 INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO t SELECT x::int, timestamp_sequence('2024-01-01', 1_000_000_000L) " +
+                    "FROM long_sequence(100)");
+
+            // The timestamp min/max/first/last rewrite pushes LIMIT 1 into the scan.
+            String[] pushed = {
+                    "SELECT max(ts) AS a0 FROM t WHERE test_fault() ORDER BY a0",
+                    "SELECT min(ts) AS a0 FROM t WHERE test_fault() ORDER BY a0",
+                    "SELECT first(ts) AS a0 FROM t WHERE test_fault()",
+                    "SELECT last(ts) AS a0 FROM t WHERE test_fault()",
+            };
+            for (String sql : pushed) {
+                Assert.assertTrue("expected pushed-down limit in plan: " + sql,
+                        QueryRunner.planHasPushedLimit(planOf(sql)));
+            }
+
+            // Aggregates that keep a real aggregation step have no pushed limit, so a
+            // fired fault must surface and the oracle must not be relaxed for them.
+            // This includes a LIMIT over a row-count-changing aggregate: the LIMIT is
+            // trivially satisfied by the single aggregate row and pushes no scan limit,
+            // so the async filter still scans every frame and a fired fault must
+            // surface. Since the SQL text does carry "limit", the swallow oracle keeps
+            // these from being silently tolerated through factoryHasBlockingAggregation
+            // rather than the pushed-limit marker.
+            String[] notPushed = {
+                    "SELECT max(c0) AS a0 FROM t WHERE test_fault() ORDER BY a0",
+                    "SELECT max(ts) AS a0, count() AS a1 FROM t WHERE test_fault()",
+                    "SELECT count() AS a0 FROM t WHERE test_fault()",
+                    "SELECT count() AS a0 FROM t WHERE test_fault() LIMIT 5",
+                    "SELECT sum(c0) AS a0 FROM t WHERE test_fault() LIMIT 5",
+                    "SELECT avg(c0) AS a0 FROM t WHERE test_fault() LIMIT 1",
+            };
+            for (String sql : notPushed) {
+                Assert.assertFalse("unexpected pushed-down limit in plan: " + sql,
+                        QueryRunner.planHasPushedLimit(planOf(sql)));
+            }
+        });
+    }
+
+    @Test
+    public void testQueryFuzz() throws Exception {
+        // Enable dev mode so the test_fault() function the FUNCTION fault relies on
+        // is active; it folds to the constant true otherwise.
+        setProperty(PropertyKey.DEV_MODE_ENABLED, "true");
+        // Install a FailureFileFacade as the engine's files facade so the runner can
+        // arm file-I/O faults; it is a transparent passthrough until armed.
+        final FailureFileFacade faultFf = new FailureFileFacade(engine.getConfiguration().getFilesFacade());
+        engine.clear();
+        assertMemoryLeak(faultFf, () -> {
+            // Query (SQL) jobs and writer (O3 / purge / index) jobs run on two
+            // separate pools so runFuzz can halt the writer pool once the tables are
+            // built, leaving the query loop with no background file ops or native
+            // allocations on the shared workers. That quiesced query phase lets FILE
+            // and MALLOC faults run under parallel SQL execution. The fresh
+            // SqlExecutionContext advertises the real pool width to the planner (the
+            // default test context reports getSharedQueryWorkerCount()=1).
+            final int workerCount = Integer.getInteger("questdb.fuzz.workers", 4);
+            final Rnd modeRnd = TestUtils.generateRandom(LOG);
+            final WorkerPool queryPool = TestWorkerPool.createWithRandomMode(modeRnd, new WorkerPoolConfiguration() {
+                @Override
+                public String getPoolName() {
+                    return QUERY_POOL_NAME;
+                }
+
+                @Override
+                public int getWorkerCount() {
+                    return workerCount;
+                }
+            });
+            WorkerPoolUtils.setupQueryJobs(queryPool, engine, true);
+            final WorkerPool writerPool = TestWorkerPool.createWithRandomMode(modeRnd, new WorkerPoolConfiguration() {
+                @Override
+                public String getPoolName() {
+                    return "fuzzWriter";
+                }
+
+                @Override
+                public int getWorkerCount() {
+                    return workerCount;
+                }
+            });
+            WorkerPoolUtils.setupWriterJobs(writerPool, engine);
+            queryPool.start(LOG);
+            writerPool.start(LOG);
+            try (
+                    SqlExecutionContext parallelCtx = new SqlExecutionContextImpl(engine, workerCount)
+                            .with(securityContext, bindVariableService, null, -1, circuitBreaker)
+            ) {
+                parallelCtx.initNow();
+                runFuzz(parallelCtx, writerPool, QUERY_POOL_NAME + '_');
+            } finally {
+                // Suppress halt-time failures so they don't mask the original
+                // assertion or test exception that's already on its way out. halt()
+                // is idempotent, so halting the writer pool here is a no-op once
+                // runFuzz has already halted it after the build phase.
+                haltQuietly(writerPool);
+                haltQuietly(queryPool);
+            }
+        });
+    }
+
+    private static AssertionError buildFailure(ObjList<QueryRunner.Result> failures) {
+        StringBuilder sb = new StringBuilder("query fuzz found ").append(failures.size())
+                .append(" unexpected failure(s):\n");
+        for (int i = 0, n = failures.size(); i < n; i++) {
+            QueryRunner.Result r = failures.getQuick(i);
+            sb.append("  [").append(i + 1).append("] ")
+                    .append(r.getFailure().getClass().getSimpleName())
+                    .append(": ").append(r.getFailure().getMessage()).append('\n')
+                    .append("        sql: ").append(r.getSql()).append('\n');
+        }
+        // Chain the first cause so the stack trace still points at real source.
+        return new AssertionError(sb.toString(), failures.getQuick(0).getFailure());
+    }
+
+    private static ObjList<FuzzTable> createTables(Rnd rnd, FuzzConfig config, SqlExecutionContext sqlExecutionContext) throws SqlException {
+        final FuzzTableFactory factory = new FuzzTableFactory(config);
+        final ObjList<FuzzTable> tables = new ObjList<>();
+        for (int i = 0; i < config.getNumTables(); i++) {
+            final FuzzTable t = factory.create(
+                    rnd,
+                    "fuzz_t" + i,
+                    sql -> engine.execute(sql, sqlExecutionContext),
+                    QueryFuzzTest::drainWalQueue
+            );
+            tables.add(t);
+            logSchema(t);
+            if (t.getShadow() != null) {
+                logSchema(t.getShadow());
+            }
+        }
+        return tables;
+    }
+
+    private static void assertBinomialLowerTail(double expected, int k, int n) {
+        Assert.assertEquals(expected, binomialLowerTail(k, n, 0.4), expected * 1e-9);
+    }
+
+    /**
+     * Returns the exact binomial lower tail: the chance that {@code n} independent draws, each a
+     * success with probability {@code p}, yield at most {@code k} successes. The loop builds each
+     * term from the one before in log space, because the first term, (1 - p)^n, underflows a double
+     * at a few thousand draws, while the terms near {@code k} still carry the sum.
+     */
+    private static double binomialLowerTail(int k, int n, double p) {
+        final double logOdds = Math.log(p) - Math.log1p(-p);
+        double logTerm = n * Math.log1p(-p);
+        double tail = Math.exp(logTerm);
+        for (int i = 1; i <= k; i++) {
+            logTerm += Math.log((double) (n - i + 1) / i) + logOdds;
+            tail += Math.exp(logTerm);
+        }
+        return tail;
+    }
+
+    private static GeneratedQuery generateConcurrentQuery(Rnd rnd, ObjList<FuzzTable> tables, BindContext bindContext, FuzzConfig config) {
+        return QueryGenerator.generate(
+                rnd,
+                tables,
+                bindContext,
+                false,
+                false,
+                config.isLatestOnEnabled(),
+                config.isHorizonJoinEnabled(),
+                config.isWindowJoinEnabled(),
+                config.isHashJoinEnabled(),
+                config.isGroupingSetsEnabled(),
+                config
+        );
+    }
+
+    /**
+     * Says whether a working planner, one that runs FUSED_SHARE_BASELINE of the completed
+     * comparisons on the fused plan, would run {@code selected} or fewer of {@code completed} on it
+     * with a chance below FUSED_SHARE_FALSE_ALARM.
+     */
+    private static boolean isFusedShareImplausible(int selected, int completed) {
+        return binomialLowerTail(selected, completed, FUSED_SHARE_BASELINE) < FUSED_SHARE_FALSE_ALARM;
+    }
+
+    private static boolean[] parallelFlags(SqlExecutionContext context) {
+        return new boolean[]{
+                context.isParallelFilterEnabled(),
+                context.isParallelGroupByEnabled(),
+                context.isParallelHashJoinGroupByEnabled(),
+                context.isParallelHorizonJoinEnabled(),
+                context.isParallelReadParquetEnabled(),
+                context.isParallelTopKEnabled(),
+                context.isParallelWindowJoinEnabled()
+        };
+    }
+
+    private static String planOf(String sql) throws SqlException {
+        try (RecordCursorFactory factory = engine.select(sql, sqlExecutionContext)) {
+            TextPlanSink sink = new TextPlanSink();
+            sink.of(factory, sqlExecutionContext);
+            return sink.getSink().toString();
+        }
+    }
+
+    private static void haltQuietly(WorkerPool pool) {
+        try {
+            pool.halt();
+        } catch (Throwable t) {
+            LOG.error().$("worker pool halt failed: ").$(t).$();
+        }
+    }
+
+    /**
+     * Names why {@code shape} could not have generated a single query in this run, or returns
+     * {@code null} when the run's tables and knobs allow it. runFuzz asserts a zero-query shape only
+     * in the {@code null} case, so a deliberately disabled shape - or one whose per-run precondition
+     * the random draw never met - cannot fail the run.
+     * <p>
+     * The switch covers {@link QueryShape} exhaustively on purpose: adding a shape stops the test
+     * compiling until whoever adds it declares whether a zero-query run is legitimate for it.
+     */
+    private static String describeUngeneratableShape(QueryShape shape, FuzzConfig config, ObjList<FuzzTable> tables) {
+        return switch (shape) {
+            case GROUP_BY, SAMPLE_BY, SIMPLE -> null;
+            case GROUPING_SETS -> config.isGroupingSetsEnabled()
+                    ? null
+                    : "-D" + FuzzConfig.GROUPING_SETS_PROP + "=false";
+            case HASH_JOIN_GROUP_BY -> config.isHashJoinEnabled()
+                    ? describeMissingJoinTables(tables)
+                    : "-D" + FuzzConfig.HASH_JOIN_PROP + "=false";
+            case HORIZON_JOIN -> config.isHorizonJoinEnabled()
+                    ? describeMissingJoinTables(tables)
+                    : "-D" + FuzzConfig.HORIZON_JOIN_PROP + "=false";
+            case LATEST_ON -> config.isLatestOnEnabled()
+                    ? null
+                    : "-D" + FuzzConfig.LATEST_ON_PROP + "=false";
+            case POSTING -> hasPostingIndexedSymbol(tables)
+                    ? null
+                    : "the run's random schema drew no posting-indexed SYMBOL, so PostingClause.tryGenerate returns null on every draw";
+            case TEMPORAL_JOIN -> describeMissingJoinTables(tables);
+            case WINDOW -> config.isWindowEnabled()
+                    ? null
+                    : "-D" + FuzzConfig.WINDOW_PROP + "=false";
+            case WINDOW_JOIN -> config.isWindowJoinEnabled()
+                    ? describeMissingJoinTables(tables)
+                    : "-D" + FuzzConfig.WINDOW_JOIN_PROP + "=false";
+        };
+    }
+
+    /**
+     * QueryGenerator gates its whole join band on two or more tables, so with fewer than that every
+     * join shape legitimately generates nothing. FuzzConfig draws at least two, so this normally
+     * returns {@code null}; it exists so lowering that floor cannot turn the zero guard flaky.
+     */
+    private static String describeMissingJoinTables(ObjList<FuzzTable> tables) {
+        return tables.size() >= 2
+                ? null
+                : "the run drew " + tables.size() + " table(s) and QueryGenerator gates the join band on two or more";
+    }
+
+    /**
+     * Says whether any of the run's tables carries a posting-indexed SYMBOL column, which is what
+     * PostingClause.tryGenerate needs to emit anything at all. FuzzTableFactory.assignIndexes draws
+     * the index kind per SYMBOL column per run - half the SYMBOL columns get an index and a quarter
+     * of those draw BITMAP - so a run can draw a schema with none, and 7 of 40 measured runs did.
+     * On those runs POSTING reports 0/0 with a perfectly working generator, whatever the budget.
+     */
+    private static boolean hasPostingIndexedSymbol(ObjList<FuzzTable> tables) {
+        for (int i = 0, n = tables.size(); i < n; i++) {
+            final FuzzTable t = tables.getQuick(i);
+            for (int j = 0, m = t.getColumnCount(); j < m; j++) {
+                final FuzzIndex index = t.getColumn(j).getIndex();
+                if (index != null && index.isPosting()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static void logSchema(FuzzTable t) {
+        StringBuilder sb = new StringBuilder("fuzz schema ").append(t.getName())
+                .append(" (parquet=").append(t.getParquetMode());
+        if (t.getParquetPartitions() != null) {
+            sb.append(" partitions=[").append(t.getParquetPartitions()).append(']');
+        }
+        if (t.getCompositeDay() != null) {
+            sb.append(" composite=").append(t.getCompositeDay());
+        }
+        sb.append("):");
+        for (int j = 0, n = t.getColumnCount(); j < n; j++) {
+            FuzzColumn c = t.getColumn(j);
+            sb.append(' ').append(c.getName()).append('=').append(c.getType().getDdl());
+            if (c.isIndexed()) {
+                sb.append(c.getIndex().describe());
+            }
+        }
+        LOG.info().$safe(sb.toString()).$();
+    }
+
+    // One materialized row, as QueryRunner.materialize() writes it, without its newline.
+    private static String line(String... cells) {
+        final StringSink sink = new StringSink();
+        for (String cell : cells) {
+            QueryRunner.appendCell(sink, cell);
+            sink.put('\t');
+        }
+        return sink.toString();
+    }
+
+    private static SqlExecutionContextImpl newFuzzContext(int workerCount) {
+        final SqlExecutionContextImpl context = new SqlExecutionContextImpl(engine, workerCount)
+                .with(securityContext, new BindVariableServiceImpl(configuration), null, -1, null);
+        context.initNow();
+        return context;
+    }
+
+    private static BufferedWriter openDump(String path) throws IOException {
+        if (path == null || path.isEmpty()) {
+            return null;
+        }
+        return new BufferedWriter(new FileWriter(Paths.get(path).toFile(), true));
+    }
+
+    private static void runFuzz(SqlExecutionContext sqlExecutionContext, WorkerPool writerPool, String queryWorkerNamePrefix) throws Exception {
+        Long s0 = Long.getLong("questdb.fuzz.s0");
+        Long s1 = Long.getLong("questdb.fuzz.s1");
+        Rnd rnd = (s0 != null && s1 != null)
+                ? TestUtils.generateRandom(LOG, s0, s1)
+                : TestUtils.generateRandom(LOG);
+        FuzzConfig config = new FuzzConfig(rnd);
+
+        // Composite partitions ship OFF; the test defaults (Overrides) turn them ON. A per-run coin
+        // here keeps both configurations fuzzed rather than pinning ON every run: on the runs that
+        // draw false the suite exercises the shipped default write path - the OFF branches in
+        // TableWriter and O3PartitionJob - and FuzzTableFactory's per-table backdate lands as an
+        // ordinary O3 overlap rather than a composite one (its outcome feeds only diagnostics, so the
+        // diff-shadow oracle holds either way). The draw comes from the same seed logged above, so a
+        // red run replays it.
+        boolean mergeAppendEnabled = rnd.nextBoolean();
+        node1.setProperty(PropertyKey.CAIRO_O3_PARTITION_MERGE_APPEND_ENABLED, mergeAppendEnabled);
+        LOG.info().$("merge-append coin [mergeAppendEnabled=").$(mergeAppendEnabled).I$();
+
+        LOG.info().$("fuzz config: tables=").$(config.getNumTables())
+                .$(", rows=").$(config.getRowsPerTable())
+                .$(", queries=").$(config.getNumQueries())
+                .$(", diffJit=").$(config.isDiffJitEnabled())
+                .$(", diffShadow=").$(config.isDiffShadowEnabled())
+                .$(", verifyCursor=").$(config.isVerifyCursorEnabled())
+                .$(", faults=").$(config.isFaultInjectionEnabled())
+                .$(", faultPct=").$(config.getFaultProbabilityPct())
+                .$(", parallelFaults=").$(config.isParallelFaultEnabled())
+                .$(", window=").$(config.isWindowEnabled())
+                .$(", latestOn=").$(config.isLatestOnEnabled())
+                .$(", horizonJoin=").$(config.isHorizonJoinEnabled())
+                .$(", windowJoin=").$(config.isWindowJoinEnabled())
+                .$(", hashJoin=").$(config.isHashJoinEnabled())
+                .$(", diffFused=").$(config.isDiffFusedEnabled())
+                .$(", diffMapPage=").$(config.isDiffMapPageEnabled())
+                .$(", hashJoinPayload=").$(config.getHashJoinPayloadLayout() != null ? config.getHashJoinPayloadLayout().name() : "rule")
+                .$(", hashJoinBuild=").$(config.getHashJoinBuildMode().name())
+                .$();
+        if (config.getHashJoinPayloadLayout() != null) {
+            config.getHashJoinPayloadLayout().apply(node1.getConfigurationOverrides());
+        }
+        config.getHashJoinBuildMode().applyProperties(node1.getConfigurationOverrides());
+
+        ObjList<FuzzTable> tables = createTables(rnd, config, sqlExecutionContext);
+
+        // Writes are done: close the build-phase writers and halt the writer pool
+        // so the query loop runs background-silent (see testQueryFuzz). A column
+        // purge scheduled by the writer close is abandoned -- it only touches
+        // on-disk files, which the leak oracle does not measure.
+        engine.releaseInactive();
+        writerPool.halt();
+
+        QueryRunner runner = new QueryRunner(
+                engine,
+                sqlExecutionContext,
+                config.isDiffJitEnabled(),
+                config.isDiffShadowEnabled(),
+                config.isDiffFusedEnabled(),
+                config.isDiffMapPageEnabled() ? node1.getConfigurationOverrides() : null,
+                config.isVerifyCursorEnabled(),
+                tables,
+                queryWorkerNamePrefix
+        );
+        // Snapshot the parallel-execution flags so the per-query serial
+        // override can restore them. Snapshotting once outside the loop also
+        // preserves any global override the user passed via system properties.
+        // HORIZON JOIN, WINDOW JOIN and the fused hash join GROUP BY must be
+        // included: without them the serial control arm still runs those joins
+        // in parallel, defeating the determinism the serial arm exists to
+        // provide. isParallelHashJoinGroupByEnabled() also requires parallel
+        // GROUP BY and query workers, both on at this point, so the snapshot
+        // reads the context's own flag.
+        final boolean savedParallelFilter = sqlExecutionContext.isParallelFilterEnabled();
+        final boolean savedParallelGroupBy = sqlExecutionContext.isParallelGroupByEnabled();
+        final boolean savedParallelHashJoinGroupBy = sqlExecutionContext.isParallelHashJoinGroupByEnabled();
+        final boolean savedParallelHorizonJoin = sqlExecutionContext.isParallelHorizonJoinEnabled();
+        final boolean savedParallelReadParquet = sqlExecutionContext.isParallelReadParquetEnabled();
+        final boolean savedParallelTopK = sqlExecutionContext.isParallelTopKEnabled();
+        final boolean savedParallelWindowJoin = sqlExecutionContext.isParallelWindowJoinEnabled();
+        int bindGen = 0;
+        int faultGen = 0;
+        int skipped = 0;
+        int serial = 0;
+        // Per-shape differential-query counts, so a generator that emits nothing the engine can
+        // compile cannot hide behind the aggregate (see MIN_ACCEPTED_PCT_PER_SHAPE). Fault queries
+        // run a different oracle and are left out of both counts.
+        final int[] generatedByShape = new int[QueryShape.values().length];
+        final int[] skippedByShape = new int[QueryShape.values().length];
+        ObjList<QueryRunner.Result> failures = new ObjList<>();
+        try (BufferedWriter dump = openDump(config.getDumpPath())) {
+            for (int q = 0; q < config.getNumQueries(); q++) {
+                setProperty(PropertyKey.CAIRO_SQL_LATEST_BY_JIT_ENABLED, Boolean.toString(rnd.nextBoolean()));
+                // Decide fault injection before generation so a FUNCTION fault can
+                // ask the generator to emit the fault function. Drawn from the
+                // seeded rnd, so replay reproduces the choice.
+                FaultType faultType = (config.isFaultInjectionEnabled() && rnd.nextInt(100) < config.getFaultProbabilityPct())
+                        ? runner.chooseFaultType(rnd)
+                        : null;
+                boolean injectFaultFn = faultType == FaultType.FUNCTION;
+                long preGenS0 = rnd.getSeed0();
+                long preGenS1 = rnd.getSeed1();
+                GeneratedQuery query = QueryGenerator.generate(rnd, tables, null, injectFaultFn, config.isWindowEnabled(), config.isLatestOnEnabled(), config.isHorizonJoinEnabled(), config.isWindowJoinEnabled(), config.isHashJoinEnabled(), config.isGroupingSetsEnabled(), config);
+                QueryRunner.Result result;
+                if (faultType != null) {
+                    // Fault queries use a crash-and-recover oracle, not the
+                    // differential one, so they skip the bind/serial variants.
+                    faultGen++;
+                    if (dump != null) {
+                        dump.write(query.sql());
+                        dump.newLine();
+                    }
+                    // With the knob on, all fault types run under parallel SQL
+                    // execution so the parallel filter / GROUP BY / top-K reduce
+                    // error paths get exercised. The writer pool is halted for the
+                    // whole query loop, so no background job competes: FUNCTION is
+                    // data-scoped, FILE is scoped to the query execution, and
+                    // MALLOC's process-global RSS ceiling can only be tripped by the
+                    // query's own allocations.
+                    boolean runFaultParallel = config.isParallelFaultEnabled();
+                    LOG.info().$("fuzz fault (").$(faultType.name()).$(runFaultParallel ? ", parallel" : ", serial").$("): ").$safe(query.sql()).$();
+                    if (!runFaultParallel) {
+                        sqlExecutionContext.setParallelFilterEnabled(false);
+                        sqlExecutionContext.setParallelGroupByEnabled(false);
+                        sqlExecutionContext.setParallelHashJoinGroupByEnabled(false);
+                        sqlExecutionContext.setParallelHorizonJoinEnabled(false);
+                        sqlExecutionContext.setParallelReadParquetEnabled(false);
+                        sqlExecutionContext.setParallelTopKEnabled(false);
+                        sqlExecutionContext.setParallelWindowJoinEnabled(false);
+                    }
+                    try {
+                        result = runner.runFault(query, faultType, rnd, runFaultParallel);
+                    } finally {
+                        if (!runFaultParallel) {
+                            sqlExecutionContext.setParallelFilterEnabled(savedParallelFilter);
+                            sqlExecutionContext.setParallelGroupByEnabled(savedParallelGroupBy);
+                            sqlExecutionContext.setParallelHashJoinGroupByEnabled(savedParallelHashJoinGroupBy);
+                            sqlExecutionContext.setParallelHorizonJoinEnabled(savedParallelHorizonJoin);
+                            sqlExecutionContext.setParallelReadParquetEnabled(savedParallelReadParquet);
+                            sqlExecutionContext.setParallelTopKEnabled(savedParallelTopK);
+                            sqlExecutionContext.setParallelWindowJoinEnabled(savedParallelWindowJoin);
+                        }
+                    }
+                } else {
+                    generatedByShape[query.shape().ordinal()]++;
+                    // With small probability, regenerate the same query with a
+                    // BindContext threaded through so a fraction of bindable
+                    // typed constants emit as ?::TYPE bind variables. The Rnd
+                    // is rewound to the pre-literal state so the tree shape
+                    // matches; the BindContext gets its own derived Rnd so the
+                    // bind/no-bind decisions are deterministic per seed.
+                    //
+                    // Determinism invariant: the second QueryGenerator.generate()
+                    // call must draw the same number and order of rnd ops as the
+                    // first. The two calls only differ in whether they consult
+                    // the BindContext (which uses its own seeded Rnd), so adding
+                    // any rnd operation to the bind path - or skipping one on
+                    // the literal path - desynchronises the two trees and the
+                    // shapes will diverge. Take care when modifying any code
+                    // reachable from QueryGenerator.generate().
+                    if (rnd.nextInt(100) < QUERY_BIND_PROBABILITY_PCT) {
+                        long bindS0 = rnd.nextLong();
+                        long bindS1 = rnd.nextLong();
+                        rnd.reset(preGenS0, preGenS1);
+                        BindContext ctx = new BindContext(new Rnd(bindS0, bindS1), CONSTANT_BIND_PROBABILITY_PCT);
+                        GeneratedQuery bindForm = QueryGenerator.generate(rnd, tables, ctx, injectFaultFn, config.isWindowEnabled(), config.isLatestOnEnabled(), config.isHorizonJoinEnabled(), config.isWindowJoinEnabled(), config.isHashJoinEnabled(), config.isGroupingSetsEnabled(), config);
+                        if (ctx.getBindValues().size() > 0) {
+                            query = query.withBind(bindForm.sql(), ctx.getBindNames(), ctx.getBindValues());
+                            bindGen++;
+                            LOG.info().$("fuzz bind: ").$safe(query.bindSql()).$();
+                        }
+                    }
+                    if (dump != null) {
+                        dump.write(query.sql());
+                        dump.newLine();
+                    }
+                    boolean disableParallel = rnd.nextInt(100) < SERIAL_PROBABILITY_PCT;
+                    if (disableParallel) {
+                        serial++;
+                        sqlExecutionContext.setParallelFilterEnabled(false);
+                        sqlExecutionContext.setParallelGroupByEnabled(false);
+                        sqlExecutionContext.setParallelHashJoinGroupByEnabled(false);
+                        sqlExecutionContext.setParallelHorizonJoinEnabled(false);
+                        sqlExecutionContext.setParallelReadParquetEnabled(false);
+                        sqlExecutionContext.setParallelTopKEnabled(false);
+                        sqlExecutionContext.setParallelWindowJoinEnabled(false);
+                        LOG.info().$("fuzz serial: ").$safe(query.sql()).$();
+                    }
+                    try {
+                        result = runner.run(query);
+                    } finally {
+                        if (disableParallel) {
+                            sqlExecutionContext.setParallelFilterEnabled(savedParallelFilter);
+                            sqlExecutionContext.setParallelGroupByEnabled(savedParallelGroupBy);
+                            sqlExecutionContext.setParallelHashJoinGroupByEnabled(savedParallelHashJoinGroupBy);
+                            sqlExecutionContext.setParallelHorizonJoinEnabled(savedParallelHorizonJoin);
+                            sqlExecutionContext.setParallelReadParquetEnabled(savedParallelReadParquet);
+                            sqlExecutionContext.setParallelTopKEnabled(savedParallelTopK);
+                            sqlExecutionContext.setParallelWindowJoinEnabled(savedParallelWindowJoin);
+                        }
+                    }
+                }
+                if (result.isSkipped()) {
+                    skipped++;
+                    if (faultType == null) {
+                        skippedByShape[query.shape().ordinal()]++;
+                    }
+                    LOG.info().$("fuzz skip (").$safe(result.getSkipReason()).$("): ").$safe(query.sql()).$();
+                } else if (result.isFailed()) {
+                    LOG.error().$("fuzz failure on query: ").$safe(query.sql())
+                            .$(" -- ").$(result.getFailure().getClass().getName())
+                            .$(": ").$safe(result.getFailure().getMessage())
+                            .$();
+                    failures.add(result);
+                }
+            }
+        }
+        LOG.info().$("fuzz done: ").$(config.getNumQueries()).$(" queries, ")
+                .$(serial).$(" serial, ")
+                .$(faultGen).$(" with fault injection (").$(runner.getFaultsFired()).$(" fired), ")
+                .$(bindGen).$(" with bind variant, ")
+                .$(skipped).$(" skipped on expected errors, ")
+                .$(failures.size()).$(" failures")
+                .$();
+        LOG.info().$("fuzz faults by type: ")
+                .$("FILE ").$(runner.getFaultsFired(FaultType.FILE)).$('/').$(runner.getFaultsArmed(FaultType.FILE))
+                .$(", MALLOC ").$(runner.getFaultsFired(FaultType.MALLOC)).$('/').$(runner.getFaultsArmed(FaultType.MALLOC))
+                .$(", FUNCTION ").$(runner.getFaultsFired(FaultType.FUNCTION)).$('/').$(runner.getFaultsArmed(FaultType.FUNCTION))
+                .$(" (fired/armed)")
+                .$();
+        LogRecord shapeLog = LOG.info().$("fuzz shapes (accepted/generated): ");
+        for (QueryShape shape : QueryShape.values()) {
+            final int generated = generatedByShape[shape.ordinal()];
+            shapeLog.$(shape.name()).$(' ')
+                    .$(generated - skippedByShape[shape.ordinal()]).$('/').$(generated).$(' ');
+        }
+        shapeLog.$();
+        LOG.info().$("fuzz fused axis: ").$(runner.getFusedAxisSelected()).$(" of ")
+                .$(runner.getFusedAxisCompletedRuns()).$(" completed comparisons used the fused plan; ")
+                .$(runner.getFusedAxisRuns()).$(" comparisons across ")
+                .$(generatedByShape[QueryShape.HASH_JOIN_GROUP_BY.ordinal()]).$(" equi-join GROUP BY queries; ")
+                .$(runner.getBuildChoiceRuns()).$(" runs picked the build per execution")
+                .$();
+        LOG.info().$("fuzz map page axis: ").$(runner.getMapPageAxisRuns()).$(" comparisons").$();
+        LOG.info().$("fuzz reference axis: ").$(runner.getReferenceAxisRuns()).$(" comparisons across ")
+                .$(generatedByShape[QueryShape.GROUPING_SETS.ordinal()]).$(" grouping sets queries")
+                .$();
+
+        if (failures.size() > 0) {
+            throw buildFailure(failures);
+        }
+        // Guard each generator against emitting SQL the engine cannot compile, and against emitting
+        // nothing at all. A shape whose generator drifts out of step with the engine's rules still
+        // leaves the run green: every query it emits raises an expected error, gets counted as
+        // skipped, and asserts nothing. A shape whose dispatch in QueryGenerator has gone
+        // unreachable is worse - it reports zero generated, and the accepted-rate floor below reads
+        // a zero as "too small a sample" and skips it.
+        int differentialGen = 0;
+        for (QueryShape shape : QueryShape.values()) {
+            differentialGen += generatedByShape[shape.ordinal()];
+        }
+        for (QueryShape shape : QueryShape.values()) {
+            final int generated = generatedByShape[shape.ordinal()];
+            if (generated == 0) {
+                // Zero is legitimate for a shape this run could never draw: its -D toggle is off,
+                // or - for POSTING - the run's random schema carries no posting-indexed SYMBOL.
+                // Assert only when the run's tables and knobs allow the shape, so the guard cannot
+                // fail a working generator on an unlucky seed.
+                final String reason = describeUngeneratableShape(shape, config, tables);
+                if (reason != null) {
+                    LOG.info().$("fuzz shape cannot generate this run, NOT guarded: ")
+                            .$(shape.name()).$(" (").$safe(reason).$(')')
+                            .$();
+                    continue;
+                }
+                if (differentialGen < MIN_QUERIES_FOR_ZERO_GUARD) {
+                    LOG.info().$("fuzz shape generated nothing but the run is too small to guard it: ")
+                            .$(shape.name()).$(", ").$(differentialGen).$('/').$(MIN_QUERIES_FOR_ZERO_GUARD)
+                            .$(" differential queries; raise -D").$(FuzzConfig.QUERIES_PROP).$(" to guard it")
+                            .$();
+                    continue;
+                }
+                Assert.fail("the " + shape.name() + " generator emitted no query across "
+                        + differentialGen + " differential queries, though this run's tables and knobs"
+                        + " allow the shape; QueryGenerator no longer reaches that generator");
+            }
+            if (generated < MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR) {
+                // Not enough queries to hold this shape to the floor. Say so out loud: a shape that
+                // quietly stops generating (or goes rare) is otherwise indistinguishable from one
+                // that passed, and the guard for it is off for this run.
+                LOG.info().$("fuzz shape below the accept-floor sample size, NOT guarded this run: ")
+                        .$(shape.name()).$(' ').$(generated).$('/').$(MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR)
+                        .$(" queries; raise -D").$(FuzzConfig.QUERIES_PROP).$(" to guard it")
+                        .$();
+                continue;
+            }
+            final int accepted = generated - skippedByShape[shape.ordinal()];
+            Assert.assertTrue(
+                    "the " + shape.name() + " generator ran only " + accepted + " of its " + generated
+                            + " queries; the rest were skipped on expected errors, so it looks out of step with the engine",
+                    100L * accepted >= (long) MIN_ACCEPTED_PCT_PER_SHAPE * generated
+            );
+        }
+        // Guard the fused on/off axis against going vacuous. It compares two different plans only
+        // when the pivot selected the fused hash join GROUP BY, and a planner change that stops
+        // selecting it leaves every comparison ordinary against ordinary. The share counts only
+        // completed comparisons: the serial arm and the fault branch never run the axis, and a
+        // query that fails to compile fails in both plans. The guard fails a run only when a working
+        // planner would select the fused plan this rarely with a chance below FUSED_SHARE_FALSE_ALARM.
+        // It holds the run to the same sample floor as the accepted rate above, and logs below it.
+        final int fusedCompleted = runner.getFusedAxisCompletedRuns();
+        if (config.isDiffFusedEnabled() && generatedByShape[QueryShape.HASH_JOIN_GROUP_BY.ordinal()] > 0) {
+            if (fusedCompleted < MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR) {
+                LOG.info().$("fuzz fused axis below the sample size, NOT guarded this run: ")
+                        .$(fusedCompleted).$('/').$(MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR)
+                        .$(" completed comparisons; raise -D").$(FuzzConfig.QUERIES_PROP).$(" to guard it")
+                        .$();
+            } else {
+                final int fusedSelected = runner.getFusedAxisSelected();
+                Assert.assertFalse(
+                        "the fused hash join GROUP BY ran on only " + fusedSelected + " of " + fusedCompleted
+                                + " completed comparisons, which a planner that fuses " + Math.round(100 * FUSED_SHARE_BASELINE)
+                                + "% of them does with probability "
+                                + binomialLowerTail(fusedSelected, fusedCompleted, FUSED_SHARE_BASELINE)
+                                + "; the fused on/off axis looks vacuous",
+                        isFusedShareImplausible(fusedSelected, fusedCompleted)
+                );
+            }
+        }
+        // Guard the reference axis against going vacuous. It compares only when a grouping sets
+        // query and its UNION ALL rewrite both run, so a rewrite that stops compiling would leave
+        // every grouping sets query unchecked against it while the shape still counts as accepted.
+        final int groupingSetsGenerated = generatedByShape[QueryShape.GROUPING_SETS.ordinal()];
+        if (groupingSetsGenerated >= MIN_SHAPE_QUERIES_FOR_ACCEPT_FLOOR) {
+            Assert.assertTrue(
+                    "the reference axis compared none of the " + groupingSetsGenerated
+                            + " grouping sets queries; the UNION ALL rewrite looks out of step with the engine",
+                    runner.getReferenceAxisRuns() > 0
+            );
+        }
+        // Guard the fault injector against a silent disarm. It has several ways to stop biting while
+        // the run stays green and tests nothing but the happy path: dev mode off (test_fault() folds
+        // to the constant true), the FailureFileFacade not installed on the engine, or the MALLOC RSS
+        // ceiling armed above what the query allocates.
+        //
+        // The facade case never even arms - QueryRunner drops FILE from its fault types when the
+        // engine's FilesFacade is not a FailureFileFacade - so it reads as "armed 0, fired 0" and no
+        // fire-count floor can see it. Assert the type is on offer instead.
+        for (FaultType type : FaultType.values()) {
+            Assert.assertTrue(
+                    "fault type " + type.name() + " was never offered to the runner; that injector looks disarmed",
+                    runner.isFaultTypeAvailable(type)
+            );
+        }
+        if (faultGen >= MIN_FAULT_QUERIES_FOR_FIRE_FLOOR) {
+            Assert.assertTrue(
+                    "fault injection ran on " + faultGen + " queries but no fault fired; the injector looks disarmed",
+                    runner.getFaultsFired() > 0
+            );
+        }
+        // The aggregate floor above cannot tell a live FUNCTION injector from a dead FILE one: a single
+        // FUNCTION fire satisfies it while FILE and MALLOC fire zero all run. Hold each type to its own
+        // floor, but only once it has armed often enough that a zero-fire run means something. Arming
+        // does not imply firing - each fault arms at a random trigger point (the Nth file op, the Nth
+        // test_fault() call, an RSS ceiling a few KB up), and a query that does fewer ops than its
+        // trigger runs clean - so a strict "armed once, must fire" would flake. Measured per-arm fire
+        // rates run 49-88% by type; at a pessimistic 30% the odds of 20 arms all missing are below
+        // 1e-3. A default run arms ~5 per type, so this floor engages on a soak
+        // (-Dquestdb.fuzz.queries=500, or a raised -Dquestdb.fuzz.fault.pct).
+        for (FaultType type : FaultType.values()) {
+            final int armed = runner.getFaultsArmed(type);
+            if (armed >= MIN_FAULT_QUERIES_PER_TYPE_FOR_FIRE_FLOOR) {
+                Assert.assertTrue(
+                        "fault type " + type.name() + " armed on " + armed
+                                + " queries but never fired; that injector looks disarmed",
+                        runner.getFaultsFired(type) > 0
+                );
+            }
+        }
+    }
+
+    private static void setParallelFlags(SqlExecutionContext context, boolean[] flags) {
+        context.setParallelFilterEnabled(flags[0]);
+        context.setParallelGroupByEnabled(flags[1]);
+        context.setParallelHashJoinGroupByEnabled(flags[2]);
+        context.setParallelHorizonJoinEnabled(flags[3]);
+        context.setParallelReadParquetEnabled(flags[4]);
+        context.setParallelTopKEnabled(flags[5]);
+        context.setParallelWindowJoinEnabled(flags[6]);
+    }
+}

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,10 +28,16 @@ import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.TableColumnMetadata;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.std.Misc;
 
 public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
     public static final GenericRecordMetadata DEFAULT_COUNT_METADATA = new GenericRecordMetadata();
@@ -44,24 +50,19 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
-    public void close() {
-        base.close();
+    public RecordCursorFactory getBaseFactory() {
+        return base;
     }
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        try (RecordCursor baseCursor = base.getCursor(executionContext)) {
-            final long size = baseCursor.size();
-            if (size < 0) {
-                long count = 0;
-                while (baseCursor.hasNext()) {
-                    count++;
-                }
-                cursor.of(count);
-            } else {
-                cursor.of(size);
-            }
+        final RecordCursor baseCursor = base.getCursor(executionContext);
+        try {
+            cursor.of(baseCursor, executionContext.getCircuitBreaker());
             return cursor;
+        } catch (Throwable th) {
+            cursor.close();
+            throw th;
         }
     }
 
@@ -71,17 +72,45 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Count");
+        sink.child(base);
+    }
+
+    @Override
     public boolean usesCompiledFilter() {
         return base.usesCompiledFilter();
     }
 
+    @Override
+    public boolean usesIndex() {
+        return base.usesIndex();
+    }
+
+    @Override
+    protected void _close() {
+        base.close();
+    }
+
     private static class CountRecordCursor implements NoRandomAccessRecordCursor {
         private final CountRecord countRecord = new CountRecord();
-        private boolean hasNext = true;
+        private final RecordCursor.Counter counter = new Counter();
+        private RecordCursor baseCursor;
+        private SqlExecutionCircuitBreaker circuitBreaker;
         private long count;
+        private boolean hasNext = true;
+
+        @Override
+        public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
+            if (hasNext) {
+                counter.add(1);
+                hasNext = false;
+            }
+        }
 
         @Override
         public void close() {
+            baseCursor = Misc.free(baseCursor);
         }
 
         @Override
@@ -92,6 +121,17 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
         @Override
         public boolean hasNext() {
             if (hasNext) {
+                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+                // recalculate state only when new query is executed and not after toTop() is called.
+                if (this.count == -1) {
+                    long size = baseCursor.size();
+                    if (size > -1) {
+                        count = size;
+                    } else {
+                        baseCursor.calculateSize(circuitBreaker, counter);
+                        count = counter.get();
+                    }
+                }
                 hasNext = false;
                 return true;
             }
@@ -99,8 +139,8 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public void toTop() {
-            hasNext = true;
+        public long preComputedStateSize() {
+            return count;
         }
 
         @Override
@@ -108,9 +148,18 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
             return 1;
         }
 
-        private void of(long count) {
-            this.count = count;
-            toTop();
+        @Override
+        public void toTop() {
+            baseCursor.toTop();
+            hasNext = true;
+        }
+
+        private void of(RecordCursor baseCursor, SqlExecutionCircuitBreaker circuitBreaker) {
+            this.baseCursor = baseCursor;
+            this.circuitBreaker = circuitBreaker;
+            this.count = -1;
+            this.hasNext = true;
+            this.counter.clear();
         }
 
         private class CountRecord implements Record {
@@ -122,6 +171,6 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     static {
-        DEFAULT_COUNT_METADATA.add(new TableColumnMetadata("count", 1, ColumnType.LONG));
+        DEFAULT_COUNT_METADATA.add(new TableColumnMetadata("count", ColumnType.LONG));
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.CharFunction;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.std.Unsafe;
 import org.jetbrains.annotations.NotNull;
 
 public class MaxCharGroupByFunction extends CharFunction implements GroupByFunction, UnaryFunction {
@@ -43,12 +44,30 @@ public class MaxCharGroupByFunction extends CharFunction implements GroupByFunct
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        if (rowCount > 0) {
+            final long hi = dataAddr + rowCount * (long) Character.BYTES;
+            char max = 0;
+            for (; dataAddr < hi; dataAddr += Character.BYTES) {
+                char value = Unsafe.getChar(dataAddr);
+                if (value > max) {
+                    max = value;
+                }
+            }
+            final char existing = mapValue.getChar(valueIndex);
+            if (max > existing || existing == 0) {
+                mapValue.putChar(valueIndex, max);
+            }
+        }
+    }
+
+    @Override
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
         mapValue.putChar(valueIndex, arg.getChar(record));
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
         char max = mapValue.getChar(valueIndex);
         char next = arg.getChar(record);
         if (next > max) {
@@ -57,14 +76,8 @@ public class MaxCharGroupByFunction extends CharFunction implements GroupByFunct
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
-        this.valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.CHAR);
-    }
-
-    @Override
-    public void setNull(MapValue mapValue) {
-        mapValue.putChar(valueIndex, (char) 0);
+    public Function getArg() {
+        return arg;
     }
 
     @Override
@@ -73,7 +86,57 @@ public class MaxCharGroupByFunction extends CharFunction implements GroupByFunct
     }
 
     @Override
-    public Function getArg() {
-        return arg;
+    public String getName() {
+        return "max";
+    }
+
+    @Override
+    public int getValueIndex() {
+        return valueIndex;
+    }
+
+    @Override
+    public void initValueIndex(int valueIndex) {
+        this.valueIndex = valueIndex;
+    }
+
+    @Override
+    public void initValueTypes(ArrayColumnTypes columnTypes) {
+        this.valueIndex = columnTypes.getColumnCount();
+        columnTypes.add(ColumnType.CHAR);
+    }
+
+    @Override
+    public boolean isConstant() {
+        return false;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
+    }
+
+    @Override
+    public void merge(MapValue destValue, MapValue srcValue) {
+        char srcMax = srcValue.getChar(valueIndex);
+        char destMax = destValue.getChar(valueIndex);
+        if (srcMax > destMax || destMax == 0) {
+            destValue.putChar(valueIndex, srcMax);
+        }
+    }
+
+    @Override
+    public void setNull(MapValue mapValue) {
+        mapValue.putChar(valueIndex, (char) 0);
+    }
+
+    @Override
+    public boolean supportsBatchComputation() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsParallelism() {
+        return UnaryFunction.super.supportsParallelism();
     }
 }

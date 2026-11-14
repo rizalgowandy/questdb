@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,25 +34,34 @@ import java.util.concurrent.locks.LockSupport;
  */
 public class SOCountDownLatch implements CountDownLatchSPI {
     private static final long VALUE_OFFSET;
-
-    static {
-        VALUE_OFFSET = Unsafe.getFieldOffset(SOCountDownLatch.class, "count");
-    }
-
-    private volatile int count = 0;
-    private volatile Thread waiter = null;
+    private volatile int count;
+    private volatile Thread waiter;
 
     public SOCountDownLatch(int count) {
         this.count = count;
     }
 
     public SOCountDownLatch() {
+        // no-op
     }
 
     public void await() {
         this.waiter = Thread.currentThread();
-        while (getCount() > 0) {
-            Os.pause();
+        boolean isInterrupted = false;
+        try {
+            while (getCount() > 0) {
+                // Don't use LockSupport.park() here.
+                // Once in a while there can be a delay between check of this.count > -count
+                // and parking and unparkWaiter() will be called before park().
+                // Limit the parking time by using Os.park() instead of LockSupport.park()
+                Os.park(this);
+                // Consume interrupts so the next park can block; restore the flag on exit.
+                isInterrupted |= Thread.interrupted();
+            }
+        } finally {
+            if (isInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -61,19 +70,27 @@ public class SOCountDownLatch implements CountDownLatchSPI {
         if (getCount() == 0) {
             return true;
         }
+        if (nanos <= 0) {
+            return getCount() == 0;
+        }
 
-        while (true) {
-            long start = System.nanoTime();
-            LockSupport.parkNanos(nanos);
-            long elapsed = System.nanoTime() - start;
-
-            if (elapsed < nanos) {
-                // this could be spurious wakeup, ignore if count is non-zero
+        final long deadline = System.nanoTime() + nanos;
+        boolean isInterrupted = false;
+        long remainingNanos = nanos;
+        try {
+            while (remainingNanos > 0) {
+                LockSupport.parkNanos(this, remainingNanos);
+                // Consume interrupts so the next park can block; restore the flag on exit.
+                isInterrupted |= Thread.interrupted();
                 if (getCount() == 0) {
                     return true;
                 }
-            } else {
-                return false;
+                remainingNanos = deadline - System.nanoTime();
+            }
+            return getCount() == 0;
+        } finally {
+            if (isInterrupted) {
+                Thread.currentThread().interrupt();
             }
         }
     }
@@ -110,5 +127,9 @@ public class SOCountDownLatch implements CountDownLatchSPI {
         if (waiter != null) {
             LockSupport.unpark(waiter);
         }
+    }
+
+    static {
+        VALUE_OFFSET = Unsafe.getFieldOffset(SOCountDownLatch.class, "count");
     }
 }

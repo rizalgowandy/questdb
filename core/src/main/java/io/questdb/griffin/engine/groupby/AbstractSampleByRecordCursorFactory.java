@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
@@ -33,31 +35,36 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 
-public abstract class AbstractSampleByRecordCursorFactory implements RecordCursorFactory {
+public abstract class AbstractSampleByRecordCursorFactory extends AbstractRecordCursorFactory {
 
-    protected final RecordCursorFactory base;
-    protected final RecordMetadata metadata;
-    protected final ObjList<Function> recordFunctions;
+    protected RecordCursorFactory base;
+    protected Function offsetFunc;
+    protected ObjList<Function> recordFunctions;
+    protected Function sampleFromFunc;
+    protected Function sampleToFunc;
+    protected Function timezoneNameFunc;
 
     public AbstractSampleByRecordCursorFactory(
             RecordCursorFactory base,
             RecordMetadata metadata,
-            ObjList<Function> recordFunctions
+            ObjList<Function> recordFunctions,
+            Function timezoneNameFunc,
+            Function offsetFunc,
+            Function sampleFromFunc,
+            Function sampleToFunc
     ) {
+        super(metadata);
         this.base = base;
-        this.metadata = metadata;
         this.recordFunctions = recordFunctions;
+        this.timezoneNameFunc = timezoneNameFunc;
+        this.offsetFunc = offsetFunc;
+        this.sampleFromFunc = sampleFromFunc;
+        this.sampleToFunc = sampleToFunc;
     }
 
     @Override
-    public void close() {
-        Misc.freeObjList(recordFunctions);
-        Misc.free(base);
-    }
-
-    @Override
-    public RecordMetadata getMetadata() {
-        return metadata;
+    public RecordCursorFactory getBaseFactory() {
+        return base;
     }
 
     @Override
@@ -70,6 +77,73 @@ public abstract class AbstractSampleByRecordCursorFactory implements RecordCurso
         return base.usesCompiledFilter();
     }
 
+    @Override
+    public boolean usesIndex() {
+        return base.usesIndex();
+    }
+
+    @Override
+    protected void _close() {
+        CairoException.rethrowCleanupFailure(closeSampleByOwnersBestEffort(null));
+    }
+
+    protected final Throwable closeDetachedSampleByOwnersBestEffort(
+            Throwable failure,
+            RecordCursorFactory base,
+            Function offsetFunc,
+            ObjList<Function> recordFunctions,
+            Function sampleFromFunc,
+            Function sampleToFunc,
+            Function timezoneNameFunc
+    ) {
+        failure = Misc.freeObjListBestEffort(failure, recordFunctions);
+        failure = Misc.freeBestEffort(failure, base);
+        // The factory is the lifetime owner of the temporal parameter functions (timezone,
+        // offset, FROM, TO); the cursors only borrow them across the executions of this cached
+        // factory. The generator accepts runtime-constant expressions here, which may own child
+        // functions, so they must be closed exactly once.
+        failure = Misc.freeBestEffort(failure, timezoneNameFunc);
+        if (offsetFunc != timezoneNameFunc) {
+            failure = Misc.freeBestEffort(failure, offsetFunc);
+        }
+        if (sampleFromFunc != timezoneNameFunc && sampleFromFunc != offsetFunc) {
+            failure = Misc.freeBestEffort(failure, sampleFromFunc);
+        }
+        if (sampleToFunc != timezoneNameFunc && sampleToFunc != offsetFunc && sampleToFunc != sampleFromFunc) {
+            failure = Misc.freeBestEffort(failure, sampleToFunc);
+        }
+        return failure;
+    }
+
+    protected final Throwable closeSampleByOwnersBestEffort(Throwable failure) {
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final Function offsetFunc = this.offsetFunc;
+        this.offsetFunc = null;
+        final ObjList<Function> recordFunctions = this.recordFunctions;
+        this.recordFunctions = null;
+        final Function sampleFromFunc = this.sampleFromFunc;
+        this.sampleFromFunc = null;
+        final Function sampleToFunc = this.sampleToFunc;
+        this.sampleToFunc = null;
+        final Function timezoneNameFunc = this.timezoneNameFunc;
+        this.timezoneNameFunc = null;
+
+        return closeDetachedSampleByOwnersBestEffort(
+                failure,
+                base,
+                offsetFunc,
+                recordFunctions,
+                sampleFromFunc,
+                sampleToFunc,
+                timezoneNameFunc
+        );
+    }
+
+    protected AbstractNoRecordSampleByCursor detachRawCursor() {
+        return getRawCursor();
+    }
+
     protected abstract AbstractNoRecordSampleByCursor getRawCursor();
 
     protected RecordCursor initFunctionsAndCursor(
@@ -77,14 +151,21 @@ public abstract class AbstractSampleByRecordCursorFactory implements RecordCurso
             RecordCursor baseCursor
     ) throws SqlException {
         try {
-            AbstractNoRecordSampleByCursor cursor = getRawCursor();
-            cursor.of(baseCursor, executionContext);
-            // init all record function for this cursor, in case functions require metadata and/or symbol tables
-            Function.init(recordFunctions, baseCursor, executionContext);
-            return cursor;
-        } catch (Throwable ex) {
+            // init all record functions for this cursor, in case functions require metadata and/or symbol tables
+            Function.init(recordFunctions, baseCursor, executionContext, null);
+        } catch (Throwable th) {
             Misc.free(baseCursor);
-            throw ex;
+            throw th;
+        }
+
+        AbstractNoRecordSampleByCursor cursor = null;
+        try {
+            cursor = getRawCursor();
+            cursor.of(baseCursor, executionContext);
+            return cursor;
+        } catch (Throwable th) {
+            Misc.free(cursor);
+            throw th;
         }
     }
 }

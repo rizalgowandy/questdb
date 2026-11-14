@@ -1,0 +1,321 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin.engine.functions.str;
+
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Test;
+
+public class LPadRPadFunctionsTest extends AbstractCairoTest {
+
+    @Test
+    public void testAscii() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table x as (select rnd_varchar('abc','def','ghi') vc from long_sequence(5))");
+            assertQuery("select lpad(vc, 5), rpad(vc, 5) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            lpad\trpad
+                              abc\tabc \s
+                              abc\tabc \s
+                              def\tdef \s
+                              ghi\tghi \s
+                              ghi\tghi \s
+                            """);
+        });
+    }
+
+    @Test
+    public void testAsciiFill() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table x as (select rnd_varchar('abc','def','ghi') vc from long_sequence(5))");
+            assertQuery("select lpad(vc, 5, '.'::varchar), rpad(vc, 5, '.'::varchar) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            lpad\trpad
+                            ..abc\tabc..
+                            ..abc\tabc..
+                            ..def\tdef..
+                            ..ghi\tghi..
+                            ..ghi\tghi..
+                            """);
+        });
+    }
+
+    @Test
+    public void testAsciiTrim() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table x as (select rnd_varchar('abc','def','ghi') vc from long_sequence(5))");
+            final String expected = """
+                    lpad\trpad
+                    ab\tbc
+                    ab\tbc
+                    de\tef
+                    gh\thi
+                    gh\thi
+                    """;
+
+            assertQuery("select lpad(vc, 2), rpad(vc, 2) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
+            assertQuery("select lpad(vc, 2, '.'::varchar), rpad(vc, 2, '.'::varchar) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+        });
+    }
+
+    @Test
+    public void testCheckMaxBuffer() throws Exception {
+        final int maxLength = configuration.getStrFunctionMaxBufferLength();
+        assertQuery("select rpad('w3r'::varchar, " + (maxLength + 1) + ")")
+                .fails(0, "breached memory limit set for rpad(ØI) [maxLength=1048576, requiredLength=1048577]");
+
+        assertQuery("select lpad('w3r'::varchar, " + (maxLength + 1) + ")")
+                .fails(0, "breached memory limit set for lpad(ØI) [maxLength=1048576, requiredLength=1048577]");
+
+        assertQuery("select rpad('w3r'::varchar, " + (maxLength + 1) + ", 'esource'::varchar)")
+                .fails(0, "breached memory limit set for rpad(ØIØ) [maxLength=1048576, requiredLength=1048577]");
+
+        assertQuery("select lpad('w3r'::varchar, " + (maxLength + 1) + ", 'esource'::varchar)")
+                .fails(0, "breached memory limit set for lpad(ØIØ) [maxLength=1048576, requiredLength=1048577]");
+    }
+
+    @Test
+    public void testFuncFuncGenericCase() throws Exception {
+        execute("create table x as (select rnd_varchar('x', 'y', 'z') str, rnd_varchar('abc','def','ghi') fill from long_sequence(5))");
+        assertQuery("select lpad(str, 7, fill), rpad(str, 7, fill) from x")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        lpad\trpad
+                        abcabcx\txabcabc
+                        ghighiy\tyghighi
+                        ghighiz\tzghighi
+                        defdefz\tzdefdef
+                        defdefx\txdefdef
+                        """);
+    }
+
+    @Test
+    public void testPadNulls() throws Exception {
+        execute("create table x as (select null::varchar as vc from long_sequence(10))");
+        assertQuery("select count (*) from (select lpad(vc, 20, '.'::varchar), rpad(vc, 20, '.'::varchar) from x order by vc) where lpad = null and rpad = null")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("count\n10\n");
+        assertQuery("select count (*) from (select lpad(vc, 20), rpad(vc, 20) from x order by vc) where lpad = null and rpad = null")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("count\n10\n");
+    }
+
+    @Test
+    public void testSimple() throws Exception {
+        configuration.getStrFunctionMaxBufferLength();
+        assertQuery("select rpad('w3r'::varchar, 7, 'esource'::varchar)")
+                .noLeakCheck()
+                .expectSize()
+                .returns("rpad\nw3resou\n");
+    }
+
+    @Test
+    public void testStrIsConst() throws Exception {
+        execute("create table x as (select rnd_varchar('abc','def','ghi') fill from long_sequence(5))");
+        assertQuery("select lpad('const', 11, fill), rpad('const', 11, fill) from x")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        lpad\trpad
+                        abcabcconst\tconstabcabc
+                        abcabcconst\tconstabcabc
+                        defdefconst\tconstdefdef
+                        ghighiconst\tconstghighi
+                        ghighiconst\tconstghighi
+                        """);
+    }
+
+    @Test
+    public void testUtf8() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table x as (select rnd_varchar('ганьба','слава','добрий','вечір') vc from long_sequence(6))");
+            assertQuery("select lpad(vc, 10), rpad(vc, 10) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            lpad\trpad
+                                 вечір\tвечір    \s
+                                 вечір\tвечір    \s
+                                ганьба\tганьба   \s
+                                добрий\tдобрий   \s
+                                 слава\tслава    \s
+                                 слава\tслава    \s
+                            """);
+        });
+    }
+
+    @Test
+    public void testUtf8Fill() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table x as (select rnd_varchar('ганьба','слава','добрий','вечір') vc from long_sequence(6))");
+            assertQuery("select lpad(vc, 10, '.'::varchar), rpad(vc, 10, '.'::varchar) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            lpad\trpad
+                            .....вечір\tвечір.....
+                            .....вечір\tвечір.....
+                            ....ганьба\tганьба....
+                            ....добрий\tдобрий....
+                            .....слава\tслава.....
+                            .....слава\tслава.....
+                            """);
+        });
+    }
+
+    @Test
+    public void testUtf8Random() throws Exception {
+        execute("create table x as (select rnd_varchar(1, 40, 0) vc1, rnd_varchar(1, 4, 0) vc2 from long_sequence(100))");
+        assertQuery("select count (*) from (select length(lpad(vc1, 20)) ll, length(rpad(vc2, 20)) lr from x) where ll = 20 and lr = 20")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        count
+                        100
+                        """);
+        // test A/B case
+        assertQuery("select count (*) from x where lpad(vc1, 20) = lpad(vc1, 20)")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        count
+                        100
+                        """);
+
+        assertQuery("select count (*) from x where rpad(vc2, 20) = rpad(vc2, 20)")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        count
+                        100
+                        """);
+    }
+
+    @Test
+    public void testUtf8RandomFill() throws Exception {
+        execute("create table x as (select rnd_varchar(1, 40, 0) vc1, rnd_varchar(1, 4, 0) vc2 from long_sequence(100))");
+        assertQuery("select count (*) from (select length(lpad(vc1, 20, '.'::varchar)) ll, length(rpad(vc2, 20, '.'::varchar)) lr from x order by vc1, vc2) where ll = 20 and lr = 20")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        count
+                        100
+                        """);
+
+        assertQuery("select count (*) from x where lpad(vc1, 20, '.'::varchar) = lpad(vc1, 20, '.'::varchar)")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        count
+                        100
+                        """);
+
+        assertQuery("select count (*) from x where rpad(vc2, 20, '.'::varchar) = rpad(vc2, 20, '.'::varchar)")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        count
+                        100
+                        """);
+    }
+
+    @Test
+    public void testUtf8Trim() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table x as (select rnd_varchar('ганьба','слава','добрий','вечір') vc from long_sequence(6))");
+            final String expected = """
+                    lpad\trpad
+                    вечі\tечір
+                    вечі\tечір
+                    гань\tньба
+                    добр\tбрий
+                    слав\tлава
+                    слав\tлава
+                    """;
+            assertQuery("select lpad(vc, 4), rpad(vc, 4) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("select lpad(vc, 4, '.'::varchar), rpad(vc, 4, '.'::varchar) from x order by vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+        });
+    }
+
+    @Test
+    public void testVarcharConstantStringWithVariableFill() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (s VARCHAR, l VARCHAR, r VARCHAR)");
+            execute("""
+                    INSERT INTO t VALUES
+                        ('*', '***ab', 'ab***'),
+                        ('é', 'éééab', 'abééé'),
+                        (NULL, NULL, NULL),
+                        ('', NULL, NULL)
+                    """);
+            assertQuery("SELECT lpad('ab'::VARCHAR, 5, s) l, rpad('ab'::VARCHAR, 5, s) r FROM t")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            l\tr
+                            ***ab\tab***
+                            éééab\tabééé
+                            \t
+                            \t
+                            """);
+            assertQuery("SELECT s FROM t WHERE l = lpad('ab'::VARCHAR, 5, s) AND r = rpad('ab'::VARCHAR, 5, s)")
+                    .noLeakCheck()
+                    .returns("""
+                            s
+                            *
+                            é
+                            
+                            
+                            """);
+        });
+    }
+}

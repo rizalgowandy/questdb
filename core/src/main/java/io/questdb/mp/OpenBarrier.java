@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,9 +25,14 @@
 package io.questdb.mp;
 
 public final class OpenBarrier implements Barrier {
-    public final static OpenBarrier INSTANCE = new OpenBarrier();
+    public static final OpenBarrier INSTANCE = new OpenBarrier();
 
     private OpenBarrier() {
+    }
+
+    @Override
+    public long availableIndex(long lo) {
+        return Long.MAX_VALUE - 1;
     }
 
     @Override
@@ -36,13 +41,8 @@ public final class OpenBarrier implements Barrier {
     }
 
     @Override
-    public void setCurrent(long value) {
-        // ignored
-    }
-
-    @Override
-    public long availableIndex(long lo) {
-        return Long.MAX_VALUE - 1;
+    public Barrier getBarrier() {
+        return null;
     }
 
     @Override
@@ -57,6 +57,11 @@ public final class OpenBarrier implements Barrier {
 
     @Override
     public void setBarrier(Barrier barrier) {
+    }
+
+    @Override
+    public void setCurrent(long value) {
+        // ignored
     }
 
     @Override

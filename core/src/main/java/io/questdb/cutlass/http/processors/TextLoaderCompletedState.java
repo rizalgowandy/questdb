@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,25 +24,22 @@
 
 package io.questdb.cutlass.http.processors;
 
-import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cutlass.text.TextLoader;
 import io.questdb.std.LongList;
 
 public class TextLoaderCompletedState {
-    private long writtenLineCount;
     private RecordMetadata metadata;
     private TextLoader textLoader;
+    private long writtenLineCount;
 
     public void copyState(TextLoader textLoader) {
         // Some values are come from TableWriter and has to be copied
         // in order to release TableWriter back to the Engine
         this.writtenLineCount = textLoader.getWrittenLineCount();
-        this.metadata = textLoader.getMetadata() != null
-                ? GenericRecordMetadata.copyOf(textLoader.getMetadata())
-                : null;
         // Some values are safe to get from TextLoader
         this.textLoader = textLoader;
+        this.metadata = textLoader.getMetadata();
     }
 
     public LongList getColumnErrorCounts() {
@@ -73,6 +70,10 @@ public class TextLoaderCompletedState {
         return textLoader.getTimestampCol();
     }
 
+    public int getWarnings() {
+        return textLoader.getWarnings();
+    }
+
     public long getWrittenLineCount() {
         return writtenLineCount;
     }
@@ -81,7 +82,7 @@ public class TextLoaderCompletedState {
         return textLoader.isForceHeaders();
     }
 
-    public int getWarnings() {
-        return textLoader.getWarnings();
+    public boolean isHeaderDetected() {
+        return textLoader.isHeaderDetected();
     }
 }

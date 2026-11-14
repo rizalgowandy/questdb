@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,25 +30,18 @@ import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.cairo.vm.api.MemoryMARW;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 
-class MigrationContext {
+public class MigrationContext {
+    private final CairoEngine engine;
+    private final MemoryMARW rwMemory;
     private final long tempMemory;
     private final int tempMemoryLen;
     private final MemoryARW tempVirtualMem;
-    private final MemoryMARW rwMemory;
-    private final CairoEngine engine;
-    private Path tablePath;
     private long metadataFd;
+    private Path tablePath;
     private Path tablePath2;
-
-    public MemoryMARW getRwMemory() {
-        return rwMemory;
-    }
-
-    public long getTempMemory() {
-        return tempMemory;
-    }
 
     public MigrationContext(
             CairoEngine engine,
@@ -64,10 +57,10 @@ class MigrationContext {
         this.rwMemory = rwMemory;
     }
 
-    public MemoryMARW createRwMemoryOf(FilesFacade ff, Path path) {
+    public MemoryMARW createRwMemoryOf(FilesFacade ff, LPSZ path) {
         // re-use same rwMemory
         // assumption that it is re-usable after the close() and then of()  methods called.
-        rwMemory.smallFile(ff, path, MemoryTag.NATIVE_DEFAULT);
+        rwMemory.smallFile(ff, path, MemoryTag.NATIVE_MIG_MMAP);
         return rwMemory;
     }
 
@@ -84,7 +77,11 @@ class MigrationContext {
     }
 
     public int getNextTableId() {
-        return (int) engine.getNextTableId();
+        return engine.getNextTableId();
+    }
+
+    public MemoryMARW getRwMemory() {
+        return rwMemory;
     }
 
     public Path getTablePath() {
@@ -93,6 +90,10 @@ class MigrationContext {
 
     public Path getTablePath2() {
         return tablePath2;
+    }
+
+    public long getTempMemory() {
+        return tempMemory;
     }
 
     public long getTempMemory(int size) {
@@ -110,10 +111,9 @@ class MigrationContext {
         return tempVirtualMem;
     }
 
-    public MigrationContext of(Path path, Path pathCopy, long metadataFd) {
+    public void of(Path path, Path pathCopy, long metadataFd) {
         this.tablePath = path;
         this.tablePath2 = pathCopy;
         this.metadataFd = metadataFd;
-        return this;
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,9 +25,11 @@
 package io.questdb.std;
 
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.NotNull;
 
 public class Long256Impl implements Long256, Sinkable {
-
     public static final Long256Impl NULL_LONG256 = new Long256Impl();
     public static final Long256Impl ZERO_LONG256 = new Long256Impl();
 
@@ -36,11 +38,28 @@ public class Long256Impl implements Long256, Sinkable {
     private long l2;
     private long l3;
 
+    public static Long256Impl add(final Long256Impl sum, final Long256 x, final Long256 y) {
+        if (x.equals(Long256Impl.NULL_LONG256) || y.equals(Long256Impl.NULL_LONG256)) {
+            return Long256Impl.NULL_LONG256;
+        }
+        sum.copyFrom(x);
+        Long256Util.add(sum, y);
+        return sum;
+    }
+
+    public static boolean isNull(Long256 value) {
+        return Long256Impl.NULL_LONG256.equals(value);
+    }
+
+    public static boolean isNull(long l0, long l1, long l2, long l3) {
+        return l0 == Numbers.LONG_NULL && l1 == Numbers.LONG_NULL && l2 == Numbers.LONG_NULL && l3 == Numbers.LONG_NULL;
+    }
+
     public static void putNull(long appendPointer) {
-        Unsafe.getUnsafe().putLong(appendPointer, NULL_LONG256.getLong0());
-        Unsafe.getUnsafe().putLong(appendPointer + Long.BYTES, NULL_LONG256.getLong1());
-        Unsafe.getUnsafe().putLong(appendPointer + Long.BYTES * 2, NULL_LONG256.getLong2());
-        Unsafe.getUnsafe().putLong(appendPointer + Long.BYTES * 3, NULL_LONG256.getLong3());
+        Unsafe.putLong(appendPointer, NULL_LONG256.getLong0());
+        Unsafe.putLong(appendPointer + Long.BYTES, NULL_LONG256.getLong1());
+        Unsafe.putLong(appendPointer + Long.BYTES * 2, NULL_LONG256.getLong2());
+        Unsafe.putLong(appendPointer + Long.BYTES * 3, NULL_LONG256.getLong3());
     }
 
     public void copyFrom(Long256 value) {
@@ -95,25 +114,23 @@ public class Long256Impl implements Long256, Sinkable {
     }
 
     @Override
-    public void toSink(CharSink sink) {
+    public void toSink(@NotNull CharSink<?> sink) {
         Numbers.appendLong256(l0, l1, l2, l3, sink);
     }
 
-    public static Long256Impl add(final Long256Impl sum, final Long256 x, final Long256 y) {
-        if (x.equals(Long256Impl.NULL_LONG256) || y.equals(Long256Impl.NULL_LONG256)) {
-            return Long256Impl.NULL_LONG256;
-        }
-        sum.copyFrom(x);
-        Long256Util.add(sum, y);
-        return sum;
+    @Override
+    public String toString() {
+        StringSink sink = new StringSink();
+        toSink(sink);
+        return sink.toString();
     }
 
     static {
         NULL_LONG256.setAll(
-                Numbers.LONG_NaN,
-                Numbers.LONG_NaN,
-                Numbers.LONG_NaN,
-                Numbers.LONG_NaN
+                Numbers.LONG_NULL,
+                Numbers.LONG_NULL,
+                Numbers.LONG_NULL,
+                Numbers.LONG_NULL
         );
         ZERO_LONG256.setAll(0, 0, 0, 0);
     }

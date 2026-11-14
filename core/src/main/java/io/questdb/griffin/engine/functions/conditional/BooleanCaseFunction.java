@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,12 +27,12 @@ package io.questdb.griffin.engine.functions.conditional;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.BooleanFunction;
-import io.questdb.griffin.engine.functions.MultiArgFunction;
 import io.questdb.std.ObjList;
 
-class BooleanCaseFunction extends BooleanFunction implements MultiArgFunction {
-    private final CaseFunctionPicker picker;
+@SuppressWarnings("resource")
+class BooleanCaseFunction extends BooleanFunction implements CaseFunction {
     private final ObjList<Function> args;
+    private final CaseFunctionPicker picker;
 
     public BooleanCaseFunction(CaseFunctionPicker picker, ObjList<Function> args) {
         this.picker = picker;
@@ -40,7 +40,7 @@ class BooleanCaseFunction extends BooleanFunction implements MultiArgFunction {
     }
 
     @Override
-    public ObjList<Function> getArgs() {
+    public ObjList<Function> args() {
         return args;
     }
 

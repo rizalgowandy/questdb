@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,11 +27,12 @@ package io.questdb.griffin.engine.functions;
 import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 
 /**
  * This factory has limitations. In that it does not differentiate cursor.toTop() from creating new
- * cursor instance. Semantically toTop() does not refresh data snapshot and newInstance() does, or it supposed to.
+ * cursor instance. Semantically toTop() does not refresh data snapshot and newInstance() does, or it's supposed to.
  */
 public class GenericRecordCursorFactory extends AbstractRecordCursorFactory {
     private final RecordCursor cursor;
@@ -52,5 +53,10 @@ public class GenericRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     public boolean recordCursorSupportsRandomAccess() {
         return supportsRandomAccess;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("GenericRecord");
     }
 }

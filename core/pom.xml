@@ -6,7 +6,7 @@
   ~    \__\_\\__,_|\___||___/\__|____/|____/
   ~
   ~  Copyright (c) 2014-2019 Appsicle
-  ~  Copyright (c) 2019-2022 QuestDB
+  ~  Copyright (c) 2019-2026 QuestDB
   ~
   ~  Licensed under the Apache License, Version 2.0 (the "License");
   ~  you may not use this file except in compliance with the License.
@@ -22,24 +22,39 @@
   ~
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~-->
 
-<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="http://maven.apache.org/POM/4.0.0"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
     <modelVersion>4.0.0</modelVersion>
-    <name>QuestDB core</name>
+    <name>QuestDB</name>
     <description>QuestDB is high performance SQL time series database</description>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.javadoc.skip>false</maven.javadoc.skip>
         <outputPath>target</outputPath>
-        <nodejs.npm.cmd>npm</nodejs.npm.cmd>
-        <nodejs.version>v16.13.1</nodejs.version>
         <runtime.assembly>none</runtime.assembly>
-        <javac.target>11</javac.target>
-        <argLine>-ea -Dfile.encoding=UTF-8</argLine>
+        <javac.target>25</javac.target>
+        <!-- Empty unless the ram-disk-test-root profile fills it in; see that profile. Surefire does not
+             forward a -Djava.io.tmpdir given on the Maven command line into its forked JVM, so the test
+             root can only be relocated through argLine. -->
+        <testTmpDirArg />
+        <argLine>-ea -Dfile.encoding=UTF-8 -XX:+UseParallelGC --sun-misc-unsafe-memory-access=allow --enable-native-access=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.time.zone=ALL-UNNAMED --add-exports=java.base/jdk.internal.vm=ALL-UNNAMED --add-exports=java.base/jdk.internal.vm=io.questdb ${testTmpDirArg}</argLine>
         <test.exclude>None</test.exclude>
+        <test.include>%regex[.*[^o].class]</test.include><!-- exclude module-info.class-->
+        <web.console.version>2.0.5</web.console.version>
+        <qdbr.path>rust/qdbr</qdbr.path>
+        <qdbr.release>true</qdbr.release>
+        <rust.native.artifacts.directory>${project.build.directory}/native-libs</rust.native.artifacts.directory>
+        <central.base.url>https://central.sonatype.com</central.base.url>
+
+        <!--
+        For debug builds, use -P qdbr-debug
+        -->
+        <qdbr.rustflags>-D warnings</qdbr.rustflags>
+
+        <questdb.client.version>1.3.12</questdb.client.version>
     </properties>
 
-    <version>6.3.2-SNAPSHOT</version>
+    <version>10.2.1-SNAPSHOT</version>
     <groupId>org.questdb</groupId>
     <artifactId>questdb</artifactId>
     <packaging>jar</packaging>
@@ -66,28 +81,60 @@
         <tag>HEAD</tag>
     </scm>
 
-    <distributionManagement>
-        <snapshotRepository>
-            <id>central</id>
-            <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-        </snapshotRepository>
-        <repository>
-            <id>central</id>
-            <url>https://oss.sonatype.org/service/local/staging/deploy/maven2</url>
-        </repository>
-    </distributionManagement>
 
     <build>
-        <directory>${outputPath}</directory>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+                <executions>
+                    <!--
+                      LICENSE.txt and THIRD_PARTY_LICENSES.txt live at the repository
+                      root: the latter is generated and committed by CI (see
+                      .github/workflows/rebuild_rust.yml) and both describe the whole
+                      repo, not just this module. Copy them rather than declaring the
+                      repo root as a <resource> directory of this module: a resource
+                      root above the module base cannot be represented in Eclipse's
+                      resource model, so m2e (and therefore jdtls/VS Code/Zed) aborts
+                      the whole workspace import on it.
+                    -->
+                    <execution>
+                        <id>copy-licenses</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.outputDirectory}/META-INF</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>${project.basedir}/..</directory>
+                                    <includes>
+                                        <include>LICENSE.txt</include>
+                                        <include>THIRD_PARTY_LICENSES.txt</include>
+                                    </includes>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.8.1</version>
+                <version>3.11.0</version>
                 <configuration>
                     <compilerArgs>
-                        <arg>${compilerArg1}</arg>
-                        <arg>${compilerArg2}</arg>
+                        <arg>-J-XX:-TieredCompilation</arg>
+                        <arg>-J-XX:TieredStopAtLevel=1</arg>
+                        <arg>--add-exports=java.base/jdk.internal.vm=io.questdb</arg>
+                        <arg>--add-exports=java.base/jdk.internal.vm=io.questdb.test</arg>
                     </compilerArgs>
                     <fork>true</fork>
                     <source>${javac.compile.source}</source>
@@ -121,6 +168,12 @@
                             <Build-Commit-Hash>${buildNumber}</Build-Commit-Hash>
                         </manifestEntries>
                     </archive>
+                    <excludes>
+                        <!-- rust-maven-plugin copies the crate's [[bin]] targets (pm_inspect, pm_generate)
+                             next to libquestdbr; the build-rust-library profile deletes them right after
+                             the Rust build and this exclusion keeps them out of the jar regardless. -->
+                        <exclude>io/questdb/bin/**/pm_*</exclude>
+                    </excludes>
                 </configuration>
             </plugin>
             <plugin>
@@ -149,7 +202,7 @@
             <!-- remove web console package on "clean" -->
             <plugin>
                 <artifactId>maven-clean-plugin</artifactId>
-                <version>3.1.0</version>
+                <version>3.2.0</version>
                 <configuration>
                     <filesets>
                         <fileset>
@@ -192,95 +245,192 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>2.17</version>
+                <version>3.5.3</version>
                 <configuration>
+                    <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
+                    <useModulePath>true</useModulePath>
+                    <includes>
+                        <include>${test.include}</include>
+                    </includes>
                     <excludes>
                         <exclude>${test.exclude}</exclude>
                     </excludes>
                     <properties>
                         <property>
                             <name>listener</name>
-                            <value>io.questdb.TestListener</value>
+                            <value>io.questdb.test.TestListener</value>
                         </property>
                     </properties>
+                    <environmentVariables>
+                        <!-- needed for testing Sender.fromEnv() -->
+                        <QDB_CLIENT_CONF>
+                            tcp::addr=localhost:9002;user=testUser1;token=UvuVb1USHGRRT08gEnwN2zGZrvM4MsLQ5brgF6SVkAw=;
+                        </QDB_CLIENT_CONF>
+                        <!-- Used by cargo when running a test with code coverage -->
+                        <LLVM_PROFILE_FILE>questdbr-junit.profraw</LLVM_PROFILE_FILE>
+                    </environmentVariables>
                 </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-javadoc-plugin</artifactId>
-                <version>3.2.0</version>
-                <executions>
-                    <execution>
-                        <id>attach-javadocs</id>
-                        <goals>
-                            <goal>jar</goal>
-                        </goals>
-                    </execution>
-                </executions>
-                <configuration>
-                    <additionalJOptions>
-                        <additionalJOption>${compilerArg1}</additionalJOption>
-                        <additionalJOption>${compilerArg2}</additionalJOption>
-                    </additionalJOptions>
-                    <sourceFileExcludes>
-                        <sourceFileExclude>${excludePattern1}</sourceFileExclude>
-                    </sourceFileExcludes>
-                </configuration>
-            </plugin>
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>exec-maven-plugin</artifactId>
-                <version>1.6.0</version>
-                <configuration>
-                    <longModulepath>false</longModulepath>
-                </configuration>
-                <executions>
-                    <execution>
-                        <id>npm-install</id>
-                        <goals>
-                            <goal>exec</goal>
-                        </goals>
-                        <configuration>
-                            <executable>${nodejs.npm.cmd}</executable>
-                            <arguments>
-                                <argument>install</argument>
-                                <argument>--no-fund</argument>
-                                <argument>--scripts-prepend-node-path=auto</argument>
-                            </arguments>
-                            <environmentVariables>
-                                <PATH>${project.basedir}/node/:${env.PATH}</PATH>
-                            </environmentVariables>
-                            <workingDirectory>../ui</workingDirectory>
-                        </configuration>
-                    </execution>
-                    <execution>
-                        <id>npm-run-build</id>
-                        <goals>
-                            <goal>exec</goal>
-                        </goals>
-                        <configuration>
-                            <executable>${nodejs.npm.cmd}</executable>
-                            <arguments>
-                                <argument>run</argument>
-                                <argument>build</argument>
-                                <argument>--scripts-prepend-node-path=auto</argument>
-                            </arguments>
-                            <environmentVariables>
-                                <PATH>${project.basedir}/node/:${env.PATH}</PATH>
-                            </environmentVariables>
-                            <workingDirectory>../ui</workingDirectory>
-                        </configuration>
-                    </execution>
-                </executions>
             </plugin>
         </plugins>
     </build>
 
     <profiles>
         <profile>
+            <!-- Puts the JUnit TemporaryFolder that every test's dbRoot hangs off (AbstractTest) on a
+                 developer-chosen path, so a local run can write to a RAM disk instead of grinding an SSD:
+
+                     mkdir -p /dev/shm/qdb-test
+                     QDB_TEST_TMPDIR=/dev/shm/qdb-test mvn -pl core test -Dtest=...
+
+                 The directory must already exist; the JVM does not create java.io.tmpdir. Active only when
+                 QDB_TEST_TMPDIR is exported, so CI keeps its real filesystems (ext4/XFS, plus the dedicated
+                 ZFS shard) and the on-disk write paths they cover.
+
+                 NOTE tmpfs is not on QuestDB's supported-filesystem list, which would make
+                 FilesFacadeImpl.allowMixedIO answer false and quietly move the suite onto the non-mixed-IO
+                 O3 write path, the opposite of what CI exercises. CairoTestConfiguration.isWriterMixedIOEnabled
+                 keeps the on-disk answer for a tmpfs root so that does not happen; see the note there. -->
+            <id>ram-disk-test-root</id>
+            <activation>
+                <property>
+                    <name>env.QDB_TEST_TMPDIR</name>
+                </property>
+            </activation>
+            <properties>
+                <testTmpDirArg>-Djava.io.tmpdir=${env.QDB_TEST_TMPDIR}</testTmpDirArg>
+            </properties>
+        </profile>
+        <profile>
+            <!-- CI gives every surefire fork (and any replacement fork that reuses a slot) its own
+                 test log path, so a dead fork's lingering Windows file handle cannot make the next
+                 fork die reopening a shared tests.log with ERROR_SHARING_VIOLATION (errno=32).
+                 Active only when QDB_LOG_W_FILE_LOCATION is exported (CI); local runs are unchanged.
+                 forkNumber separates concurrent forks, %p (the JVM pid) separates fork generations. -->
+            <id>per-fork-test-log</id>
+            <activation>
+                <property>
+                    <name>env.QDB_LOG_W_FILE_LOCATION</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <environmentVariables>
+                                <QDB_LOG_W_FILE_LOCATION>
+                                    ${env.QDB_LOG_W_FILE_LOCATION}.fork-${surefire.forkNumber}.pid-%p
+                                </QDB_LOG_W_FILE_LOCATION>
+                            </environmentVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>local-client</id>
+            <properties>
+                <questdb.client.version>1.3.12</questdb.client.version>
+            </properties>
+        </profile>
+        <profile>
+            <id>javadoc</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <doclint>all,-missing</doclint>
+                            <sourceFileExcludes>
+                                <sourceFileExclude>${excludePattern1}</sourceFileExclude>
+                            </sourceFileExcludes>
+                            <additionalOptions>
+                                <additionalOption>--add-exports java.base/jdk.internal.vm=io.questdb</additionalOption>
+                            </additionalOptions>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
             <id>maven-central-release</id>
             <build>
                 <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                        <version>3.0.0-M3</version>
+                        <executions>
+                            <execution>
+                                <id>require-aggregated-rust-native-artifacts</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <requireActiveProfile>
+                                            <profiles>include-rust-native-artifacts</profiles>
+                                            <all>true</all>
+                                        </requireActiveProfile>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                            <!-- The tag's POM is a release version, so onlyWhenRelease makes this rule
+                                 fire on every Central deploy and reject an unreleased (snapshot-versioned)
+                                 client pin or any other unreleased dependency before publication. The
+                                 lifecycle fixture scans this file for the upper-case snapshot token, so
+                                 this comment deliberately avoids it. -->
+                            <execution>
+                                <id>require-release-dependencies-for-central</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <requireReleaseDeps>
+                                            <onlyWhenRelease>true</onlyWhenRelease>
+                                            <failWhenParentIsSnapshot>true</failWhenParentIsSnapshot>
+                                        </requireReleaseDeps>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.5.0</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <doclint>all,-missing</doclint>
+                            <sourceFileExcludes>
+                                <sourceFileExclude>${excludePattern1}</sourceFileExclude>
+                            </sourceFileExcludes>
+                            <additionalOptions>
+                                <additionalOption>--add-exports java.base/jdk.internal.vm=io.questdb</additionalOption>
+                            </additionalOptions>
+                        </configuration>
+                    </plugin>
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-source-plugin</artifactId>
@@ -297,7 +447,7 @@
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-gpg-plugin</artifactId>
-                        <version>1.6</version>
+                        <version>3.2.7</version>
                         <executions>
                             <execution>
                                 <id>sign-artifacts</id>
@@ -309,24 +459,22 @@
                         </executions>
                         <configuration>
                             <executable>gpg</executable>
+                            <gpgArguments>
+                                <arg>--pinentry-mode</arg>
+                                <arg>loopback</arg>
+                            </gpgArguments>
                         </configuration>
                     </plugin>
                     <plugin>
-                        <groupId>org.sonatype.plugins</groupId>
-                        <artifactId>nexus-staging-maven-plugin</artifactId>
-                        <version>1.6.3</version>
-                        <executions>
-                            <execution>
-                                <id>default-deploy</id>
-                                <phase>deploy</phase>
-                                <goals>
-                                    <goal>deploy</goal>
-                                </goals>
-                            </execution>
-                        </executions>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.8.0</version>
+                        <extensions>true</extensions>
                         <configuration>
-                            <serverId>central</serverId>
-                            <nexusUrl>https://oss.sonatype.org</nexusUrl>
+                            <publishingServerId>central</publishingServerId>
+                            <centralBaseUrl>${central.base.url}</centralBaseUrl>
+                            <autoPublish>false</autoPublish>
+                            <waitUntil>validated</waitUntil>
                         </configuration>
                     </plugin>
                 </plugins>
@@ -336,37 +484,32 @@
             <id>build-web-console</id>
             <build>
                 <plugins>
+                    <!-- download Web Console artefact -->
                     <plugin>
-                        <groupId>com.github.eirslett</groupId>
-                        <artifactId>frontend-maven-plugin</artifactId>
-                        <version>1.9.1</version>
+                        <groupId>com.googlecode.maven-download-plugin</groupId>
+                        <artifactId>download-maven-plugin</artifactId>
+                        <version>1.6.8</version>
                         <executions>
                             <execution>
-                                <id>install node and npm</id>
-                                <goals>
-                                    <goal>install-node-and-npm</goal>
-                                </goals>
+                                <!-- the wget goal actually binds itself to this phase by default -->
                                 <phase>initialize</phase>
-                            </execution>
-                        </executions>
-                        <configuration>
-                            <nodeVersion>${nodejs.version}</nodeVersion>
-                        </configuration>
-                    </plugin>
-                    <plugin>
-                        <groupId>org.codehaus.mojo</groupId>
-                        <artifactId>exec-maven-plugin</artifactId>
-                        <executions>
-                            <execution>
-                                <id>npm-install</id>
-                                <phase>generate-sources</phase>
-                            </execution>
-                            <execution>
-                                <id>npm-run-build</id>
-                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>wget</goal>
+                                </goals>
+                                <configuration>
+                                    <url>
+                                        https://registry.npmjs.org/@questdb/web-console/-/web-console-${web.console.version}.tgz
+                                    </url>
+                                    <outputFileName>web-console.tgz</outputFileName>
+                                    <outputDirectory>${project.build.directory}/site/</outputDirectory>
+                                    <unpack>true</unpack>
+                                    <skipCache>true</skipCache>
+                                </configuration>
                             </execution>
                         </executions>
                     </plugin>
+
+                    <!-- Repackage Web Console as public.zip -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-assembly-plugin</artifactId>
@@ -374,7 +517,7 @@
                         <executions>
                             <execution>
                                 <id>package-web-console</id>
-                                <phase>generate-resources</phase>
+                                <phase>initialize</phase>
                                 <goals>
                                     <goal>single</goal>
                                 </goals>
@@ -400,6 +543,7 @@
                     <plugin>
                         <groupId>org.codehaus.mojo</groupId>
                         <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.0.0</version>
                         <configuration>
                             <longModulepath>false</longModulepath>
                         </configuration>
@@ -453,7 +597,7 @@
                                 </goals>
                                 <configuration>
                                     <descriptors>
-                                        <descriptor>src/main/assembly/binaries.xml</descriptor>
+                                        <descriptor>src/main/assembly/no-jre.xml</descriptor>
                                     </descriptors>
                                     <finalName>questdb</finalName>
                                 </configuration>
@@ -477,21 +621,302 @@
             </build>
         </profile>
         <profile>
-            <id>platform-windows-amd64</id>
+            <id>build-rust-library</id>
+            <activation>
+                <property>
+                    <!-- Defining the property with any non-empty value, including -DskipNative=false, disables the
+                         Rust build; an empty -DskipNative= counts as undefined and leaves it enabled. -->
+                    <name>!skipNative</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <!--
+                    Builds the Rust native library (libquestdbr) from source.
+                    The binary is placed in target/classes/io/questdb/bin/<platform>/
+                    where Os.java picks it up via the classpath. Skip with -DskipNative.
+                    -->
+                    <plugin>
+                        <groupId>org.questdb</groupId>
+                        <artifactId>rust-maven-plugin</artifactId>
+                        <version>1.2.0</version>
+                        <executions>
+                            <execution>
+                                <id>qdbr-build</id>
+                                <goals>
+                                    <goal>build</goal>
+                                </goals>
+                                <configuration>
+                                    <path>${qdbr.path}</path>
+                                    <release>${qdbr.release}</release>
+                                    <copyTo>${project.build.directory}/classes/io/questdb/bin/${platform.dir.name}</copyTo>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>remove-stale-rust-native-artifacts</id>
+                                <phase>process-resources</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <delete includeemptydirs="false">
+                                            <fileset dir="${project.build.outputDirectory}/io/questdb/bin">
+                                                <include name="**/libquestdbr.so" />
+                                                <include name="**/libquestdbr.dylib" />
+                                                <include name="**/questdbr.dll" />
+                                            </fileset>
+                                        </delete>
+                                    </target>
+                                </configuration>
+                            </execution>
+                            <!-- rust-maven-plugin 1.2.0 copies every [[bin]] target of the crate (pm_inspect,
+                                 pm_generate) together with the cdylib into copyTo. Those CLI tools must not
+                                 ship in questdb.jar, so remove them in the same compile phase: Maven runs
+                                 same-phase executions in POM declaration order, which is why this plugin
+                                 is declared after rust-maven-plugin. -->
+                            <execution>
+                                <id>remove-rust-cli-binaries</id>
+                                <phase>compile</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <delete includeemptydirs="false">
+                                            <fileset dir="${project.build.outputDirectory}/io/questdb/bin">
+                                                <include name="**/pm_*" />
+                                            </fileset>
+                                        </delete>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>include-rust-native-artifacts</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                        <version>3.0.0-M3</version>
+                        <executions>
+                            <execution>
+                                <id>require-skip-native-for-rust-aggregation</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <requireProperty>
+                                            <property>skipNative</property>
+                                            <message>include-rust-native-artifacts requires -DskipNative</message>
+                                            <!-- A bare -DskipNative is the value "true". An empty -DskipNative= would
+                                                 leave build-rust-library active (Maven treats an empty value as
+                                                 undefined) and let the host build overwrite a staged library. -->
+                                            <regex>true</regex>
+                                            <regexMessage>include-rust-native-artifacts requires a bare -DskipNative (value true), not -DskipNative=</regexMessage>
+                                        </requireProperty>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>validate-rust-native-artifacts</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <resourcecount property="rust.native.artifact.count">
+                                            <fileset dir="${rust.native.artifacts.directory}/io/questdb/bin" includes="**/*questdbr*" />
+                                        </resourcecount>
+                                        <condition property="has.exact.rust.native.artifacts">
+                                            <and>
+                                                <equals arg1="${rust.native.artifact.count}" arg2="4" />
+                                                <available file="${rust.native.artifacts.directory}/io/questdb/bin/linux-x86-64/libquestdbr.so" type="file" />
+                                                <length file="${rust.native.artifacts.directory}/io/questdb/bin/linux-x86-64/libquestdbr.so" length="0" when="greater" />
+                                                <available file="${rust.native.artifacts.directory}/io/questdb/bin/linux-aarch64/libquestdbr.so" type="file" />
+                                                <length file="${rust.native.artifacts.directory}/io/questdb/bin/linux-aarch64/libquestdbr.so" length="0" when="greater" />
+                                                <available file="${rust.native.artifacts.directory}/io/questdb/bin/darwin-aarch64/libquestdbr.dylib" type="file" />
+                                                <length file="${rust.native.artifacts.directory}/io/questdb/bin/darwin-aarch64/libquestdbr.dylib" length="0" when="greater" />
+                                                <available file="${rust.native.artifacts.directory}/io/questdb/bin/windows-x86-64/questdbr.dll" type="file" />
+                                                <length file="${rust.native.artifacts.directory}/io/questdb/bin/windows-x86-64/questdbr.dll" length="0" when="greater" />
+                                            </and>
+                                        </condition>
+                                        <fail unless="has.exact.rust.native.artifacts">include-rust-native-artifacts requires exactly four non-empty staged Rust libraries</fail>
+                                    </target>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>copy-rust-native-artifacts</id>
+                                <phase>process-resources</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <delete includeemptydirs="false">
+                                            <fileset dir="${project.build.outputDirectory}/io/questdb/bin">
+                                                <include name="**/libquestdbr.so" />
+                                                <include name="**/libquestdbr.dylib" />
+                                                <include name="**/questdbr.dll" />
+                                            </fileset>
+                                        </delete>
+                                        <copy file="${rust.native.artifacts.directory}/io/questdb/bin/linux-x86-64/libquestdbr.so" tofile="${project.build.outputDirectory}/io/questdb/bin/linux-x86-64/libquestdbr.so" />
+                                        <copy file="${rust.native.artifacts.directory}/io/questdb/bin/linux-aarch64/libquestdbr.so" tofile="${project.build.outputDirectory}/io/questdb/bin/linux-aarch64/libquestdbr.so" />
+                                        <copy file="${rust.native.artifacts.directory}/io/questdb/bin/darwin-aarch64/libquestdbr.dylib" tofile="${project.build.outputDirectory}/io/questdb/bin/darwin-aarch64/libquestdbr.dylib" />
+                                        <copy file="${rust.native.artifacts.directory}/io/questdb/bin/windows-x86-64/questdbr.dll" tofile="${project.build.outputDirectory}/io/questdb/bin/windows-x86-64/questdbr.dll" />
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>verify-aggregated-rust-native-jar</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>exec</goal>
+                                </goals>
+                                <configuration>
+                                    <executable>bash</executable>
+                                    <arguments>
+                                        <argument>${project.basedir}/../.github/scripts/verify-rust-native-jar.sh</argument>
+                                        <argument>${project.build.directory}/${project.build.finalName}.jar</argument>
+                                        <argument>${rust.native.artifacts.directory}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <!--
+        Uses a host Rust library that another job already built instead of compiling the crate again.
+        CI only: the hosted macOS/Windows test legs build libquestdbr once per OS (ci/templates/hosted-jobs.yml)
+        and pass -DskipNative -Dqdbr.prebuilt.dir=<dir>. The library is copied into target/classes after
+        `clean`, at the same path the build-rust-library profile writes to.
+        -->
+        <profile>
+            <id>prebuilt-rust-native</id>
+            <activation>
+                <property>
+                    <name>qdbr.prebuilt.dir</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                        <version>3.0.0-M3</version>
+                        <executions>
+                            <execution>
+                                <id>require-skip-native-for-prebuilt-rust</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <requireProperty>
+                                            <property>skipNative</property>
+                                            <message>qdbr.prebuilt.dir requires -DskipNative</message>
+                                            <!-- Same reason as include-rust-native-artifacts: an empty -DskipNative=
+                                                 leaves build-rust-library active and rebuilds the library. -->
+                                            <regex>true</regex>
+                                            <regexMessage>qdbr.prebuilt.dir requires a bare -DskipNative (value true), not -DskipNative=</regexMessage>
+                                        </requireProperty>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-antrun-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <executions>
+                            <execution>
+                                <id>validate-prebuilt-rust-native</id>
+                                <phase>validate</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <fail message="qdbr.prebuilt.dir must contain exactly one Rust library (libquestdbr.so, libquestdbr.dylib or questdbr.dll): ${qdbr.prebuilt.dir}">
+                                            <condition>
+                                                <not>
+                                                    <resourcecount count="1">
+                                                        <fileset dir="${qdbr.prebuilt.dir}" includes="libquestdbr.so,libquestdbr.dylib,questdbr.dll" />
+                                                    </resourcecount>
+                                                </not>
+                                            </condition>
+                                        </fail>
+                                    </target>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>copy-prebuilt-rust-native</id>
+                                <phase>process-resources</phase>
+                                <goals>
+                                    <goal>run</goal>
+                                </goals>
+                                <configuration>
+                                    <target>
+                                        <copy todir="${project.build.outputDirectory}/io/questdb/bin/${platform.dir.name}" overwrite="true" failonerror="true">
+                                            <fileset dir="${qdbr.prebuilt.dir}" includes="libquestdbr.so,libquestdbr.dylib,questdbr.dll" />
+                                        </copy>
+                                    </target>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+        <profile>
+            <id>platform-windows-x86-64</id>
             <activation>
                 <os>
                     <family>windows</family>
                 </os>
             </activation>
             <properties>
-                <archive.name>${project.version}-rt-windows-amd64</archive.name>
-                <runtime.name>questdb-${project.version}-rt-windows-amd64</runtime.name>
-                <runtime.assembly>src/main/assembly/windows-runtime.xml</runtime.assembly>
-                <nodejs.npm.cmd>${project.basedir}/node/npm.cmd</nodejs.npm.cmd>
+                <archive.name>${project.version}-rt-windows-x86-64</archive.name>
+                <runtime.name>questdb-${project.version}-rt-windows-x86-64</runtime.name>
+                <runtime.assembly>src/main/assembly/rt-win.xml</runtime.assembly>
+                <platform.dir.name>windows-x86-64</platform.dir.name>
             </properties>
         </profile>
         <profile>
-            <id>platform-linux-amd64</id>
+            <id>platform-linux-x86-64</id>
             <activation>
                 <os>
                     <family>unix</family>
@@ -499,14 +924,15 @@
                 </os>
             </activation>
             <properties>
-                <archive.name>${project.version}-rt-linux-amd64</archive.name>
-                <runtime.name>questdb-${project.version}-rt-linux-amd64</runtime.name>
-                <runtime.assembly>src/main/assembly/linux-runtime.xml</runtime.assembly>
-                <nodejs.npm.cmd>${project.basedir}/node/npm</nodejs.npm.cmd>
+                <archive.name>${project.version}-rt-linux-x86-64</archive.name>
+                <runtime.name>questdb-${project.version}-rt-linux-x86-64</runtime.name>
+                <runtime.assembly>src/main/assembly/rt-unix.xml</runtime.assembly>
+                <platform.dir.name>linux-x86-64</platform.dir.name>
+                <jemalloc.so>libjemalloc.so</jemalloc.so>
             </properties>
         </profile>
         <profile>
-            <id>platform-freebsd-amd64</id>
+            <id>platform-freebsd-x86-64</id>
             <activation>
                 <os>
                     <family>FreeBSD</family>
@@ -514,10 +940,10 @@
                 </os>
             </activation>
             <properties>
-                <archive.name>${project.version}-rt-freebsd-amd64</archive.name>
-                <runtime.name>questdb-${project.version}-rt-freebsd-amd64</runtime.name>
-                <runtime.assembly>src/main/assembly/linux-runtime.xml</runtime.assembly>
-                <nodejs.npm.cmd>${project.basedir}/node/npm</nodejs.npm.cmd>
+                <archive.name>${project.version}-rt-freebsd-x86-64</archive.name>
+                <runtime.name>questdb-${project.version}-rt-freebsd-x86-64</runtime.name>
+                <runtime.assembly>src/main/assembly/rt-freebsd.xml</runtime.assembly>
+                <platform.dir.name>freebsd-x86-64</platform.dir.name>
             </properties>
         </profile>
         <profile>
@@ -531,117 +957,84 @@
             <properties>
                 <archive.name>${project.version}-rt-linux-aarch64</archive.name>
                 <runtime.name>questdb-${project.version}-rt-linux-aarch64</runtime.name>
-                <runtime.assembly>src/main/assembly/linux-runtime.xml</runtime.assembly>
-                <nodejs.npm.cmd>${project.basedir}/node/npm</nodejs.npm.cmd>
+                <runtime.assembly>src/main/assembly/rt-unix.xml</runtime.assembly>
+                <platform.dir.name>linux-aarch64</platform.dir.name>
+                <jemalloc.so>libjemalloc.so</jemalloc.so>
             </properties>
         </profile>
+        <!--
+        There is deliberately no platform-osx-x86-64 distribution profile: x86-64 (Intel)
+        macOS is not a supported platform. No CI job builds or tests it, so we commit and ship
+        no darwin-x86-64 native library or rt-osx-x86-64 runtime archive. This build-only
+        profile still gives local Intel Mac source builds the directory Os.java loads.
+        -->
         <profile>
-            <id>platform-osx-amd64</id>
+            <id>build-osx-x86-64-natives</id>
             <activation>
                 <os>
                     <family>Mac</family>
+                    <arch>x86_64</arch>
                 </os>
             </activation>
             <properties>
-                <archive.name>${project.version}-rt-osx-amd64</archive.name>
-                <runtime.name>questdb-${project.version}-rt-osx-amd64</runtime.name>
-                <runtime.assembly>src/main/assembly/linux-runtime.xml</runtime.assembly>
-                <nodejs.npm.cmd>${project.basedir}/node/npm</nodejs.npm.cmd>
+                <platform.dir.name>darwin-x86-64</platform.dir.name>
             </properties>
         </profile>
-		<profile>
-			<id>jacoco</id>
-			<build>
-				<plugins>
-					<plugin>
-						<groupId>org.jacoco</groupId>
-						<artifactId>jacoco-maven-plugin</artifactId>
-						<version>0.8.8</version>
-						<executions>
-							<execution>
-								<id>default-prepare-agent</id>
-								<goals>
-									<goal>prepare-agent</goal>
-								</goals>
-							</execution>
-							<execution>
-								<id>default-report</id>
-								<phase>test</phase>
-								<goals>
-									<goal>report</goal>
-								</goals>
-							</execution>
-						</executions>
-					</plugin>
-				</plugins>
-			</build>
-		</profile>
         <profile>
-            <id>java8</id>
-            <properties>
-                <jdk.version>8</jdk.version>
-                <java.enforce.version>1.8.0_242</java.enforce.version>
-                <questdb.artifactid>questdb-jdk8</questdb.artifactid>
-                <excludePattern1>module-info.java</excludePattern1>
-                <excludeTestPattern1>module-info.java</excludeTestPattern1>
-                <javac.compile.source>1.8</javac.compile.source>
-                <javac.compile.target>1.8</javac.compile.target>
-            </properties>
+            <id>platform-osx-aarch64</id>
             <activation>
-                <jdk>(,1.8]</jdk>
+                <os>
+                    <family>Mac</family>
+                    <arch>aarch64</arch>
+                </os>
             </activation>
+            <properties>
+                <archive.name>${project.version}-rt-osx-aarch64</archive.name>
+                <runtime.name>questdb-${project.version}-rt-osx-aarch64</runtime.name>
+                <runtime.assembly>src/main/assembly/rt-unix.xml</runtime.assembly>
+                <platform.dir.name>darwin-aarch64</platform.dir.name>
+            </properties>
+        </profile>
+        <profile>
+            <id>jacoco</id>
             <build>
                 <plugins>
                     <plugin>
-                        <groupId>com.igormaznitsa</groupId>
-                        <artifactId>jcp</artifactId>
-                        <version>7.0.4</version>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>jacoco-maven-plugin</artifactId>
+                        <version>0.8.14</version>
                         <executions>
-                            <!-- make preprocessing of sources -->
                             <execution>
-                                <id>preprocess-sources</id>
+                                <id>default-prepare-agent</id>
                                 <goals>
-                                    <goal>preprocess</goal>
+                                    <goal>prepare-agent</goal>
+                                </goals>
+                            </execution>
+                            <execution>
+                                <id>default-report</id>
+                                <phase>test</phase>
+                                <goals>
+                                    <goal>report</goal>
                                 </goals>
                             </execution>
                         </executions>
-                        <configuration>
-                            <vars>
-                                <jdk.version>${jdk.version}</jdk.version>
-                            </vars>
-                            <excludeExtensions>
-                                <ext>MD</ext>
-                                <ext>md</ext>
-                                <ext>xml</ext>
-                            </excludeExtensions>
-                        </configuration>
                     </plugin>
                 </plugins>
             </build>
-            <dependencies>
-                <dependency>
-                    <groupId>org.jetbrains</groupId>
-                    <artifactId>annotations</artifactId>
-                    <version>16.0.2</version>
-                    <scope>provided</scope>
-                </dependency>
-            </dependencies>
         </profile>
         <profile>
-            <id>java11+</id>
+            <id>java25+</id>
             <properties>
-                <jdk.version>11</jdk.version>
-                <java.enforce.version>11</java.enforce.version>
+                <jdk.version>25</jdk.version>
+                <java.enforce.version>25</java.enforce.version>
                 <questdb.artifactid>questdb</questdb.artifactid>
-                <compilerArg1>--add-exports</compilerArg1>
-                <compilerArg2>java.base/jdk.internal.math=io.questdb</compilerArg2>
                 <excludePattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludePattern1>
                 <excludeTestPattern1>nothing-to-exclude-dummy-value-include-all-java11plus</excludeTestPattern1>
                 <javac.compile.source>${javac.target}</javac.compile.source>
                 <javac.compile.target>${javac.target}</javac.compile.target>
             </properties>
             <activation>
-                <jdk>(1.8,)</jdk>
+                <jdk>(24,)</jdk>
             </activation>
             <dependencies>
                 <dependency>
@@ -651,6 +1044,59 @@
                     <scope>provided</scope>
                 </dependency>
             </dependencies>
+        </profile>
+        <profile>
+            <id>qdbr-debug</id>
+            <properties>
+                <qdbr.release>false</qdbr.release>
+            </properties>
+        </profile>
+        <profile>
+            <id>qdbr-coverage</id>
+            <properties>
+                <qdbr.release>false</qdbr.release>
+                <qdbr.rustflags>-D warnings -C instrument-coverage</qdbr.rustflags>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.questdb</groupId>
+                        <artifactId>rust-maven-plugin</artifactId>
+                        <version>1.2.0</version>
+                        <executions>
+                            <execution>
+                                <id>qdbr-build</id>
+                                <goals>
+                                    <goal>build</goal>
+                                </goals>
+                                <configuration>
+                                    <path>rust/qdbr</path>
+                                    <release>${qdbr.release}</release>
+                                    <copyTo>${project.build.directory}/classes/io/questdb/bin/${platform.dir.name}</copyTo>
+                                    <environmentVariables>
+                                        <RUSTFLAGS>${qdbr.rustflags}</RUSTFLAGS>
+                                    </environmentVariables>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>qdbr-test</id>
+                                <goals>
+                                    <goal>test</goal>
+                                </goals>
+                                <phase>none</phase>
+                                <configuration>
+                                    <path>rust/qdbr</path>
+                                    <release>${qdbr.release}</release>
+                                    <environmentVariables>
+                                        <RUSTFLAGS>${qdbr.rustflags}</RUSTFLAGS>
+                                        <LLVM_PROFILE_FILE>questdbr-cargo-test.profraw</LLVM_PROFILE_FILE>
+                                    </environmentVariables>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
         </profile>
     </profiles>
 
@@ -665,7 +1111,13 @@
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
-            <version>42.3.3</version>
+            <version>42.7.7</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.questdb</groupId>
+            <artifactId>questdb-client</artifactId>
+            <version>${questdb.client.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

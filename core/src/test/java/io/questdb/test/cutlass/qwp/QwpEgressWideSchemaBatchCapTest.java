@@ -1,0 +1,279 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.cutlass.qwp;
+
+import io.questdb.PropertyKey;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatch;
+import io.questdb.client.cutlass.qwp.client.QwpColumnBatchHandler;
+import io.questdb.client.cutlass.qwp.client.QwpQueryClient;
+import io.questdb.cutlass.qwp.server.egress.QwpEgressUpgradeProcessor;
+import io.questdb.cutlass.qwp.server.egress.QwpRowExceedsBufferException;
+import io.questdb.std.IntList;
+import io.questdb.test.AbstractBootstrapTest;
+import io.questdb.test.TestServerMain;
+import io.questdb.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+
+/**
+ * Regression for the egress batch size cap. The streaming loop in {@code
+ * QwpEgressUpgradeProcessor.streamResults} used to bound batches purely by
+ * row count ({@code MAX_ROWS_PER_BATCH = 16_384}). Wide schemas (many
+ * VARCHAR / BINARY / array columns, often grown via concurrent
+ * ALTER TABLE ADD COLUMN) blew past the rawSocket send buffer in a single
+ * batch, and the resulting {@code emitDeltaSection} / {@code emitTableBlock}
+ * overflow surfaced as {@code STATUS_INTERNAL_ERROR (0x06)} mid-stream,
+ * tearing down the query.
+ * <p>
+ * After the fix, the loop binary-searches the largest emittable row prefix
+ * via {@code QwpResultBatchBuffer.findLargestEmittablePrefix} and carries
+ * the suffix over into the next batch, splitting the stream into multiple
+ * RESULT_BATCH frames that each fit the send buffer. The residual overflow
+ * path (a single row whose wire encoding still exceeds the buffer)
+ * surfaces as {@link QwpRowExceedsBufferException}, mapped to
+ * {@code STATUS_LIMIT_EXCEEDED (0x0B)} on the wire, which the C client
+ * reports as {@code line_reader_error_server_limit_exceeded = 19} rather
+ * than the misleading {@code server_internal_error = 16}.
+ */
+public class QwpEgressWideSchemaBatchCapTest extends AbstractBootstrapTest {
+    private static final int MAX_ROWS = QwpEgressUpgradeProcessor.MAX_ROWS_PER_BATCH;
+
+    @Before
+    public void setUp() {
+        super.setUp();
+        TestUtils.unchecked(() -> createDummyConfiguration());
+        dbPath.parent().$();
+    }
+
+    @Test
+    public void testPartialBatchIsDrainedBeforeBufferingMoreRows() throws Exception {
+        assertPartialBatchIsDrained(null, "SELECT x, x + 1, x + 2 FROM long_sequence(" + (2 * MAX_ROWS) + ")");
+    }
+
+    @Test
+    public void testPartialTableScanBatchIsDrainedBeforeBufferingMoreRows() throws Exception {
+        assertPartialBatchIsDrained(
+                "CREATE TABLE t AS (SELECT x a, x + 1 b, x + 2 c FROM long_sequence(" + (2 * MAX_ROWS) + "))",
+                "SELECT * FROM t"
+        );
+    }
+
+    /**
+     * Pins the residual overflow arm of the batch-cap fix: when a single
+     * row's wire encoding exceeds the rawSocket send buffer,
+     * {@code findLargestEmittablePrefix} returns 0 and the throw site
+     * raises {@link QwpRowExceedsBufferException}, which
+     * {@code mapErrorStatus} translates to {@code STATUS_LIMIT_EXCEEDED
+     * (0x0B)} on the wire. The C client reports it as
+     * {@code line_reader_error_server_limit_exceeded = 19} rather than the
+     * masking {@code server_internal_error = 16}.
+     * <p>
+     * Companion to {@link #testWideSchemaQueryDoesNotOverflowBatch} which
+     * pins the happy path; together they cover both arms of the cap fix.
+     */
+    @Test
+    public void testSingleRowExceedingSendBufferReportsLimitExceeded() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The egress handshake reserves an upper bound for the SERVER_INFO
+            // frame (~131 KB worst-case for the cluster + node id strings), so
+            // the send buffer cannot drop below that and still complete the WS
+            // upgrade. 160 KiB clears the handshake check; a 256-KiB VARCHAR
+            // row then overflows the post-handshake RESULT_BATCH budget and
+            // forces emitTableBlock to return -1.
+            try (final TestServerMain serverMain = startWithEnvVariables(
+                    "QDB_HTTP_SEND_BUFFER_SIZE", "163840")) {
+                serverMain.execute("CREATE TABLE one_big_row(v VARCHAR, ts TIMESTAMP) "
+                        + "TIMESTAMP(ts) PARTITION BY DAY WAL");
+                final StringBuilder bigValue = new StringBuilder(262_144);
+                bigValue.repeat("x", 262_144);
+                serverMain.execute("INSERT INTO one_big_row VALUES ('"
+                        + bigValue + "'::VARCHAR, 1::TIMESTAMP)");
+                serverMain.awaitTable("one_big_row");
+
+                final byte[] status = {0};
+                final String[] message = {null};
+                try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                        "ws::addr=127.0.0.1:" + HTTP_PORT + ";")) {
+                    client.connect();
+                    client.execute("SELECT * FROM one_big_row", new QwpColumnBatchHandler() {
+                        @Override
+                        public void onBatch(QwpColumnBatch batch) {
+                            Assert.fail("unexpected batch: a 256 KiB row cannot fit a 160 KiB send buffer");
+                        }
+
+                        @Override
+                        public void onEnd(long rows) {
+                            Assert.fail("unexpected end: expected STATUS_LIMIT_EXCEEDED instead");
+                        }
+
+                        @Override
+                        public void onError(byte s, String m) {
+                            status[0] = s;
+                            message[0] = m;
+                        }
+                    });
+                }
+                Assert.assertEquals(
+                        "expected STATUS_LIMIT_EXCEEDED (0x0B), got 0x"
+                                + Integer.toHexString(status[0] & 0xff)
+                                + " msg=" + message[0],
+                        (byte) 0x0B, status[0]);
+                TestUtils.assertContains(message[0], "single row exceeds send buffer");
+            }
+        });
+    }
+
+    /**
+     * Wide-schema SELECT must complete cleanly without surfacing a batch
+     * overflow error. Builds a 41-column table (20 VARCHAR + 10 BINARY +
+     * 5 UUID + 5 LONG256 + ts) and ingests 4000 rows. Total payload
+     * comfortably exceeds the default 2 MiB send buffer at 16_384 rows /
+     * batch but partial-emit suffix carry-over splits it across multiple
+     * RESULT_BATCH frames. SYMBOL columns are deliberately omitted so the
+     * test pins the size-driven split rather than the symbol-dict reserve --
+     * dict overhead has its own coverage in QwpEgressBootstrapTest.
+     */
+    @Test
+    public void testWideSchemaQueryDoesNotOverflowBatch() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (final TestServerMain serverMain = startWithEnvVariables()) {
+                final StringBuilder createCols = new StringBuilder();
+                final StringBuilder insertCols = new StringBuilder();
+                final StringBuilder insertVals = new StringBuilder();
+                for (int i = 0; i < 20; i++) {
+                    createCols.append("v").append(i).append(" VARCHAR, ");
+                    insertCols.append("v").append(i).append(", ");
+                    insertVals.append("rnd_varchar(20, 40, 0), ");
+                }
+                for (int i = 0; i < 10; i++) {
+                    createCols.append("b").append(i).append(" BINARY, ");
+                    insertCols.append("b").append(i).append(", ");
+                    insertVals.append("rnd_bin(20, 40, 0), ");
+                }
+                for (int i = 0; i < 5; i++) {
+                    createCols.append("u").append(i).append(" UUID, ");
+                    insertCols.append("u").append(i).append(", ");
+                    insertVals.append("rnd_uuid4(), ");
+                }
+                for (int i = 0; i < 5; i++) {
+                    createCols.append("l").append(i).append(" LONG256, ");
+                    insertCols.append("l").append(i).append(", ");
+                    insertVals.append("rnd_long256(), ");
+                }
+                createCols.append("ts TIMESTAMP");
+                insertCols.append("ts");
+                insertVals.append("x::TIMESTAMP");
+
+                serverMain.execute("CREATE TABLE wide(" + createCols
+                        + ") TIMESTAMP(ts) PARTITION BY DAY WAL");
+                serverMain.execute("INSERT INTO wide(" + insertCols + ")\n"
+                        + "SELECT " + insertVals + " FROM long_sequence(4000)");
+                serverMain.awaitTable("wide");
+
+                final int[] totalRows = {0};
+                final int[] batchCount = {0};
+                try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                        "ws::addr=127.0.0.1:" + HTTP_PORT + ";")) {
+                    client.connect();
+                    client.execute("SELECT * FROM wide", new QwpColumnBatchHandler() {
+                        @Override
+                        public void onBatch(QwpColumnBatch batch) {
+                            totalRows[0] += batch.getRowCount();
+                            batchCount[0]++;
+                        }
+
+                        @Override
+                        public void onEnd(long rows) {
+                        }
+
+                        @Override
+                        public void onError(byte status, String message) {
+                            Assert.fail("egress error status=0x" + Integer.toHexString(status & 0xff)
+                                    + " msg=" + message);
+                        }
+                    });
+                }
+                Assert.assertEquals(4000, totalRows[0]);
+                // With 40 wide columns the 4000-row payload comfortably
+                // exceeds the 2 MiB send buffer for a single batch. The
+                // dynamic cap must split the stream into multiple batches;
+                // a single-batch result means the cap regressed back to
+                // row-count-only.
+                Assert.assertTrue(
+                        "wide-schema query must split across multiple batches (got " + batchCount[0] + ")",
+                        batchCount[0] > 1);
+            }
+        });
+    }
+
+    private static void assertPartialBatchIsDrained(String ddl, String query) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (final TestServerMain serverMain = startWithEnvVariables(
+                    PropertyKey.HTTP_SEND_BUFFER_SIZE.getEnvVarName(), "256K")) {
+                if (ddl != null) {
+                    serverMain.execute(ddl);
+                }
+                final IntList batchRows = new IntList();
+                try (QwpQueryClient client = QwpQueryClient.fromConfig(
+                        "ws::addr=127.0.0.1:" + HTTP_PORT + ";max_batch_rows=" + MAX_ROWS + ";")) {
+                    client.connect();
+                    client.execute(query, new QwpColumnBatchHandler() {
+                        @Override
+                        public void onBatch(QwpColumnBatch batch) {
+                            batchRows.add(batch.getRowCount());
+                        }
+
+                        @Override
+                        public void onEnd(long rows) {
+                        }
+
+                        @Override
+                        public void onError(byte status, String message) {
+                            Assert.fail("egress error status=0x" + Integer.toHexString(status & 0xff)
+                                    + " msg=" + message);
+                        }
+                    });
+                }
+
+                Assert.assertTrue("query must be split into multiple frames", batchRows.size() > 2);
+                int rowsReceived = 0;
+                for (int i = 0, n = batchRows.size(); i < n; i++) {
+                    rowsReceived += batchRows.getQuick(i);
+                }
+                Assert.assertEquals(2 * MAX_ROWS, rowsReceived);
+                final int firstFrameRows = batchRows.getQuick(0);
+                final int secondFrameRows = batchRows.getQuick(1);
+                Assert.assertTrue("first frame must force a partial emit", firstFrameRows < MAX_ROWS);
+                Assert.assertTrue("remaining suffix must fit in the second frame", firstFrameRows > MAX_ROWS / 2);
+                Assert.assertEquals(
+                        "the second frame must drain the first scratch population",
+                        MAX_ROWS,
+                        firstFrameRows + secondFrameRows
+                );
+            }
+        });
+    }
+}

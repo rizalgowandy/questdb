@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,9 +36,29 @@ import static io.questdb.cairo.TableUtils.META_FILE_NAME;
 import static io.questdb.cairo.TableUtils.TXN_FILE_NAME;
 
 final class Mig614 {
-    private static final long TX_OFFSET_STRUCT_VERSION = 40;
-    private static final long META_OFFSET_STRUCTURE_VERSION = 32;
     private static final Log LOG = LogFactory.getLog(EngineMigration.class);
+    private static final long META_OFFSET_STRUCTURE_VERSION = 32;
+    private static final long TX_OFFSET_STRUCT_VERSION = 40;
+
+    private static void openFileSafe(MemoryMARW metaMem, FilesFacade ff, Path path, long readOffset) {
+        long fileLen = ff.length(path.$());
+
+        if (fileLen < 0) {
+            throw CairoException.critical(ff.errno()).put("cannot read file length: ").put(path);
+        }
+
+        if (fileLen < readOffset + Long.BYTES) {
+            throw CairoException.critical(0).put("File length ").put(fileLen).put(" is too small at ").put(path);
+        }
+
+        metaMem.of(
+                ff,
+                path.$(),
+                ff.getPageSize(),
+                fileLen,
+                MemoryTag.NATIVE_MIG_MMAP
+        );
+    }
 
     static void migrate(MigrationContext migrationContext) {
         final FilesFacade ff = migrationContext.getFf();
@@ -60,24 +80,5 @@ final class Mig614 {
 
             rwMemory.putLong(META_OFFSET_STRUCTURE_VERSION, structureVersion);
         }
-    }
-
-    private static void openFileSafe(MemoryMARW metaMem, FilesFacade ff, Path path, long readOffset) {
-        long fileLen = ff.length(path);
-
-        if (fileLen < 0) {
-            throw CairoException.instance(ff.errno()).put("cannot read file length: ").put(path);
-        }
-
-        if (fileLen < readOffset + Long.BYTES) {
-            throw CairoException.instance(0).put("File length ").put(fileLen).put(" is too small at ").put(path);
-        }
-
-        metaMem.of(
-                ff,
-                path,
-                ff.getPageSize(),
-                fileLen,
-                MemoryTag.NATIVE_DEFAULT);
     }
 }

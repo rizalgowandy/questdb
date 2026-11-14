@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,23 +25,30 @@
 package io.questdb.griffin.engine.functions.groupby;
 
 import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.FunctionExtension;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.groupby.InterpolationUtil;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
 
-public class InterpolationGroupByFunction implements GroupByFunction {
+public class InterpolationGroupByFunction implements GroupByFunction, FunctionExtension {
     private final GroupByFunction wrappedFunction;
-
+    // start timestamp of the bucket being interpolated, see setBucketTimestamp()
+    private long bucketTimestamp;
+    private long endTime;
     private boolean interpolating;
     private long startTime;
-    private long endTime;
-    private long interval;
-    private long current;
     private Record target;
 
     private InterpolationGroupByFunction(GroupByFunction wrappedFunction) {
@@ -53,28 +60,28 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
-        wrappedFunction.computeFirst(mapValue, record);
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
+        wrappedFunction.computeFirst(mapValue, record, rowId);
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
-        wrappedFunction.computeNext(mapValue, record);
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
+        wrappedFunction.computeNext(mapValue, record, rowId);
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
-        wrappedFunction.pushValueTypes(columnTypes);
+    public FunctionExtension extendedOps() {
+        return this;
     }
 
     @Override
-    public void setNull(MapValue mapValue) {
-        wrappedFunction.setNull(mapValue);
+    public ArrayView getArray(Record rec) {
+        throw new UnsupportedOperationException();
     }
 
     @Override
     public int getArrayLength() {
-        return wrappedFunction.getArrayLength();
+        return wrappedFunction.extendedOps().getArrayLength();
     }
 
     @Override
@@ -96,7 +103,7 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     public byte getByte(Record rec) {
         byte value = wrappedFunction.getByte(rec);
         if (interpolating) {
-            return (byte) InterpolationUtil.interpolate(startTime + current++ * interval, startTime, value, endTime, wrappedFunction.getByte(target));
+            return (byte) InterpolationUtil.interpolate(bucketTimestamp, startTime, value, endTime, wrappedFunction.getByte(target));
         }
         return value;
     }
@@ -105,7 +112,7 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     public char getChar(Record rec) {
         char value = wrappedFunction.getChar(rec);
         if (interpolating) {
-            return (char) InterpolationUtil.interpolate(startTime + current++ * interval, startTime, value, endTime, wrappedFunction.getChar(target));
+            return (char) InterpolationUtil.interpolate(bucketTimestamp, startTime, value, endTime, wrappedFunction.getChar(target));
         }
         return value;
     }
@@ -116,10 +123,40 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     }
 
     @Override
+    public void getDecimal128(Record rec, Decimal128 sink) {
+        wrappedFunction.getDecimal128(rec, sink);
+    }
+
+    @Override
+    public short getDecimal16(Record rec) {
+        return wrappedFunction.getDecimal16(rec);
+    }
+
+    @Override
+    public void getDecimal256(Record rec, Decimal256 sink) {
+        wrappedFunction.getDecimal256(rec, sink);
+    }
+
+    @Override
+    public int getDecimal32(Record rec) {
+        return wrappedFunction.getDecimal32(rec);
+    }
+
+    @Override
+    public long getDecimal64(Record rec) {
+        return wrappedFunction.getDecimal64(rec);
+    }
+
+    @Override
+    public byte getDecimal8(Record rec) {
+        return wrappedFunction.getDecimal8(rec);
+    }
+
+    @Override
     public double getDouble(Record rec) {
         final double value = wrappedFunction.getDouble(rec);
         if (interpolating) {
-            return InterpolationUtil.interpolate(startTime + current++ * interval, startTime, value, endTime, wrappedFunction.getDouble(target));
+            return InterpolationUtil.interpolate(bucketTimestamp, startTime, value, endTime, wrappedFunction.getDouble(target));
         }
         return value;
     }
@@ -128,31 +165,71 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     public float getFloat(Record rec) {
         float value = wrappedFunction.getFloat(rec);
         if (interpolating) {
-            return (float) InterpolationUtil.interpolate(startTime + current++ * interval, startTime, value, endTime, wrappedFunction.getFloat(target));
+            return (float) InterpolationUtil.interpolate(bucketTimestamp, startTime, value, endTime, wrappedFunction.getFloat(target));
         }
         return value;
+    }
+
+    @Override
+    public byte getGeoByte(Record rec) {
+        return wrappedFunction.getGeoByte(rec);
+    }
+
+    @Override
+    public int getGeoInt(Record rec) {
+        return wrappedFunction.getGeoInt(rec);
+    }
+
+    @Override
+    public long getGeoLong(Record rec) {
+        return wrappedFunction.getGeoLong(rec);
+    }
+
+    @Override
+    public short getGeoShort(Record rec) {
+        return wrappedFunction.getGeoShort(rec);
+    }
+
+    @Override
+    public final int getIPv4(Record rec) {
+        throw new UnsupportedOperationException();
     }
 
     @Override
     public int getInt(Record rec) {
         int value = wrappedFunction.getInt(rec);
         if (interpolating) {
-            return (int) InterpolationUtil.interpolate(startTime + current++ * interval, startTime, value, endTime, wrappedFunction.getInt(target));
+            return (int) InterpolationUtil.interpolate(bucketTimestamp, startTime, value, endTime, wrappedFunction.getInt(target));
         }
         return value;
+    }
+
+    @Override
+    public @NotNull Interval getInterval(Record rec) {
+        throw new UnsupportedOperationException();
     }
 
     @Override
     public long getLong(Record rec) {
         long value = wrappedFunction.getLong(rec);
         if (interpolating) {
-            return (long) InterpolationUtil.interpolate(startTime + current++ * interval, startTime, value, endTime, wrappedFunction.getLong(target));
+            return (long) InterpolationUtil.interpolate(bucketTimestamp, startTime, value, endTime, wrappedFunction.getLong(target));
         }
         return value;
     }
 
     @Override
-    public void getLong256(Record rec, CharSink sink) {
+    public long getLong128Hi(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long getLong128Lo(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void getLong256(Record rec, CharSink<?> sink) {
         wrappedFunction.getLong256(rec, sink);
     }
 
@@ -167,42 +244,32 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     }
 
     @Override
-    public RecordCursorFactory getRecordCursorFactory() {
-        return wrappedFunction.getRecordCursorFactory();
+    public Record getRecord(Record rec) {
+        return wrappedFunction.extendedOps().getRecord(rec);
     }
 
     @Override
-    public Record getRecord(Record rec) {
-        return wrappedFunction.getRecord(rec);
+    public RecordCursorFactory getRecordCursorFactory() {
+        return wrappedFunction.getRecordCursorFactory();
     }
 
     @Override
     public short getShort(Record rec) {
         short value = wrappedFunction.getShort(rec);
         if (interpolating) {
-            return (short) InterpolationUtil.interpolate(startTime + current++ * interval, startTime, value, endTime, wrappedFunction.getShort(target));
+            return (short) InterpolationUtil.interpolate(bucketTimestamp, startTime, value, endTime, wrappedFunction.getShort(target));
         }
         return value;
     }
 
     @Override
-    public CharSequence getStr(Record rec) {
-        return wrappedFunction.getStr(rec);
+    public CharSequence getStrA(Record rec) {
+        return wrappedFunction.getStrA(rec);
     }
 
     @Override
-    public CharSequence getStr(Record rec, int arrayIndex) {
-        return wrappedFunction.getStr(rec, arrayIndex);
-    }
-
-    @Override
-    public void getStr(Record rec, CharSink sink) {
-        wrappedFunction.getStr(rec, sink);
-    }
-
-    @Override
-    public void getStr(Record rec, CharSink sink, int arrayIndex) {
-        wrappedFunction.getStr(rec, sink, arrayIndex);
+    public CharSequence getStrA(Record rec, int arrayIndex) {
+        return wrappedFunction.extendedOps().getStrA(rec, arrayIndex);
     }
 
     @Override
@@ -212,7 +279,7 @@ public class InterpolationGroupByFunction implements GroupByFunction {
 
     @Override
     public CharSequence getStrB(Record rec, int arrayIndex) {
-        return wrappedFunction.getStrB(rec, arrayIndex);
+        return wrappedFunction.extendedOps().getStrB(rec, arrayIndex);
     }
 
     @Override
@@ -222,7 +289,7 @@ public class InterpolationGroupByFunction implements GroupByFunction {
 
     @Override
     public int getStrLen(Record rec, int arrayIndex) {
-        return wrappedFunction.getStrLen(rec, arrayIndex);
+        return wrappedFunction.extendedOps().getStrLen(rec, arrayIndex);
     }
 
     @Override
@@ -241,33 +308,53 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     }
 
     @Override
-    public byte getGeoByte(Record rec) {
-        return wrappedFunction.getGeoByte(rec);
-    }
-
-    @Override
-    public short getGeoShort(Record rec) {
-        return wrappedFunction.getGeoShort(rec);
-    }
-
-    @Override
-    public int getGeoInt(Record rec) {
-        return wrappedFunction.getGeoInt(rec);
-    }
-
-    @Override
-    public long getGeoLong(Record rec) {
-        return wrappedFunction.getGeoLong(rec);
-    }
-
-    @Override
     public int getType() {
         return wrappedFunction.getType();
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return false;
+    public int getValueIndex() {
+        return wrappedFunction.getValueIndex();
+    }
+
+    @Override
+    public Utf8Sequence getVarcharA(Record rec) {
+        return wrappedFunction.getVarcharA(rec);
+    }
+
+    @Override
+    public Utf8Sequence getVarcharB(Record rec) {
+        return wrappedFunction.getVarcharB(rec);
+    }
+
+    @Override
+    public int getVarcharSize(Record rec) {
+        return wrappedFunction.getVarcharSize(rec);
+    }
+
+    @Override
+    public void initValueIndex(int valueIndex) {
+        wrappedFunction.initValueIndex(valueIndex);
+    }
+
+    @Override
+    public void initValueTypes(ArrayColumnTypes columnTypes) {
+        wrappedFunction.initValueTypes(columnTypes);
+    }
+
+    /**
+     * Sets the start timestamp of the bucket being interpolated. The fill cursor calls this for each bucket
+     * of a gap after the first one, which {@link #startInterpolating(long, long, long)} sets up. The bucket
+     * start serves as the x value of the interpolation, which keeps the result correct for variable-length
+     * buckets (month and year strides) and for getters that run any number of times per bucket, or not at all.
+     */
+    public void setBucketTimestamp(long bucketTimestamp) {
+        this.bucketTimestamp = bucketTimestamp;
+    }
+
+    @Override
+    public void setNull(MapValue mapValue) {
+        wrappedFunction.setNull(mapValue);
     }
 
     public void setTarget(Record target) {
@@ -278,11 +365,15 @@ public class InterpolationGroupByFunction implements GroupByFunction {
         interpolating = true;
         this.startTime = startTime;
         this.endTime = endTime;
-        this.interval = currentTime - startTime;
-        this.current = 1;
+        this.bucketTimestamp = currentTime;
     }
 
     public void stopInterpolating() {
         interpolating = false;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.val("Interpolated(").val(wrappedFunction).val(")");
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,35 +35,40 @@ import io.questdb.std.Rnd;
 import java.io.Closeable;
 
 class RndStringMemory implements Closeable {
-    private final MemoryAR strMem;
-    private final MemoryAR idxMem;
     private final int count;
-    private final int lo;
     private final int hi;
+    private final MemoryAR idxMem;
+    private final int lo;
+    private final MemoryAR strMem;
 
     RndStringMemory(String signature, int count, int lo, int hi, int position, CairoConfiguration configuration) throws SqlException {
-        this.count = count;
-        this.lo = lo;
-        this.hi = hi;
+        try {
+            this.count = count;
+            this.lo = lo;
+            this.hi = hi;
 
-        final int pageSize = configuration.getRndFunctionMemoryPageSize();
-        final int maxPages = configuration.getRndFunctionMemoryMaxPages();
-        final long memLimit = (long) maxPages * pageSize;
-        // check against worst case, the highest possible mem usage
-        final long requiredMem = count * (Vm.getStorageLength(hi) + Long.BYTES);
-        if (requiredMem > memLimit) {
-            throw SqlException.position(position)
-                    .put("breached memory limit set for ").put(signature)
-                    .put(" [pageSize=").put(pageSize)
-                    .put(", maxPages=").put(maxPages)
-                    .put(", memLimit=").put(memLimit)
-                    .put(", requiredMem=").put(requiredMem)
-                    .put(']');
+            final int pageSize = configuration.getRndFunctionMemoryPageSize();
+            final int maxPages = configuration.getRndFunctionMemoryMaxPages();
+            final long memLimit = (long) maxPages * pageSize;
+            // check against worst case, the highest possible mem usage
+            final long requiredMem = count * (Vm.getStorageLength(hi) + Long.BYTES);
+            if (requiredMem > memLimit) {
+                throw SqlException.position(position)
+                        .put("breached memory limit set for ").put(signature)
+                        .put(" [pageSize=").put(pageSize)
+                        .put(", maxPages=").put(maxPages)
+                        .put(", memLimit=").put(memLimit)
+                        .put(", requiredMem=").put(requiredMem)
+                        .put(']');
+            }
+
+            final int idxPages = count * 8 / pageSize + 1;
+            strMem = Vm.getCARWInstance(pageSize, maxPages - idxPages, MemoryTag.NATIVE_FUNC_RSS);
+            idxMem = Vm.getCARWInstance(pageSize, idxPages, MemoryTag.NATIVE_FUNC_RSS);
+        } catch (Throwable th) {
+            close();
+            throw th;
         }
-
-        final int idxPages = count * 8 / pageSize + 1;
-        strMem = Vm.getARInstance(pageSize, maxPages - idxPages, MemoryTag.NATIVE_DEFAULT);
-        idxMem = Vm.getARInstance(pageSize, idxPages, MemoryTag.NATIVE_DEFAULT);
     }
 
     @Override
@@ -72,33 +77,16 @@ class RndStringMemory implements Closeable {
         Misc.free(idxMem);
     }
 
-    CharSequence getStr(long index) {
-        if (index < 0) {
-            return null;
-        }
-        return strMem.getStr(getStrAddress(index));
+    public int getHi() {
+        return hi;
     }
 
-    CharSequence getStr2(long index) {
-        if (index < 0) {
-            return null;
-        }
-        return strMem.getStr2(getStrAddress(index));
+    public int getLo() {
+        return lo;
     }
 
     private long getStrAddress(long index) {
         return idxMem.getLong(index * Long.BYTES);
-    }
-
-    void init(Rnd rnd) {
-        strMem.jumpTo(0);
-        idxMem.jumpTo(0);
-
-        if (lo == hi) {
-            initFixedLength(rnd);
-        } else {
-            initVariableLength(rnd);
-        }
     }
 
     private void initFixedLength(Rnd rnd) {
@@ -114,6 +102,31 @@ class RndStringMemory implements Closeable {
             final int len = lo + rnd.nextPositiveInt() % (hi - lo + 1);
             final long o = strMem.putStr(rnd.nextChars(len));
             idxMem.putLong(o - Vm.getStorageLength(len));
+        }
+    }
+
+    CharSequence getStr(long index) {
+        if (index < 0) {
+            return null;
+        }
+        return strMem.getStrA(getStrAddress(index));
+    }
+
+    CharSequence getStr2(long index) {
+        if (index < 0) {
+            return null;
+        }
+        return strMem.getStrB(getStrAddress(index));
+    }
+
+    void init(Rnd rnd) {
+        strMem.jumpTo(0);
+        idxMem.jumpTo(0);
+
+        if (lo == hi) {
+            initFixedLength(rnd);
+        } else {
+            initVariableLength(rnd);
         }
     }
 }

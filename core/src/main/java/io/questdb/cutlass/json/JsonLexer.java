@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,67 +24,56 @@
 
 package io.questdb.cutlass.json;
 
-import io.questdb.std.*;
+import io.questdb.std.IntHashSet;
+import io.questdb.std.IntStack;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Mutable;
+import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8s;
 
 import java.io.Closeable;
 
 public class JsonLexer implements Mutable, Closeable {
-    public static final int EVT_OBJ_START = 1;
-    public static final int EVT_OBJ_END = 2;
-    public static final int EVT_ARRAY_START = 3;
     public static final int EVT_ARRAY_END = 4;
-    public static final int EVT_NAME = 5;
-    public static final int EVT_VALUE = 6;
+    public static final int EVT_ARRAY_START = 3;
     public static final int EVT_ARRAY_VALUE = 7;
-
-    private static final int S_START = 0;
-    private static final int S_EXPECT_NAME = 1;
-    private static final int S_EXPECT_FIRST_NAME = 5;
-    private static final int S_EXPECT_VALUE = 2;
-    private static final int S_EXPECT_COMMA = 3;
+    public static final int EVT_NAME = 5;
+    public static final int EVT_OBJ_END = 2;
+    public static final int EVT_OBJ_START = 1;
+    public static final int EVT_VALUE = 6;
     private static final int S_EXPECT_COLON = 4;
+    private static final int S_EXPECT_COMMA = 3;
+    private static final int S_EXPECT_FIRST_NAME = 5;
+    private static final int S_EXPECT_NAME = 1;
+    private static final int S_EXPECT_VALUE = 2;
+    private static final int S_START = 0;
     private static final IntHashSet unquotedTerminators = new IntHashSet(256);
-
-    static {
-        unquotedTerminators.add(' ');
-        unquotedTerminators.add('\t');
-        unquotedTerminators.add('\n');
-        unquotedTerminators.add('\r');
-        unquotedTerminators.add(',');
-        unquotedTerminators.add('}');
-        unquotedTerminators.add(']');
-        unquotedTerminators.add('{');
-        unquotedTerminators.add('[');
-    }
-
-    private final IntStack objDepthStack = new IntStack(64);
     private final IntStack arrayDepthStack = new IntStack(64);
-    private final StringSink sink = new StringSink();
     private final int cacheSizeLimit;
-    private int state = S_START;
-    private int objDepth = 0;
+    private final IntStack objDepthStack = new IntStack(64);
+    private final StringSink sink = new StringSink();
     private int arrayDepth = 0;
-    private boolean ignoreNext = false;
-    private boolean quoted = false;
     private long cache;
     private int cacheCapacity;
     private int cacheSize = 0;
-    private boolean useCache = false;
+    private boolean ignoreNext = false;
+    private int objDepth = 0;
     private int position = 0;
+    private boolean quoted = false;
+    private int state = S_START;
+    private boolean useCache = false;
 
     public JsonLexer(int cacheSize, int cacheSizeLimit) {
-        this.cacheCapacity = cacheSize;
-        this.cache = Unsafe.malloc(cacheSize, MemoryTag.NATIVE_DEFAULT);
         this.cacheSizeLimit = cacheSizeLimit;
-    }
-
-    private static boolean isNotATerminator(char c) {
-        return unquotedTerminators.excludes(c);
-    }
-
-    private static JsonException unsupportedEncoding(int position) {
-        return JsonException.$(position, "Unsupported encoding");
+        // if cacheSizeLimit is 0 or negative, the cache is disabled
+        // only disable the cache, if parse() is called only once for every message with the full json structure
+        if (cacheSizeLimit > 0) {
+            this.cacheCapacity = cacheSize;
+            this.cache = Unsafe.malloc(cacheSize, MemoryTag.NATIVE_TEXT_PARSER_RSS);
+        }
     }
 
     @Override
@@ -104,12 +93,12 @@ public class JsonLexer implements Mutable, Closeable {
     @Override
     public void close() {
         if (cacheCapacity > 0 && cache != 0) {
-            Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_TEXT_PARSER_RSS);
+            cache = 0;
         }
     }
 
     public void parse(long lo, long hi, JsonParser listener) throws JsonException {
-
         if (lo >= hi) {
             return;
         }
@@ -125,7 +114,7 @@ public class JsonLexer implements Mutable, Closeable {
         int arrayDepth = this.arrayDepth;
 
         while (p < hi) {
-            char c = (char) Unsafe.getUnsafe().getByte(p++);
+            char c = (char) Unsafe.getByte(p++);
 
             if (ignoreNext) {
                 ignoreNext = false;
@@ -293,7 +282,18 @@ public class JsonLexer implements Mutable, Closeable {
         }
     }
 
+    private static boolean isNotATerminator(char c) {
+        return unquotedTerminators.excludes(c);
+    }
+
+    private static JsonException unsupportedEncoding(int position) {
+        return JsonException.$(position, "Unsupported encoding");
+    }
+
     private void addToStash(long lo, long hi) throws JsonException {
+        if (cacheSizeLimit < 1) {
+            throw JsonException.$(position, "JSON lexer cache is disabled");
+        }
         final int len = (int) (hi - lo);
         int n = len + cacheSize;
         if (n > cacheCapacity) {
@@ -310,10 +310,10 @@ public class JsonLexer implements Mutable, Closeable {
         if (n > cacheSizeLimit) {
             throw JsonException.$(position, "String is too long");
         }
-        long ptr = Unsafe.malloc(n, MemoryTag.NATIVE_DEFAULT);
+        long ptr = Unsafe.malloc(n, MemoryTag.NATIVE_TEXT_PARSER_RSS);
         if (cacheCapacity > 0) {
             Vect.memcpy(ptr, cache, cacheSize);
-            Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(cache, cacheCapacity, MemoryTag.NATIVE_TEXT_PARSER_RSS);
         }
         cacheCapacity = n;
         cache = ptr;
@@ -322,7 +322,7 @@ public class JsonLexer implements Mutable, Closeable {
     private CharSequence getCharSequence(long lo, long hi, int position) throws JsonException {
         sink.clear();
         if (cacheSize == 0) {
-            if (!Chars.utf8Decode(lo, hi - 1, sink)) {
+            if (!Utf8s.utf8ToUtf16(lo, hi - 1, sink)) {
                 throw unsupportedEncoding(position);
             }
         } else {
@@ -336,9 +336,9 @@ public class JsonLexer implements Mutable, Closeable {
         long lim = cache + cacheSize;
         int loOffset = 0;
         while (p < lim) {
-            byte b = Unsafe.getUnsafe().getByte(p);
+            byte b = Unsafe.getByte(p);
             if (b < 0) {
-                int len = Chars.utf8DecodeMultiByte(p, lim, b, sink);
+                int len = Utf8s.utf8DecodeMultiByte(p, lim, b, sink);
                 if (len != -1) {
                     p += len;
                 } else {
@@ -355,7 +355,7 @@ public class JsonLexer implements Mutable, Closeable {
                         addToStash(lo, lo + n);
                         assert offset < cacheSize;
                         assert cacheSize <= cacheCapacity;
-                        len = Chars.utf8DecodeMultiByte(cache + offset, cache + cacheSize, b, sink);
+                        len = Utf8s.utf8DecodeMultiByte(cache + offset, cache + cacheSize, b, sink);
                         if (len == -1) {
                             // definitely UTF8 error
                             throw unsupportedEncoding(position);
@@ -374,9 +374,9 @@ public class JsonLexer implements Mutable, Closeable {
 
         p = lo + loOffset;
         while (p < hi) {
-            byte b = Unsafe.getUnsafe().getByte(p);
+            byte b = Unsafe.getByte(p);
             if (b < 0) {
-                int len = Chars.utf8DecodeMultiByte(p, hi, b, sink);
+                int len = Utf8s.utf8DecodeMultiByte(p, hi, b, sink);
                 if (len == -1) {
                     throw unsupportedEncoding(position);
                 }
@@ -386,5 +386,17 @@ public class JsonLexer implements Mutable, Closeable {
                 ++p;
             }
         }
+    }
+
+    static {
+        unquotedTerminators.add(' ');
+        unquotedTerminators.add('\t');
+        unquotedTerminators.add('\n');
+        unquotedTerminators.add('\r');
+        unquotedTerminators.add(',');
+        unquotedTerminators.add('}');
+        unquotedTerminators.add(']');
+        unquotedTerminators.add('{');
+        unquotedTerminators.add('[');
     }
 }

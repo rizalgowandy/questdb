@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@
 
 package io.questdb.mp;
 
+import io.questdb.std.Os;
+
 /**
  * M - multi thread
  * C - consumer
@@ -38,9 +40,16 @@ public class MCSequence extends AbstractMSequence {
         super(cycle, waitStrategy);
     }
 
-    public MCSequence(long value, int cycle) {
-        this(cycle);
-        this.value = value;
+    public void clear() {
+        while (true) {
+            long n = next();
+            if (n == -1) {
+                break;
+            }
+            if (n != -2) {
+                done(n);
+            }
+        }
     }
 
     public <T> void consumeAll(RingQueue<T> queue, QueueConsumer<T> consumer) {
@@ -50,9 +59,10 @@ public class MCSequence extends AbstractMSequence {
             if (cursor > -1) {
                 consumer.consume(queue.get(cursor));
                 done(cursor);
+            } else if (cursor == -2) {
+                Os.pause();
             }
         } while (cursor != -1);
-
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,88 +25,260 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableUtils;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.ParquetDecodeHint;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.IntHashSet;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.str.StringSink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class LatestBySubQueryRecordCursorFactory extends AbstractTreeSetRecordCursorFactory {
     private final int columnIndex;
-    // this instance is shared between factory and cursor
-    // factory will be resolving symbols for cursor and if successful
-    // symbol keys will be added to this hash set
-    private final IntHashSet symbolKeys = new IntHashSet();
-    private final RecordCursorFactory recordCursorFactory;
-    private final Function filter;
     private final Record.CharSequenceFunction func;
+    private final boolean indexed;
+    private Function filter;
+    private RecordCursorFactory recordCursorFactory;
 
     public LatestBySubQueryRecordCursorFactory(
             @NotNull CairoConfiguration configuration,
             @NotNull RecordMetadata metadata,
-            @NotNull DataFrameCursorFactory dataFrameCursorFactory,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
             int columnIndex,
             @NotNull RecordCursorFactory recordCursorFactory,
             @Nullable Function filter,
             boolean indexed,
             @NotNull Record.CharSequenceFunction func,
-            @NotNull IntList columnIndexes
+            @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts
     ) {
-        super(metadata, dataFrameCursorFactory, configuration);
-        if (indexed) {
-            if (filter != null) {
-                this.cursor = new LatestByValuesIndexedFilteredRecordCursor(columnIndex, rows, symbolKeys, null, filter, columnIndexes);
-            } else {
-                this.cursor = new LatestByValuesIndexedRecordCursor(columnIndex, symbolKeys, null, rows, columnIndexes);
-            }
-        } else {
-            if (filter != null) {
-                this.cursor = new LatestByValuesFilteredRecordCursor(columnIndex, rows, symbolKeys, null, filter, columnIndexes);
-            } else {
-                this.cursor = new LatestByValuesRecordCursor(columnIndex, rows, symbolKeys, null, columnIndexes);
-            }
-        }
-        this.columnIndex = columnIndex;
-        this.recordCursorFactory = recordCursorFactory;
-        this.filter = filter;
-        this.func = func;
-    }
+        super(configuration, metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
 
-    @Override
-    public void close() {
-        super.close();
-        recordCursorFactory.close();
-        if (filter != null) {
-            filter.close();
-        }
-    }
-
-    @Override
-    protected AbstractDataFrameRecordCursor getCursorInstance(
-            DataFrameCursor dataFrameCursor,
-            SqlExecutionContext executionContext
-    ) throws SqlException {
-        StaticSymbolTable symbolTable = dataFrameCursor.getSymbolTable(columnIndex);
-        symbolKeys.clear();
-        try (RecordCursor cursor = recordCursorFactory.getCursor(executionContext)) {
-            final Record record = cursor.getRecord();
-            while (cursor.hasNext()) {
-                int symbolKey = symbolTable.keyOf(func.get(record, 0));
-                if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
-                    symbolKeys.add(TableUtils.toIndexKey(symbolKey));
+        try {
+            this.indexed = indexed;
+            final IntHashSet symbolKeys;
+            final PageFrameRecordCursor cursor;
+            if (indexed) {
+                symbolKeys = new IntHashSet();
+                if (filter != null) {
+                    cursor = new LatestByValuesIndexedFilteredRecordCursor(configuration, metadata, columnIndex, rows, symbolKeys, filter);
+                } else {
+                    cursor = new LatestByValuesIndexedRecordCursor(configuration, metadata, columnIndex, symbolKeys, rows);
                 }
+            } else {
+                final LatestByValueListRecordCursor valueListCursor = new LatestByValueListRecordCursor(
+                        configuration, metadata, columnIndex, filter, configuration.getDefaultSymbolCapacity(), true, false
+                );
+                symbolKeys = valueListCursor.getIncludedSymbolKeys();
+                cursor = valueListCursor;
             }
+            this.cursor = new PageFrameRecordCursorWrapper(cursor, symbolKeys);
+            this.recordCursorFactory = recordCursorFactory;
+            this.filter = filter;
+            this.columnIndex = columnIndex;
+            this.func = func;
+        } catch (Throwable th) {
+            close();
+            throw th;
         }
-
-        return super.getCursorInstance(dataFrameCursor, executionContext);
     }
 
     @Override
     public boolean recordCursorSupportsRandomAccess() {
         return true;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("LatestBySubQuery");
+        LatestByCompiledFilter.addJitAttr(sink, filter);
+        sink.child("Subquery", recordCursorFactory);
+        sink.child(cursor);
+        sink.child(partitionFrameCursorFactory);
+    }
+
+    @Override
+    public boolean usesCompiledFilter() {
+        return filter instanceof LatestByCompiledFilter;
+    }
+
+    // Holds the LATEST BY key sub-query in a private field and does not expose it through
+    // getBaseFactory() - the base is the partition frame scan, not the sub-query - so the
+    // external-source property is propagated explicitly. Without this, a mat-view predicate
+    // sub-query of the shape "WHERE key IN (SELECT ... FROM read_parquet(...)) LATEST ON ..."
+    // is accepted and the view then refreshes against an untracked external file.
+    @Override
+    public boolean usesExternalDataSource() {
+        return recordCursorFactory != null && recordCursorFactory.usesExternalDataSource();
+    }
+
+    @Override
+    public boolean usesIndex() {
+        return indexed;
+    }
+
+    @Override
+    protected void _close() {
+        final PageFrameRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final Function filter = this.filter;
+        this.filter = null;
+        final RecordCursorFactory recordCursorFactory = this.recordCursorFactory;
+        this.recordCursorFactory = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
+        }
+        failure = Misc.freeBestEffort(failure, recordCursorFactory);
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeBestEffort(failure, filter);
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    private class PageFrameRecordCursorWrapper implements PageFrameRecordCursor {
+        private final PageFrameRecordCursor delegate;
+        private final IntHashSet symbolKeys;
+        private RecordCursor baseCursor;
+
+        private PageFrameRecordCursorWrapper(PageFrameRecordCursor delegate, IntHashSet symbolKeys) {
+            this.delegate = delegate;
+            this.symbolKeys = symbolKeys;
+        }
+
+        @Override
+        public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
+            if (baseCursor != null) {
+                buildSymbolKeys();
+                baseCursor = Misc.free(baseCursor);
+            }
+
+            delegate.calculateSize(circuitBreaker, counter);
+        }
+
+        @Override
+        public void close() {
+            final RecordCursor baseCursor = this.baseCursor;
+            this.baseCursor = null;
+            Throwable failure = Misc.freeBestEffort(null, baseCursor);
+            failure = Misc.freeBestEffort(failure, delegate);
+            CairoException.rethrowCleanupFailure(failure);
+        }
+
+        @Override
+        public PageFrameCursor getPageFrameCursor() {
+            return delegate.getPageFrameCursor();
+        }
+
+        @Override
+        public Record getRecord() {
+            return delegate.getRecord();
+        }
+
+        @Override
+        public Record getRecordB() {
+            return delegate.getRecordB();
+        }
+
+        @Override
+        public StaticSymbolTable getSymbolTable(int columnIndex) {
+            return delegate.getSymbolTable(columnIndex);
+        }
+
+        @Override
+        public boolean hasNext() {
+            if (baseCursor != null) {
+                buildSymbolKeys();
+                baseCursor = Misc.free(baseCursor);
+            }
+            return delegate.hasNext();
+        }
+
+        @Override
+        public boolean isUsingIndex() {
+            return delegate.isUsingIndex();
+        }
+
+        @Override
+        public SymbolTable newSymbolTable(int columnIndex) {
+            return delegate.newSymbolTable(columnIndex);
+        }
+
+        @Override
+        public void of(PageFrameCursor cursor, SqlExecutionContext executionContext) throws SqlException {
+            if (baseCursor != null) {
+                baseCursor = Misc.free(baseCursor);
+            }
+            baseCursor = recordCursorFactory.getCursor(executionContext);
+            symbolKeys.clear();
+            delegate.of(cursor, executionContext);
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return baseCursor == null ? 1 : 0;
+        }
+
+        @Override
+        public void recordAt(Record record, long atRowId) {
+            delegate.recordAt(record, atRowId);
+        }
+
+        @Override
+        public void setParquetDecodeHint(ParquetDecodeHint hint) {
+            delegate.setParquetDecodeHint(hint);
+        }
+
+        @Override
+        public long size() {
+            return delegate.size();
+        }
+
+        @Override
+        public void skipRows(Counter rowCount, long maxRowsAfterSkip) {
+            if (baseCursor != null) {
+                buildSymbolKeys();
+                baseCursor = Misc.free(baseCursor);
+            }
+            delegate.skipRows(rowCount, maxRowsAfterSkip);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            delegate.toPlan(sink);
+        }
+
+        @Override
+        public void toTop() {
+            delegate.toTop();
+        }
+
+        private void buildSymbolKeys() {
+            final StaticSymbolTable symbolTable = delegate.getSymbolTable(columnIndex);
+            final Record record = baseCursor.getRecord();
+            StringSink sink = Misc.getThreadLocalSink();
+            while (baseCursor.hasNext()) {
+                int symbolKey = symbolTable.keyOf(func.get(record, 0, sink));
+                if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
+                    symbolKeys.add(indexed ? TableUtils.toIndexKey(symbolKey) : symbolKey);
+                }
+            }
+        }
     }
 }

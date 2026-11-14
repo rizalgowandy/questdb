@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <direct.h>
 #include <string.h>
 #include <time.h>
 #include "common.h"
@@ -9,14 +10,13 @@
 #include "getopt.h"
 #else
 
-#include <rpc.h>
 #include <handleapi.h>
 #include <synchapi.h>
 #include <processthreadsapi.h>
 #include <errhandlingapi.h>
 #include <getopt.h>
 
-#endif // __MSVC__
+#endif // _MSC_VER
 
 #define CMD_START   1
 #define CMD_STOP    2
@@ -24,7 +24,7 @@
 #define CMD_REMOVE  4
 #define CMD_STATUS  5
 #define CMD_SERVICE 6
-#define CMD_CONSOLE -1
+#define CMD_CONSOLE (-1)
 
 void buildJavaExec(CONFIG *config, const char *javaExecOpt);
 
@@ -46,18 +46,31 @@ void freeConfig(CONFIG *config) {
     }
 }
 
-void pathCopy(char *dest, const char *file) {
+int pathCopy(char *dest, size_t destSize, const char *file) {
+    if (dest == NULL || file == NULL || destSize == 0) {
+        return -1;
+    }
+
     char *next;
     char *slash = (char *) file;
 
     while ((next = strpbrk(slash + 1, "\\/"))) slash = next;
-    strncpy(dest, file, slash - file);
+    size_t len = slash - file;
+
+    if (len >= destSize) {
+        eprintf("Path too long for buffer (need %zu, have %zu)\n", len + 1, destSize);
+        return -1;
+    }
+
+    strncpy(dest, file, len);
+    dest[len] = '\0';
+    return 0;
 }
 
 int makeDir(const char *dir) {
     struct stat st = {0};
     if (stat(dir, &st) == -1) {
-        if (mkdir(dir) == -1) {
+        if (_mkdir(dir) == -1) {
             eprintf("Cannot create directory: %s\n", dir);
             return 0;
         }
@@ -77,13 +90,19 @@ int fileExists(char *file) {
 
 void buildJavaArgs(CONFIG *config) {
     // main class
-    LPCSTR mainClass = "io.questdb/io.questdb.ServerMain";
+    LPCSTR mainClass = QUESTDB_MAIN_CLASS;
 
     // put together static java opts
     LPCSTR javaOpts = "-XX:+UnlockExperimentalVMOptions"
                       " -XX:+AlwaysPreTouch"
                       " -XX:+UseParallelGC"
-                      " ";
+                      " --sun-misc-unsafe-memory-access=allow"
+                      " --enable-native-access=" QUESTDB_NATIVE_MODULES
+                      " --add-opens=java.base/java.lang=" QUESTDB_NATIVE_MODULES
+                      " --add-opens=java.base/java.lang.reflect=" QUESTDB_NATIVE_MODULES
+                      " --add-opens=java.base/java.nio=" QUESTDB_NATIVE_MODULES
+                      " --add-opens=java.base/java.time.zone=" QUESTDB_NATIVE_MODULES
+                      " --add-exports=java.base/jdk.internal.vm=" QUESTDB_NATIVE_MODULES;
 
     // put together classpath
 
@@ -91,20 +110,30 @@ void buildJavaArgs(CONFIG *config) {
     memset(classpath, 0, sizeof(classpath));
 
     if (!config->localRuntime) {
-        pathCopy(classpath, config->exeName);
+        if (pathCopy(classpath, sizeof(classpath), config->exeName) != 0) {
+            eprintf("Failed to extract classpath from executable path\n");
+            config->errorCode = ECONFIG_PATH_ERROR;
+            return;
+        }
         strcat(classpath, "\\questdb.jar");
     }
 
-    // put together command line
-
-    char *args = malloc((strlen(javaOpts) + strlen(classpath) + strlen(mainClass) + strlen(config->dir) + 256) *
-                        sizeof(char));
+    // put together command line, dir is x2 because we're including the path to `hs_err_pid`
+    // 512 is extra for the constant strings
+    char *args = malloc(
+            (strlen(javaOpts) + strlen(classpath) + strlen(mainClass) + strlen(config->dir) * 2 + 512) * sizeof(char));
     strcpy(args, javaOpts);
+    // quote the directory in case it contains spaces
+    strcat(args, " -XX:ErrorFile=\"");
+    strcat(args, config->dir);
+    strcat(args, "\\db\\");
+    strcat(args, "hs_err_pid+%p.log\""); // crash file name
     if (!config->localRuntime) {
         strcat(args, " -p \"");
         strcat(args, classpath);
-        strcat(args, "\" ");
+        strcat(args, "\"");
     }
+    strcat(args, " -Dcontainerized=false");
     strcat(args, " -m ");
     strcat(args, mainClass);
     strcat(args, " -d \"");
@@ -213,7 +242,7 @@ void initAndParseConfig(int argc, char **argv, CONFIG *config) {
     config->serviceName = lpServiceName;
 
     char buf[2048];
-    sprintf(buf, "JAVA_HOME %s ", config->javaExec);
+    snprintf(buf, sizeof(buf), "JAVA_HOME %s ", config->javaExec);
     log_event(EVENTLOG_INFORMATION_TYPE, config->serviceName, buf);
 
     // Service display name
@@ -239,21 +268,30 @@ void buildJavaExec(CONFIG *config, const char *javaExecOpt) {
     memset(config->javaExec, 0, MAX_PATH);
 
     if (javaExecOpt) {
-        strcpy(config->javaExec, javaExecOpt);
+        strncpy(config->javaExec, javaExecOpt, MAX_PATH - 1);
+        config->javaExec[MAX_PATH - 1] = '\0';
         config->localRuntime = FALSE;
         return;
     } else {
         // check if we are being executed from runtime location
-        pathCopy(config->javaExec, config->exeName);
-        strcat(config->javaExec, "\\java.exe");
-        if (fileExists(config->javaExec)) {
-            config->localRuntime = TRUE;
-            return;
-        } else {
-            // fallback to JAVA_HOME
-            char *javaHome = getenv("JAVA_HOME");
-            if (javaHome) {
-                strcpy(config->javaExec, javaHome);
+        if (pathCopy(config->javaExec, MAX_PATH, config->exeName) == 0) {
+            size_t len = strlen(config->javaExec);
+            if (len + strlen("\\java.exe") < MAX_PATH) {
+                strcat(config->javaExec, "\\java.exe");
+                if (fileExists(config->javaExec)) {
+                    config->localRuntime = TRUE;
+                    return;
+                }
+            }
+        }
+
+        // fallback to JAVA_HOME
+        char *javaHome = getenv("JAVA_HOME");
+        if (javaHome) {
+            strncpy(config->javaExec, javaHome, MAX_PATH - 1);
+            config->javaExec[MAX_PATH - 1] = '\0';
+            size_t len = strlen(config->javaExec);
+            if (len + strlen("\\bin\\java.exe") < MAX_PATH) {
                 strcat(config->javaExec, "\\bin\\java.exe");
                 if (fileExists(config->javaExec)) {
                     config->localRuntime = FALSE;
@@ -269,11 +307,15 @@ void buildJavaExec(CONFIG *config, const char *javaExecOpt) {
 }
 
 
-FILE *redirectStdout(CONFIG *config) {
+FILE *createStdoutLog(CONFIG *config) {
     // create log dir
     char log[MAX_PATH];
-    strcpy(log, config->dir);
-    strcat(log, "\\log");
+    int len = snprintf(log, MAX_PATH, "%s\\log", config->dir);
+
+    if (len < 0 || len >= MAX_PATH) {
+        eprintf("Log directory path too long\n");
+        return NULL;
+    }
 
     if (!makeDir(log)) {
         return NULL;
@@ -281,13 +323,30 @@ FILE *redirectStdout(CONFIG *config) {
 
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
-    strcat(log, "\\stdout-");
-    strftime(log + strlen(log), MAX_PATH - strlen(log) - 4, "%Y-%m-%dT%H-%M-%S", t);
-    strcat(log, ".txt");
+    len = snprintf(log, MAX_PATH, "%s\\log\\stdout-stderr-", config->dir);
+    if (len > 0 && len < MAX_PATH) {
+        strftime(log + len, MAX_PATH - len, "%Y-%m-%dT%H-%M-%S.txt", t);
+    } else {
+        eprintf("Log file path too long\n");
+        return NULL;
+    }
 
-    FILE *stream;
-    if ((stream = freopen(log, "w", stdout)) == NULL) {
-        eprintf("Cannot open file for write: %s (%i)\n", log, errno);
+    SECURITY_ATTRIBUTES sa;
+    ZeroMemory(&sa, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE stream = CreateFile(
+            log,
+            FILE_APPEND_DATA,
+            FILE_SHARE_WRITE | FILE_SHARE_READ,
+            &sa,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+
+    if (stream == NULL) {
+        eprintf("Cannot create file: %s (%i)\n", log, errno);
     }
 
     return stream;
@@ -299,23 +358,64 @@ int qdbConsole(CONFIG *config) {
         return 55;
     }
 
-    FILE *stream = redirectStdout(config);
+    FILE *stream = createStdoutLog(config);
     if (stream == NULL) {
         return 55;
     }
 
     STARTUPINFO si;
-    PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
-    eprintf("JAVA_EXE: %s\n\r\n\r", config->javaExec);
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = stream;
+    si.hStdError = stream;
+
+    printf("%s %s\n\n", config->javaExec, config->javaArgs);
 
     // Start the child process.
-    if (!CreateProcess(config->javaExec, config->javaArgs, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    if (!CreateProcess(
+            config->javaExec,
+            config->javaArgs,
+            NULL,
+            NULL,
+            TRUE,
+            0,
+            NULL,
+            NULL,
+            &si,
+            &pi
+    )) {
         eprintf("CreateProcess failed [%s](%lu).\n", config->javaExec, GetLastError());
         return 1;
+    }
+
+    char hello_txt[MAX_PATH];
+    snprintf(hello_txt, MAX_PATH, "%s\\hello.txt", config->dir);
+    for (int i = 0; i < 80; i++) {
+        DWORD exit_code = 0;
+        if (GetExitCodeProcess(pi.hProcess, &exit_code) && exit_code != STILL_ACTIVE) {
+            break;
+        }
+        FILE *hello_in;
+        fopen_s(&hello_in, hello_txt, "r");
+        if (hello_in != NULL) {
+            char buf[BUFSIZ];
+            while (TRUE) {
+                size_t read_count = fread(&buf, sizeof(char), BUFSIZ, hello_in);
+                fwrite(&buf, sizeof(char), read_count, stdout);
+                if (read_count < BUFSIZ) {
+                    break;
+                }
+            }
+            fclose(hello_in);
+            _unlink(hello_txt);
+            break;
+        }
+        Sleep(250);
     }
 
     // Wait until child process exits.
@@ -348,26 +448,22 @@ void logConfigError(CONFIG *config) {
             text = "Too many commands. Only one command is allowed.";
             break;
 
+        case ECONFIG_PATH_ERROR:
+            text = "Failed to extract path from executable.";
+            break;
+
         default:
             text = NULL;
     }
 
     if (text != NULL) {
         char buf[128];
-        sprintf(buf, "Failed to start service: %s\n", text);
+        snprintf(buf, sizeof(buf), "Failed to start service: %s\n", text);
         log_event(EVENTLOG_ERROR_TYPE, SVC_NAME_PREFIX, buf);
     }
 }
 
 int qdbRun(int argc, char **argv) {
-
-    eprintf("\n");
-    eprintf("  ___                  _   ____  ____\n");
-    eprintf(" / _ \\ _   _  ___  ___| |_|  _ \\| __ )\n");
-    eprintf("| | | | | | |/ _ \\/ __| __| | | |  _ \\\n");
-    eprintf("| |_| | |_| |  __/\\__ \\ |_| |_| | |_) |\n");
-    eprintf(" \\__\\_\\\\__,_|\\___||___/\\__|____/|____/\n");
-    eprintf("                        www.questdb.io\n\n");
 
     CONFIG config;
     initAndParseConfig(argc, argv, &config);

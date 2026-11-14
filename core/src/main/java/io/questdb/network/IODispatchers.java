@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,16 +31,14 @@ public class IODispatchers {
     private IODispatchers() {
     }
 
-    public static <C extends IOContext> IODispatcher<C> create(
+    public static <C extends IOContext<C>> IODispatcher<C> create(
             IODispatcherConfiguration configuration,
             IOContextFactory<C> ioContextFactory
     ) {
         switch (Os.type) {
-            case Os.LINUX_AMD64:
-            case Os.LINUX_ARM64:
+            case Os.LINUX:
                 return new IODispatcherLinux<>(configuration, ioContextFactory);
-            case Os.OSX_AMD64:
-            case Os.OSX_ARM64:
+            case Os.DARWIN:
             case Os.FREEBSD:
                 return new IODispatcherOsx<>(configuration, ioContextFactory);
             case Os.WINDOWS:

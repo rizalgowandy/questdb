@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ public class CursorDereferenceFunctionFactory implements FunctionFactory {
         Function columnNameFunction = args.getQuick(1);
         RecordMetadata metadata = cursorFunction.getMetadata();
         // name is always constant
-        final CharSequence columnName = columnNameFunction.getStr(null);
+        final CharSequence columnName = columnNameFunction.getStrA(null);
         final int columnIndex = metadata.getColumnIndexQuiet(columnName);
         if (columnIndex == -1) {
             throw SqlException.invalidColumn(argPositions.getQuick(1), columnName);
@@ -74,9 +74,9 @@ public class CursorDereferenceFunctionFactory implements FunctionFactory {
     }
 
     private static class IntColumnFunction extends IntFunction implements BinaryFunction {
-        private final Function cursorFunction;
-        private final Function columnNameFunction;
         private final int columnIndex;
+        private final Function columnNameFunction;
+        private final Function cursorFunction;
 
         public IntColumnFunction(
                 Function cursorFunction,
@@ -90,8 +90,18 @@ public class CursorDereferenceFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public int getInt(Record rec) {
+            return cursorFunction.extendedOps().getRecord(rec).getInt(columnIndex);
+        }
+
+        @Override
         public Function getLeft() {
             return cursorFunction;
+        }
+
+        @Override
+        public String getName() {
+            return ".";
         }
 
         @Override
@@ -100,8 +110,8 @@ public class CursorDereferenceFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public int getInt(Record rec) {
-            return cursorFunction.getRecord(rec).getInt(columnIndex);
+        public boolean isOperator() {
+            return true;
         }
     }
 }

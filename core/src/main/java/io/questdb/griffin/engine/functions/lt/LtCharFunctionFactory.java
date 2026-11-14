@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,16 +28,15 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
-import io.questdb.griffin.engine.functions.constants.CharConstant;
 import io.questdb.std.IntList;
+import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 
 public class LtCharFunctionFactory implements FunctionFactory {
-
-    private static final char CHAR_NULL = CharConstant.ZERO.getChar(null);
 
     @Override
     public String getSignature() {
@@ -72,13 +71,9 @@ public class LtCharFunctionFactory implements FunctionFactory {
 
         @Override
         public boolean getBool(Record rec) {
-            char left = this.left.getChar(rec);
-            char right = this.right.getChar(rec);
-
-            if (left == CHAR_NULL || right == CHAR_NULL) {
-                return false;
-            }
-            return negated == (left >= right);
+            char a = left.getChar(rec);
+            char b = right.getChar(rec);
+            return a != Numbers.CHAR_NULL && b != Numbers.CHAR_NULL && negated == (a >= b);
         }
 
         @Override
@@ -89,6 +84,17 @@ public class LtCharFunctionFactory implements FunctionFactory {
         @Override
         public Function getRight() {
             return right;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val(">=");
+            } else {
+                sink.val('<');
+            }
+            sink.val(right);
         }
     }
 }

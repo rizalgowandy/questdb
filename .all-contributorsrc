@@ -1,8 +1,17 @@
 {
   "files": [
     "README.md",
+    "i18n/README.ar-dz.md",
+    "i18n/README.es-es.md",
+    "i18n/README.it-it.md",
+    "i18n/README.ja-ja.md",
+    "i18n/README.pt.md",
+    "i18n/README.ua-ua.md",
     "i18n/README.zh-cn.md",
-    "i18n/README.ar-dz.md"
+    "i18n/README.zh-hk.md",
+    "i18n/README.tr-tr.md",
+    "i18n/README.hn-in.md",
+    "i18n/README.vi-vn.md"
   ],
   "imageSize": 100,
   "commit": false,
@@ -924,6 +933,163 @@
         "code",
         "doc"
       ]
+    },
+    {
+      "login": "selmanfarukyilmaz",
+      "name": "Selman Faruk Yılmaz",
+      "avatar_url": "https://avatars.githubusercontent.com/u/96119894?v=4",
+      "profile": "https://www.linkedin.com/in/selmanfaruky%C4%B1lmaz/",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "donet5",
+      "name": "果糖网",
+      "avatar_url": "https://avatars.githubusercontent.com/u/12455385?v=4",
+      "profile": "http://www.donet5.com",
+      "contributions": [
+        "ideas",
+        "bug"
+      ]
+    },
+    {
+      "login": "Zahlii",
+      "name": "N",
+      "avatar_url": "https://avatars.githubusercontent.com/u/218582?v=4",
+      "profile": "https://github.com/Zahlii",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "salsasepp",
+      "name": "Stefan S",
+      "avatar_url": "https://avatars.githubusercontent.com/u/4884807?v=4",
+      "profile": "https://github.com/salsasepp",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "EmmettM",
+      "name": "EmmettM",
+      "avatar_url": "https://avatars.githubusercontent.com/u/4196372?v=4",
+      "profile": "https://github.com/EmmettM",
+      "contributions": [
+        "bug",
+        "test"
+      ]
+    },
+    {
+      "login": "robd003",
+      "name": "Robert Palmer",
+      "avatar_url": "https://avatars.githubusercontent.com/u/571328?v=4",
+      "profile": "https://allfactors.com",
+      "contributions": [
+        "ideas"
+      ]
+    },
+    {
+      "login": "AllenEdison",
+      "name": "AllenEdison",
+      "avatar_url": "https://avatars.githubusercontent.com/u/46532217?v=4",
+      "profile": "https://github.com/AllenEdison",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "CSharpDummy",
+      "name": "CSharpDummy",
+      "avatar_url": "https://avatars.githubusercontent.com/u/7610502?v=4",
+      "profile": "https://github.com/CSharpDummy",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "shimondoodkin",
+      "name": "Shimon Doodkin",
+      "avatar_url": "https://avatars.githubusercontent.com/u/314464?v=4",
+      "profile": "https://github.com/shimondoodkin",
+      "contributions": [
+        "bug",
+        "ideas"
+      ]
+    },
+    {
+      "login": "huuhait",
+      "name": "Hữu Hà",
+      "avatar_url": "https://avatars.githubusercontent.com/u/40519768?v=4",
+      "profile": "https://www.zsmart.tech/",
+      "contributions": [
+        "bug",
+        "ideas"
+      ]
+    },
+    {
+      "login": "alexey-milovidov",
+      "name": "Alexey Milovidov",
+      "avatar_url": "https://avatars.githubusercontent.com/u/18581488?v=4",
+      "profile": "https://clickhouse.com/",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "suconghou",
+      "name": "suconghou",
+      "avatar_url": "https://avatars.githubusercontent.com/u/4580719?v=4",
+      "profile": "http://blog.suconghou.cn",
+      "contributions": [
+        "bug"
+      ]
+    },
+    {
+      "login": "allegraharris",
+      "name": "Allegra Harris",
+      "avatar_url": "https://avatars.githubusercontent.com/u/89586969?v=4",
+      "profile": "https://github.com/allegraharris",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "oliver-daniel",
+      "name": "Oliver Daniel",
+      "avatar_url": "https://avatars.githubusercontent.com/u/17235417?v=4",
+      "profile": "https://github.com/oliver-daniel",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "kerimsenturk5734",
+      "name": "Kerim Şentürk",
+      "avatar_url": "https://avatars.githubusercontent.com/u/72925170?v=4",
+      "profile": "https://github.com/kerimsenturk5734",
+      "contributions": [
+        "doc"
+      ]
+    },
+    {
+      "login": "heysagnik",
+      "name": "Sagnik Sahoo",
+      "avatar_url": "https://avatars.githubusercontent.com/u/70798495?v=4",
+      "profile": "https://github.com/heysagnik",
+      "contributions": [
+        "doc"
+      ]
+    },
+    {
+      "login": "hoangsvit",
+      "name": "David Nguyen",
+      "avatar_url": "https://avatars.githubusercontent.com/u/11882322?v=4",
+      "profile": "https://github.com/hoangsvit",
+      "contributions": [
+        "doc"
+      ]
     }
   ],
   "badgeTemplate": "[![All Contributors](https://img.shields.io/badge/all_contributors-<%= contributors.length %>-orange.svg)](#contributors)",
@@ -934,5 +1100,6 @@
   "repoType": "github",
   "repoHost": "https://github.com",
   "skipCi": true,
-  "commitConvention": "angular"
+  "commitConvention": "angular",
+  "commitType": "docs"
 }

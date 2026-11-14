@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
@@ -64,19 +65,19 @@ public class LtLong256FunctionFactory implements FunctionFactory {
         @Override
         public boolean getBool(Record rec) {
             final Long256 lv = left.getLong256A(rec);
-            final Long256 rv = right.getLong256A(rec);
+            final Long256 rv = right.getLong256B(rec);
 
             if (lv.equals(Long256Impl.NULL_LONG256) || rv.equals(Long256Impl.NULL_LONG256)) {
                 return false;
             }
             if (lv.getLong3() != rv.getLong3()) {
-                return negated == (Long.compareUnsigned(lv.getLong3(), rv.getLong3()) >= 0);
+                return negated == (Long.compareUnsigned(lv.getLong3(), rv.getLong3()) > 0);
             }
             if (lv.getLong2() != rv.getLong2()) {
-                return negated == (Long.compareUnsigned(lv.getLong2(), rv.getLong2()) >= 0);
+                return negated == (Long.compareUnsigned(lv.getLong2(), rv.getLong2()) > 0);
             }
             if (lv.getLong1() != rv.getLong1()) {
-                return negated == (Long.compareUnsigned(lv.getLong1(), rv.getLong1()) >= 0);
+                return negated == (Long.compareUnsigned(lv.getLong1(), rv.getLong1()) > 0);
             }
             return negated == (Long.compareUnsigned(lv.getLong0(), rv.getLong0()) >= 0);
         }
@@ -89,6 +90,17 @@ public class LtLong256FunctionFactory implements FunctionFactory {
         @Override
         public Function getRight() {
             return right;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val(">=");
+            } else {
+                sink.val('<');
+            }
+            sink.val(right);
         }
     }
 }

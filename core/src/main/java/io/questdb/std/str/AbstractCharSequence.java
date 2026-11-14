@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,10 +28,19 @@ import io.questdb.std.Chars;
 import io.questdb.std.Misc;
 import org.jetbrains.annotations.NotNull;
 
+/**
+ * Abstract base class for CharSequence implementations.
+ */
 public abstract class AbstractCharSequence implements CharSequence, CloneableMutable {
 
+    /**
+     * Converts a CharSequence to a String.
+     *
+     * @param cs the CharSequence to convert
+     * @return the String representation
+     */
     public static String getString(CharSequence cs) {
-        final CharSink b = Misc.getThreadLocalBuilder();
+        final Utf16Sink b = Misc.getThreadLocalSink();
         b.put(cs);
         return b.toString();
     }
@@ -43,13 +52,24 @@ public abstract class AbstractCharSequence implements CharSequence, CloneableMut
     }
 
     @Override
+    public boolean equals(Object obj) {
+        return this == obj || obj instanceof CharSequence && Chars.equals(this, (CharSequence) obj);
+    }
+
+    @Override
     public int hashCode() {
         return Chars.hashCode(this);
     }
 
     @Override
-    public boolean equals(Object obj) {
-        return this == obj || obj instanceof CharSequence && Chars.equals(this, (CharSequence) obj);
+    public final @NotNull CharSequence subSequence(int start, int end) {
+        if (start == 0 && end == length()) {
+            return this;
+        }
+        if (start == end) {
+            return "";
+        }
+        return _subSequence(start, end);
     }
 
     @NotNull
@@ -58,8 +78,14 @@ public abstract class AbstractCharSequence implements CharSequence, CloneableMut
         return getString(this);
     }
 
-    @Override
-    public CharSequence subSequence(int start, int end) {
+    /**
+     * Returns a subsequence of this character sequence.
+     *
+     * @param start the start index
+     * @param end   the end index
+     * @return the subsequence
+     */
+    protected CharSequence _subSequence(int start, int end) {
         throw new UnsupportedOperationException();
     }
 }

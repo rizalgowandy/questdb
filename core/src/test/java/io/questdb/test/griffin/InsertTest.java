@@ -1,0 +1,2394 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin;
+
+import io.questdb.PropertyKey;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GeoHashes;
+import io.questdb.cairo.ImplicitCastException;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.sql.BindVariableService;
+import io.questdb.cairo.sql.InsertMethod;
+import io.questdb.cairo.sql.InsertOperation;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
+import io.questdb.griffin.CompiledQuery;
+import io.questdb.griffin.SqlCompiler;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.Long256;
+import io.questdb.std.Numbers;
+import io.questdb.std.Rnd;
+import io.questdb.std.datetime.microtime.MicrosFormatUtils;
+import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.CreateTableTestUtils;
+import io.questdb.test.cairo.TableModel;
+import io.questdb.test.cairo.TestTableReaderRecordCursor;
+import io.questdb.test.griffin.engine.TestBinarySequence;
+import io.questdb.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+
+public class InsertTest extends AbstractCairoTest {
+    private final boolean walEnabled;
+
+    public InsertTest() {
+        this.walEnabled = TestUtils.isWal();
+    }
+
+    public void assertReaderCheckWal(String expected, CharSequence tableName) {
+        if (walEnabled) {
+            drainWalQueue();
+        }
+        assertReader(expected, tableName);
+    }
+
+    @Override
+    @Before
+    public void setUp() {
+        super.setUp();
+        node1.setProperty(PropertyKey.CAIRO_WAL_ENABLED_DEFAULT, walEnabled);
+        engine.getMatViewStateStore().clear();
+    }
+
+    @Test
+    public void testAutoIncrementUniqueId_FirstColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table currencies(id long, ccy symbol, ts timestamp) timestamp(ts)");
+
+            execute("insert into currencies values (1, 'USD', '2019-03-10T00:00:00.000000Z')");
+            assertQuery("currencies")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tccy\tts
+                            1\tUSD\t2019-03-10T00:00:00.000000Z
+                            """);
+
+            execute("insert into currencies select max(id) + 1, 'EUR', '2019-03-10T01:00:00.000000Z' from currencies");
+            assertQuery("currencies")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tccy\tts
+                            1\tUSD\t2019-03-10T00:00:00.000000Z
+                            2\tEUR\t2019-03-10T01:00:00.000000Z
+                            """);
+
+            execute("insert into currencies select max(id) + 1, 'GBP', '2019-03-10T02:00:00.000000Z' from currencies");
+            assertQuery("currencies")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tccy\tts
+                            1\tUSD\t2019-03-10T00:00:00.000000Z
+                            2\tEUR\t2019-03-10T01:00:00.000000Z
+                            3\tGBP\t2019-03-10T02:00:00.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testAutoIncrementUniqueId_NotFirstColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table currencies(ccy symbol, id long, ts timestamp) timestamp(ts)");
+
+            execute("insert into currencies values ('USD', 1, '2019-03-10T00:00:00.000000Z')");
+            assertQuery("currencies")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ccy\tid\tts
+                            USD\t1\t2019-03-10T00:00:00.000000Z
+                            """);
+
+            execute("insert into currencies select 'EUR', max(id) + 1, '2019-03-10T01:00:00.000000Z' from currencies");
+            assertQuery("currencies")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ccy\tid\tts
+                            USD\t1\t2019-03-10T00:00:00.000000Z
+                            EUR\t2\t2019-03-10T01:00:00.000000Z
+                            """);
+
+            execute("insert into currencies select 'GBP', max(id) + 1, '2019-03-10T02:00:00.000000Z' from currencies");
+            assertQuery("currencies")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ccy\tid\tts
+                            USD\t1\t2019-03-10T00:00:00.000000Z
+                            EUR\t2\t2019-03-10T01:00:00.000000Z
+                            GBP\t3\t2019-03-10T02:00:00.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testCannotInsertIntoMatView() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table currencies(ccy symbol, id long, ts timestamp) timestamp(ts) partition by day wal");
+            execute("insert into currencies values ('USD', 1, '2019-03-10T00:00:00.000000Z')");
+            execute("insert into currencies select 'EUR', max(id) + 1, '2019-03-10T01:00:00.000000Z' from currencies");
+            execute("insert into currencies select 'GBP', max(id) + 1, '2019-03-10T02:00:00.000000Z' from currencies");
+
+            execute("create materialized view curr_view as (select ts, max(id) as id from currencies sample by 1h) partition by day");
+            try {
+                execute("insert into curr_view values ('SEK', 3, '2019-03-10T03:00:00.000000Z')");
+                Assert.fail("INSERT should fail");
+            } catch (SqlException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "cannot modify materialized view [view=curr_view]");
+                Assert.assertEquals(12, e.getPosition());
+            }
+        });
+    }
+
+    @Test
+    public void testCannotInsertIntoView() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table currencies(ccy symbol, id long, ts timestamp) timestamp(ts) partition by day wal");
+            execute("insert into currencies values ('USD', 1, '2019-03-10T00:00:00.000000Z')");
+            execute("insert into currencies select 'EUR', max(id) + 1, '2019-03-10T01:00:00.000000Z' from currencies");
+            execute("insert into currencies select 'GBP', max(id) + 1, '2019-03-10T02:00:00.000000Z' from currencies");
+
+            execute("create view curr_view as (select ts, max(id) as id from currencies sample by 1h)");
+            try {
+                execute("insert into curr_view values ('JPY', 4, '2019-03-10T03:00:00.000000Z')");
+                Assert.fail("INSERT should fail");
+            } catch (SqlException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "cannot modify view [view=curr_view]");
+                Assert.assertEquals(12, e.getPosition());
+            }
+        });
+    }
+
+    @Test
+    public void testGeoHash() throws Exception {
+        final TimestampFunction timestampFunction = new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30 * 12;
+            }
+        };
+
+        assertMemoryLeak(() -> {
+            TableModel model = CreateTableTestUtils.getGeoHashTypesModelWithNewTypes(configuration, PartitionBy.YEAR);
+            TestUtils.createTable(engine, model);
+            Rnd rnd = new Rnd();
+
+            final String sql;
+            sql = "insert into allgeo values (" + "$1, " + "$2, " + "$3, " + "$4, " + "$5)";
+
+
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                final CompiledQuery cq = compiler.compile(sql, sqlExecutionContext);
+                Assert.assertEquals(CompiledQuery.INSERT, cq.getType());
+                try (InsertOperation insert = cq.popInsertOperation();
+                     InsertMethod method = insert.createMethod(sqlExecutionContext)) {
+                    for (int i = 0; i < 10_000; i++) {
+                        bindVariableService.setGeoHash(0, rnd.nextGeoHashByte(6), ColumnType.getGeoHashTypeWithBits(6));
+                        bindVariableService.setGeoHash(1, rnd.nextGeoHashShort(12), ColumnType.getGeoHashTypeWithBits(12));
+                        // truncate this one, target column is 27 bit
+                        bindVariableService.setGeoHash(2, rnd.nextGeoHashInt(29), ColumnType.getGeoHashTypeWithBits(29));
+                        bindVariableService.setGeoHash(3, rnd.nextGeoHashLong(44), ColumnType.getGeoHashTypeWithBits(44));
+                        bindVariableService.setTimestamp(4, timestampFunction.getTimestamp());
+                        method.execute(sqlExecutionContext);
+                    }
+                    method.commit();
+                }
+            }
+
+            rnd.reset();
+            try (
+                    TableReader reader = getReader("allgeo");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                final Record record = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    Assert.assertEquals(rnd.nextGeoHashByte(6), record.getGeoByte(0));
+                    Assert.assertEquals(rnd.nextGeoHashShort(12), record.getGeoShort(1));
+                    Assert.assertEquals(GeoHashes.widen(rnd.nextGeoHashInt(29), 29, 27), record.getGeoInt(2));
+                    Assert.assertEquals(rnd.nextGeoHashLong(44), record.getGeoLong(3));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testInsertAllByDay() throws Exception {
+        testBindVariableInsert(PartitionBy.DAY, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L;
+            }
+        }, true, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByDayUndefined() throws Exception {
+        testBindVariableInsert(PartitionBy.DAY, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L;
+            }
+        }, false, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByDayUndefinedNoColumnSet() throws Exception {
+        testBindVariableInsert(PartitionBy.DAY, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L;
+            }
+        }, false, false, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByDayUndefinedNoColumnSetWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.DAY, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L;
+            }
+        }, false, false, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByDayUndefinedWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.DAY, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L;
+            }
+        }, false, true, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByDayWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.DAY, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L;
+            }
+        }, true, true, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByMonth() throws Exception {
+        testBindVariableInsert(PartitionBy.MONTH, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30;
+            }
+        }, true, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByMonthUndefined() throws Exception {
+        testBindVariableInsert(PartitionBy.MONTH, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30;
+            }
+        }, false, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByMonthUndefinedNoColumnSet() throws Exception {
+        testBindVariableInsert(PartitionBy.MONTH, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30;
+            }
+        }, false, false, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByMonthUndefinedNoColumnSetWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.MONTH, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30;
+            }
+        }, false, false, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByMonthUndefinedWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.MONTH, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30;
+            }
+        }, false, true, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByMonthWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.MONTH, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30;
+            }
+        }, true, true, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByNone() throws Exception {
+        testBindVariableInsert(PartitionBy.NONE, () -> 0, true, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByNoneUndefined() throws Exception {
+        testBindVariableInsert(PartitionBy.NONE, () -> 0, false, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByNoneUndefinedNoColumnSet() throws Exception {
+        testBindVariableInsert(PartitionBy.NONE, () -> 0, false, false, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByNoneUndefinedNoColumnSetWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.NONE, () -> 0, false, false, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByNoneUndefinedWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.NONE, () -> 0, false, true, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByNoneWithNanoTs() throws Exception {
+        testBindVariableInsert(PartitionBy.NONE, () -> 0, true, true, ColumnType.TIMESTAMP_NANO);
+    }
+
+    @Test
+    public void testInsertAllByWeek() throws Exception {
+        testBindVariableInsert(PartitionBy.WEEK, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 7;
+            }
+        }, true, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByWeekUndefined() throws Exception {
+        testBindVariableInsert(PartitionBy.WEEK, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 7;
+            }
+        }, false, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByWeekUndefinedNoColumnSet() throws Exception {
+        testBindVariableInsert(PartitionBy.WEEK, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 7;
+            }
+        }, false, false, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByYear() throws Exception {
+        testBindVariableInsert(PartitionBy.YEAR, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30 * 12;
+            }
+        }, true, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAllByYearUndefined() throws Exception {
+        testBindVariableInsert(PartitionBy.YEAR, new TimestampFunction() {
+            private long last = MicrosFormatUtils.parseTimestamp("2019-03-10T00:00:00.000000Z");
+
+            @Override
+            public long getTimestamp() {
+                return last = last + 100000L * 30 * 12;
+            }
+        }, false, true, ColumnType.TIMESTAMP_MICRO);
+    }
+
+    @Test
+    public void testInsertAsSelectISODateStringToDesignatedTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab select 1, '2021-01-03'", null, false, "timestamp");
+    }
+
+    @Test
+    public void testInsertAsSelectISODateStringToDesignatedTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab select 1, '2021-01-03'", null, false, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertAsSelectISODateVarcharToDesignatedTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab select 1, '2021-01-03'::varchar", null, false, "timestamp");
+    }
+
+    @Test
+    public void testInsertAsSelectISODateVarcharToDesignatedTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab select 1, '2021-01-03'::varchar", null, false, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertAsSelectNumberStringToDesignatedTimestampColumn() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456Z
+                """, "insert atomic into tab select 1, '123456'", null, false, "timestamp");
+    }
+
+    @Test
+    public void testInsertAsSelectNumberStringToDesignatedTimestampNSColumn() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456789Z
+                """, "insert atomic into tab select 1, '123456789'", null, false, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertAsSelectNumberVarcharToDesignatedTimestampColumn() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456Z
+                """, "insert atomic into tab select 1, '123456'::varchar", null, false, "timestamp");
+    }
+
+    @Test
+    public void testInsertAsSelectNumberVarcharToDesignatedTimestampNSColumn() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456789Z
+                """, "insert atomic into tab select 1, '123456789'::varchar", null, false, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertAsSelectTimestampAscOrder() throws Exception {
+        testInsertAsSelectWithOrderBy("order by ts asc");
+    }
+
+    @Test
+    public void testInsertAsSelectTimestampAscOrderWithNanoTS() throws Exception {
+        testInsertAsSelectWithOrderByWithNanoTS("order by ts asc");
+    }
+
+    @Test
+    public void testInsertAsSelectTimestampDescOrder() throws Exception {
+        testInsertAsSelectWithOrderBy("order by ts desc");
+    }
+
+    @Test
+    public void testInsertAsSelectTimestampDescOrderWithNanoTS() throws Exception {
+        testInsertAsSelectWithOrderByWithNanoTS("order by ts desc");
+    }
+
+    @Test
+    public void testInsertAsSelectTimestampNoOrder() throws Exception {
+        testInsertAsSelectWithOrderBy("");
+    }
+
+    @Test
+    public void testInsertAsSelectTimestampNoOrderWithNanoTS() throws Exception {
+        testInsertAsSelectWithOrderByWithNanoTS("");
+    }
+
+    @Test
+    public void testInsertAsWithNanos_string() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456789Z
+                """, "with x as (select 1, '123456789') insert atomic into tab select * from x", null, false, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertAsWithNanos_varchar() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456789Z
+                """, "with x as (select 1, '123456789'::varchar) insert atomic into tab select * from x", null, false, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertAsWith_string() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456Z
+                """, "with x as (select 1, '123456'::string) insert atomic into tab select * from x", null, false, "timestamp");
+    }
+
+    @Test
+    public void testInsertAsWith_varchar() throws Exception {
+        assertInsertTimestamp("""
+                seq\tts
+                1\t1970-01-01T00:00:00.123456Z
+                """, "with x as (select 1, '123456'::varchar) insert atomic into tab select * from x", null, false, "timestamp");
+    }
+
+    @Test
+    public void testInsertContextSwitch() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            sqlExecutionContext.getBindVariableService().setDouble("bal", 150.4);
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                CompiledQuery cq = compiler.compile("insert into balances values (1, 'GBP', :bal)", sqlExecutionContext);
+                Assert.assertEquals(CompiledQuery.INSERT, cq.getType());
+
+                try (InsertOperation insertOperation = cq.popInsertOperation()) {
+                    try (InsertMethod method = insertOperation.createMethod(sqlExecutionContext)) {
+                        method.execute(sqlExecutionContext);
+                        method.commit();
+                    }
+
+                    BindVariableService bindVariableService = new BindVariableServiceImpl(configuration);
+                    bindVariableService.setDouble("bal", 56.4);
+
+                    try (SqlExecutionContext sqlExecutionContext = TestUtils.createSqlExecutionCtx(engine, bindVariableService); InsertMethod method = insertOperation.createMethod(sqlExecutionContext)) {
+                        method.execute(sqlExecutionContext);
+                        method.commit();
+                    }
+                }
+            }
+
+            assertReaderCheckWal("""
+                    cust_id\tccy\tbalance
+                    1\tGBP\t150.4
+                    1\tGBP\t56.4
+                    """, "balances");
+        });
+    }
+
+    @Test
+    public void testInsertContextSwitch_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            sqlExecutionContext.getBindVariableService().setDouble("bal", 150.4);
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                CompiledQuery cq = compiler.compile("insert into balances values (1, 'GBP'::varchar, :bal)", sqlExecutionContext);
+                Assert.assertEquals(CompiledQuery.INSERT, cq.getType());
+                try (InsertOperation insertOperation = cq.popInsertOperation()) {
+                    try (InsertMethod method = insertOperation.createMethod(sqlExecutionContext)) {
+                        method.execute(sqlExecutionContext);
+                        method.commit();
+                    }
+                    BindVariableService bindVariableService = new BindVariableServiceImpl(configuration);
+                    bindVariableService.setDouble("bal", 56.4);
+
+                    try (SqlExecutionContext sqlExecutionContext = TestUtils.createSqlExecutionCtx(engine, bindVariableService); InsertMethod method = insertOperation.createMethod(sqlExecutionContext)) {
+                        method.execute(sqlExecutionContext);
+                        method.commit();
+                    }
+                }
+            }
+
+            assertReaderCheckWal("""
+                    cust_id\tccy\tbalance
+                    1\tGBP\t150.4
+                    1\tGBP\t56.4
+                    """, "balances");
+        });
+    }
+
+    @Test
+    public void testInsertDecimalArithmetic() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table arithmetic(id int, base decimal(8,2), calculated decimal(10,4), ts timestamp) timestamp(ts)");
+
+            execute("insert into arithmetic values (1, 100.50m, 100.50m * 1.1m, 0)");
+            execute("insert into arithmetic values (2, 75.25m, 75.25m + 24.75m, 1000000)");
+            execute("insert into arithmetic values (3, 200.00m, 200.00m / 2m, 2000000)");
+
+            drainWalQueue();
+
+            assertQuery("arithmetic")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tbase\tcalculated\tts
+                            1\t100.50\t110.5500\t1970-01-01T00:00:00.000000Z
+                            2\t75.25\t100.0000\t1970-01-01T00:00:01.000000Z
+                            3\t200.00\t100.0000\t1970-01-01T00:00:02.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertDecimalFromCast() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table int_to_decimal(id int, original int, converted decimal(10,2), ts timestamp) timestamp(ts)");
+
+            execute("insert into int_to_decimal values (1, 100, cast(100 as decimal(10,2)), 0)");
+            execute("insert into int_to_decimal values (2, 250, cast(250 as decimal(10,2)), 1000000)");
+
+            drainWalQueue();
+
+            assertQuery("int_to_decimal")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\toriginal\tconverted\tts
+                            1\t100\t100.00\t1970-01-01T00:00:00.000000Z
+                            2\t250\t250.00\t1970-01-01T00:00:01.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertDecimalFromSelect() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table source(id int, val decimal(8,3), ts timestamp) timestamp(ts)");
+            execute("create table target(id int, price decimal(10,3), adjusted decimal(8,3), ts timestamp) timestamp(ts)");
+
+            execute("insert into source values (1, 123.456m, 0)");
+            execute("insert into source values (2, 789.012m, 1000000)");
+            execute("insert into source values (3, 456.789m, 2000000)");
+
+            execute("insert into target select id, val * 2m as price, val, ts from source where id > 1");
+
+            drainWalQueue();
+
+            assertQuery("target")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tprice\tadjusted\tts
+                            2\t1578.024\t789.012\t1970-01-01T00:00:01.000000Z
+                            3\t913.578\t456.789\t1970-01-01T00:00:02.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertDecimalHighPrecision() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table high_precision(id int, large_value decimal(30,10), ts timestamp) timestamp(ts)");
+
+            execute("insert into high_precision values (1, 12345678901234567890.1234567890m, 0)");
+            execute("insert into high_precision values (2, 98765432109876543210.9876543210m, 1000000)");
+
+            drainWalQueue();
+
+            assertQuery("high_precision")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tlarge_value\tts
+                            1\t12345678901234567890.1234567890\t1970-01-01T00:00:00.000000Z
+                            2\t98765432109876543210.9876543210\t1970-01-01T00:00:01.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertDecimalLiterals() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table decimals(id int, price decimal(10,2), rate decimal(6,4), ts timestamp) timestamp(ts)");
+
+            execute("insert into decimals values (1, 99.99m, 0.1234m, 0)");
+            execute("insert into decimals values (2, 1234.56m, 1.2345m, 1000000)");
+            execute("insert into decimals values (3, 0.01m, 0.0001m, 2000000)");
+            execute("insert into decimals values (4, 9999.99m, 9.9999m, 3000000)");
+
+            drainWalQueue();
+
+            assertQuery("decimals")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tprice\trate\tts
+                            1\t99.99\t0.1234\t1970-01-01T00:00:00.000000Z
+                            2\t1234.56\t1.2345\t1970-01-01T00:00:01.000000Z
+                            3\t0.01\t0.0001\t1970-01-01T00:00:02.000000Z
+                            4\t9999.99\t9.9999\t1970-01-01T00:00:03.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertDecimalMixedWithOtherTypes() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table mixed_types(" +
+                    "id int, " +
+                    "price decimal(10,2), " +
+                    "name string, " +
+                    "active boolean, " +
+                    "quantity decimal(8,0), " +
+                    "rate double, " +
+                    "symbol symbol, " +
+                    "ts timestamp) timestamp(ts)");
+
+            execute("insert into mixed_types values (1, 99.99m, 'Item1', true, 100m, 1.5, 'ABC', 0)");
+            execute("insert into mixed_types values (2, 150.75m, 'Item2', false, 50m, 2.25, 'DEF', 1000000)");
+
+            drainWalQueue();
+
+            assertQuery("mixed_types")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tprice\tname\tactive\tquantity\trate\tsymbol\tts
+                            1\t99.99\tItem1\ttrue\t100\t1.5\tABC\t1970-01-01T00:00:00.000000Z
+                            2\t150.75\tItem2\tfalse\t50\t2.25\tDEF\t1970-01-01T00:00:01.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertDecimalNullValues() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table decimal_nulls(id int, value decimal(12,4), ts timestamp) timestamp(ts)");
+
+            execute("insert into decimal_nulls values (1, 123.4567m, 0)");
+            execute("insert into decimal_nulls values (2, null, 1000000)");
+            execute("insert into decimal_nulls values (3, 999.9999m, 2000000)");
+
+            drainWalQueue();
+
+            assertQuery("decimal_nulls")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            id\tvalue\tts
+                            1\t123.4567\t1970-01-01T00:00:00.000000Z
+                            2\t\t1970-01-01T00:00:01.000000Z
+                            3\t999.9999\t1970-01-01T00:00:02.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertEmptyStringSelectEmptyStringColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, '')");
+            assertQuery("select id from tab where val = ''")
+                    .noLeakCheck()
+                    .returns("id\n1\n");
+        });
+    }
+
+    @Test
+    public void testInsertEmptyStringSelectNullStringColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, '')");
+            assertQuery("select id from tab where val = null")
+                    .noLeakCheck()
+                    .returns("id\n");
+        });
+    }
+
+    @Test
+    public void testInsertEmptyVarcharSelectEmptyVarcharColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, ''::varchar)");
+            assertQuery("select id from tab where val = ''")
+                    .noLeakCheck()
+                    .returns("id\n1\n");
+        });
+    }
+
+    @Test
+    public void testInsertEmptyVarcharSelectNullVarcharColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, ''::varchar)");
+            assertQuery("select id from tab where val = null")
+                    .noLeakCheck()
+                    .returns("id\n");
+        });
+    }
+
+    @Test
+    public void testInsertExecutionAfterStructureChange() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                CompiledQuery cq = compiler.compile("insert into balances values (1, 'GBP', 356.12)", sqlExecutionContext);
+                Assert.assertEquals(CompiledQuery.INSERT, cq.getType());
+                try (InsertOperation insertOperation = cq.popInsertOperation()) {
+                    execute("alter table balances drop column ccy", sqlExecutionContext);
+                    insertOperation.createMethod(sqlExecutionContext);
+                }
+                Assert.fail();
+            } catch (TableReferenceOutOfDateException ignored) {
+            }
+        });
+    }
+
+    @Test
+    public void testInsertExplicitTimestampNSPos1() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE TS (timestamp TIMESTAMP_NS, field STRING, value DOUBLE) TIMESTAMP(timestamp) partition by day");
+            execute("INSERT INTO TS(field, value, timestamp) values('X',123.33, to_timestamp('2019-12-04T13:20:49', 'yyyy-MM-ddTHH:mm:ss'))");
+            String expected = """
+                    timestamp\tfield\tvalue
+                    2019-12-04T13:20:49.000000000Z\tX\t123.33
+                    """;
+
+            assertReaderCheckWal(expected, "TS");
+        });
+    }
+
+    @Test
+    public void testInsertExplicitTimestampNSPos1_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE TS (timestamp TIMESTAMP_NS, field STRING, value DOUBLE) TIMESTAMP(timestamp) partition by day");
+            execute("INSERT INTO TS(field, value, timestamp) values('X',123.33, to_timestamp('2019-12-04T13:20:49'::varchar, 'yyyy-MM-ddTHH:mm:ss'))");
+            String expected = """
+                    timestamp\tfield\tvalue
+                    2019-12-04T13:20:49.000000000Z\tX\t123.33
+                    """;
+
+            assertReaderCheckWal(expected, "TS");
+        });
+    }
+
+    @Test
+    public void testInsertExplicitTimestampPos1() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE TS (timestamp TIMESTAMP, field STRING, value DOUBLE) TIMESTAMP(timestamp)");
+            execute("INSERT INTO TS(field, value, timestamp) values('X',123.33, to_timestamp('2019-12-04T13:20:49', 'yyyy-MM-ddTHH:mm:ss'))");
+            String expected = """
+                    timestamp\tfield\tvalue
+                    2019-12-04T13:20:49.000000Z\tX\t123.33
+                    """;
+
+            assertReaderCheckWal(expected, "TS");
+        });
+    }
+
+    @Test
+    public void testInsertExplicitTimestampPos1_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE TS (timestamp TIMESTAMP, field STRING, value DOUBLE) TIMESTAMP(timestamp)");
+            execute("INSERT INTO TS(field, value, timestamp) values('X',123.33, to_timestamp('2019-12-04T13:20:49'::varchar, 'yyyy-MM-ddTHH:mm:ss'))");
+            String expected = """
+                    timestamp\tfield\tvalue
+                    2019-12-04T13:20:49.000000Z\tX\t123.33
+                    """;
+
+            assertReaderCheckWal(expected, "TS");
+        });
+    }
+
+    @Test
+    public void testInsertISODateStringToDesignatedTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03')", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISODateStringToDesignatedTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03')", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISODateVarcharToDesignatedTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03'::varchar)", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISODateVarcharToDesignatedTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03'::varchar)", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMicroStringTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00.000000Z')", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMicroStringTimestampColumnNSNoTimezone() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000001Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00.000000001')", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMicroStringTimestampColumnNoTimezone() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00.000000')", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMicroStringTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00.000000000Z')", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMicroVarcharTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00.000000Z'::varchar)", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMicroVarcharTimestampColumnNoTimezone() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00.000000'::varchar)", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMicroVarcharTimestampNSColumnNoTimezone() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000123Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00.000000123'::varchar)", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateStringTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-02T23:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00+01')", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateStringTimestampColumn2() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T03:30:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T02:00:00-01:30')", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateStringTimestampColumnFails() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-01-03T02:00:00-:30` [STRING -> TIMESTAMP]", "insert into tab values (1, '2021-01-03T02:00:00-:30')", ImplicitCastException.class, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateStringTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-02T23:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00+01')", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateStringTimestampNSColumn2() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T03:30:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T02:00:00-01:30')", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateStringTimestampNSColumnFails() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-01-03T02:00:00-:30` [STRING -> TIMESTAMP_NS]", "insert into tab values (1, '2021-01-03T02:00:00-:30')", ImplicitCastException.class, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateVarcharTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-02T23:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00+01'::varchar)", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateVarcharTimestampColumn2() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T03:30:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T02:00:00-01:30'::varchar)", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateVarcharTimestampColumnFails() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-01-03T02:00:00-:30` [VARCHAR -> TIMESTAMP]", "insert into tab values (1, '2021-01-03T02:00:00-:30'::varchar)", ImplicitCastException.class, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateVarcharTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-02T23:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00+01'::varchar)", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateVarcharTimestampNSColumn2() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T03:30:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T02:00:00-01:30'::varchar)", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOMilliWithTzDateVarcharTimestampNSColumnFails() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-01-03T02:00:00-:30` [VARCHAR -> TIMESTAMP_NS]", "insert into tab values (1, '2021-01-03T02:00:00-:30'::varchar)", ImplicitCastException.class, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOSecondsDateStringTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00Z')", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertISOSecondsDateStringTimestampNSColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00Z')", null, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertISOSecondsDateVarcharTimestampColumn() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t2021-01-03T00:00:00.000000Z
+                """;
+
+        assertInsertTimestamp(expected, "insert into tab values (1, '2021-01-03T00:00:00Z'::varchar)", null, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertImplicitTimestampPos1() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE TS (timestamp TIMESTAMP, field STRING, value DOUBLE) TIMESTAMP(timestamp)");
+            execute("INSERT INTO TS values(to_timestamp('2019-12-04T13:20:49', 'yyyy-MM-ddTHH:mm:ss'),'X',123.33d)");
+            String expected = """
+                    timestamp\tfield\tvalue
+                    2019-12-04T13:20:49.000000Z\tX\t123.33
+                    """;
+
+            assertReaderCheckWal(expected, "TS");
+        });
+    }
+
+    @Test
+    public void testInsertImplicitTimestampPos1_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE TS (timestamp TIMESTAMP, field VARCHAR, value DOUBLE) TIMESTAMP(timestamp)");
+            execute("INSERT INTO TS values(to_timestamp('2019-12-04T13:20:49'::varchar, 'yyyy-MM-ddTHH:mm:ss'),'X',123.33d)");
+            String expected = """
+                    timestamp\tfield\tvalue
+                    2019-12-04T13:20:49.000000Z\tX\t123.33
+                    """;
+
+            assertReaderCheckWal(expected, "TS");
+        });
+    }
+
+    @Test
+    public void testInsertIntoNonExistingTable() throws Exception {
+        assertMemoryLeak(() -> {
+            try {
+                execute("insert into tab values (1)");
+                Assert.fail();
+            } catch (SqlException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "table does not exist [table=tab]");
+                Assert.assertEquals(12, e.getPosition());
+            }
+        });
+    }
+
+    @Test
+    public void testInsertInvalidColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            try {
+                assertExceptionNoLeakCheck("insert into balances(cust_id, ccy2, balance) values (1, 'GBP', 356.12)", sqlExecutionContext);
+            } catch (SqlException e) {
+                Assert.assertEquals(30, e.getPosition());
+                TestUtils.assertContains(e.getFlyweightMessage(), "Invalid column");
+            }
+        });
+    }
+
+    @Test
+    public void testInsertInvalidDateStringTimestampColumn() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-23-03T00:00:00Z` [STRING -> TIMESTAMP]", "insert into tab values (1, '2021-23-03T00:00:00Z')", ImplicitCastException.class, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertInvalidDateStringTimestampNSColumn() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-23-03T00:00:00Z` [STRING -> TIMESTAMP_NS]", "insert into tab values (1, '2021-23-03T00:00:00Z')", ImplicitCastException.class, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertInvalidDateVarcharTimestampColumn() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-23-03T00:00:00Z` [VARCHAR -> TIMESTAMP]", "insert into tab values (1, '2021-23-03T00:00:00Z'::varchar)", ImplicitCastException.class, true, "timestamp");
+    }
+
+    @Test
+    public void testInsertInvalidDateVarcharTimestampNSColumn() throws Exception {
+        assertInsertTimestamp("inconvertible value: `2021-23-03T00:00:00Z` [VARCHAR -> TIMESTAMP_NS]", "insert into tab values (1, '2021-23-03T00:00:00Z'::varchar)", ImplicitCastException.class, true, "timestamp_ns");
+    }
+
+    @Test
+    public void testInsertMultipleRows() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol) timestamp(ts);");
+            execute("insert into trades VALUES (1262599200000000, 'USDJPY'), (3262599300000000, 'USDFJD');");
+
+            String expected = """
+                    ts\tsym
+                    2010-01-04T10:00:00.000000Z\tUSDJPY
+                    2073-05-21T13:35:00.000000Z\tUSDFJD
+                    """;
+
+            assertReaderCheckWal(expected, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertMultipleRowsBindVariables() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol) timestamp(ts);");
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                final String sql = "insert into trades VALUES (1262599200000000, $1), (3262599300000000, $2);";
+                final CompiledQuery cq = compiler.compile(sql, sqlExecutionContext);
+                Assert.assertEquals(CompiledQuery.INSERT, cq.getType());
+                try (InsertOperation insert = cq.popInsertOperation();
+                     InsertMethod method = insert.createMethod(sqlExecutionContext)) {
+                    bindVariableService.setStr(0, "USDJPY");
+                    bindVariableService.setStr(1, "USDFJD");
+                    method.execute(sqlExecutionContext);
+                    method.commit();
+                }
+            }
+            String expected = """
+                    ts\tsym
+                    2010-01-04T10:00:00.000000Z\tUSDJPY
+                    2073-05-21T13:35:00.000000Z\tUSDFJD
+                    """;
+            assertReaderCheckWal(expected, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertMultipleRowsExtraParentheses() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (i INT, sym symbol)");
+            execute("insert into trades VALUES ((1), 'USD'), ((2), (('FJD')));");
+
+            String expected = """
+                    i\tsym
+                    1\tUSD
+                    2\tFJD
+                    """;
+
+            assertReaderCheckWal(expected, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertMultipleRowsFailInvalidSyntax() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (i int, sym symbol)");
+
+            // No comma delimiter between rows
+            assertQuery("insert into trades VALUES (1, 'USDJPY')(2, 'USDFJD');")
+                    .fails(39, "',' expected");
+
+            // Empty row
+            assertQuery("insert into trades VALUES (1, 'USDJPY'), ();")
+                    .fails(42, "Expression expected");
+
+            // Empty row with comma delimiter inside
+            assertQuery("insert into trades VALUES (1, 'USDJPY'), (2, 'USDFJD'), (,);")
+                    .fails(57, "Expression expected");
+
+            // Empty row column
+            assertQuery("insert into trades VALUES (1, 'USDJPY'), (2, 'USDFJD'), (3,);")
+                    .fails(59, "Expression expected");
+
+            // Multi row insert can't end in comma token
+            assertQuery("insert into trades VALUES (1, 'USDJPY'), (2, 'USDFJD'),;")
+                    .fails(55, "'(' expected");
+        });
+    }
+
+    @Test
+    public void testInsertMultipleRowsFailRowWrongColumnCount() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (i int, sym symbol)");
+            assertQuery("insert into trades VALUES (1, 'USDJPY'), ('USDFJD');")
+                    .fails(50, "row value count does not match column count [expected=2, actual=1, tuple=2]");
+        });
+    }
+
+    @Test
+    public void testInsertMultipleRowsFailTypeConversion() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (sym symbol)");
+            assertQuery("insert into trades VALUES ('USDJPY'), (1), ('USDFJD');")
+                    .fails(39, "inconvertible types: INT -> SYMBOL [from=1, to=sym]");
+        });
+    }
+
+    @Test
+    public void testInsertMultipleRowsMissingBindVariables() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (ts timestamp, i int) timestamp(ts);");
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                final String sql = "insert into t VALUES (1262599200000000, $1), (3262599300000000, $2);";
+                final CompiledQuery cq = compiler.compile(sql, sqlExecutionContext);
+                Assert.assertEquals(CompiledQuery.INSERT, cq.getType());
+
+                try (InsertOperation insert = cq.popInsertOperation();
+                     InsertMethod method = insert.createMethod(sqlExecutionContext)) {
+                    bindVariableService.setInt(0, 1);
+                    method.execute(sqlExecutionContext);
+                    method.commit();
+                }
+            }
+            String expected = """
+                    ts\ti
+                    2010-01-04T10:00:00.000000Z\t1
+                    2073-05-21T13:35:00.000000Z\tnull
+                    """;
+            assertReaderCheckWal(expected, "t");
+        });
+    }
+
+    @Test
+    public void testInsertMultipleRowsOutOfOrder() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp) timestamp(ts) partition by day;");
+            try {
+                execute("insert into trades VALUES (1), (3), (2);");
+            } catch (CairoException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "cannot insert rows out of order to non-partitioned table.");
+            }
+
+            execute("create table trades_ns (ts timestamp_ns) timestamp(ts) partition by day;");
+            try {
+                execute("insert into trades VALUES (1), (3), (2);");
+            } catch (CairoException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "cannot insert rows out of order to non-partitioned table.");
+            }
+        });
+    }
+
+    @Test
+    public void testInsertNoSelfReference() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE trades_aapl (ts TIMESTAMP, px INT, qty int, side STRING) TIMESTAMP(ts)");
+            assertQuery("insert into trades_aapl (ts) values (ts)")
+                    .fails(37, "Invalid column");
+        });
+    }
+
+    @Test
+    public void testInsertNoTimestamp() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            execute("insert into balances values (1, 'USD', 356.12)");
+            String expected = """
+                    cust_id\tccy\tbalance
+                    1\tUSD\t356.12
+                    """;
+
+            assertReaderCheckWal(expected, "balances");
+        });
+    }
+
+    @Test
+    public void testInsertNotEnoughFields() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("insert into balances values (1, 'USD')")
+                    .fails(37, "row value count does not match column count [expected=3, actual=2, tuple=1]");
+        });
+    }
+
+    @Test
+    public void testInsertNullStringSelectEmptyStringColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, NULL)");
+            assertQuery("select id from tab where val = ''")
+                    .noLeakCheck()
+                    .returns("id\n");
+        });
+    }
+
+    @Test
+    public void testInsertNullStringSelectNullStringColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, null)");
+            assertQuery("select id from tab where val = null")
+                    .noLeakCheck()
+                    .returns("id\n1\n");
+        });
+    }
+
+    @Test
+    public void testInsertNullVarcharSelectEmptyVarcharColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, NULL::varchar)");
+            assertQuery("select id from tab where val = ''")
+                    .noLeakCheck()
+                    .returns("id\n");
+        });
+    }
+
+    @Test
+    public void testInsertNullVarcharSelectNullVarcharColumnIndexed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (id int, val symbol index)");
+            execute("insert into tab values (1, null::varchar)");
+            assertQuery("select id from tab where val = null")
+                    .noLeakCheck()
+                    .returns("id\n1\n");
+        });
+    }
+
+    @Test
+    public void testInsertSelectTwoWheres() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table result (r long)");
+
+            assertQuery("insert into result select * from long_sequence(1) where true where false;")
+                    .noLeakCheck()
+                    .fails(61, "unexpected token [where]");
+        });
+    }
+
+    @Test
+    public void testInsertSingleAndMultipleCharacterSymbols() throws Exception {
+        final String expected = """
+                sym\tid\tts
+                A\t315515118\t1970-01-03T00:00:00.000000Z
+                BB\t-727724771\t1970-01-03T00:06:00.000000Z
+                BB\t-948263339\t1970-01-03T00:12:00.000000Z
+                CC\t592859671\t1970-01-03T00:18:00.000000Z
+                CC\t-847531048\t1970-01-03T00:24:00.000000Z
+                A\t-2041844972\t1970-01-03T00:30:00.000000Z
+                CC\t-1575378703\t1970-01-03T00:36:00.000000Z
+                BB\t1545253512\t1970-01-03T00:42:00.000000Z
+                A\t1573662097\t1970-01-03T00:48:00.000000Z
+                BB\t339631474\t1970-01-03T00:54:00.000000Z
+                """;
+
+        assertQuery("x")
+                .ddl("""
+                        create table x (
+                            sym symbol index,
+                            id int,
+                            ts timestamp
+                        ) timestamp(ts) partition by DAY""")
+                .timestamp("ts")
+                .mutateWith("""
+                        insert into x select * from (select rnd_symbol('A', 'BB', 'CC', 'DDD') sym,\s
+                                rnd_int() id,\s
+                                timestamp_sequence(172800000000, 360000000) ts\s
+                            from long_sequence(10)) timestamp (ts)""")
+                .expectSize()
+                .returns("sym\tid\tts\n", expected);
+    }
+
+    @Test
+    public void testInsertSingleCharacterSymbol() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table ww (id int, sym symbol)");
+            execute("insert into ww VALUES ( 2, 'A')");
+            String expected = """
+                    id\tsym
+                    2\tA
+                    """;
+
+            assertReaderCheckWal(expected, "ww");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolIntoVarcharCol() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table src (ts timestamp, sym symbol) timestamp(ts) partition by day;");
+            execute("insert into src values (0, 'foo');");
+            execute("insert into src values (20000, null);");
+            execute("insert into src values (30000, 'bar');");
+
+            execute("create table dest (ts timestamp, vch varchar) timestamp(ts) partition by day;");
+            drainWalQueue();
+
+            execute("insert into dest select ts, sym from src;");
+
+            String expected = """
+                    ts\tvch
+                    1970-01-01T00:00:00.000000Z\tfoo
+                    1970-01-01T00:00:00.020000Z\t
+                    1970-01-01T00:00:00.030000Z\tbar
+                    """;
+            assertQueryCheckWal(expected);
+
+            // check symbol null was inserted as a null varch and not as an empty varchar
+            assertQuery("select * from dest where vch is null")
+                    .noLeakCheck()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tvch
+                            1970-01-01T00:00:00.020000Z\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertSymbolNonPartitioned() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table symbols (sym symbol, isNewSymbol BOOLEAN)");
+            execute("insert into symbols (sym, isNewSymbol) VALUES ('USDJPY', false);");
+            execute("insert into symbols (sym, isNewSymbol) VALUES ('USDFJD', true);");
+
+            String expected = """
+                    sym\tisNewSymbol
+                    USDJPY\tfalse
+                    USDFJD\ttrue
+                    """;
+
+            assertReaderCheckWal(expected, "symbols");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolNonPartitioned_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table symbols (sym symbol, isNewSymbol BOOLEAN)");
+            execute("insert into symbols (sym, isNewSymbol) VALUES ('USDJPY'::varchar, false);");
+            execute("insert into symbols (sym, isNewSymbol) VALUES ('USDFJD'::varchar, true);");
+
+            String expected = """
+                    sym\tisNewSymbol
+                    USDJPY\tfalse
+                    USDFJD\ttrue
+                    """;
+
+            assertReaderCheckWal(expected, "symbols");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolPartitioned() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol, bid double, ask double) timestamp(ts) partition by DAY;");
+            execute("insert into trades VALUES ( 1262599200000000, 'USDJPY', 1, 2);");
+            execute("insert into trades VALUES ( 1262599300000000, 'USDFJD', 2, 4);");
+
+            String expected = """
+                    ts\tsym\tbid\task
+                    2010-01-04T10:00:00.000000Z\tUSDJPY\t1.0\t2.0
+                    2010-01-04T10:01:40.000000Z\tUSDFJD\t2.0\t4.0
+                    """;
+
+            assertReaderCheckWal(expected, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolPartitionedAfterTruncate() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol, bid double, ask double) timestamp(ts) partition by DAY;");
+            execute("insert into trades VALUES ( 1262599200000000, 'USDJPY', 1, 2);");
+
+            String expected1 = """
+                    ts\tsym\tbid\task
+                    2010-01-04T10:00:00.000000Z\tUSDJPY\t1.0\t2.0
+                    """;
+
+            assertReaderCheckWal(expected1, "trades");
+
+            try (TableWriter w = getWriter("trades")) {
+                w.truncate();
+            }
+
+            execute("insert into trades VALUES ( 3262599300000000, 'USDFJD', 2, 4);");
+
+            String expected2 = """
+                    ts\tsym\tbid\task
+                    2073-05-21T13:35:00.000000Z\tUSDFJD\t2.0\t4.0
+                    """;
+
+            assertReaderCheckWal(expected2, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolPartitionedAfterTruncate_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol, bid double, ask double) timestamp(ts) partition by DAY;");
+            execute("insert into trades VALUES ( 1262599200000000, 'USDJPY'::varchar, 1, 2);");
+
+            String expected1 = """
+                    ts\tsym\tbid\task
+                    2010-01-04T10:00:00.000000Z\tUSDJPY\t1.0\t2.0
+                    """;
+
+            assertReaderCheckWal(expected1, "trades");
+
+            try (TableWriter w = getWriter("trades")) {
+                w.truncate();
+            }
+
+            execute("insert into trades VALUES ( 3262599300000000, 'USDFJD'::varchar, 2, 4);");
+
+            String expected2 = """
+                    ts\tsym\tbid\task
+                    2073-05-21T13:35:00.000000Z\tUSDFJD\t2.0\t4.0
+                    """;
+
+            assertReaderCheckWal(expected2, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolPartitionedFarApart() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol, bid double, ask double) timestamp(ts) partition by DAY;");
+            execute("insert into trades VALUES ( 1262599200000000, 'USDJPY', 1, 2);");
+            execute("insert into trades VALUES ( 3262599300000000, 'USDFJD', 2, 4);");
+
+            String expected = """
+                    ts\tsym\tbid\task
+                    2010-01-04T10:00:00.000000Z\tUSDJPY\t1.0\t2.0
+                    2073-05-21T13:35:00.000000Z\tUSDFJD\t2.0\t4.0
+                    """;
+
+            assertReaderCheckWal(expected, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolPartitionedFarApart_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol, bid double, ask double) timestamp(ts) partition by DAY;");
+            execute("insert into trades VALUES ( 1262599200000000, 'USDJPY'::varchar, 1, 2);");
+            execute("insert into trades VALUES ( 3262599300000000, 'USDFJD'::varchar, 2, 4);");
+
+            String expected = """
+                    ts\tsym\tbid\task
+                    2010-01-04T10:00:00.000000Z\tUSDJPY\t1.0\t2.0
+                    2073-05-21T13:35:00.000000Z\tUSDFJD\t2.0\t4.0
+                    """;
+
+            assertReaderCheckWal(expected, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertSymbolPartitioned_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table trades (ts timestamp, sym symbol, bid double, ask double) timestamp(ts) partition by DAY;");
+            execute("insert into trades VALUES ( 1262599200000000, 'USDJPY'::varchar, 1, 2);");
+            execute("insert into trades VALUES ( 1262599300000000, 'USDFJD'::varchar, 2, 4);");
+
+            String expected = """
+                    ts\tsym\tbid\task
+                    2010-01-04T10:00:00.000000Z\tUSDJPY\t1.0\t2.0
+                    2010-01-04T10:01:40.000000Z\tUSDFJD\t2.0\t4.0
+                    """;
+
+            assertReaderCheckWal(expected, "trades");
+        });
+    }
+
+    @Test
+    public void testInsertTimestampNSOverflowException() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (t1 timestamp_ns) timestamp(t1) partition by day;");
+            assertQuery("insert into tab values ('2300-01-03T00:00:00.000001123')")
+                    .fails(24, "timestamp_ns before 1970-01-01 and beyond 2261-12-31 23:59:59.999999999 is not allowed");
+        });
+    }
+
+    @Test
+    public void testInsertTimestampNSOverflowException3() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (t1 timestamp, t2 timestamp) timestamp(t2) partition by DAY;");
+            execute("insert into tab values ('2321-01-03T00:00:00.123', '2021-01-03T00:00:00.456');");
+            assertReaderCheckWal("""
+                    t1\tt2
+                    2321-01-03T00:00:00.123000Z\t2021-01-03T00:00:00.456000Z
+                    """, "tab");
+            execute("create table tab1 (t1 timestamp_ns, t2 timestamp_ns) timestamp(t2) partition by DAY;");
+            assertQuery("insert into tab1 select t1, t2 from tab")
+                    .fails(0, "inconvertible value: 11076652800123000 [TIMESTAMP -> TIMESTAMP_NS]");
+        });
+    }
+
+    @Test
+    public void testInsertTimestampNSWithTimeZone() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (timestamp timestamp_ns) timestamp(timestamp) partition by day;");
+            execute("insert into t values (timestamp with time zone '2020-12-31 15:15:51.663+00:00')");
+
+            String expected1 = """
+                    timestamp
+                    2020-12-31T15:15:51.663000000Z
+                    """;
+
+            assertReaderCheckWal(expected1, "t");
+
+            execute("insert into t values (cast('2021-12-31 15:15:51.663+00:00' as timestamp with time zone))");
+
+            String expected2 = expected1 + "2021-12-31T15:15:51.663000000Z\n";
+
+            assertReaderCheckWal(expected2, "t");
+
+            assertQuery("insert into t values  (timestamp with time zone)")
+                    .fails(47, "String literal expected after 'timestamp with time zone'");
+        });
+    }
+
+    @Test
+    public void testInsertTimestampNSWithTimeZone_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (timestamp timestamp_ns) timestamp(timestamp) partition by day;");
+            execute("insert into t values (timestamp with time zone '2020-12-31 15:15:51.663+00:00')");
+
+            String expected1 = """
+                    timestamp
+                    2020-12-31T15:15:51.663000000Z
+                    """;
+
+            assertReaderCheckWal(expected1, "t");
+
+            execute("insert into t values (cast('2021-12-31 15:15:51.663+00:00'::varchar as timestamp with time zone))");
+
+            String expected2 = expected1 + "2021-12-31T15:15:51.663000000Z\n";
+
+            assertReaderCheckWal(expected2, "t");
+
+            assertQuery("insert into t values  (timestamp with time zone)")
+                    .fails(47, "String literal expected after 'timestamp with time zone'");
+        });
+    }
+
+    @Test
+    public void testInsertTimestampNS_timestamp() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (t1 timestamp, t2 timestamp) timestamp(t2) partition by DAY;");
+            execute("insert into tab values ('2021-01-03T00:00:00.123', '2021-01-03T00:00:00.456');");
+            assertReaderCheckWal("""
+                    t1\tt2
+                    2021-01-03T00:00:00.123000Z\t2021-01-03T00:00:00.456000Z
+                    """, "tab");
+            execute("create table tab1 (t1 timestamp_ns, t2 timestamp_ns) timestamp(t2) partition by DAY;");
+            execute("insert into tab1 select t1, t2 from tab;");
+            assertReaderCheckWal("""
+                    t1\tt2
+                    2021-01-03T00:00:00.123000000Z\t2021-01-03T00:00:00.456000000Z
+                    """, "tab1");
+        });
+    }
+
+    @Test
+    public void testInsertTimestampWithTimeZone() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (timestamp timestamp) timestamp(timestamp);");
+            execute("insert into t values (timestamp with time zone '2020-12-31 15:15:51.663+00:00')");
+
+            String expected1 = """
+                    timestamp
+                    2020-12-31T15:15:51.663000Z
+                    """;
+
+            assertReaderCheckWal(expected1, "t");
+
+            execute("insert into t values (cast('2021-12-31 15:15:51.663+00:00' as timestamp with time zone))");
+
+            String expected2 = expected1 + "2021-12-31T15:15:51.663000Z\n";
+
+            assertReaderCheckWal(expected2, "t");
+
+            assertQuery("insert into t values  (timestamp with time zone)")
+                    .fails(47, "String literal expected after 'timestamp with time zone'");
+        });
+    }
+
+    @Test
+    public void testInsertTimestampWithTimeZone_varchar() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table t (timestamp timestamp) timestamp(timestamp);");
+
+            // We cannot cast '2020-12-31 15:15:51.663+00:00'::varchar,
+            // because it will act as (timestamp with time zone '2020-12-31 15:15:51.663+00:00')::varchar
+            // This creates a varchar constant whose value is the string representation of the timestamp in microseconds
+            // since the epoch. And such string constants cannot be inserted as timestamps. Only actual string/varchar timestamps
+            // can be inserted into a timestamp column.
+            // If you cast '2020-12-31 15:15:51.663+00:00'::string then it fails too.
+            // thus Varchar behaves the same as String in this case.
+            execute("insert into t values (timestamp with time zone '2020-12-31 15:15:51.663+00:00')");
+
+            String expected1 = """
+                    timestamp
+                    2020-12-31T15:15:51.663000Z
+                    """;
+
+            assertReaderCheckWal(expected1, "t");
+
+            execute("insert into t values (cast('2021-12-31 15:15:51.663+00:00'::varchar as timestamp with time zone))");
+
+            String expected2 = expected1 + "2021-12-31T15:15:51.663000Z\n";
+
+            assertReaderCheckWal(expected2, "t");
+
+            assertQuery("insert into t values  (timestamp with time zone)")
+                    .fails(47, "String literal expected after 'timestamp with time zone'");
+        });
+    }
+
+    @Test
+    public void testInsertTimestamp_timestampNS() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab (t1 timestamp_ns, t2 timestamp_ns) timestamp(t2) partition by day;");
+            execute("insert into tab values ('2021-01-03T00:00:00.000001123', '2021-01-03T00:00:00.000004456');");
+            assertReaderCheckWal("""
+                    t1\tt2
+                    2021-01-03T00:00:00.000001123Z\t2021-01-03T00:00:00.000004456Z
+                    """, "tab");
+            execute("create table tab1 (t1 timestamp, t2 timestamp) timestamp(t2) partition by day;");
+            execute("insert into tab1 select t1, t2 from tab;");
+            assertReaderCheckWal("""
+                    t1\tt2
+                    2021-01-03T00:00:00.000001Z\t2021-01-03T00:00:00.000004Z
+                    """, "tab1");
+        });
+    }
+
+    @Test
+    public void testInsertUUIDIntoVarcharCol() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table src (ts timestamp, u uuid) timestamp(ts) partition by day;");
+            execute("insert into src values (0, '11111111-1111-1111-1111-111111111111');");
+            execute("insert into src values (20000, null);");
+            execute("insert into src values (30000, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');");
+
+            execute("create table dest (ts timestamp, vch varchar) timestamp(ts) partition by day;");
+            drainWalQueue();
+
+            execute("insert into dest select ts, u from src;");
+
+            String expected = """
+                    ts\tvch
+                    1970-01-01T00:00:00.000000Z\t11111111-1111-1111-1111-111111111111
+                    1970-01-01T00:00:00.020000Z\t
+                    1970-01-01T00:00:00.030000Z\ta0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+                    """;
+            assertQueryCheckWal(expected);
+
+            // check symbol null was inserted as a null varch and not as an empty varchar
+            assertQuery("select * from dest where vch is null")
+                    .noLeakCheck()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tvch
+                            1970-01-01T00:00:00.020000Z\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertValueCannotReferenceTableColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("insert into balances values (1, ccy, 356.12)")
+                    .fails(32, "Invalid column: ccy");
+        });
+    }
+
+    @Test
+    public void testInsertValuesAsLambda() throws Exception {
+        assertQuery("insert into names values(select rnd_str('Tom', 'Anna', 'John', 'Tim', 'Kim', 'Jim'), rnd_str('Smith', 'Mason', 'Johnson', 'Thompson') from long_sequence(8))")
+                .fails(25, "query is not allowed here");
+    }
+
+    @Test
+    public void testInsertVarcharToDifferentTypeCol() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table src (ts timestamp, vch varchar, vch2 varchar, vch3 varchar) timestamp(ts) partition by day;");
+            execute("insert into src values (0, '1', '11111111-1111-1111-1111-111111111111', '2022-11-20T10:30:55.123Z');");
+            execute("insert into src values (20000, null, null, null);");
+            execute("insert into src values (30000, '2', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '-900');");
+
+            execute("create table dest (ts timestamp, s string, l long, sh short, i int, b byte, c char, f float, d double, u uuid, dt date, ts2 timestamp, sym symbol) timestamp(ts) partition by day;");
+            drainWalQueue();
+
+            execute("insert into dest select ts, vch, vch, vch, vch, vch, vch, vch, vch, vch2, vch3, vch3, vch from src;");
+
+            String expected = """
+                    ts\ts\tl\tsh\ti\tb\tc\tf\td\tu\tdt\tts2\tsym
+                    1970-01-01T00:00:00.000000Z\t1\t1\t1\t1\t1\t1\t1.0\t1.0\t11111111-1111-1111-1111-111111111111\t2022-11-20T10:30:55.123Z\t2022-11-20T10:30:55.123000Z\t1
+                    1970-01-01T00:00:00.020000Z\t\tnull\t0\tnull\t0\t\tnull\tnull\t\t\t\t
+                    1970-01-01T00:00:00.030000Z\t2\t2\t2\t2\t2\t2\t2.0\t2.0\ta0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\t1969-12-31T23:59:59.100Z\t1969-12-31T23:59:59.999100Z\t2
+                    """;
+            assertQueryCheckWal(expected);
+
+            // check varchar null was inserted as a null string and not as an empty string
+            assertQuery("select * from dest where s is null")
+                    .noLeakCheck()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\ts\tl\tsh\ti\tb\tc\tf\td\tu\tdt\tts2\tsym
+                            1970-01-01T00:00:00.020000Z\t\tnull\t0\tnull\t0\t\tnull\tnull\t\t\t\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testInsertWithLessColumnsThanExistingTable() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab(seq long, ts timestamp) timestamp(ts);");
+            assertQuery("insert into tab select x ac  from long_sequence(10)")
+                    .fails(12, "select clause must provide timestamp column");
+        });
+    }
+
+    @Test
+    public void testInsertWithWrongDesignatedColumn() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab(seq long, ts timestamp) timestamp(ts);");
+            assertQuery("insert into tab select * from (select  timestamp_sequence(0, x) ts, x ac from long_sequence(10)) timestamp(ts)")
+                    .fails(12, "designated timestamp of existing table");
+        });
+    }
+
+    @Test
+    public void testInsertWithoutDesignatedTimestamp() throws Exception {
+        final String expected = """
+                seq\tts
+                1\t1970-01-01T00:00:00.000000Z
+                2\t1970-01-01T00:00:00.000001Z
+                3\t1970-01-01T00:00:00.000003Z
+                4\t1970-01-01T00:00:00.000006Z
+                5\t1970-01-01T00:00:00.000010Z
+                6\t1970-01-01T00:00:00.000015Z
+                7\t1970-01-01T00:00:00.000021Z
+                8\t1970-01-01T00:00:00.000028Z
+                9\t1970-01-01T00:00:00.000036Z
+                10\t1970-01-01T00:00:00.000045Z
+                """;
+
+        if (walEnabled) {
+            drainWalQueue();
+        }
+        assertQuery("tab")
+                .ddl("create table tab(seq long, ts timestamp) timestamp(ts);")
+                .timestamp("ts")
+                .mutateWith("insert into tab select x ac, timestamp_sequence(0, x) ts from long_sequence(10)")
+                .expectSize()
+                .returns("seq\tts\n", expected);
+    }
+
+    @Test
+    public void testInsertWithoutDesignatedTimestampAndTypeDoesNotMatch() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tab(seq long, ts timestamp) timestamp(ts);");
+            assertQuery("insert into tab select x ac, rnd_int() id from long_sequence(10)")
+                    .fails(12, "expected timestamp column");
+        });
+    }
+
+    @Test
+    public void testInsertWrongTypeConstant() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table test (a timestamp)", sqlExecutionContext);
+            assertQuery("insert into test values ('foobar')")
+                    .fails(0, "inconvertible value: `foobar` [STRING -> TIMESTAMP]");
+            assertQuery("insert into test values ('foobar'::varchar)")
+                    .fails(0, "inconvertible value: `foobar` [VARCHAR -> TIMESTAMP]");
+        });
+    }
+
+    @Test
+    public void testVarcharMixedAscii() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table test (a varchar, b varchar, ts timestamp) timestamp(ts) partition by day");
+            execute("insert into test values ('a', 'b', 0)");
+            execute("insert into test values ('2HEz*Dq', 'cVԕΖVq', 0)");
+            execute("insert into test values ('Ɨ\uDA83\uDD95\uD9ED\uDF4C눻D\uDBA8\uDFB6qٽUY⚂խ:', 'C>Wy;', 0)");
+            execute("insert into test values ('6tuU}+8mV', null, 0)");
+            execute("insert into test values ('te', '葈ﾫ!\uD8F3\uDD99Ҧ\uDB8D\uDFC8R\uD988\uDCEEOa*', 0)");
+            execute("insert into test values ('+٘ˣ聉|凜-،W.ƣ', '1);86rU)', 0)");
+            execute("insert into test values ('{[pG5d^fG>v [6', 'Ȕ\uDB75\uDF17ߚ`ŷ֪', 0)");
+
+            drainWalQueue();
+
+            assertQuery("test")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            a\tb\tts
+                            a\tb\t1970-01-01T00:00:00.000000Z
+                            2HEz*Dq\tcVԕΖVq\t1970-01-01T00:00:00.000000Z
+                            Ɨ\uDA83\uDD95\uD9ED\uDF4C눻D\uDBA8\uDFB6qٽUY⚂խ:\tC>Wy;\t1970-01-01T00:00:00.000000Z
+                            6tuU}+8mV\t\t1970-01-01T00:00:00.000000Z
+                            te\t葈ﾫ!\uD8F3\uDD99Ҧ\uDB8D\uDFC8R\uD988\uDCEEOa*\t1970-01-01T00:00:00.000000Z
+                            +٘ˣ聉|凜-،W.ƣ\t1);86rU)\t1970-01-01T00:00:00.000000Z
+                            {[pG5d^fG>v [6\tȔ\uDB75\uDF17ߚ`ŷ֪\t1970-01-01T00:00:00.000000Z
+                            """);
+
+            execute("create table y as (select * from test) timestamp(ts) partition by day");
+
+            drainWalQueue();
+
+            assertQuery("y")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            a\tb\tts
+                            a\tb\t1970-01-01T00:00:00.000000Z
+                            2HEz*Dq\tcVԕΖVq\t1970-01-01T00:00:00.000000Z
+                            Ɨ\uDA83\uDD95\uD9ED\uDF4C눻D\uDBA8\uDFB6qٽUY⚂խ:\tC>Wy;\t1970-01-01T00:00:00.000000Z
+                            6tuU}+8mV\t\t1970-01-01T00:00:00.000000Z
+                            te\t葈ﾫ!\uD8F3\uDD99Ҧ\uDB8D\uDFC8R\uD988\uDCEEOa*\t1970-01-01T00:00:00.000000Z
+                            +٘ˣ聉|凜-،W.ƣ\t1);86rU)\t1970-01-01T00:00:00.000000Z
+                            {[pG5d^fG>v [6\tȔ\uDB75\uDF17ߚ`ŷ֪\t1970-01-01T00:00:00.000000Z
+                            """);
+
+            // sort rows without using rowid
+            assertQuery("'*!*y' order by a, b")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a\tb\tts
+                            +٘ˣ聉|凜-،W.ƣ\t1);86rU)\t1970-01-01T00:00:00.000000Z
+                            2HEz*Dq\tcVԕΖVq\t1970-01-01T00:00:00.000000Z
+                            6tuU}+8mV\t\t1970-01-01T00:00:00.000000Z
+                            a\tb\t1970-01-01T00:00:00.000000Z
+                            te\t葈ﾫ!\uD8F3\uDD99Ҧ\uDB8D\uDFC8R\uD988\uDCEEOa*\t1970-01-01T00:00:00.000000Z
+                            {[pG5d^fG>v [6\tȔ\uDB75\uDF17ߚ`ŷ֪\t1970-01-01T00:00:00.000000Z
+                            Ɨ\uDA83\uDD95\uD9ED\uDF4C눻D\uDBA8\uDFB6qٽUY⚂խ:\tC>Wy;\t1970-01-01T00:00:00.000000Z
+                            """);
+        });
+    }
+
+    private void assertInsertTimestamp(String expected, String ddl2, Class<?> exceptionType, boolean commitInsert, String timestampType) throws Exception {
+        assertMemoryLeak(() -> {
+            if (commitInsert) {
+                execute("create table tab(seq long, ts #TIMESTAMP_TYPE) timestamp(ts) partition by day".replace("#TIMESTAMP_TYPE", timestampType));
+                try {
+                    execute(ddl2);
+                    if (exceptionType != null) {
+                        Assert.fail("SqlException expected");
+                    }
+                    if (walEnabled) {
+                        drainWalQueue();
+                    }
+                    assertQuery("tab")
+                            .noLeakCheck()
+                            .expectSize()
+                            .timestamp("ts")
+                            .returns(expected);
+                } catch (Throwable e) {
+                    if (exceptionType == null) {
+                        throw e;
+                    }
+                    Assert.assertSame(exceptionType, e.getClass());
+                    TestUtils.assertContains(e.getMessage(), expected);
+                }
+            } else {
+                execute("create table tab(seq long, ts #TIMESTAMP_TYPE) timestamp(ts) partition by day".replace("#TIMESTAMP_TYPE", timestampType));
+                try {
+                    execute(ddl2);
+                    if (exceptionType != null) {
+                        Assert.fail("SqlException expected");
+                    }
+                    if (walEnabled) {
+                        drainWalQueue();
+                    }
+                    assertQuery("tab")
+                            .noLeakCheck()
+                            .expectSize()
+                            .timestamp("ts")
+                            .returns(expected);
+                } catch (Throwable e) {
+                    if (exceptionType == null) throw e;
+                    Assert.assertSame(exceptionType, e.getClass());
+                    TestUtils.assertContains(e.getMessage(), expected);
+                }
+            }
+
+            execute("drop table tab");
+
+            if (commitInsert) {
+                execute("create table tab(seq long, ts #TIMESTAMP_TYPE)".replace("#TIMESTAMP_TYPE", timestampType));
+                try {
+                    execute(ddl2);
+                    if (exceptionType != null) {
+                        Assert.fail("SqlException expected");
+                    }
+                    assertQuery("tab")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns(expected);
+                } catch (Throwable e) {
+                    if (exceptionType == null) throw e;
+                    Assert.assertSame(exceptionType, e.getClass());
+                    TestUtils.assertContains(e.getMessage(), expected);
+                }
+            } else {
+                execute("create table tab(seq long, ts #TIMESTAMP_TYPE)".replace("#TIMESTAMP_TYPE", timestampType));
+                try {
+                    execute(ddl2, sqlExecutionContext);
+                    if (exceptionType != null) {
+                        Assert.fail("SqlException expected");
+                    }
+                    assertQuery("tab")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns(expected);
+                } catch (Throwable e) {
+                    e.printStackTrace(System.out);
+                    if (exceptionType == null) throw e;
+                    Assert.assertSame(exceptionType, e.getClass());
+                    TestUtils.assertContains(e.getMessage(), expected);
+                }
+            }
+        });
+    }
+
+    private void assertQueryCheckWal(String expected) throws Exception {
+        if (walEnabled) {
+            drainWalQueue();
+        }
+
+        assertQuery("dest")
+                .noLeakCheck()
+                .timestamp("ts")
+                .expectSize()
+                .returns(expected);
+    }
+
+    private void testBindVariableInsert(int partitionBy, TimestampFunction timestampFunction, boolean initBindVariables, boolean columnSet, int timestampType) throws Exception {
+        assertMemoryLeak(() -> {
+            CreateTableTestUtils.createAllTableWithNewTypes(engine, partitionBy, timestampType);
+            // this is BLOB
+            byte[] blob = new byte[500];
+            TestBinarySequence bs = new TestBinarySequence();
+            bs.of(blob);
+            Rnd rnd = new Rnd();
+
+            if (initBindVariables) {
+                // this is type declaration to have query compile correctly
+                bindVariableService.setInt(0, 0);
+                bindVariableService.setShort(1, (short) 10);
+                bindVariableService.setByte(2, (byte) 91);
+                bindVariableService.setDouble(3, 9.2);
+                bindVariableService.setFloat(4, 5.6f);
+                bindVariableService.setLong(5, 99901);
+                bindVariableService.setStr(6, "hello kitty");
+                bindVariableService.setStr(7, "sym?");
+                bindVariableService.setBoolean(8, true);
+                bindVariableService.setBin(9, bs);
+                bindVariableService.setDate(10, 1234L);
+                bindVariableService.setLong256(11, 1, 2, 3, 4);
+                bindVariableService.setChar(12, 'A');
+                bindVariableService.setStr(13, "a07934b2-a15d-48e0-9509-88dbaca49734");
+                bindVariableService.setStr(14, "192.0.0.1");
+                bindVariableService.setStr(15, "foo bar");
+                bindVariableService.setTimestamp(16, timestampFunction.getTimestamp());
+            }
+
+            final String sql;
+            if (columnSet) {
+                sql = "insert into all2 (" + "int, " + "short, " + "byte, " + "double, " + "float, " + "long, " + "str, " + "sym, " + "bool, " + "bin, " + "date, " + "long256, " + "chr, " + "uuid, " + "ipv4, " + "varchar, " + "timestamp" + ") values (" + "$1, " + "$2, " + "$3, " + "$4, " + "$5, " + "$6, " + "$7, " + "$8, " + "$9, " + "$10, " + "$11, " + "$12, " + "$13, " + "$14, " + "$15, " + "$16, " + "$17)";
+            } else {
+                sql = "insert into all2 values (" + "$1, " + "$2, " + "$3, " + "$4, " + "$5, " + "$6, " + "$7, " + "$8, " + "$9, " + "$10, " + "$11, " + "$12, " + "$13, " + "$14, " + "$15, " + "$16, " + "$17)";
+            }
+
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                final CompiledQuery cq = compiler.compile(sql, sqlExecutionContext);
+                Assert.assertEquals(CompiledQuery.INSERT, cq.getType());
+                try (InsertOperation insert = cq.popInsertOperation();
+                     InsertMethod method = insert.createMethod(sqlExecutionContext)) {
+                    for (int i = 0; i < 10_000; i++) {
+                        bindVariableService.setInt(0, rnd.nextInt());
+                        bindVariableService.setShort(1, rnd.nextShort());
+                        bindVariableService.setByte(2, rnd.nextByte());
+                        bindVariableService.setDouble(3, rnd.nextDouble());
+                        bindVariableService.setFloat(4, rnd.nextFloat());
+                        bindVariableService.setLong(5, rnd.nextLong());
+                        bindVariableService.setStr(6, rnd.nextChars(6));
+                        bindVariableService.setStr(7, rnd.nextChars(1));
+                        bindVariableService.setBoolean(8, rnd.nextBoolean());
+                        rnd.nextBytes(blob);
+                        bindVariableService.setBin(9, bs);
+                        bindVariableService.setDate(10, rnd.nextLong());
+                        bindVariableService.setLong256(11, rnd.nextLong(), rnd.nextLong(), rnd.nextLong(), rnd.nextLong());
+                        bindVariableService.setChar(12, rnd.nextChar());
+                        sink.clear();
+                        Numbers.appendUuid(rnd.nextLong(), rnd.nextLong(), sink);
+                        bindVariableService.setStr(13, sink);
+                        sink.clear();
+                        Numbers.intToIPv4Sink(sink, rnd.nextInt());
+                        bindVariableService.setStr(14, sink);
+                        bindVariableService.setStr(15, rnd.nextChars(16));
+                        bindVariableService.setTimestamp(16, timestampFunction.getTimestamp());
+                        method.execute(sqlExecutionContext);
+                    }
+                    method.commit();
+                }
+            }
+
+            rnd.reset();
+            try (
+                    TableReader reader = getReader("all2");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                final Record record = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    Assert.assertEquals(rnd.nextInt(), record.getInt(0));
+                    Assert.assertEquals(rnd.nextShort(), record.getShort(1));
+                    Assert.assertEquals(rnd.nextByte(), record.getByte(2));
+                    Assert.assertEquals(rnd.nextDouble(), record.getDouble(3), 0.0001);
+                    Assert.assertEquals(rnd.nextFloat(), record.getFloat(4), 0.000001);
+                    Assert.assertEquals(rnd.nextLong(), record.getLong(5));
+                    TestUtils.assertEquals(rnd.nextChars(6), record.getStrA(6));
+                    TestUtils.assertEquals(rnd.nextChars(1), record.getSymA(7));
+                    Assert.assertEquals(rnd.nextBoolean(), record.getBool(8));
+                    rnd.nextBytes(blob);
+                    BinarySequence binarySequence = record.getBin(9);
+                    Assert.assertEquals(blob.length, binarySequence.length());
+                    for (int j = 0, m = blob.length; j < m; j++) {
+                        Assert.assertEquals(blob[j], binarySequence.byteAt(j));
+                    }
+                    Assert.assertEquals(rnd.nextLong(), record.getDate(10));
+                    Long256 long256 = record.getLong256A(11);
+                    Assert.assertEquals(rnd.nextLong(), long256.getLong0());
+                    Assert.assertEquals(rnd.nextLong(), long256.getLong1());
+                    Assert.assertEquals(rnd.nextLong(), long256.getLong2());
+                    Assert.assertEquals(rnd.nextLong(), long256.getLong3());
+                    Assert.assertEquals(rnd.nextChar(), record.getChar(12));
+                    Assert.assertEquals(rnd.nextLong(), record.getLong128Lo(13));
+                    Assert.assertEquals(rnd.nextLong(), record.getLong128Hi(13));
+                    Assert.assertEquals(rnd.nextInt(), record.getInt(14));
+                    TestUtils.assertEquals(rnd.nextChars(16), record.getVarcharA(15));
+                }
+            }
+        });
+    }
+
+    private void testInsertAsSelectWithOrderBy(String orderByClause) throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table src (ts timestamp, v long) timestamp(ts) partition by day;");
+            execute("insert into src values (0, 0);");
+            execute("insert into src values (10000, 1);");
+            execute("insert into src values (20000, 2);");
+            execute("insert into src values (30000, 3);");
+            execute("insert into src values (40000, 4);");
+
+            execute("create table dest (ts timestamp, v long) timestamp(ts) partition by day;");
+            drainWalQueue();
+
+            execute("insert into dest select * from src where v % 2 = 0 " + orderByClause + ";");
+
+            String expected = """
+                    ts\tv
+                    1970-01-01T00:00:00.000000Z\t0
+                    1970-01-01T00:00:00.020000Z\t2
+                    1970-01-01T00:00:00.040000Z\t4
+                    """;
+
+            assertQueryCheckWal(expected);
+        });
+    }
+
+    private void testInsertAsSelectWithOrderByWithNanoTS(String orderByClause) throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table src (ts timestamp_ns, v long) timestamp(ts) partition by day;");
+            execute("insert into src values (0, 0);");
+            execute("insert into src values (10000000, 1);");
+            execute("insert into src values (20000000, 2);");
+            execute("insert into src values (30000000, 3);");
+            execute("insert into src values (40000000, 4);");
+
+            execute("create table dest (ts timestamp_ns, v long) timestamp(ts) partition by day;");
+            drainWalQueue();
+
+            execute("insert into dest select * from src where v % 2 = 0 " + orderByClause + ";");
+
+            String expected = """
+                    ts\tv
+                    1970-01-01T00:00:00.000000000Z\t0
+                    1970-01-01T00:00:00.020000000Z\t2
+                    1970-01-01T00:00:00.040000000Z\t4
+                    """;
+
+            assertQueryCheckWal(expected);
+        });
+    }
+
+    @FunctionalInterface
+    private interface TimestampFunction {
+        long getTimestamp();
+    }
+}

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,28 +25,30 @@
 package io.questdb.griffin.engine.functions.date;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.StrFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
+import io.questdb.std.FiberLocal;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.DateLocale;
-import io.questdb.std.datetime.microtime.TimestampFormatCompiler;
-import io.questdb.std.str.CharSink;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf16Sink;
 import org.jetbrains.annotations.Nullable;
 
 public class ToStrTimestampFunctionFactory implements FunctionFactory {
 
-    private static final ThreadLocal<TimestampFormatCompiler> tlCompiler = ThreadLocal.withInitial(TimestampFormatCompiler::new);
-    private static final ThreadLocal<StringSink> tlSink = ThreadLocal.withInitial(StringSink::new);
+    private static final FiberLocal<StringSink> tlSink = new FiberLocal<>(StringSink::new);
 
     @Override
     public String getSignature() {
@@ -62,16 +64,16 @@ public class ToStrTimestampFunctionFactory implements FunctionFactory {
             SqlExecutionContext sqlExecutionContext
     ) throws SqlException {
         Function fmt = args.getQuick(1);
-        CharSequence format = fmt.getStr(null);
+        CharSequence format = fmt.getStrA(null);
         if (format == null) {
             throw SqlException.$(argPositions.getQuick(1), "format must not be null");
         }
-
-        DateFormat timestampFormat = tlCompiler.get().compile(fmt.getStr(null));
         Function var = args.getQuick(0);
+        TimestampDriver driver = ColumnType.getTimestampDriver(ColumnType.getHigherPrecisionTimestampType(ColumnType.getTimestampType(var.getType()), ColumnType.TIMESTAMP_MICRO));
+        DateFormat timestampFormat = driver.getTimestampDateFormatFactory().get(fmt.getStrA(null));
         if (var.isConstant()) {
             long value = var.getTimestamp(null);
-            if (value == Numbers.LONG_NaN) {
+            if (value == Numbers.LONG_NULL) {
                 return StrConstant.NULL;
             }
 
@@ -88,15 +90,15 @@ public class ToStrTimestampFunctionFactory implements FunctionFactory {
         final Function arg;
         final DateFormat format;
         final DateLocale locale;
-        final StringSink sink1;
-        final StringSink sink2;
+        final StringSink sinkA;
+        final StringSink sinkB;
 
         public ToCharDateFFunc(Function arg, DateFormat format, DateLocale timestampLocale) {
             this.arg = arg;
             this.format = format;
             locale = timestampLocale;
-            sink1 = new StringSink();
-            sink2 = new StringSink();
+            sinkA = new StringSink();
+            sinkB = new StringSink();
         }
 
         @Override
@@ -105,47 +107,48 @@ public class ToStrTimestampFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public CharSequence getStr(Record rec) {
-            return toSink(rec, sink1);
+        public CharSequence getStrA(Record rec) {
+            return toSink(rec, sinkA);
         }
 
         @Override
         public CharSequence getStrB(Record rec) {
-            return toSink(rec, sink2);
-        }
-
-        @Override
-        public void getStr(Record rec, CharSink sink) {
-            long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
-                return;
-            }
-            toSink(value, sink);
+            return toSink(rec, sinkB);
         }
 
         @Override
         public int getStrLen(Record rec) {
             long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
-                return -1;
+            if (value != Numbers.LONG_NULL) {
+                sinkA.clear();
+                toSink(value, sinkA);
+                return sinkA.length();
             }
-            sink1.clear();
-            toSink(value, sink1);
-            return sink1.length();
+            return -1;
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("to_str(").val(arg).val(')');
         }
 
         @Nullable
         private CharSequence toSink(Record rec, StringSink sink) {
             final long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
-                return null;
+            if (value != Numbers.LONG_NULL) {
+                sink.clear();
+                toSink(value, sink);
+                return sink;
             }
-            sink.clear();
-            toSink(value, sink);
-            return sink;
+            return null;
         }
 
-        private void toSink(long value, CharSink sink) {
+        private void toSink(long value, Utf16Sink sink) {
             format.format(value, locale, "Z", sink);
         }
     }

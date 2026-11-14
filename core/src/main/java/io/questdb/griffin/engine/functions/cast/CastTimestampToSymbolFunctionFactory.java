@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.SymbolFunction;
@@ -50,7 +51,7 @@ public class CastTimestampToSymbolFunctionFactory implements FunctionFactory {
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
         final Function arg = args.getQuick(0);
         if (arg.isConstant()) {
-            final StringSink sink = Misc.getThreadLocalBuilder();
+            final StringSink sink = Misc.getThreadLocalSink();
             sink.put(arg.getTimestamp(null));
             return SymbolConstant.newInstance(sink);
         }
@@ -60,7 +61,11 @@ public class CastTimestampToSymbolFunctionFactory implements FunctionFactory {
     private static class Func extends SymbolFunction implements UnaryFunction {
         private final Function arg;
         private final StringSink sink = new StringSink();
-        private final LongIntHashMap symbolTableShortcut = new LongIntHashMap();
+        // The sentinel is Numbers.LONG_NULL rather than the default -1 so that -1
+        // (a perfectly legal TIMESTAMP input -- 1us before the epoch) can be stored
+        // as a key without colliding with the "empty slot" marker. LONG_NULL itself
+        // never reaches this map because it is filtered upstream in getInt()/getSymbol().
+        private final LongIntHashMap symbolTableShortcut = new LongIntHashMap(16, 0.5, Numbers.LONG_NULL);
         private final ObjList<String> symbols = new ObjList<>();
         private int next = 1;
 
@@ -75,44 +80,9 @@ public class CastTimestampToSymbolFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public CharSequence getSymbol(Record rec) {
-            final long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
-                return null;
-            }
-
-            final int keyIndex = symbolTableShortcut.keyIndex(value);
-            if (keyIndex < 0) {
-                return symbols.getQuick(symbolTableShortcut.valueAt(keyIndex));
-            }
-
-            symbolTableShortcut.putAt(keyIndex, value, next++);
-            sink.clear();
-            sink.put(value);
-            final String str = Chars.toString(sink);
-            symbols.add(Chars.toString(sink));
-            return str;
-        }
-
-        @Override
-        public CharSequence getSymbolB(Record rec) {
-            return getSymbol(rec);
-        }
-
-        @Override
-        public CharSequence valueOf(int symbolKey) {
-            return symbols.getQuick(TableUtils.toIndexKey(symbolKey));
-        }
-
-        @Override
-        public CharSequence valueBOf(int key) {
-            return valueOf(key);
-        }
-
-        @Override
         public int getInt(Record rec) {
             final long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
+            if (value == Numbers.LONG_NULL) {
                 return SymbolTable.VALUE_IS_NULL;
             }
 
@@ -129,8 +99,28 @@ public class CastTimestampToSymbolFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public boolean isSymbolTableStatic() {
-            return false;
+        public CharSequence getSymbol(Record rec) {
+            final long value = arg.getTimestamp(rec);
+            if (value == Numbers.LONG_NULL) {
+                return null;
+            }
+
+            final int keyIndex = symbolTableShortcut.keyIndex(value);
+            if (keyIndex < 0) {
+                return symbols.getQuick(symbolTableShortcut.valueAt(keyIndex));
+            }
+
+            symbolTableShortcut.putAt(keyIndex, value, next++);
+            sink.clear();
+            sink.put(value);
+            final String str = Chars.toString(sink);
+            symbols.add(str);
+            return str;
+        }
+
+        @Override
+        public CharSequence getSymbolB(Record rec) {
+            return getSymbol(rec);
         }
 
         @Override
@@ -143,13 +133,41 @@ public class CastTimestampToSymbolFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public boolean isSymbolTableStatic() {
+            return false;
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
         public @Nullable SymbolTable newSymbolTable() {
-            Func copy = new Func(arg);
-            copy.symbolTableShortcut.putAll(this.symbolTableShortcut);
-            copy.symbols.clear();
-            copy.symbols.addAll(this.symbols);
-            copy.next = this.next;
-            return copy;
+            return new CastToSymbolTable(symbols);
+        }
+
+        @Override
+        public boolean supportsKeyValueAccess() {
+            // getInt() mints a key with one probe on the decoded scalar, never by hashing the row's
+            // text, and valueOf() resolves it by indexing symbols. A key consumer such as QWP egress
+            // should therefore encode each distinct value once instead of re-encoding it per row.
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(arg).val("::symbol");
+        }
+
+        @Override
+        public CharSequence valueBOf(int key) {
+            return valueOf(key);
+        }
+
+        @Override
+        public CharSequence valueOf(int symbolKey) {
+            return symbols.getQuick(TableUtils.toIndexKey(symbolKey));
         }
     }
 }

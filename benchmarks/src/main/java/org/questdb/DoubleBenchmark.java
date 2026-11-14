@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -53,13 +53,8 @@ public class DoubleBenchmark {
     }
 
     @Benchmark
-    public long testToLong() {
-        return Double.doubleToLongBits(x);
-    }
-
-    @Benchmark
-    public double testStraight() {
-        return x;
+    public boolean testBitFiddle() {
+        return (Double.doubleToLongBits(x) & EXP_BIT_MASK) == EXP_BIT_MASK;
     }
 
     @Benchmark
@@ -68,7 +63,12 @@ public class DoubleBenchmark {
     }
 
     @Benchmark
-    public boolean testBitFiddle() {
-        return (Double.doubleToLongBits(x) & EXP_BIT_MASK) == EXP_BIT_MASK;
+    public double testStraight() {
+        return x;
+    }
+
+    @Benchmark
+    public long testToLong() {
+        return Double.doubleToLongBits(x);
     }
 }

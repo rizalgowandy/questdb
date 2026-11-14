@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,14 +29,8 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.StrFunction;
-import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
-import io.questdb.std.Chars;
-import io.questdb.std.IntList;
-import io.questdb.std.Misc;
-import io.questdb.std.ObjList;
-import io.questdb.std.str.CharSink;
+import io.questdb.std.*;
 import io.questdb.std.str.StringSink;
 
 public class CastFloatToStrFunctionFactory implements FunctionFactory {
@@ -48,60 +42,43 @@ public class CastFloatToStrFunctionFactory implements FunctionFactory {
 
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
-        Function intFunc = args.getQuick(0);
-        if (intFunc.isConstant()) {
-            final StringSink sink = Misc.getThreadLocalBuilder();
-            sink.put(intFunc.getFloat(null), configuration.getFloatToStrCastScale());
+        Function floatFunc = args.getQuick(0);
+        if (floatFunc.isConstant()) {
+            final StringSink sink = Misc.getThreadLocalSink();
+            sink.put(floatFunc.getFloat(null));
             return new StrConstant(Chars.toString(sink));
         }
-        return new Func(args.getQuick(0), configuration.getFloatToStrCastScale());
+        return new Func(args.getQuick(0));
     }
 
-    private static class Func extends StrFunction implements UnaryFunction {
-        private final Function arg;
+    public static class Func extends AbstractCastToStrFunction {
         private final StringSink sinkA = new StringSink();
         private final StringSink sinkB = new StringSink();
-        private final int scale;
 
-        public Func(Function arg, int scale) {
-            this.arg = arg;
-            this.scale = scale;
+        public Func(Function arg) {
+            super(arg);
         }
 
         @Override
-        public Function getArg() {
-            return arg;
-        }
-
-        @Override
-        public CharSequence getStr(Record rec) {
+        public CharSequence getStrA(Record rec) {
             final float value = arg.getFloat(rec);
-            if (Float.isNaN(value)) {
+            if (Numbers.isNull(value)) {
                 return null;
             }
             sinkA.clear();
-            sinkA.put(value, 4);
+            sinkA.put(value);
             return sinkA;
         }
 
         @Override
         public CharSequence getStrB(Record rec) {
             final float value = arg.getFloat(rec);
-            if (Float.isNaN(value)) {
+            if (Numbers.isNull(value)) {
                 return null;
             }
             sinkB.clear();
-            sinkB.put(value, 4);
+            sinkB.put(value);
             return sinkB;
-        }
-
-        @Override
-        public void getStr(Record rec, CharSink sink) {
-            final float value = arg.getFloat(rec);
-            if (Float.isNaN(value)) {
-                return;
-            }
-            sink.put(value, scale);
         }
     }
 }

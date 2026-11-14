@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,197 +25,285 @@
 package io.questdb.cutlass.http.processors;
 
 import io.questdb.Metrics;
-import io.questdb.Telemetry;
+import io.questdb.TelemetryOrigin;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoError;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.EntryUnavailableException;
-import io.questdb.cairo.sql.OperationFuture;
+import io.questdb.cairo.ImplicitCastException;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.sql.InsertOperation;
 import io.questdb.cairo.sql.NetworkSqlExecutionCircuitBreaker;
-import io.questdb.cairo.sql.ReaderOutOfDateException;
+import io.questdb.cairo.sql.OperationFuture;
+import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.cutlass.http.*;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
+import io.questdb.cutlass.http.ActiveConnectionTracker;
+import io.questdb.cutlass.http.HttpChunkedResponse;
+import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpConstants;
+import io.questdb.cutlass.http.HttpException;
+import io.questdb.cutlass.http.HttpRequestHandler;
+import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestProcessor;
+import io.questdb.cutlass.http.LocalValue;
 import io.questdb.cutlass.http.ex.RetryOperationException;
 import io.questdb.cutlass.text.Utf8Exception;
-import io.questdb.griffin.*;
-import io.questdb.griffin.engine.ops.UpdateOperation;
+import io.questdb.griffin.CompiledQuery;
+import io.questdb.griffin.ReadOnlyStatementGate;
+import io.questdb.griffin.SqlCompiler;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.SqlTimeoutException;
+import io.questdb.griffin.engine.ops.Operation;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import io.questdb.mp.SCSequence;
 import io.questdb.network.NoSpaceLeftInResponseBufferException;
 import io.questdb.network.PeerDisconnectedException;
 import io.questdb.network.PeerIsSlowToReadException;
-import io.questdb.network.ServerDisconnectException;
-import io.questdb.std.*;
-import io.questdb.std.str.DirectByteCharSequence;
+import io.questdb.std.Chars;
+import io.questdb.std.FlyweightMessageContainer;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjList;
+import io.questdb.std.datetime.Clock;
+import io.questdb.std.str.DirectUtf8Sequence;
 import io.questdb.std.str.Path;
-import org.jetbrains.annotations.Nullable;
-import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
+import java.util.concurrent.locks.Lock;
 
-public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
+import static io.questdb.cutlass.http.HttpConstants.URL_PARAM_LIMIT;
+import static io.questdb.cutlass.http.HttpConstants.URL_PARAM_QUERY;
+import static java.net.HttpURLConnection.*;
 
-    private static final LocalValue<JsonQueryProcessorState> LV = new LocalValue<>();
+public class JsonQueryProcessor implements HttpRequestProcessor, HttpRequestHandler, Closeable {
+
     private static final Log LOG = LogFactory.getLog(JsonQueryProcessor.class);
-
+    private static final LocalValue<JsonQueryProcessorState> LV = new LocalValue<>();
     protected final ObjList<QueryExecutor> queryExecutors = new ObjList<>();
-    private final SqlCompiler compiler;
-    private final JsonQueryProcessorConfiguration configuration;
-    private final SqlExecutionContextImpl sqlExecutionContext;
-    private final Path path = new Path();
-    private final NanosecondClock nanosecondClock;
-    private final NetworkSqlExecutionCircuitBreaker circuitBreaker;
-    private final Metrics metrics;
+    private final long asyncCommandTimeout;
     private final long asyncWriterStartTimeout;
-    private final long asyncWriterFullTimeoutNs;
-
-    @TestOnly
-    public JsonQueryProcessor(
-            JsonQueryProcessorConfiguration configuration,
-            CairoEngine engine,
-            int workerCount
-    ) {
-        this(configuration, engine, workerCount, null, null);
-    }
+    private final JsonQueryProcessorConfiguration configuration;
+    private final CairoEngine engine;
+    private final int maxSqlRecompileAttempts;
+    private final Metrics metrics;
+    private final Clock nanosecondClock;
+    private final Path path;
+    private final byte requiredAuthType;
+    private final int sharedWorkerCount;
 
     public JsonQueryProcessor(
             JsonQueryProcessorConfiguration configuration,
             CairoEngine engine,
-            int workerCount,
-            @Nullable FunctionFactoryCache functionFactoryCache,
-            @Nullable DatabaseSnapshotAgent snapshotAgent
+            int sharedQueryWorkerCount
     ) {
-        this(configuration, engine, new SqlCompiler(engine, functionFactoryCache, snapshotAgent), new SqlExecutionContextImpl(engine, workerCount));
-    }
+        try {
+            this.configuration = configuration;
+            this.path = new Path();
+            this.engine = engine;
+            this.sharedWorkerCount = sharedQueryWorkerCount;
+            requiredAuthType = configuration.getRequiredAuthType();
 
-    public JsonQueryProcessor(
-            JsonQueryProcessorConfiguration configuration,
-            CairoEngine engine,
-            SqlCompiler sqlCompiler,
-            SqlExecutionContextImpl sqlExecutionContext
-    ) {
-        this.configuration = configuration;
-        this.compiler = sqlCompiler;
-        final QueryExecutor sendConfirmation = this::updateMetricsAndSendConfirmation;
-        this.queryExecutors.extendAndSet(CompiledQuery.SELECT, this::executeNewSelect);
-        this.queryExecutors.extendAndSet(CompiledQuery.INSERT, this::executeInsert);
-        this.queryExecutors.extendAndSet(CompiledQuery.UPDATE, this::executeUpdate);
-        this.queryExecutors.extendAndSet(CompiledQuery.TRUNCATE, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.ALTER, this::executeAlterTable);
-        this.queryExecutors.extendAndSet(CompiledQuery.REPAIR, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.SET, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.BEGIN, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.COMMIT, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.ROLLBACK, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.DROP, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.RENAME_TABLE, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.COPY_LOCAL, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.CREATE_TABLE, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.INSERT_AS_SELECT, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.COPY_REMOTE, JsonQueryProcessor::cannotCopyRemote);
-        this.queryExecutors.extendAndSet(CompiledQuery.BACKUP_TABLE, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.CREATE_TABLE_AS_SELECT, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.SNAPSHOT_DB_PREPARE, sendConfirmation);
-        this.queryExecutors.extendAndSet(CompiledQuery.SNAPSHOT_DB_COMPLETE, sendConfirmation);
-        this.sqlExecutionContext = sqlExecutionContext;
-        this.nanosecondClock = engine.getConfiguration().getNanosecondClock();
-        this.circuitBreaker = new NetworkSqlExecutionCircuitBreaker(engine.getConfiguration().getCircuitBreakerConfiguration());
-        this.metrics = engine.getMetrics();
-        this.asyncWriterStartTimeout = engine.getConfiguration().getWriterAsyncCommandBusyWaitTimeout();
-        this.asyncWriterFullTimeoutNs = engine.getConfiguration().getWriterAsyncCommandMaxTimeout() * 1000;
+            final QueryExecutor sendConfirmation = this::updateMetricsAndSendConfirmation;
+            this.queryExecutors.extendAndSet(CompiledQuery.SELECT, this::executeNewSelect);
+            this.queryExecutors.extendAndSet(CompiledQuery.INSERT, this::executeInsert);
+            this.queryExecutors.extendAndSet(CompiledQuery.TRUNCATE, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.ALTER, this::executeAlterTable);
+            this.queryExecutors.extendAndSet(CompiledQuery.SET, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.DROP, this::executeDdl);
+            this.queryExecutors.extendAndSet(CompiledQuery.PSEUDO_SELECT, this::executePseudoSelect);
+            this.queryExecutors.extendAndSet(CompiledQuery.CREATE_TABLE, this::executeDdl);
+            this.queryExecutors.extendAndSet(CompiledQuery.INSERT_AS_SELECT, this::executeInsert);
+            this.queryExecutors.extendAndSet(CompiledQuery.COPY_REMOTE, JsonQueryProcessor::cannotCopyRemote);
+            this.queryExecutors.extendAndSet(CompiledQuery.RENAME_TABLE, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.REPAIR, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.UPDATE, this::executeUpdate);
+            this.queryExecutors.extendAndSet(CompiledQuery.VACUUM, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.BEGIN, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.COMMIT, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.ROLLBACK, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.CREATE_TABLE_AS_SELECT, this::executeDdl);
+            this.queryExecutors.extendAndSet(CompiledQuery.CHECKPOINT_CREATE, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.CHECKPOINT_RELEASE, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.DEALLOCATE, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.EXPLAIN, this::executeExplain);
+            this.queryExecutors.extendAndSet(CompiledQuery.TABLE_RESUME, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.TABLE_SUSPEND, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.TABLE_SET_TYPE, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.TABLE_REBASE, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.CREATE_USER, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.ALTER_USER, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.CANCEL_QUERY, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.EMPTY, (state, cq, keepAliveHeader) -> sendEmptyQueryNotice(state, keepAliveHeader));
+            this.queryExecutors.extendAndSet(CompiledQuery.CREATE_MAT_VIEW, this::executeDdl);
+            this.queryExecutors.extendAndSet(CompiledQuery.CREATE_LIVE_VIEW, this::executeDdl);
+            this.queryExecutors.extendAndSet(CompiledQuery.CREATE_VIEW, this::executeDdl);
+            this.queryExecutors.extendAndSet(CompiledQuery.COMPILE_VIEW, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.ALTER_VIEW, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.ALTER_STORAGE_POLICY, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.REFRESH_MAT_VIEW, sendConfirmation);
+            this.queryExecutors.extendAndSet(CompiledQuery.BACKUP_DATABASE, sendConfirmation);
+
+            // Query types start with 1 instead of 0, so we have to add 1 to the expected size.
+            assert this.queryExecutors.size() == (CompiledQuery.TYPES_COUNT + 1);
+            assert hasExecutorForEveryType(this.queryExecutors);
+            this.nanosecondClock = configuration.getNanosecondClock();
+            this.maxSqlRecompileAttempts = engine.getConfiguration().getMaxSqlRecompileAttempts();
+            this.metrics = engine.getMetrics();
+            this.asyncWriterStartTimeout = engine.getConfiguration().getWriterAsyncCommandBusyWaitTimeout();
+            this.asyncCommandTimeout = engine.getConfiguration().getWriterAsyncCommandMaxTimeout();
+        } catch (Throwable th) {
+            close();
+            throw th;
+        }
     }
 
     @Override
     public void close() {
-        Misc.free(compiler);
         Misc.free(path);
-        Misc.free(circuitBreaker);
     }
 
-    public void execute0(JsonQueryProcessorState state) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
-
+    public void execute0(JsonQueryProcessorState state) throws PeerDisconnectedException, PeerIsSlowToReadException {
         OperationFuture fut = state.getOperationFuture();
         final HttpConnectionContext context = state.getHttpConnectionContext();
+        NetworkSqlExecutionCircuitBreaker circuitBreaker = context.getOrCreateCircuitBreaker(engine);
+        SqlExecutionContextImpl sqlExecutionContext = context.getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+        sqlExecutionContext.setQueryFutureUpdateListener(configuration.getQueryFutureUpdateListener());
+        circuitBreaker.resetTimer();
 
         if (fut == null) {
-            metrics.jsonQuery().markStart();
+            metrics.jsonQueryMetrics().markStart();
             state.startExecutionTimer();
-            // do not set random for new request to avoid copying random from previous request into next one
-            // the only time we need to copy random from state is when we resume request execution
-            sqlExecutionContext.with(context.getCairoSecurityContext(), null, null, context.getFd(), circuitBreaker.of(context.getFd()));
-            if (state.getStatementTimeoutNs() > 0L) {
-                circuitBreaker.setMaxTime(state.getStatementTimeoutNs() / 1000L);
+            // do not set random for a new request to avoid copying random from previous request into next one
+            // the only time we need to copy random from the state is when we resume request execution
+            sqlExecutionContext.with(context.getSecurityContext(), null, null, context.getFd(), circuitBreaker.of(context.getFd()));
+            sqlExecutionContext.initNow();
+            if (state.getStatementTimeout() > 0L) {
+                circuitBreaker.setTimeout(state.getStatementTimeout());
             } else {
                 circuitBreaker.resetMaxTimeToDefault();
             }
-            state.info().$("exec [q='").utf8(state.getQuery()).$("']").$();
         }
 
         try {
+            state.mountSqlExecutionOwner();
             if (fut != null) {
                 retryQueryExecution(state, fut);
                 return;
             }
 
-            final RecordCursorFactory factory = QueryCache.getInstance().poll(state.getQuery());
+            final RecordCursorFactory factory = context.getSelectCache().poll(state.getSelectCacheKey(sqlExecutionContext.getSecurityContext()));
             if (factory != null) {
+                // queries with sensitive info are not cached, doLog = true
+                if (!state.isSqlExecutionOwnerStarted()) {
+                    try {
+                        state.beginSqlExecutionOwner(state.getQuery(), sqlExecutionContext, CompiledQuery.SELECT);
+                    } catch (RuntimeException | Error e) {
+                        // The cache poll transferred ownership to this request, but an admission
+                        // failure happened before executeCachedSelect() could hand it to the state.
+                        final Throwable cleanupFailure = Misc.freeBestEffort(null, factory);
+                        if (cleanupFailure != null && cleanupFailure != e) {
+                            e.addSuppressed(cleanupFailure);
+                        }
+                        throw e;
+                    }
+                }
                 try {
-                    sqlExecutionContext.storeTelemetry(CompiledQuery.SELECT, Telemetry.ORIGIN_HTTP_JSON);
-                    executeCachedSelect(
-                            state,
-                            factory,
-                            configuration.getKeepAliveHeader());
-                } catch (ReaderOutOfDateException e) {
-                    LOG.info().$(e.getFlyweightMessage()).$();
-                    Misc.free(factory);
-                    compileQuery(state);
+                    state.publishSqlExecutionOwner(false);
+                    sqlExecutionContext.storeTelemetry(CompiledQuery.SELECT, TelemetryOrigin.HTTP);
+                    executeCachedSelect(state, factory);
+                } catch (TableReferenceOutOfDateException e) {
+                    LOG.info().$safe(e.getFlyweightMessage()).$();
+                    compileAndExecuteQuery(state);
                 }
             } else {
                 // new query
-                compileQuery(state);
+                compileAndExecuteQuery(state);
             }
-        } catch (SqlException e) {
-            syntaxError(context.getChunkedResponseSocket(), e, state, configuration.getKeepAliveHeader());
+        } catch (SqlException | ImplicitCastException e) {
+            state.setQueryCacheable(false);
+            sendException(
+                    state,
+                    e.getPosition(),
+                    e.getFlyweightMessage(),
+                    HTTP_BAD_REQUEST
+            );
             readyForNextRequest(context);
         } catch (EntryUnavailableException e) {
-            LOG.info().$("[fd=").$(context.getFd()).$("] Resource busy, will retry").$();
+            LOG.info().$("[fd=").$(context.getFd()).$("] resource busy, will retry").$();
+            state.unmountSqlExecutionOwner();
             throw RetryOperationException.INSTANCE;
-        } catch (CairoError | CairoException e) {
-            internalError(context.getChunkedResponseSocket(), e.getFlyweightMessage(), e, state);
+        } catch (CairoException e) {
+            internalError(
+                    context.getChunkedResponse(),
+                    context.getLastRequestBytesSent(),
+                    e.getFlyweightMessage(),
+                    getStatusCode(e),
+                    e,
+                    state,
+                    context.getMetrics()
+            );
             readyForNextRequest(context);
         } catch (PeerIsSlowToReadException | PeerDisconnectedException e) {
             // re-throw the exception
             throw e;
         } catch (Throwable e) {
-            state.error().$("Uh-oh. Error!").$(e).$();
-            throw ServerDisconnectException.INSTANCE;
+            internalError(
+                    context.getChunkedResponse(),
+                    context.getLastRequestBytesSent(),
+                    e.getMessage(),
+                    HTTP_INTERNAL_ERROR,
+                    e,
+                    state,
+                    context.getMetrics()
+            );
+            readyForNextRequest(context);
         }
     }
 
-    private static void sendUpdateConfirmation(JsonQueryProcessorState state, CharSequence keepAliveHeader, long updateRecords) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        final HttpConnectionContext context = state.getHttpConnectionContext();
-        final HttpChunkedResponseSocket socket = context.getChunkedResponseSocket();
-        header(socket, keepAliveHeader, 200);
-        socket.put('{').putQuoted("ddl").put(':').putQuoted("OK").put(',').putQuoted("updated").put(':').put(updateRecords).put('}').put('\n');
-        socket.sendChunk(true);
-        readyForNextRequest(context);
+    @Override
+    public void failRequest(HttpConnectionContext context, HttpException e) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        final JsonQueryProcessorState state = LV.get(context);
+        final HttpChunkedResponse response = context.getChunkedResponse();
+        sendException(
+                state,
+                e.getPosition(),
+                e.getFlyweightMessage(),
+                HTTP_BAD_REQUEST
+        );
+        response.shutdownWrite();
     }
 
     @Override
-    public void onRequestComplete(
-            HttpConnectionContext context
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
+    public String getName() {
+        return ActiveConnectionTracker.PROCESSOR_JSON;
+    }
+
+    @Override
+    public HttpRequestProcessor getProcessor(HttpRequestHeader requestHeader) {
+        return this;
+    }
+
+    @Override
+    public byte getRequiredAuthType() {
+        return requiredAuthType;
+    }
+
+    @Override
+    public void onRequestComplete(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
         JsonQueryProcessorState state = LV.get(context);
         if (state == null) {
             LV.set(context, state = new JsonQueryProcessorState(
                     context,
                     nanosecondClock,
-                    configuration.getFloatScale(),
-                    configuration.getDoubleScale()
+                    configuration.getKeepAliveHeader()
             ));
         }
 
-        // clear random for new request to avoid reusing random between requests
+        // clear random for a new request to avoid reusing random between requests
         state.setRnd(null);
 
         if (parseUrl(state, configuration.getKeepAliveHeader())) {
@@ -226,56 +314,71 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
     }
 
     @Override
-    public void resumeSend(
-            HttpConnectionContext context
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+    public void onRequestRetry(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        JsonQueryProcessorState state = LV.get(context);
+        execute0(state);
+    }
+
+    @Override
+    public void parkRequest(HttpConnectionContext context, boolean pausedQuery) {
         final JsonQueryProcessorState state = LV.get(context);
         if (state != null) {
-            // we are resuming request execution, we need to copy random to execution context
-            sqlExecutionContext.with(context.getCairoSecurityContext(), null, state.getRnd(), context.getFd(), circuitBreaker.of(context.getFd()));
-            doResumeSend(state, context);
+            state.setPausedQuery(pausedQuery);
+            // preserve random when we park the context
+            SqlExecutionContextImpl sqlExecutionContext = context.getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+            state.setRnd(sqlExecutionContext.getRandom());
+            state.parkSqlExecutionOwner();
         }
     }
 
     @Override
-    public void parkRequest(HttpConnectionContext context) {
-        final JsonQueryProcessorState state = LV.get(context);
-        if (state != null) {
-            // preserve random when we park the context
-            state.setRnd(sqlExecutionContext.getRandom());
-        }
+    public boolean processServiceAccountCookie(HttpConnectionContext context, SecurityContext securityContext) {
+        return context.getCookieHandler().processServiceAccountCookie(context, securityContext);
     }
 
-    private static void doResumeSend(
-            JsonQueryProcessorState state,
-            HttpConnectionContext context
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        if (state.noCursor()) {
-            return;
-        }
+    @Override
+    public boolean reservedOneAdminConnection() {
+        return true;
+    }
 
-        LOG.debug().$("resume [fd=").$(context.getFd()).$(']').$();
-
-        final HttpChunkedResponseSocket socket = context.getChunkedResponseSocket();
-        while (true) {
+    @Override
+    public void resumeSend(HttpConnectionContext context) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        final JsonQueryProcessorState state = LV.get(context);
+        if (state != null) {
+            // we are resuming request execution, we need to copy random to execution context
+            NetworkSqlExecutionCircuitBreaker circuitBreaker = context.getOrCreateCircuitBreaker(engine);
+            SqlExecutionContextImpl sqlExecutionContext = context.getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+            sqlExecutionContext.with(context.getSecurityContext(), null, state.getRnd(), context.getFd(), circuitBreaker.of(context.getFd()));
+            if (!state.isPausedQuery()) {
+                context.resumeResponseSend();
+            } else {
+                state.setPausedQuery(false);
+            }
             try {
-                state.resume(socket);
-                break;
-            } catch (NoSpaceLeftInResponseBufferException ignored) {
-                if (socket.resetToBookmark()) {
-                    socket.sendChunk(false);
-                } else {
-                    // what we have here is out unit of data, column value or query
-                    // is larger that response content buffer
-                    // all we can do in this scenario is to log appropriately
-                    // and disconnect socket
-                    state.logBufferTooSmall();
-                    throw PeerDisconnectedException.INSTANCE;
-                }
+                state.resumeSqlExecutionOwner();
+                doResumeSend(state, context);
+            } catch (CairoError e) {
+                internalError(
+                        context.getChunkedResponse(),
+                        context.getLastRequestBytesSent(),
+                        e.getFlyweightMessage(),
+                        HTTP_INTERNAL_ERROR,
+                        e,
+                        state,
+                        context.getMetrics()
+                );
+            } catch (CairoException e) {
+                internalError(
+                        context.getChunkedResponse(),
+                        context.getLastRequestBytesSent(),
+                        e.getFlyweightMessage(),
+                        HTTP_BAD_REQUEST,
+                        e,
+                        state,
+                        context.getMetrics()
+                );
             }
         }
-        // reached the end naturally?
-        readyForNextRequest(context);
     }
 
     private static void cannotCopyRemote(
@@ -286,86 +389,221 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
         throw SqlException.$(0, "copy from STDIN is not supported over REST");
     }
 
-    protected static void header(
-            HttpChunkedResponseSocket socket,
-            CharSequence keepAliveHeader,
-            int status_code
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        socket.status(status_code, "application/json; charset=utf-8");
-        socket.headers().setKeepAlive(keepAliveHeader);
-        socket.sendHeader();
+    private static int getStatusCode(CairoException e) {
+        if (e.isAuthorizationError()) {
+            return HTTP_FORBIDDEN;
+        }
+        return HTTP_BAD_REQUEST;
+    }
+
+    // Every declared CompiledQuery type must resolve to a non-null executor. The list-size check alone
+    // is blind to a null hole below the highest-set index (extendAndSet(EMPTY) grows the list past it),
+    // which is how a missing CREATE_LIVE_VIEW executor once slipped through as a runtime NPE on /exec.
+    // Indices 15/16 are a permanent gap in the type numbering (VACUUM = UPDATE + 3).
+    private static boolean hasExecutorForEveryType(ObjList<QueryExecutor> executors) {
+        for (int type = 1; type <= CompiledQuery.TYPES_COUNT; type++) {
+            if (type == 15 || type == 16) {
+                continue;
+            }
+            if (executors.getQuick(type) == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static void logInternalError(
+            Throwable e,
+            JsonQueryProcessorState state,
+            Metrics metrics
+    ) {
+        if (e instanceof CairoException ce) {
+            if (ce.isInterruption()) {
+                state.info().$("query cancelled [reason=`").$safe(ce.getFlyweightMessage())
+                        .$("`, q=`").$safe(state.getQueryOrHidden())
+                        .$("`]").$();
+            } else if (ce.isCritical()) {
+                state.critical().$("error [msg=`").$safe(ce.getFlyweightMessage())
+                        .$("`, errno=").$(ce.getErrno())
+                        .$(", q=`").$safe(state.getQueryOrHidden())
+                        .$("`]").$();
+            } else {
+                state.error().$("error [msg=`").$safe(ce.getFlyweightMessage())
+                        .$("`, errno=").$(ce.getErrno())
+                        .$(", q=`").$safe(state.getQueryOrHidden())
+                        .$("`]").$();
+            }
+        } else if (e instanceof HttpException) {
+            state.error().$("internal HTTP server error [reason=`").$safe(((HttpException) e).getFlyweightMessage())
+                    .$("`, q=`").$safe(state.getQueryOrHidden())
+                    .$("`]").$();
+        } else {
+            state.critical().$("internal error [ex=").$(e)
+                    .$(", q=`").$safe(state.getQueryOrHidden())
+                    .$("`]").$();
+            // This is a critical error, so we treat it as an unhandled one.
+            metrics.healthMetrics().incrementUnhandledErrors();
+        }
     }
 
     private static void readyForNextRequest(HttpConnectionContext context) {
-        LOG.info().$("all sent [fd=").$(context.getFd()).$(", lastRequestBytesSent=").$(context.getLastRequestBytesSent()).$(", nCompletedRequests=").$(context.getNCompletedRequests() + 1)
-                .$(", totalBytesSent=").$(context.getTotalBytesSent()).$(']').$();
+        LOG.debug().$("all sent [fd=").$(context.getFd())
+                .$(", lastRequestBytesSent=").$(context.getLastRequestBytesSent())
+                .$(", nCompletedRequests=").$(context.getNCompletedRequests() + 1)
+                .$(", totalBytesSent=").$(context.getTotalBytesSent()).I$();
     }
 
-    private void updateMetricsAndSendConfirmation(
+    private static void sendConfirmation(
             JsonQueryProcessorState state,
-            CompiledQuery cq,
             CharSequence keepAliveHeader
     ) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        metrics.jsonQuery().markComplete();
-        sendConfirmation(state, keepAliveHeader);
-    }
-
-    private static void sendConfirmation(JsonQueryProcessorState state, CharSequence keepAliveHeader) throws PeerDisconnectedException, PeerIsSlowToReadException {
         final HttpConnectionContext context = state.getHttpConnectionContext();
-        final HttpChunkedResponseSocket socket = context.getChunkedResponseSocket();
-        header(socket, keepAliveHeader, 200);
-        socket.put('{').putQuoted("ddl").put(':').putQuoted("OK").put('}').put('\n');
-        socket.sendChunk(true);
-        readyForNextRequest(context);
+        final HttpChunkedResponse response = context.getChunkedResponse();
+
+        state.storeConfirmation();
+        header(response, context, keepAliveHeader, 200);
+        state.onResumeConfirmation(response);
     }
 
-    private void compileQuery(JsonQueryProcessorState state) throws SqlException, PeerDisconnectedException, PeerIsSlowToReadException {
-        boolean recompileStale = true;
-        do {
-            try {
-                final long nanos = nanosecondClock.getTicks();
-                final CompiledQuery cc = compiler.compile(state.getQuery(), sqlExecutionContext);
-                sqlExecutionContext.storeTelemetry(cc.getType(), Telemetry.ORIGIN_HTTP_JSON);
-                state.setCompilerNanos(nanosecondClock.getTicks() - nanos);
-                state.setQueryType(cc.getType());
-                queryExecutors.getQuick(cc.getType()).execute(
-                        state,
-                        cc,
-                        configuration.getKeepAliveHeader()
-                );
-                recompileStale = false;
-            } catch (ReaderOutOfDateException e) {
-                LOG.info().$(e.getFlyweightMessage()).$();
-                // will recompile
-            }
-        } while (recompileStale);
-    }
-
-    static void sendException(
-            HttpChunkedResponseSocket socket,
-            int position,
-            CharSequence message,
-            CharSequence query,
-            CharSequence keepAliveHeader
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        header(socket, keepAliveHeader, 400);
-        JsonQueryProcessorState.prepareExceptionJson(socket, position, message, query);
-    }
-
-    private static void syntaxError(
-            HttpChunkedResponseSocket socket,
-            SqlException sqlException,
+    private static void sendEmptyQueryNotice(
             JsonQueryProcessorState state,
             CharSequence keepAliveHeader
     ) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        state.logSyntaxError(sqlException);
-        sendException(
-                socket,
-                sqlException.getPosition(),
-                sqlException.getFlyweightMessage(),
-                state.getQuery(),
-                keepAliveHeader
-        );
+        final HttpConnectionContext context = state.getHttpConnectionContext();
+        final HttpChunkedResponse response = context.getChunkedResponse();
+
+        state.storeEmptyQuery();
+        header(response, context, keepAliveHeader, 200);
+        state.onResumeEmptyQuery(response);
+    }
+
+    private static void sendInsertConfirmation(
+            JsonQueryProcessorState state,
+            CharSequence keepAliveHeader
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        final HttpConnectionContext context = state.getHttpConnectionContext();
+        final HttpChunkedResponse response = context.getChunkedResponse();
+
+        state.storeInsertConfirmation();
+        header(response, context, keepAliveHeader, 200);
+        state.onResumeInsertConfirmation(response);
+    }
+
+    private static void sendUpdateConfirmation(
+            JsonQueryProcessorState state,
+            CharSequence keepAliveHeader,
+            long updateRecords
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        final HttpConnectionContext context = state.getHttpConnectionContext();
+        final HttpChunkedResponse response = context.getChunkedResponse();
+
+        state.storeUpdateConfirmation(updateRecords);
+        header(response, context, keepAliveHeader, 200);
+        state.onResumeUpdateConfirmation(response);
+    }
+
+    private void compileAndExecuteQuery(
+            JsonQueryProcessorState state
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
+        SqlExecutionContextImpl sqlExecutionContext = state.getHttpConnectionContext().getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+        try (SqlCompiler compiler = engine.getSqlCompiler()) {
+            for (int retries = 0; ; retries++) {
+                final long compilationStart = nanosecondClock.getTicks();
+                final CompiledQuery cc = compiler.compile(state.getQuery(), sqlExecutionContext);
+                state.setQueryType(cc.getType());
+                if (!state.isSqlExecutionOwnerStarted()) {
+                    try {
+                        state.beginSqlExecutionOwner(state.getQuery(), sqlExecutionContext, cc.getType());
+                    } catch (RuntimeException | Error e) {
+                        cc.freeAfterOwnerStartFailure(e);
+                        throw e;
+                    }
+                }
+                state.publishSqlExecutionOwner(sqlExecutionContext.containsSecret());
+                sqlExecutionContext.storeTelemetry(cc.getType(), TelemetryOrigin.HTTP);
+                state.setCompilerNanos(nanosecondClock.getTicks() - compilationStart);
+                // Read-only boundary gate: engine.isReadOnlyMode() flips to true as the FIRST step of
+                // an in-place PRIMARY->REPLICA switch cascade, before the security context resolved for
+                // this request reflects the replica role. A write/DDL submitted over /exec on a
+                // connection authorized while the node was still PRIMARY would otherwise be executed and
+                // land on a node that is already demoting (its WAL uploader may have closed), losing the
+                // write once the node settles as a replica. Re-checking the live engine state per
+                // statement closes that window for the HTTP /exec path. The statement-type classification
+                // (and the parquet-export temp-table DROP exemption) lives in ReadOnlyStatementGate so
+                // the pg-wire gate in PGPipelineEntry and this one cannot drift apart.
+                if (engine.isReadOnlyMode()
+                        && ReadOnlyStatementGate.isRefusedOnReadOnly(cc.getType(), cc.getOperation(), engine.getConfiguration())) {
+                    // The compiled query holds a native op (InsertOperation, UpdateOperation,
+                    // AlterOperation, or an Operation subtype for CREATE/DROP). The per-type
+                    // executors that normally free these ops are not reached when we throw here,
+                    // so we must free them explicitly to avoid a native-memory leak per refused
+                    // request. closeAllButSelect() frees INSERT/UPDATE/ALTER ops; Misc.free
+                    // covers CREATE/DROP operation subtypes.
+                    cc.closeAllButSelect();
+                    Misc.free(cc.getOperation());
+                    throw CairoException.readOnlyAccess();
+                }
+                // todo: reconsider whether we need to keep the SqlCompiler instance open while executing the query
+                // the problem is the each instance of the compiler has just a single instance of the CompilerQuery object.
+                // the CompilerQuery is used as a flyweight(?) and we cannot return the SqlCompiler instance to the pool
+                // until we extract the result from the CompilerQuery.
+                try {
+                    queryExecutors.getQuick(cc.getType()).execute(
+                            state,
+                            cc,
+                            configuration.getKeepAliveHeader()
+                    );
+                    break;
+                } catch (TableReferenceOutOfDateException e) {
+                    if (retries == maxSqlRecompileAttempts) {
+                        throw SqlException.$(0, e.getFlyweightMessage());
+                    }
+                    LOG.info().$safe(e.getFlyweightMessage()).$();
+                    // will recompile
+                }
+            }
+        } finally {
+            state.setContainsSecret(sqlExecutionContext.containsSecret());
+        }
+    }
+
+    private void doResumeSend(
+            JsonQueryProcessorState state,
+            HttpConnectionContext context
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        LOG.debug().$("resume [fd=").$(context.getFd()).I$();
+
+        final HttpChunkedResponse response = context.getChunkedResponse();
+        while (true) {
+            try {
+                state.resume(response);
+                break;
+            } catch (SqlException | ImplicitCastException e) {
+                // close the factory on reset instead of caching it
+                state.setQueryCacheable(false);
+                sendException(
+                        state,
+                        e.getPosition(),
+                        e.getFlyweightMessage(),
+                        HTTP_BAD_REQUEST
+                );
+                // close the factory on reset instead of caching it
+                break;
+            } catch (NoSpaceLeftInResponseBufferException ignored) {
+                if (response.resetToBookmark()) {
+                    response.sendChunk(false);
+                } else {
+                    // out unit of data, column value or query is larger than response content buffer
+                    state.logBufferTooSmall();
+                    throw CairoException.nonCritical()
+                            .put("response buffer is too small for the column value [columnName=").put(state.getCurrentColumnName())
+                            .put(", columnIndex=").put(state.getCurrentColumnIndex())
+                            .put(']');
+                }
+            }
+        }
+        // reached the end naturally?
+        readyForNextRequest(context);
     }
 
     private void executeAlterTable(
@@ -378,7 +616,7 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
             fut = cq.execute(state.getEventSubSequence());
             int waitResult = fut.await(getAsyncWriterStartTimeout(state));
             if (waitResult != OperationFuture.QUERY_COMPLETE) {
-                state.setOperationFuture(null, fut); // Alter operation does not need to be disposable
+                state.setOperationFuture(fut);
                 fut = null;
                 throw EntryUnavailableException.instance("retry alter table wait");
             }
@@ -387,102 +625,114 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
                 fut.close();
             }
         }
-        metrics.jsonQuery().markComplete();
+        metrics.jsonQueryMetrics().markComplete();
         sendConfirmation(state, keepAliveHeader);
     }
 
     private void executeCachedSelect(
             JsonQueryProcessorState state,
-            RecordCursorFactory factory,
-            CharSequence keepAliveHeader
+            RecordCursorFactory factory
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
         state.setCompilerNanos(0);
-        state.logExecuteCached();
-        executeSelect(state, factory, keepAliveHeader);
+        SqlExecutionContextImpl sqlExecutionContext = state.getHttpConnectionContext().getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+        sqlExecutionContext.setCacheHit(true);
+        executeSelect0(state, factory, true);
     }
 
-    @Override
-    public void onRequestRetry(
-            HttpConnectionContext context
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
-        JsonQueryProcessorState state = LV.get(context);
-        execute0(state);
+    private void executeDdl(
+            JsonQueryProcessorState state,
+            CompiledQuery cq,
+            CharSequence keepAliveHeader
+    ) throws PeerIsSlowToReadException, PeerDisconnectedException, SqlException {
+        SqlExecutionContextImpl sqlExecutionContext = state.getHttpConnectionContext().getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+        Operation op = cq.getOperation();
+        try {
+            int waitResult = executeDdlFenced(
+                    sqlExecutionContext,
+                    cq.getType(),
+                    op,
+                    state.getEventSubSequence(),
+                    getAsyncWriterStartTimeout(state)
+            );
+            if (waitResult != OperationFuture.QUERY_COMPLETE) {
+                state.setOperation(op);
+                // clear operation to report to avoid closing it
+                op = null;
+                throw EntryUnavailableException.instance("retry alter table wait");
+            }
+        } finally {
+            Misc.free(op);
+        }
+        metrics.jsonQueryMetrics().markComplete();
+        sendConfirmation(state, keepAliveHeader);
     }
 
-    @Override
-    public void failRequest(HttpConnectionContext context, HttpException e)
-            throws PeerDisconnectedException, PeerIsSlowToReadException {
-        final JsonQueryProcessorState state = LV.get(context);
-        final HttpChunkedResponseSocket socket = context.getChunkedResponseSocket();
-        internalError(socket, e.getFlyweightMessage(), e, state);
-        socket.shutdownWrite();
+    /**
+     * Demote write-fence for the HTTP /exec CTAS/CREATE/DROP/CREATE MAT VIEW/CREATE VIEW arms, the twin
+     * of pg-wire's PGPipelineEntry.executeDdlFenced. These DDL statements submit op.execute() outside any
+     * writer funnel, so the pre-compile gate in compileAndExecuteQuery is their only read-only check --
+     * and that read is check-then-act: the operation can begin while the node is still PRIMARY and
+     * externalize its effect (a fresh table, a CTAS data commit, a drop) on a node that flips to REPLICA
+     * mid-execute, acknowledging with HTTP 200 a change no uploader replicates.
+     * <p>
+     * For a non-WAL CTAS the data commit lives inside execute() (SqlCompilerImpl.copyTableData ->
+     * writer.commit(), with the writer built directly via new TableWriter, bypassing the pooled
+     * acquire-gates and so uncounted by the demote drain); for a WAL CTAS the externalization is the WAL
+     * pump inside the same execute(). Holding the role-switch READ lock across the in-lock re-check AND
+     * op.execute() serializes the whole operation against the flip and so closes both windows from one
+     * seam: either the flip ran first (we see REPLICA and refuse without executing) or the operation runs
+     * fully as PRIMARY and the flip's flag publish (which takes the WRITE side) waits behind it. The READ
+     * side lets concurrent commits on other tables/protocols run in parallel; only the role flip is
+     * excluded.
+     * <p>
+     * Both refusal checks consult the SAME ReadOnlyStatementGate predicate the pre-compile gate uses --
+     * NOT a blanket isReadOnlyMode() refusal -- because the gate carries the one DDL exemption a read-only
+     * replica must keep: the admin's DROP of the HTTP parquet exporter's leftover temp table. A blanket
+     * refusal here would refuse the exempted DROP the pre-gate just allowed through (the regression CI
+     * build 241196 caught).
+     * <p>
+     * The retry path (retryQueryExecution) needs no second fence: it only awaits the already-submitted
+     * future and never re-invokes op.execute(). The operation's async apply path acquires the same fence,
+     * so this method releases its read hold before waiting for the future.
+     */
+    private int executeDdlFenced(
+            SqlExecutionContextImpl sqlExecutionContext,
+            int sqlType,
+            Operation op,
+            SCSequence eventSubSequence,
+            long awaitTimeout
+    ) throws SqlException {
+        if (engine.isReadOnlyMode()
+                && ReadOnlyStatementGate.isRefusedOnReadOnly(sqlType, op, engine.getConfiguration())) {
+            throw CairoException.readOnlyAccess();
+        }
+        final Lock lock = engine.getRoleSwitchReadLock();
+        final OperationFuture future;
+        lock.lock();
+        try {
+            // Authoritative in-lock re-check against the role flip, which holds the WRITE side of this
+            // lock around the REPLICA flag publish. op.execute() runs inside the read hold so the flip
+            // cannot interleave (its write acquire waits), while other commits share the read side.
+            if (engine.isReadOnlyMode()
+                    && ReadOnlyStatementGate.isRefusedOnReadOnly(sqlType, op, engine.getConfiguration())) {
+                throw CairoException.readOnlyAccess();
+            }
+            future = op.execute(sqlExecutionContext, eventSubSequence);
+        } finally {
+            lock.unlock();
+        }
+        try (future) {
+            return future.await(awaitTimeout);
+        }
     }
 
-    private void executeUpdate(
+    // same as select new but disallows caching of EXPLAIN plans
+    private void executeExplain(
             JsonQueryProcessorState state,
             CompiledQuery cq,
             CharSequence keepAliveHeader
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
-        UpdateOperation op = cq.getOperation();
-        op.start();
-        op.withContext(sqlExecutionContext);
-        circuitBreaker.resetTimer();
-        OperationFuture fut = null;
-        boolean isAsyncWait = false;
-        try {
-            fut = cq.getDispatcher().execute(op, sqlExecutionContext, state.getEventSubSequence());
-            int waitResult = fut.await(getAsyncWriterStartTimeout(state));
-            if (waitResult != OperationFuture.QUERY_COMPLETE) {
-                isAsyncWait = true;
-                state.setOperationFuture(op, fut);
-                throw EntryUnavailableException.instance("retry update table wait");
-            }
-            // All good, finished update
-            final long updatedCount = fut.getAffectedRowsCount();
-            metrics.jsonQuery().markComplete();
-            sendUpdateConfirmation(state, keepAliveHeader, updatedCount);
-        } finally {
-            if (!isAsyncWait && fut != null) {
-                fut.close();
-                op.close();
-            }
-        }
-    }
-
-    private long getAsyncWriterStartTimeout(JsonQueryProcessorState state) {
-        return Math.min(asyncWriterStartTimeout, state.getStatementTimeoutNs() / 1000L);
-    }
-
-    private void retryQueryExecution(JsonQueryProcessorState state, OperationFuture fut) throws SqlException, PeerIsSlowToReadException, PeerDisconnectedException {
-        final int waitResult;
-        try {
-            waitResult = fut.await(0);
-        } catch (ReaderOutOfDateException e) {
-            state.freeAsyncOperation();
-            compileQuery(state);
-            return;
-        }
-
-        if (waitResult != OperationFuture.QUERY_COMPLETE) {
-            long maxWait = state.getStatementTimeoutNs() > 0 ? state.getStatementTimeoutNs() : asyncWriterFullTimeoutNs;
-            if (state.getExecutionTime() < maxWait) {
-                // Schedule a retry
-                state.info().$("waiting for update query [instance=").$(fut.getInstanceId()).I$();
-                throw EntryUnavailableException.instance("wait for update query");
-            } else {
-                state.freeAsyncOperation();
-                throw SqlTimeoutException.timeout("Query timeout. Please add HTTP header 'Statement-Timeout' with timeout in ms");
-            }
-        } else {
-            // Done
-            state.freeAsyncOperation();
-            if (state.getQueryType() == CompiledQuery.UPDATE) {
-                sendUpdateConfirmation(state, configuration.getKeepAliveHeader(), fut.getAffectedRowsCount());
-            } else {
-                // Alter, sends ddl:OK
-                sendConfirmation(state, configuration.getKeepAliveHeader());
-            }
-        }
+        executeSelect0(state, cq.getRecordCursorFactory(), false);
     }
 
     private void executeInsert(
@@ -490,9 +740,12 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
             CompiledQuery cq,
             CharSequence keepAliveHeader
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
-        cq.getInsertOperation().execute(sqlExecutionContext).await();
-        metrics.jsonQuery().markComplete();
-        sendConfirmation(state, keepAliveHeader);
+        SqlExecutionContextImpl sqlExecutionContext = state.getHttpConnectionContext().getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+        try (InsertOperation insert = cq.popInsertOperation()) {
+            insert.execute(sqlExecutionContext).await();
+            metrics.jsonQueryMetrics().markComplete();
+            sendInsertConfirmation(state, keepAliveHeader);
+        }
     }
 
     private void executeNewSelect(
@@ -500,50 +753,122 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
             CompiledQuery cq,
             CharSequence keepAliveHeader
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
-        state.logExecuteNew();
-        final RecordCursorFactory factory = cq.getRecordCursorFactory();
-        executeSelect(
-                state,
-                factory,
-                keepAliveHeader);
+        executeSelect0(state, cq.getRecordCursorFactory(), cq.isCacheable());
     }
 
-    private void executeSelect(
+    private void executePseudoSelect(
             JsonQueryProcessorState state,
-            RecordCursorFactory factory,
+            CompiledQuery cq,
             CharSequence keepAliveHeader
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
+        final RecordCursorFactory factory = cq.getRecordCursorFactory();
+        if (factory == null) {
+            updateMetricsAndSendConfirmation(state, cq, keepAliveHeader);
+            return;
+        }
+
+        // new import case
+        executeSelect0(state, factory, false);
+    }
+
+    private void executeSelect0(
+            JsonQueryProcessorState state,
+            RecordCursorFactory factory,
+            boolean queryCacheable
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
         final HttpConnectionContext context = state.getHttpConnectionContext();
+        SqlExecutionContextImpl sqlExecutionContext = context.getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+        if (!state.of(factory, queryCacheable)) {
+            readyForNextRequest(context);
+            return;
+        }
+
+        final RecordCursor cursor;
         try {
-            if (state.of(factory, sqlExecutionContext)) {
-                header(context.getChunkedResponseSocket(), keepAliveHeader, 200);
-                doResumeSend(state, context);
-                metrics.jsonQuery().markComplete();
-            } else {
-                readyForNextRequest(context);
-            }
+            cursor = factory.getCursor(sqlExecutionContext);
+        } catch (Throwable th) {
+            // clear factory in the state because we already set it
+            state.clearFactory();
+            throw th;
+        }
+
+        try {
+            state.setCursor(cursor);
+            doResumeSend(state, context);
+            metrics.jsonQueryMetrics().markComplete();
         } catch (CairoException ex) {
-            state.setQueryCacheable(ex.isCacheable());
+            state.setQueryCacheable(queryCacheable && ex.isCacheable());
             throw ex;
         }
     }
 
-    private void internalError(
-            HttpChunkedResponseSocket socket,
-            CharSequence message,
-            Throwable e,
-            JsonQueryProcessorState state
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
-        if (e instanceof CairoException && ((CairoException) e).isInterruption()) {
-            state.info().$("query cancelled [q=`").utf8(state.getQuery()).$("`, reason=`").$(((CairoException) e).getFlyweightMessage()).$("`]").$();
-        } else if (e instanceof HttpException) {
-            state.error().$("internal HTTP server error [q=`").utf8(state.getQuery()).$("`, reason=`").$(((HttpException) e).getFlyweightMessage()).$("`]").$();
-        } else {
-            state.error().$("internal error [q=`").utf8(state.getQuery()).$("`, ex=").$(e).$(']').$();
-            // This is a critical error, so we treat it as an unhandled one.
-            metrics.healthCheck().incrementUnhandledErrors();
+    private void executeUpdate(
+            JsonQueryProcessorState state,
+            CompiledQuery cq,
+            CharSequence keepAliveHeader
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, SqlException {
+        HttpConnectionContext context = state.getHttpConnectionContext();
+        NetworkSqlExecutionCircuitBreaker circuitBreaker = context.getOrCreateCircuitBreaker(engine);
+        SqlExecutionContextImpl sqlExecutionContext = context.getOrCreateSqlExecutionContext(engine, sharedWorkerCount);
+        circuitBreaker.resetTimer();
+        sqlExecutionContext.initNow();
+        OperationFuture fut = null;
+        boolean isAsyncWait = false;
+        try {
+            // closeOnDone hands the update operation over. execute() closes it when the statement
+            // completes or fails, a cancelled query and an OOM included, and the future closes
+            // the one it holds.
+            fut = cq.execute(sqlExecutionContext, state.getEventSubSequence(), true);
+            int waitResult = fut.await(getAsyncWriterStartTimeout(state));
+            if (waitResult != OperationFuture.QUERY_COMPLETE) {
+                isAsyncWait = true;
+                state.setOperationFuture(fut);
+                throw EntryUnavailableException.instance("retry update table wait");
+            }
+            // All good, finished updates
+            final long updatedCount = fut.getAffectedRowsCount();
+            metrics.jsonQueryMetrics().markComplete();
+            sendUpdateConfirmation(state, keepAliveHeader, updatedCount);
+        } finally {
+            if (!isAsyncWait && fut != null) {
+                fut.close();
+            }
         }
-        sendException(socket, 0, message, state.getQuery(), configuration.getKeepAliveHeader());
+    }
+
+    private long getAsyncWriterStartTimeout(JsonQueryProcessorState state) {
+        return Math.min(asyncWriterStartTimeout, state.getStatementTimeout());
+    }
+
+    private void internalError(
+            HttpChunkedResponse response,
+            long bytesSent,
+            CharSequence message,
+            int code,
+            Throwable e,
+            JsonQueryProcessorState state,
+            Metrics metrics
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        logInternalError(e, state, metrics);
+        final int errorMessagePosition;
+        final CharSequence errorMessage;
+        if (e instanceof FlyweightMessageContainer ex) {
+            errorMessagePosition = ex.getPosition();
+            errorMessage = ex.getFlyweightMessage();
+        } else {
+            errorMessagePosition = 0;
+            errorMessage = e.getMessage();
+        }
+        if (bytesSent > 0) {
+            state.querySuffixWithError(response, code, message, errorMessagePosition);
+        } else {
+            sendException(
+                    state,
+                    errorMessagePosition,
+                    errorMessage,
+                    code
+            );
+        }
     }
 
     private boolean parseUrl(
@@ -551,11 +876,18 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
             CharSequence keepAliveHeader
     ) throws PeerDisconnectedException, PeerIsSlowToReadException {
         // Query text.
-        final HttpRequestHeader header = state.getHttpConnectionContext().getRequestHeader();
-        final DirectByteCharSequence query = header.getUrlParam("query");
-        if (query == null || query.length() == 0) {
+        final HttpConnectionContext context = state.getHttpConnectionContext();
+        final HttpRequestHeader header = context.getRequestHeader();
+        final DirectUtf8Sequence query = header.getUrlParam(URL_PARAM_QUERY);
+        if (query == null || query.size() == 0) {
+            try {
+                state.configure(header, null, 0, Long.MAX_VALUE);
+            } catch (Utf8Exception e) {
+                // This should never happen.
+                // Since we are not parsing query text, we should not have any encoding issues.
+            }
             state.info().$("Empty query header received. Sending empty reply.").$();
-            sendException(state.getHttpConnectionContext().getChunkedResponseSocket(), 0, "No query text", query, keepAliveHeader);
+            sendEmptyQueryNotice(state, keepAliveHeader);
             return false;
         }
 
@@ -563,20 +895,20 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
         long skip = 0;
         long stop = Long.MAX_VALUE;
 
-        CharSequence limit = header.getUrlParam("limit");
+        DirectUtf8Sequence limit = header.getUrlParam(URL_PARAM_LIMIT);
         if (limit != null) {
-            int sepPos = Chars.indexOf(limit, ',');
+            int sepPos = Chars.indexOf(limit.asAsciiCharSequence(), ',');
             try {
                 if (sepPos > 0) {
                     skip = Numbers.parseLong(limit, 0, sepPos) - 1;
-                    if (sepPos + 1 < limit.length()) {
-                        stop = Numbers.parseLong(limit, sepPos + 1, limit.length());
+                    if (sepPos + 1 < limit.size()) {
+                        stop = Numbers.parseLong(limit, sepPos + 1, limit.size());
                     }
                 } else {
                     stop = Numbers.parseLong(limit);
                 }
             } catch (NumericException ex) {
-                // Skip or stop will have default value.
+                // Skip or stop will have the default value.
             }
         }
         if (stop < 0) {
@@ -595,10 +927,92 @@ public class JsonQueryProcessor implements HttpRequestProcessor, Closeable {
             state.configure(header, query, skip, stop);
         } catch (Utf8Exception e) {
             state.info().$("Bad UTF8 encoding").$();
-            sendException(state.getHttpConnectionContext().getChunkedResponseSocket(), 0, "Bad UTF8 encoding in query text", query, keepAliveHeader);
+            HttpChunkedResponse response = context.getChunkedResponse();
+            state.storeBadUtf8();
+            header(response, context, keepAliveHeader, HTTP_BAD_REQUEST);
+            state.onResumeBadUtf8(response);
             return false;
         }
         return true;
+    }
+
+    private void retryQueryExecution(
+            JsonQueryProcessorState state,
+            OperationFuture fut
+    ) throws PeerIsSlowToReadException, PeerDisconnectedException, SqlException {
+        final int waitResult;
+        try {
+            waitResult = fut.await(0);
+        } catch (TableReferenceOutOfDateException e) {
+            state.freeAsyncOperation();
+            compileAndExecuteQuery(state);
+            return;
+        }
+
+        if (waitResult != OperationFuture.QUERY_COMPLETE) {
+            long timeout = state.getStatementTimeout() > 0 ? state.getStatementTimeout() : asyncCommandTimeout;
+            if (state.getExecutionTimeNanos() / 1_000_000L < timeout) {
+                // Schedule a retry
+                throw EntryUnavailableException.instance("wait for update query");
+            } else {
+                state.freeAsyncOperation();
+                throw SqlTimeoutException.timeout("Query timeout. Please add HTTP header 'Statement-Timeout' with timeout in ms [timeout=").put(timeout).put("ms]");
+            }
+        } else {
+            // Done
+            state.freeAsyncOperation();
+            if (state.getQueryType() == CompiledQuery.UPDATE) {
+                sendUpdateConfirmation(state, configuration.getKeepAliveHeader(), fut.getAffectedRowsCount());
+            } else {
+                // Alter, sends ddl:OK
+                sendConfirmation(state, configuration.getKeepAliveHeader());
+            }
+        }
+    }
+
+    private void updateMetricsAndSendConfirmation(
+            JsonQueryProcessorState state,
+            CompiledQuery cq,
+            CharSequence keepAliveHeader
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        metrics.jsonQueryMetrics().markComplete();
+        sendConfirmation(state, keepAliveHeader);
+    }
+
+    protected static void header(
+            HttpChunkedResponse response,
+            HttpConnectionContext context,
+            CharSequence keepAliveHeader,
+            int statusCode
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        // State management note: We assume our response sink buffer is large enough to accommodate for all
+        // HTTP response headers. In other words - this method never throws the NoSpaceLeftInResponseBufferException
+        // exception.
+        // It can still throw PeerIsSlowToReadException when there is no space in TCP send buffer! In practice, it means
+        // the processor should advance its state BEFORE calling this method.
+
+        response.status(statusCode, HttpConstants.CONTENT_TYPE_JSON);
+        response.headers().setKeepAlive(keepAliveHeader);
+        context.getCookieHandler().setServiceAccountCookie(response.headers(), context.getSecurityContext());
+        final CharSequence sessionId = context.getSessionIdSink();
+        if (!sessionId.isEmpty()) {
+            context.getCookieHandler().setSessionCookie(response.headers(), sessionId);
+        }
+        response.sendHeader();
+    }
+
+    void sendException(
+            JsonQueryProcessorState state,
+            int position,
+            CharSequence message,
+            int code
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
+        final HttpConnectionContext context = state.getHttpConnectionContext();
+        final HttpChunkedResponse response = context.getChunkedResponse();
+
+        state.storeError(position, message);
+        header(response, context, configuration.getKeepAliveHeader(), code);
+        state.onResumeError(response);
     }
 
     @FunctionalInterface

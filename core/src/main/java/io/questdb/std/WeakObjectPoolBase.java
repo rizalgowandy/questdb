@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,15 +37,15 @@ import java.util.ArrayDeque;
  * returns it to its own local pool.
  * <p>
  * In an extreme situation this object migration could keep feeding some
- * pools until we run out of memory. Hence we limit the maximum number of
+ * pools until we run out of memory. Hence, we limit the maximum number of
  * objects a pool can hold.
  */
 abstract class WeakObjectPoolBase<T> {
     // package private for testing
     final ArrayDeque<T> cache = new ArrayDeque<>();
-
     private final int initSize;
     private final int maxSize;
+    int leased = 0;
 
     public WeakObjectPoolBase(int initSize) {
         this.initSize = initSize;
@@ -53,11 +53,13 @@ abstract class WeakObjectPoolBase<T> {
     }
 
     public T pop() {
+        leased++;
         final T obj = cache.poll();
         return obj == null ? newInstance() : obj;
     }
 
-    boolean push(T obj) {
+    public boolean push(T obj) {
+        leased--;
         assert obj != null;
         if (cache.size() < maxSize) {
             clear(obj);
@@ -67,6 +69,16 @@ abstract class WeakObjectPoolBase<T> {
             close(obj);
             return false;
         }
+    }
+
+    public int resetLeased() {
+        int l = leased;
+        leased = 0;
+        return l;
+    }
+
+    public int size() {
+        return cache.size();
     }
 
     void clear(T obj) {

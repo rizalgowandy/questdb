@@ -1,105 +1,548 @@
+parameters:
+  - name: isCheckoutEnabled
+    type: boolean
+    default: true
+  - name: isHetznerAptMirrorEnabled
+    type: boolean
+    default: true
+  # Name of a pipeline artifact holding this platform's prebuilt Rust library
+  # (rust-build-job.yml). Empty: Maven compiles the crate in this job.
+  - name: prebuiltRustArtifact
+    type: string
+    default: ''
+  - name: testTimeoutInMinutes
+    type: number
+    default: 55
+  - name: artifactNameSuffix
+    type: string
+    default: ""
+  # Main CI runs every test shard on several jobs at once (the Linux legs of one stage, or the
+  # macOS and Windows halves of the hosted pipeline). Name those jobs here, space-separated, and
+  # select-test-commit-mode.yml puts half of them on NOSYNC and half on ADAPTIVE, swapping them on
+  # the branch's next run. Empty leaves the suite default (ADAPTIVE) in place, which is what the
+  # fuzz and adaptive-soak pipelines rely on.
+  - name: testCommitModeGroup
+    type: string
+    default: ""
+  # This job's name within testCommitModeGroup.
+  - name: testCommitModeMember
+    type: string
+    default: ""
+
 steps:
-  - checkout: self
-    fetchDepth: 1
-    lfs: false
-    submodules: false
+  - ${{ if eq(parameters.isCheckoutEnabled, true) }}:
+      - template: checkout-source.yml
+  - ${{ if eq(parameters.isHetznerAptMirrorEnabled, true) }}:
+      - template: use-hetzner-apt-mirrors.yml
+        parameters:
+          shouldRun: |
+            and(
+              succeeded(),
+              eq(variables['os'], 'Linux'),
+              startsWith(variables['poolName'], 'hetzner-')
+            )
+  - template: detect-local-client.yml
+  - bash: |
+      if curl -sf --connect-timeout 2 http://maven.internal:8081/ > /dev/null 2>&1; then
+        echo "Private Reposilite cache reachable, using hetzner maven settings"
+        echo "##vso[task.setvariable variable=MAVEN_SETTINGS_FILE]$(Build.SourcesDirectory)/ci/maven-settings-hetzner.xml"
+        # Allow HTTP keep-alive when routing through the private Reposilite cache.
+        # -Dhttp.keepAlive=false opens a new TCP connection per artifact; the single-IP cache
+        # reached over the Hetzner vSwitch can't absorb that connection churn under concurrent
+        # builds (intermittent "Connect to maven.internal:8081 ... Connection timed out", which
+        # the failover-less mirror turns into a build failure). Reusing connections avoids it.
+        # NOTE: this toggle only affects the default HttpClient resolver transport. Tasks that
+        # run with -Dmaven.resolver.transport=wagon ignore it and instead pool connections via
+        # -Dmaven.wagon.httpconnectionManager.ttlSeconds (already set in MAVEN_RUN_OPTS).
+        echo "##vso[task.setvariable variable=MAVEN_KEEPALIVE_OPT]"
+      else
+        echo "Private Reposilite not reachable, using default maven settings"
+        echo "##vso[task.setvariable variable=MAVEN_SETTINGS_FILE]$(Build.SourcesDirectory)/ci/maven-settings.xml"
+        # Direct-to-Central path: keep historical behaviour (no connection reuse).
+        echo "##vso[task.setvariable variable=MAVEN_KEEPALIVE_OPT]-Dhttp.keepAlive=false"
+      fi
+      # Empty unless select-test-commit-mode.yml picks a mode for this job. Defined here because
+      # this step runs in every job, and "Run tests" would otherwise pass the undefined macro to
+      # Maven as literal text.
+      echo "##vso[task.setvariable variable=TEST_COMMIT_MODE_OPT]"
+    displayName: "Select Maven settings (local proxy vs default)"
+  - bash: |
+      rm -rf /tmp/junit* /tmp/surefire-agent /tmp/libquestdbr* /tmp/libqdbsqllogic*
+    displayName: "Cleanup dangling test artifacts from /tmp"
+    condition: startsWith(variables['poolName'], 'hetzner-')
+  # Never infer the architecture from an image label: "macos-14" is arm64 on
+  # GitHub Actions but Intel x64 on Azure. Assert it so a silent swap back to
+  # Intel fails loudly instead of testing an architecture we do not ship.
+  #
+  # The arm64 image exposes the JDK as JAVA_HOME_25_ARM64, but the Maven task
+  # resolves jdkVersionOption via JAVA_HOME_25_X64. Point the latter at the JDK
+  # we found, exactly as the linux_arm64 job does for hetzner-incus-arm.
+  - bash: |
+      set -eu
+      echo "image=$(imageName) arch=$(uname -m) os=$(sw_vers -productVersion)"
+      if [ "$(uname -m)" != "arm64" ]; then
+        echo "ERROR: expected arm64, got $(uname -m)"
+        exit 1
+      fi
+      JAVA_PATH="${JAVA_HOME_25_ARM64:-}"
+      if [ -z "$JAVA_PATH" ]; then
+        JAVA_PATH="$(/usr/libexec/java_home -v 25 2>/dev/null || true)"
+      fi
+      if [ -z "$JAVA_PATH" ]; then
+        echo "ERROR: no JDK 25 on the image. Available:"
+        /usr/libexec/java_home -V 2>&1 || true
+        exit 1
+      fi
+      echo "JAVA_HOME will be set to: $JAVA_PATH"
+      echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH"
+      echo "##vso[task.setvariable variable=JAVA_HOME_25_X64]$JAVA_PATH"
+    displayName: "Assert macOS agent is arm64 and activate JDK 25"
+    condition: eq(variables['os'], 'macOS')
+  # macOS caps the number of files a process may open separately from its
+  # inherited rlimit. If kern.maxfilesperproc is too low, the JVM cannot raise
+  # its soft limit and falls back to OPEN_MAX (10240), which is insufficient for
+  # tests that scan thousands of table partitions in parallel.
+  - bash: |
+      set -eux
+      sudo sysctl -w kern.maxfiles=10485760
+      sudo sysctl -w kern.maxfilesperproc=1048576
+      sysctl kern.maxfiles kern.maxfilesperproc
+    displayName: "Increase file count on macOS"
+    condition: eq(variables['os'], 'macOS')
   - bash: sudo sysctl -w fs.file-max=500000
     displayName: "Increase file count on Linux"
-    condition: eq(variables['os'], 'Linux')
+    condition: |
+      and(
+        eq(variables['os'], 'Linux'),
+        ne(variables['poolName'], 'hetzner-incus'),
+        ne(variables['poolName'], 'hetzner-incus-arm'),
+        ne(variables['poolName'], 'hetzner-incus-zfs')
+      )
+  - bash: |
+      JAVA_PATH="/usr/lib/jvm/java-25-openjdk-amd64"
+      echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH"
+      echo "##vso[task.setvariable variable=JAVA_HOME_25_X64]$JAVA_PATH"
+      echo "JAVA_HOME will be set to: $JAVA_PATH"
+    displayName: "Activate JDK 25 (openjdk amd64)"
+    condition: |
+      and(
+        ne(variables['System.JobName'], 'linux_x64_graal'),
+        or(
+          eq(variables['poolName'], 'hetzner-incus'),
+          eq(variables['poolName'], 'hetzner-incus-zfs')
+        )
+      )
+  - bash: |
+      JAVA_PATH="/usr/lib/jvm/java-25-openjdk-arm64"
+      echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH"
+      echo "##vso[task.setvariable variable=JAVA_HOME_25_X64]$JAVA_PATH"
+      echo "JAVA_HOME will be set to: $JAVA_PATH"
+    displayName: "Activate JDK 25 (openjdk arm64)"
+    condition: |
+      eq(variables['poolName'], 'hetzner-incus-arm')
+  - bash: |
+      JAVA_PATH="/opt/graalvm-25"
+      echo "##vso[task.setvariable variable=JAVA_HOME]$JAVA_PATH"
+      echo "##vso[task.setvariable variable=JAVA_HOME_25_X64]$JAVA_PATH"
+      echo "JAVA_HOME will be set to: $JAVA_PATH"
+    displayName: "Activate GraalVM 25"
+    condition: |
+      eq(variables['System.JobName'], 'linux_x64_graal')
+  # Compile the client's native library from source when building it as a
+  # -SNAPSHOT (local-client). A Maven-Central client ships the binaries in its
+  # jar, so this is a no-op there. Runs after JDK activation so $JAVA_HOME points
+  # at the JDK whose jni.h CMake builds against.
+  - template: build-client-native.yml
   - task: Cache@2
+    displayName: "Cache non-default Maven"
+    continueOnError: true
     inputs:
-      key: '"questdb_main" | "maven"'
+      key: '"maven_version" | "$(MAVEN_VERSION)"'
+      path: $(build.sourcesdirectory)/maven/apache-maven-$(MAVEN_VERSION)
+      cacheHitVar: MVN_CACHE_RESTORED
+    condition: |
+      and(
+        ne(variables['MAVEN_VERSION_OPTION'], 'Default'),
+        ne(variables['poolName'], 'hetzner-incus'),
+        ne(variables['poolName'], 'hetzner-incus-arm'),
+        ne(variables['poolName'], 'hetzner-incus-zfs')
+      )
+  - task: Cache@2
+    displayName: "Cache .m2/repository"
+    continueOnError: true
+    inputs:
+      # The pom hash in the key makes a dependency change save an updated cache
+      # (Azure skips the save on an exact key hit, so a static key freezes the
+      # cache at its first save); restoreKeys still restores the newest previous
+      # cache on a pom change, so only the delta comes from Maven Central.
+      key: '"questdb_main" | "$(Agent.OS)" | "$(jdk)" | "maven" | **/pom.xml'
       restoreKeys: |
+        "questdb_main" | "$(Agent.OS)" | "$(jdk)" | "maven"
       path: $(MAVEN_CACHE_FOLDER)
+    # Allowlist, not a hetzner-pool denylist: this cache only serves the hosted
+    # (Microsoft) agents, which cannot reach the Reposilite cache. The denylist
+    # failed open on the fuzz pipeline, which sets pool.name directly and defines
+    # no poolName variable, so ne('') passed and the task ran on its Hetzner
+    # agents -- harmless while the static key froze saves after the first one,
+    # but the pom-hashed key would have started re-saving the shared $HOME/.m2
+    # there on every pom change. A consumer without poolName now gets no cache
+    # instead of a surprise one.
+    condition: eq(variables['poolName'], 'Azure Pipelines')
+  - task: Cache@2
+    displayName: "Cache .cargo/registry"
+    continueOnError: true
+    inputs:
+      key: '"cargo-registry" | "$(RUSTC_HOST_TRIPLE)" | "$(RUSTC_RELEASE)" | "$(LINUX_GLIBC_VERSION)" | **/Cargo.lock'
+      restoreKeys: |
+        "cargo-registry" | "$(RUSTC_HOST_TRIPLE)" | "$(RUSTC_RELEASE)" | "$(LINUX_GLIBC_VERSION)"
+      path: $(CARGO_HOME)/registry
+    condition: |
+      and(
+        startsWith(variables['testset'], 'coverage'),
+        eq(variables['RUST_SOURCE_CODE_CHANGED'], 'true'),
+        ne(variables['poolName'], 'hetzner-incus'),
+        ne(variables['poolName'], 'hetzner-incus-arm'),
+        ne(variables['poolName'], 'hetzner-incus-zfs')
+      )
+  - pwsh: New-Item -Path "$(MAVEN_CACHE_FOLDER)" -ItemType Directory -Force
+    displayName: "Ensure .m2/repository exists (PowerShell)"
+    condition: eq(variables['os'], 'Windows')
+  - bash: mkdir -p "$(MAVEN_CACHE_FOLDER)"
+    displayName: "Ensure .m2/repository exists (bash)"
+    condition: ne(variables['os'], 'Windows')
+  - script: "wget https://archive.apache.org/dist/maven/maven-3/$(MAVEN_VERSION)/binaries/apache-maven-$(MAVEN_VERSION)-bin.zip"
+    displayName: "Get non-default Maven (bash)"
+    condition: |
+      and(
+        ne(variables['MAVEN_VERSION_OPTION'], 'Default'),
+        ne(variables.MVN_CACHE_RESTORED, 'true'),
+        ne(variables['os'], 'Windows')
+      )
+  - pwsh: |
+      "(new-object System.Net.WebClient).DownloadFile('https://www.apache.org/dist/maven/maven-3/$(MAVEN_VERSION)/binaries/apache-maven-$(MAVEN_VERSION)-bin.zip','$(build.sourcesdirectory)/apache-maven-$(MAVEN_VERSION)-bin.zip')"
+    displayName: "Get non-default Maven (PowerShell)"
+    condition: |
+      and(
+        ne(variables['MAVEN_VERSION_OPTION'], 'Default'),
+        ne(variables.MVN_CACHE_RESTORED, 'true'),
+        eq(variables['os'], 'Windows')
+      )
+  - task: ExtractFiles@1
+    inputs:
+      archiveFilePatterns: "apache-maven-$(MAVEN_VERSION)-bin.zip"
+      destinationFolder: "$(build.sourcesdirectory)/maven"
+    condition: and(ne(variables['MAVEN_VERSION_OPTION'], 'Default'), ne(variables.MVN_CACHE_RESTORED, 'true'))
+
+  # Where the Rust library comes from. With prebuiltRustArtifact, the leg tests against the
+  # library a rust-build-job.yml job published instead of compiling the crate; RUST_NATIVE_ARGS
+  # carries the Maven flags for that. It is set on every agent, empty where Maven compiles the
+  # crate itself, because an undefined $(VAR) would reach Maven as literal text. Coverage legs
+  # never pass an artifact: they need the library instrumented for coverage (qdbr-coverage).
+  - ${{ if ne(parameters.prebuiltRustArtifact, '') }}:
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download prebuilt Rust library"
+        inputs:
+          buildType: current
+          artifactName: ${{ parameters.prebuiltRustArtifact }}
+          targetPath: $(Pipeline.Workspace)/qdbr-native
+      - bash: echo "##vso[task.setvariable variable=RUST_NATIVE_ARGS]-DskipNative -Dqdbr.prebuilt.dir=$(Pipeline.Workspace)/qdbr-native"
+        displayName: "Use prebuilt Rust library"
+  - ${{ else }}:
+      - bash: echo "##vso[task.setvariable variable=RUST_NATIVE_ARGS]"
+        displayName: "Use Maven-built Rust library"
+      - script: python3 .github/prepare_rust_env.py --export-cargo-install-env --match core/rust/qdbr/rust-toolchain.toml
+        displayName: "Ensure Rust is installed"
+        # Note, the `prepare_rust_env.py` script exports a number of variables.
+
+  - template: install-llvm.yml
+    parameters:
+      shouldRun: |
+        and(
+          startsWith(variables['testset'], 'coverage'),
+          eq(variables['RUST_SOURCE_CODE_CHANGED'], 'true'),
+          ne(variables['System.PullRequest.IsFork'], 'true')
+        )
+
+  - ${{ if ne(parameters.testCommitModeGroup, '') }}:
+      - template: select-test-commit-mode.yml
+        parameters:
+          group: ${{ parameters.testCommitModeGroup }}
+          member: ${{ parameters.testCommitModeMember }}
+
   - task: Maven@3
     displayName: "Compile with Maven"
     inputs:
+      mavenVersionOption: "$(MAVEN_VERSION_OPTION)"
+      mavenDirectory: "$(build.sourcesdirectory)/maven/apache-maven-$(MAVEN_VERSION)"
       mavenPomFile: "pom.xml"
       mavenOptions: "$(MAVEN_OPTS)"
-      options:
-        "compile -DskipTests -P build-web-console  -Dhttp.keepAlive=false"
+      goals: "compile"
+      options: "-s $(MAVEN_SETTINGS_FILE) $(javadoc_step) -DskipTests -P build-web-console$(javadoc_profile) $(CLIENT_PROFILE) $(MAVEN_RUN_OPTS) $(RUST_NATIVE_ARGS)"
       jdkVersionOption: $(jdk)
-    condition:
-      or(eq(variables['SOURCE_CODE_CHANGED'], 'false'), eq(variables['testset'],
-      'none'))
+    # succeeded() explicitly: a bare variable condition replaces Azure's implicit
+    # succeeded() guard, so without it this step runs after an earlier step (e.g.
+    # the submodule clone in detect-local-client) failed, and dies on the
+    # never-populated $(MAVEN_SETTINGS_FILE) -- burying the real error.
+    condition: |
+      and(
+        succeeded(),
+        or(
+          eq(variables['testset'], 'none'),
+          eq(variables['SOURCE_CODE_CHANGED'], 'false')
+        )
+      )
+  - task: Maven@3
+    displayName: "Run tests (prebuilt Rust library)"
+    inputs:
+      mavenVersionOption: "$(MAVEN_VERSION_OPTION)"
+      mavenDirectory: '$(build.sourcesdirectory)/maven/apache-maven-$(MAVEN_VERSION)'
+      mavenPomFile: "pom.xml"
+      mavenOptions: "-Xlog:gc -Dfile.encoding=UTF-8 $(MAVEN_OPTS)"
+      goals: "clean test"
+      options: "-s $(MAVEN_SETTINGS_FILE) --batch-mode --quiet $(TEST_REACTOR_ARGS) -Dtest.include=$(includeTests)
+        -Dtest.exclude=$(excludeTests)
+        -Dout=$(Build.SourcesDirectory)/ci/qlog.conf
+        -DfailIfNoTests=false
+        -Dsurefire.failIfNoSpecifiedTests=false
+        $(WEB_CONSOLE_PROFILE)
+        $(CLIENT_PROFILE) $(MAVEN_RUN_OPTS) $(RUST_NATIVE_ARGS) $(TEST_COMMIT_MODE_OPT)"
+      jdkVersionOption: $(jdk)
+      ${{ if ne(parameters.testCommitModeGroup, '') }}:
+        testRunTitle: "$(TEST_RUN_TITLE)"
+    env:
+      QDB_TEST_WINDOWS_SYMLINKS: "1"
+    timeoutInMinutes: ${{ parameters.testTimeoutInMinutes }}
+    # succeeded() explicitly: see "Compile with Maven" above.
+    condition: |
+      and(
+        succeeded(),
+        eq(variables['testset'], 'all'),
+        eq(variables['SOURCE_CODE_CHANGED'], 'true'),
+        or(eq(variables['os'], 'Windows'), eq(variables['os'], 'macOS'))
+      )
   - task: Maven@3
     displayName: "Run tests"
     inputs:
+      mavenVersionOption: "$(MAVEN_VERSION_OPTION)"
+      mavenDirectory: "$(build.sourcesdirectory)/maven/apache-maven-$(MAVEN_VERSION)"
       mavenPomFile: "pom.xml"
-      mavenOptions: "$(MAVEN_OPTS)"
+      mavenOptions: "-Xlog:gc -Dfile.encoding=UTF-8 $(MAVEN_OPTS)"
       goals: "clean test"
-      options:
-        "--batch-mode --quiet -Dtest=$(includeTests)
+      options: "-s $(MAVEN_SETTINGS_FILE) --batch-mode --quiet $(TEST_REACTOR_ARGS) -Dtest.include=$(includeTests)
         -Dtest.exclude=$(excludeTests)
-        -Dout=$(Build.SourcesDirectory)/ci/qlog.conf -Dhttp.keepAlive=false
-        -DfailIfNoTests=false"
+        -Dout=$(Build.SourcesDirectory)/ci/qlog.conf
+        -DfailIfNoTests=false
+        -Dsurefire.failIfNoSpecifiedTests=false
+        $(WEB_CONSOLE_PROFILE)
+        $(CLIENT_PROFILE) $(MAVEN_RUN_OPTS) $(RUST_NATIVE_ARGS) $(TEST_COMMIT_MODE_OPT)"
       jdkVersionOption: $(jdk)
-    timeoutInMinutes: 55
+      ${{ if ne(parameters.testCommitModeGroup, '') }}:
+        testRunTitle: "$(TEST_RUN_TITLE)"
+    env:
+      QDB_TEST_WINDOWS_SYMLINKS: "1"
+    # Defaults to 55, matching master's previous hardcoded value; the adaptive
+    # nightly overrides it (165 / 315) for its long single-JVM passes.
+    timeoutInMinutes: ${{ parameters.testTimeoutInMinutes }}
+    # succeeded() explicitly: see "Compile with Maven" above.
     condition: |
       and(
+        succeeded(),
         eq(variables['testset'], 'all'),
-        eq(variables['SOURCE_CODE_CHANGED'], 'true')
+        eq(variables['SOURCE_CODE_CHANGED'], 'true'),
+        eq(variables['os'], 'Linux')
+      )
+  - ${{ if ne(parameters.testCommitModeGroup, '') }}:
+      - template: verify-test-commit-mode.yml
+
+  - bash: find . -name '*.profraw' -delete
+    displayName: "Clean stale profraw files"
+    condition: |
+      and(
+        startsWith(variables['testset'], 'coverage'),
+        eq(variables['RUST_SOURCE_CODE_CHANGED'], 'true'),
+        ne(variables['System.PullRequest.IsFork'], 'true')
       )
   - task: Maven@3
-    displayName: "Run tests with Coverage"
+    displayName: "Pre-build for Coverage"
     inputs:
-      mavenPomFile: "core/pom.xml"
+      mavenVersionOption: "$(MAVEN_VERSION_OPTION)"
+      mavenDirectory: "$(build.sourcesdirectory)/maven/apache-maven-$(MAVEN_VERSION)"
+      mavenPomFile: "pom.xml"
       mavenOptions: "$(MAVEN_OPTS)"
-      goals: "test"
-      options:
-        "--batch-mode --quiet -Dtest=$(includeTests)
-        -Dtest.exclude=$(excludeTests)
-        -Dout=$(Build.SourcesDirectory)/ci/qlog.conf -Dhttp.keepAlive=false"
+      goals: "install"
+      options: "-s $(MAVEN_SETTINGS_FILE) --batch-mode -pl core -am -DskipTests
+        -P build-web-console
+        $(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
       jdkVersionOption: $(jdk)
-      codeCoverageToolOption: "$(CODE_COVERAGE_TOOL_OPTION)"
-      codeCoverageClassFilter: "$(COVERAGE_DIFF)"
-    timeoutInMinutes: 55
+    # succeeded() explicitly: see "Compile with Maven" above.
     condition: |
       and(
-        eq(variables['testset'], 'coverage'),
-        eq(variables['SOURCE_CODE_CHANGED'], 'true')
+        succeeded(),
+        startsWith(variables['testset'], 'coverage'),
+        ne(variables['System.PullRequest.IsFork'], 'true'),
+        or(
+            eq(variables['CODE_COVERAGE_TOOL_OPTION'], 'JaCoCo'),
+            eq(variables['RUST_SOURCE_CODE_CHANGED'], 'true')
+        )
       )
+  - task: Maven@3
+    displayName: "Run tests with Coverage (jemalloc)"
+    inputs:
+      mavenVersionOption: "$(MAVEN_VERSION_OPTION)"
+      mavenDirectory: "$(build.sourcesdirectory)/maven/apache-maven-$(MAVEN_VERSION)"
+      mavenPomFile: "core/pom.xml"
+      mavenOptions: "-Xlog:gc -Dfile.encoding=UTF-8 $(MAVEN_OPTS)"
+      goals: "test"
+      options: "-s $(MAVEN_SETTINGS_FILE) --batch-mode -Dtest.include=$(includeTests)
+        -Dtest.exclude=$(excludeTests)
+        -Dout=$(Build.SourcesDirectory)/ci/qlog.conf
+        -P jacoco,qdbr-coverage,build-web-console
+        $(CLIENT_PROFILE) $(MAVEN_RUN_OPTS)"
+      jdkVersionOption: $(jdk)
+    env:
+      QDB_TEST_WINDOWS_SYMLINKS: "1"
+      LD_PRELOAD: $(Build.SourcesDirectory)/core/src/main/bin/linux-x86-64/libjemalloc.so
+    timeoutInMinutes: 55
+    # succeeded() explicitly: see "Compile with Maven" above.
+    condition: |
+      and(
+        succeeded(),
+        startsWith(variables['testset'], 'coverage'),
+        ne(variables['System.PullRequest.IsFork'], 'true'),
+        or(
+            eq(variables['CODE_COVERAGE_TOOL_OPTION'], 'JaCoCo'),
+            eq(variables['RUST_SOURCE_CODE_CHANGED'], 'true')
+        )
+      )
+
   - bash: |
-      find . -type f -name 'hs_*.log' -exec sh -c 'x="{}"; mv "$x" "$(ARCHIVED_CRASH_LOG)"' \;
+      echo "##vso[task.setvariable variable=HAS_CRASH_DUMP]false"
+      find . -type f -name 'hs_*.log' -exec sh -c 'mv "$1" "$2"' _ {} "$(ARCHIVED_CRASH_LOG)" \;
+      if [ -f "$(ARCHIVED_CRASH_LOG)" ]; then
+        echo "##vso[task.setvariable variable=HAS_CRASH_DUMP]true"
+      fi
     displayName: "Tests failed -- rename crash dump"
     workingDirectory: $(Build.SourcesDirectory)/core/
-    condition: failed()
+    condition: and(failed(), not(eq(variables['os'], 'Windows')))
+  - task: PowerShell@2
+    inputs:
+      targetType: "inline"
+      script: |
+        Write-Host "##vso[task.setvariable variable=HAS_CRASH_DUMP]false"
+        Get-ChildItem -Path . -Filter "hs_*.log" -File | ForEach-Object {
+            Move-Item -Path $_.FullName -Destination "$(ARCHIVED_CRASH_LOG)"
+        }
+        if (Test-Path -LiteralPath "$(ARCHIVED_CRASH_LOG)" -PathType Leaf) {
+            Write-Host "##vso[task.setvariable variable=HAS_CRASH_DUMP]true"
+        }
+      workingDirectory: $(Build.SourcesDirectory)\core\
+    displayName: "Tests failed -- rename crash dump -- windows"
+    condition: and(failed(), eq(variables['os'], 'Windows'))
   - task: PublishBuildArtifacts@1
     displayName: "Tests failed -- Upload crash logs"
-    condition: failed()
+    condition: and(failed(), eq(variables['HAS_CRASH_DUMP'], 'true'))
     inputs:
       pathToPublish: $(ARCHIVED_CRASH_LOG)
-      artifactName: CrashDump
+      artifactName: "CrashDump${{ parameters.artifactNameSuffix }}"
+  - powershell: |
+      $base = "$(QDB_LOG_W_FILE_LOCATION)"
+      $dir = Split-Path -Parent $base
+      $name = Split-Path -Leaf $base
+      $stage = Join-Path "$(Build.BinariesDirectory)" "staged-logs"
+      New-Item -ItemType Directory -Force -Path $stage | Out-Null
+      Get-ChildItem -Path $dir -Filter "$name*" -File -ErrorAction SilentlyContinue |
+        ForEach-Object { Copy-Item $_.FullName (Join-Path $stage $_.Name) -Force }
+      Write-Host "Staged log files:"; Get-ChildItem $stage | ForEach-Object { Write-Host "  $($_.Name)" }
+    displayName: "Stage log files (Windows)"
+    condition: and(failed(), eq(variables['os'], 'Windows'))
+    continueOnError: true
+  - bash: |
+      set -u
+      base="$(QDB_LOG_W_FILE_LOCATION)"
+      stage="$(Build.BinariesDirectory)/staged-logs"
+      mkdir -p "$stage"
+      # Glob the per-fork files plus any bare base file.
+      shopt -s nullglob
+      for f in "$base" "$base".fork-* "$base".*; do
+        [ -f "$f" ] && cp -f "$f" "$stage/" || true
+      done
+      echo "Staged log files:"; ls -la "$stage" || true
+    displayName: "Stage log files (non-Windows)"
+    condition: and(failed(), ne(variables['os'], 'Windows'))
+    continueOnError: true
   - task: ArchiveFiles@2
     displayName: "Tests failed -- Compress logs"
-    condition: not(succeeded())
+    condition: failed()
     inputs:
-      rootFolderOrFile: $(QDB_LOG_W_FILE_LOCATION)
+      rootFolderOrFile: $(Build.BinariesDirectory)/staged-logs
       includeRootFolder: false
       archiveFile: $(ARCHIVED_LOGS)
       quiet: true
   - task: PublishBuildArtifacts@1
     displayName: "Tests failed -- Upload logs"
-    condition: not(succeeded())
+    condition: failed()
     inputs:
       pathToPublish: $(ARCHIVED_LOGS)
-      artifactName: MavenFailedTestsLogs
+      artifactName: "MavenFailedTestsLogs${{ parameters.artifactNameSuffix }}"
+
   - bash: |
-      mv $(Build.SourcesDirectory)/core/CCReport43F6D5EF/jacoco.exec $(Build.SourcesDirectory)/core/CCReport43F6D5EF/jacoco-$(System.JobId).exec
-    displayName: "Rename jacoco cover report"
-    workingDirectory: $(Build.SourcesDirectory)/core/
+      set -eux
+      mv core/target/jacoco.exec $(testset).exec
+    displayName: "Prepare partial JaCoCo report for upload"
     condition: |
-      and(and(
-        eq(variables['testset'], 'coverage'),
-        eq(variables['CODE_COVERAGE_TOOL_OPTION'], 'JaCoCo')
-      ), succeeded())
+      and(
+        startsWith(variables['testset'], 'coverage'),
+        eq(variables['CODE_COVERAGE_TOOL_OPTION'], 'JaCoCo'),
+        ne(variables['System.PullRequest.IsFork'], 'true')
+      )
   - task: PublishBuildArtifacts@1
-    displayName: "Publish jacoco report"
+    displayName: "Upload partial JaCoCo report"
     condition: |
-      and(and(
-        eq(variables['testset'], 'coverage'),
-        eq(variables['CODE_COVERAGE_TOOL_OPTION'], 'JaCoCo')
-      ), succeeded())
+      and(
+        startsWith(variables['testset'], 'coverage'),
+        eq(variables['CODE_COVERAGE_TOOL_OPTION'], 'JaCoCo'),
+        ne(variables['System.PullRequest.IsFork'], 'true')
+      )
     inputs:
-      pathToPublish: "$(Build.SourcesDirectory)/core/CCReport43F6D5EF/jacoco-$(system.JobId).exec"
+      pathToPublish: $(Build.SourcesDirectory)/$(testset).exec
       artifactName: jacoco-coverage
+  - bash: |
+      set -eux
+      export PATH=$LLVM_TOOLS_PATH:$PATH
+      # List profraw files for debugging purposes
+      find . -name \*.profraw
+      PROFRAW="core/questdbr-junit.profraw"
+      if [ ! -f "$PROFRAW" ]; then
+        echo "LLVM profiling file not found: $PROFRAW"
+        exit -1
+      fi
+      llvm-profdata merge -sparse -o $(testset).profdata "$PROFRAW"
+
+      IGNORE_RE='(.cargo/registry|rustc/.*\.rs)'
+      OBJECTS="--object core/target/rust-maven-plugin/qdbr/debug/libquestdbr.so"
+
+      llvm-cov export \
+        --format=lcov \
+        --ignore-filename-regex="$IGNORE_RE" \
+        $OBJECTS \
+        --instr-profile=$(testset).profdata \
+        > $(testset).lcov
+      echo "Generated $(testset).lcov"
+    displayName: "Create partial Rust coverage report (LCOV)"
+    condition: |
+      and(
+        startsWith(variables['testset'], 'coverage'),
+        eq(variables['RUST_SOURCE_CODE_CHANGED'], 'true'),
+        ne(variables['System.PullRequest.IsFork'], 'true')
+      )
+  - task: PublishBuildArtifacts@1
+    displayName: "Upload partial Rust coverage report (LCOV)"
+    condition: |
+      and(
+        startsWith(variables['testset'], 'coverage'),
+        eq(variables['RUST_SOURCE_CODE_CHANGED'], 'true'),
+        ne(variables['System.PullRequest.IsFork'], 'true')
+      )
+    inputs:
+      pathToPublish: $(Build.SourcesDirectory)/$(testset).lcov
+      artifactName: rust-llvm-coverage

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,13 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.idx.BitmapIndexUtils;
+import io.questdb.cairo.idx.BitmapIndexWriter;
 import io.questdb.cairo.vm.api.MemoryMA;
+import io.questdb.cairo.vm.api.MemoryR;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
 import io.questdb.std.str.Path;
 
 import static io.questdb.cairo.TableUtils.charFileName;
@@ -40,29 +44,68 @@ public interface MapWriter extends SymbolCountProvider {
             CharSequence columnName,
             long columnNameTxn,
             int symbolCapacity,
-            boolean symbolCacheFlag
+            boolean symbolCacheFlag,
+            int commitMode
     ) {
-        int plen = path.length();
+        // Table-level metadata is synced once per table by the caller. Under NOSYNC, skip the
+        // per-column msyncs: a CREATE TABLE with thousands of symbol columns would otherwise
+        // pay two synchronous flushes per column.
+        final boolean sync = commitMode != CommitMode.NOSYNC;
+        final boolean async = commitMode == CommitMode.ASYNC;
+        int plen = path.size();
         try {
-            mem.wholeFile(ff, offsetFileName(path.trimTo(plen), columnName, columnNameTxn), MemoryTag.MMAP_INDEX_WRITER);
+            mem.smallFile(ff, offsetFileName(path.trimTo(plen), columnName, columnNameTxn), MemoryTag.MMAP_INDEX_WRITER);
             mem.jumpTo(0);
             mem.putInt(symbolCapacity);
             mem.putBool(symbolCacheFlag);
             mem.jumpTo(SymbolMapWriter.HEADER_SIZE);
+            if (sync) {
+                mem.sync(async);
+            }
             mem.close();
 
             if (!ff.touch(charFileName(path.trimTo(plen), columnName, columnNameTxn))) {
-                throw CairoException.instance(ff.errno()).put("Cannot create ").put(path);
+                throw CairoException.critical(ff.errno()).put("Cannot create ").put(path);
             }
 
             mem.smallFile(ff, BitmapIndexUtils.keyFileName(path.trimTo(plen), columnName, columnNameTxn), MemoryTag.MMAP_INDEX_WRITER);
             BitmapIndexWriter.initKeyMemory(mem, TableUtils.MIN_INDEX_VALUE_BLOCK_SIZE);
+            if (sync) {
+                mem.sync(async);
+            }
             ff.touch(BitmapIndexUtils.valueFileName(path.trimTo(plen), columnName, columnNameTxn));
         } finally {
-            mem.close();
             path.trimTo(plen);
+            Misc.free(mem);
         }
     }
+
+    /**
+     * Column index in table writer metadata. This value is a pass-thru from table writer, and
+     * it used by table writer to look-back the column name when needed.
+     *
+     * @return column index or -1 if this is a NullWriter (noop writer)
+     */
+    int getColumnIndex();
+
+    boolean getNullFlag();
+
+    int getSymbolCapacity();
+
+    MemoryR getSymbolOffsetsMemory();
+
+    MemoryR getSymbolValuesMemory();
+
+    /**
+     * @return whether the value-to-key cache is allocated. Not the same question as
+     * {@link #isCached()}, which reports what the column asked for: a column configured CACHE
+     * keeps that flag after {@link SymbolMapWriter} has run the cache's key buffer out and
+     * dropped it, because the drop is an internal fallback rather than a change to the column.
+     * The two disagreeing is what tells a caller the column is missing a cache it is entitled
+     * to. An implementation that holds no cache of its own answers whatever {@link #isCached()}
+     * answers, so such a caller finds nothing to act on
+     */
+    boolean isCacheAllocated();
 
     boolean isCached();
 
@@ -74,7 +117,53 @@ public interface MapWriter extends SymbolCountProvider {
 
     void rollback(int symbolCount);
 
+    /**
+     * Marks this symbol writer's char memory as append-only, as
+     * {@link io.questdb.cairo.vm.api.MemoryMA#setAppendOnly(boolean)} does for column memories. Only safe
+     * under {@link io.questdb.cairo.CommitMode#ADAPTIVE}; other modes pass false and keep the full-extent
+     * {@code sync()}. The default does nothing, for writers with no such memory (e.g.
+     * {@link io.questdb.cairo.vm.NullMapWriter}).
+     */
+    default void setAppendOnly(boolean isAppendOnly) {
+    }
+
     void setSymbolIndexInTxWriter(int symbolIndexInTxWriter);
+
+    void sync(boolean async);
+
+    /**
+     * Follows {@link #sync(boolean)}'s msync with an fsync of the underlying files.
+     * <p>
+     * A save point ends with one device barrier that, per {@code fcntl(2)}, persists "data that had been
+     * fsync'd on the same device before". Symbol maps live in the table root rather than a partition
+     * directory, so the save point's partition sweep never reaches them, and msync alone leaves them outside
+     * that guarantee. The default does nothing: the no-op and view map writers have no files.
+     */
+    default void fsyncFiles() {
+    }
+
+    /**
+     * Stage 2 of the batched flush (Linux only); see {@link io.questdb.cairo.vm.api.MemoryMA#syncFlushDrain()}.
+     * The default does nothing.
+     */
+    default void syncFlushDrain() {
+    }
+
+    /**
+     * Stage 3 of the batched flush; see {@link io.questdb.cairo.vm.api.MemoryMA#syncFlushFinishIfExtended()}.
+     * The default runs a full {@code sync(false)}, for writers that do not implement the first two stages.
+     */
+    default void syncFlushFinishIfExtended() {
+        sync(false);
+    }
+
+    /**
+     * Stage 1 of the batched flush (Linux only); see {@link io.questdb.cairo.vm.api.MemoryMA#syncFlushKick()}.
+     * The default does nothing, and the default {@link #syncFlushFinishIfExtended()} then flushes with
+     * {@code sync(false)}.
+     */
+    default void syncFlushKick() {
+    }
 
     void truncate();
 

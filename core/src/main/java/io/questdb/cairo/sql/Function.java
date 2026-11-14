@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,36 +25,139 @@
 package io.questdb.cairo.sql;
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.Plannable;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.ObjList;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
 
-public interface Function extends Closeable, StatefulAtom {
+public interface Function extends Closeable, StatefulAtom, Plannable {
 
+    int COMPLEXITY_ARITHMETIC = 2;
+    int COMPLEXITY_CAST = 3;
+    int COMPLEXITY_COLUMN = 1;
+    int COMPLEXITY_GEO = 30;
+    int COMPLEXITY_JSON = 80;
+    int COMPLEXITY_MAX = 10_000;
+    int COMPLEXITY_NONE = 0;
+    int COMPLEXITY_REGEX = 50;
+    int COMPLEXITY_STRING_OP = 10;
+    int COMPLEXITY_SUBQUERY = 1000;
+
+    static int addComplexity(int a, int b) {
+        long sum = (long) a + b;
+        return (int) Math.min(sum, COMPLEXITY_MAX);
+    }
+
+    /**
+     * Notifies each function in the list that the cursor has closed, so it releases the
+     * cursor-scoped state its init() built. The counterpart of
+     * {@link #init(ObjList, SymbolTableSource, SqlExecutionContext, Function)}: whoever
+     * initializes a function list owns this call too.
+     */
+    static void cursorClosed(ObjList<? extends Function> functions) {
+        for (int i = 0, n = functions.size(); i < n; i++) {
+            functions.getQuick(i).cursorClosed();
+        }
+    }
+
+    /**
+     * Initializes each function in the list of clones. It is assumed by this method that "clones" are copies of
+     * the same function.
+     * <p>
+     * Two-phase functions might need to perform certain transformations upfront, before SQL executes. This is to
+     * avoid doing those transformations on for every row/invocation. These transformations are done during the
+     * "init" phase.
+     * <p>
+     * During concurrent SQL execution it might be beneficial to split the "init" phase into per-SQL execution and
+     * per-thread. For example "init" could be a heavy SQL execution itself, which would benefit from executing once and
+     * copying state of this execution to clones, so that clones to not have to repeat that heavy SQL execution. The
+     * "prototype" function is the one that has already been fully initialized, and it is ready to pass its state to
+     * all the clones.
+     * <p>
+     * Even though the prototype will be trying to pass its state, the clones do not have to accept it and choose to
+     * continue to calculate own state.
+     *
+     * @param clones            uniform function to initialize and accept state from the prototype, if prototype is not null
+     * @param symbolTableSource symbol table source to perform symbol value to key conversion
+     * @param executionContext  the execution context, bind variables etc
+     * @param prototypeFunction the prototype function, ready to donate its state
+     * @throws SqlException function are allowed to throw SQLException to indicate initialization error
+     */
     static void init(
+            ObjList<? extends Function> clones,
+            SymbolTableSource symbolTableSource,
+            SqlExecutionContext executionContext,
+            @Nullable Function prototypeFunction
+    ) throws SqlException {
+        if (prototypeFunction != null) {
+            for (int i = 0, n = clones.size(); i < n; i++) {
+                prototypeFunction.offerStateTo(clones.getQuick(i));
+            }
+        }
+        for (int i = 0, n = clones.size(); i < n; i++) {
+            clones.getQuick(i).init(symbolTableSource, executionContext);
+        }
+    }
+
+    static void initNc(
             ObjList<? extends Function> args,
             SymbolTableSource symbolTableSource,
-            SqlExecutionContext executionContext
+            SqlExecutionContext executionContext,
+            @Nullable Function prototypeFunction
     ) throws SqlException {
-        for (int i = 0, n = args.size(); i < n; i++) {
-            args.getQuick(i).init(symbolTableSource, executionContext);
+        if (args != null) {
+            init(args, symbolTableSource, executionContext, prototypeFunction);
         }
+    }
+
+    default void assignType(int type, BindVariableService bindVariableService) throws SqlException {
+        throw new UnsupportedOperationException();
     }
 
     @Override
     default void close() {
     }
 
-    default boolean supportsRandomAccess() {
-        return true;
+    /**
+     * Called when the cursor is closed.
+     */
+    default void cursorClosed() {
     }
 
-    int getArrayLength();
+    /**
+     * Returns the extended operations for this function, if any.
+     *
+     * @return the function extension, or null if none
+     */
+    default FunctionExtension extendedOps() {
+        return null;
+    }
+
+    default int getComplexity() {
+        return COMPLEXITY_COLUMN;
+    }
+
+    /**
+     * Returns the array value from the record.
+     *
+     * @param rec the record to read from
+     * @return the array view
+     */
+    ArrayView getArray(Record rec);
 
     BinarySequence getBin(Record rec);
 
@@ -68,74 +171,191 @@ public interface Function extends Closeable, StatefulAtom {
 
     long getDate(Record rec);
 
+    /**
+     * Sets the raw value of sink (the scale is caller saved).
+     *
+     * @param rec  the record to read from
+     * @param sink the sink to write the decimal value to
+     */
+    void getDecimal128(Record rec, Decimal128 sink);
+
+    short getDecimal16(Record rec);
+
+    /**
+     * Sets the raw value of sink (the scale is caller saved).
+     *
+     * @param rec  the record to read from
+     * @param sink the sink to write the decimal value to
+     */
+    void getDecimal256(Record rec, Decimal256 sink);
+
+    int getDecimal32(Record rec);
+
+    long getDecimal64(Record rec);
+
+    byte getDecimal8(Record rec);
+
     double getDouble(Record rec);
 
     float getFloat(Record rec);
 
+    /**
+     * Returns the geohash byte value from the record.
+     *
+     * @param rec the record to read from
+     * @return the geohash byte value
+     */
+    byte getGeoByte(Record rec);
+
+    /**
+     * Returns the geohash int value from the record.
+     *
+     * @param rec the record to read from
+     * @return the geohash int value
+     */
+    int getGeoInt(Record rec);
+
+    /**
+     * Returns the geohash long value from the record.
+     *
+     * @param rec the record to read from
+     * @return the geohash long value
+     */
+    long getGeoLong(Record rec);
+
+    /**
+     * Returns the geohash short value from the record.
+     *
+     * @param rec the record to read from
+     * @return the geohash short value
+     */
+    short getGeoShort(Record rec);
+
+    int getIPv4(Record rec);
+
     int getInt(Record rec);
 
+    /**
+     * Returns the interval value from the record.
+     *
+     * @param rec the record to read from
+     * @return the interval value
+     */
+    @NotNull
+    Interval getInterval(Record rec);
+
+    /**
+     * Returns the long value from the record.
+     *
+     * @param rec the record to read from
+     * @return the long value
+     */
     long getLong(Record rec);
 
-    void getLong256(Record rec, CharSink sink);
+    long getLong128Hi(Record rec);
+
+    long getLong128Lo(Record rec);
+
+    /**
+     * Writes the Long256 value to the given sink.
+     *
+     * @param rec  the record to read from
+     * @param sink the sink to write to
+     */
+    void getLong256(Record rec, CharSink<?> sink);
 
     Long256 getLong256A(Record rec);
 
     Long256 getLong256B(Record rec);
 
-    // when function returns factory it becomes factory
-    // on other words this is not a tear-away instance
-    RecordCursorFactory getRecordCursorFactory();
-
-    // function returns a record of values
-    Record getRecord(Record rec);
-
     default RecordMetadata getMetadata() {
         return null;
     }
 
+    /**
+     * @return function name or symbol, e.g. concat or + .
+     * r=
+     */
+    default String getName() {
+        return getClass().getName();
+    }
+
+    // when function returns factory it becomes factory
+    // on other words this is not a tear-away instance
+    RecordCursorFactory getRecordCursorFactory();
+
     short getShort(Record rec);
 
-    CharSequence getStr(Record rec);
-
-    CharSequence getStr(Record rec, int arrayIndex);
-
-    void getStr(Record rec, CharSink sink);
-
-    void getStr(Record rec, CharSink sink, int arrayIndex);
+    CharSequence getStrA(Record rec);
 
     CharSequence getStrB(Record rec);
 
-    CharSequence getStrB(Record rec, int arrayIndex);
-
     int getStrLen(Record rec);
-
-    int getStrLen(Record rec, int arrayIndex);
 
     CharSequence getSymbol(Record rec);
 
+    /**
+     * Returns the symbol value from the record (alternate buffer).
+     *
+     * @param rec the record to read from
+     * @return the symbol value
+     */
     CharSequence getSymbolB(Record rec);
 
     long getTimestamp(Record rec);
 
-    byte getGeoByte(Record rec);
-
-    short getGeoShort(Record rec);
-
-    int getGeoInt(Record rec);
-
-    long getGeoLong(Record rec);
-
     int getType();
 
-    default boolean isUndefined() {
-        return getType() == ColumnType.UNDEFINED;
-    }
+    @Nullable
+    Utf8Sequence getVarcharA(Record rec);
 
-    default void assignType(int type, BindVariableService bindVariableService) throws SqlException {
-        throw new UnsupportedOperationException();
-    }
+    @Nullable
+    Utf8Sequence getVarcharB(Record rec);
 
+    /**
+     * Returns the size of the varchar value.
+     *
+     * @param rec the record to read from
+     * @return size of the varchar value or {@link TableUtils#NULL_LEN} in case of NULL
+     */
+    int getVarcharSize(Record rec);
+
+    /**
+     * Returns true if function is constant, i.e. its value does not require
+     * any input from the record.
+     *
+     * @return true if function is constant
+     * @see #isRuntimeConstant()
+     */
     default boolean isConstant() {
+        return false;
+    }
+
+    @SuppressWarnings("BooleanMethodIsAlwaysInverted")
+    default boolean isConstantOrRuntimeConstant() {
+        return isConstant() || isRuntimeConstant();
+    }
+
+    /**
+     * Performs a best-effort comparison to check if two functions are equivalent.
+     * This is used for optimization purposes to identify duplicate or equivalent expressions.
+     * <p>
+     * Note: A false result does not guarantee that the functions are different - it just means
+     * equivalence could not be determined through this best-effort comparison.
+     *
+     * @param obj the function to compare with
+     * @return true if the functions are definitely equivalent, false if they may or may not be equivalent.
+     */
+    default boolean isEquivalentTo(Function obj) {
+        return this == obj;
+    }
+
+    /**
+     * Returns true if this function is non-deterministic.
+     *
+     * @return true if non-deterministic
+     */
+    default boolean isNonDeterministic() {
         return false;
     }
 
@@ -143,20 +363,123 @@ public interface Function extends Closeable, StatefulAtom {
         return false;
     }
 
-    // If function is constant for query, e.g. record independent
-    // For example now() and bind variables are Runtime Constants
+    // used in generic toSink implementations
+    default boolean isOperator() {
+        return false;
+    }
+
+    default boolean isRandom() {
+        return false;
+    }
+
+    /**
+     * Declares that the function will maintain its value for all the rows during
+     * {@link RecordCursor} traversal. However, between cursor traversals the function
+     * value is liable to change.
+     * <p>
+     * In practice this means that function arguments that are runtime constants can be
+     * evaluated in the functions {@link #init(ObjList, SymbolTableSource, SqlExecutionContext, Function)} call.
+     * <p>
+     * It has be noted that the function cannot be both {@link #isConstant()} and runtime constant.
+     *
+     * @return true when function is runtime constant.
+     */
     default boolean isRuntimeConstant() {
         return false;
     }
 
     /**
+     * Returns true if this function is guaranteed to evaluate to the same value for the whole
+     * duration of a single query execution, including across repeated
+     * {@link #init(SymbolTableSource, SqlExecutionContext)} calls against the same
+     * {@link SqlExecutionContext} (for example when the same expression is compiled twice:
+     * once for an interval-pruning model and once for a residual filter, each opening its own
+     * cursor).
+     * <p>
+     * This is a weaker property than determinism. {@code now()} and bind variables are
+     * non-deterministic across executions, yet stable within one: {@code now()} reads the
+     * timestamp snapshot frozen by {@code SqlExecutionContext.initNow()} at statement entry,
+     * and a bind variable's value is set before execution starts and is immutable while it
+     * runs. Genuinely traversal-unstable functions ({@code rnd_*}, {@code systimestamp()},
+     * {@code sysdate()}) re-sample on every call and must report false.
+     * <p>
+     * The default derives from {@link #isNonDeterministic()}: deterministic implies stable,
+     * and non-deterministic functions are assumed unstable unless they override this method
+     * with a proof of within-execution stability. Consumers must treat {@code false} as
+     * "stability not proven", never as a licence to re-evaluate.
+     *
+     * @return true if the value cannot change within a single query execution
+     */
+    default boolean isStableWithinExecution() {
+        return !isNonDeterministic();
+    }
+
+    /**
      * Returns true if the function and all of its children functions are thread-safe
      * and, thus, can be called concurrently, false - otherwise. Used as a hint for
-     * parallel SQL filters runtime, thus this method makes sense only for functions
-     * that are allowed in a filter (WHERE clause).
+     * parallel SQL execution, thus this method makes sense only for functions
+     * that are allowed in WHERE or GROUP BY clause.
+     * <p>
+     * In case of non-aggregate functions this flag means read thread-safety.
+     * For decomposable (think, parallel) aggregate functions
+     * ({@link io.questdb.griffin.engine.functions.GroupByFunction})
+     * it means write thread-safety, i.e. whether it's safe to use single function
+     * instance concurrently to aggregate across multiple threads.
+     * <p>
+     * If the function is not read thread-safe, it gets cloned for each worker thread.
+     *
+     * @return true if the function and all of its children functions are thread-safe
      */
-    boolean isReadThreadSafe();
+    default boolean isThreadSafe() {
+        return false;
+    }
+
+    default boolean isUndefined() {
+        return getType() == ColumnType.UNDEFINED;
+    }
+
+    default void offerStateTo(Function that) {
+    }
+
+    /**
+     * For exactly once per-row execution functions can declare themselves memoizable by
+     * returning true out of this method. Typically, this is all what's required. FunctionParser will
+     * wrap memoizable functions into type-specific Memoizers. These memoizers will implement {@see memoize} method.
+     * Caching heavy or potentially volatile computations for each data row.
+     *
+     * @return if function is memoizable
+     */
+    default boolean shouldMemoize() {
+        return false;
+    }
+
+    /**
+     * Returns true if the function supports parallel aggregation, e.g. parallel
+     * GROUP BY. If the method returns false, single-threaded execution plan
+     * must be chosen for such a query. The parallel filter does not consult this
+     * flag: a thread-unsafe filter is cloned per worker based on {@link #isThreadSafe()}.
+     * <p>
+     * Examples of parallelizable, but thread-unsafe function are regexp_replace() or min(str).
+     * These functions need to maintain a char sink, so they can't be accessed concurrently.
+     * On the other hand, regexp_replace() can be used in parallel filter and min(str)
+     * supports parallel aggregation and subsequent merge.
+     *
+     * @return true if the function and all of its children functions support parallel execution
+     */
+    default boolean supportsParallelism() {
+        return true;
+    }
+
+    default boolean supportsRandomAccess() {
+        return true;
+    }
+
+    @Override
+    default void toPlan(PlanSink sink) {
+        sink.val(getName()).val("()");
+    }
 
     default void toTop() {
+        // no-op
     }
 }

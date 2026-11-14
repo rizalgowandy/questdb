@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,64 +25,84 @@
 package io.questdb;
 
 import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.TestOnly;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URL;
-import java.util.Enumeration;
 import java.util.jar.Attributes;
 import java.util.jar.Manifest;
 
 public class BuildInformationHolder implements BuildInformation, CharSequence {
-    public static final BuildInformationHolder INSTANCE = fetchBuildInformation();
-    private static final String UNKNOWN = "Unknown Version";
-
-    private final CharSequence questDbVersion;
-    private final CharSequence commitHash;
-    private final CharSequence jdkVersion;
+    private static final String UNKNOWN = "unknown";
     private final String buildKey;
+    private final String commitHash;
+    private final String jdkVersion;
+    private final String swName;
+    private final String swVersion;
 
     public BuildInformationHolder() {
-        this(UNKNOWN, UNKNOWN, UNKNOWN);
+        this(BuildInformationHolder.class);
     }
 
-    @TestOnly
-    public BuildInformationHolder(CharSequence questDbVersion, CharSequence commitHash, CharSequence jdkVersion) {
-        this.questDbVersion = questDbVersion;
+    public BuildInformationHolder(Class<?> clazz) {
+        String swVersion;
+        String swName;
+        String commitHash;
+        String jdkVersion;
+        try {
+            final Attributes manifestAttributes = getManifestAttributes(clazz);
+            swVersion = getAttr(manifestAttributes, "Implementation-Version", "[DEVELOPMENT]");
+            swName = getAttr(manifestAttributes, "Implementation-Title", UNKNOWN);
+            commitHash = getAttr(manifestAttributes, "Build-Commit-Hash", UNKNOWN);
+            jdkVersion = getAttr(manifestAttributes, "Build-Jdk", UNKNOWN);
+        } catch (IOException e) {
+            swVersion = UNKNOWN;
+            swName = UNKNOWN;
+            commitHash = UNKNOWN;
+            jdkVersion = UNKNOWN;
+        }
+        this.swVersion = swVersion;
+        this.swName = swName;
         this.commitHash = commitHash;
         this.jdkVersion = jdkVersion;
-        this.buildKey = questDbVersion + ":" + commitHash + ":" + jdkVersion;
+        buildKey = makeBuildKey(swVersion, commitHash, jdkVersion);
     }
 
-    @Override
-    public CharSequence getQuestDbVersion() {
-        return questDbVersion;
-    }
-
-    @Override
-    public CharSequence getJdkVersion() {
-        return jdkVersion;
-    }
-
-    @Override
-    public CharSequence getCommitHash() {
-        return commitHash;
-    }
-
-    @Override
-    public String toString() {
-        return buildKey;
-    }
-
-    @Override
-    public int length() {
-        return buildKey.length();
+    public BuildInformationHolder(String swVersion, String commitHash, String jdkVersion, String swName) {
+        this.swVersion = swVersion;
+        this.commitHash = commitHash;
+        this.jdkVersion = jdkVersion;
+        this.swName = swName;
+        buildKey = makeBuildKey(swVersion, commitHash, jdkVersion);
     }
 
     @Override
     public char charAt(int index) {
         return buildKey.charAt(index);
+    }
+
+    @Override
+    public String getCommitHash() {
+        return commitHash;
+    }
+
+    @Override
+    public String getJdkVersion() {
+        return jdkVersion;
+    }
+
+    @Override
+    public String getSwName() {
+        return swName;
+    }
+
+    @Override
+    public String getSwVersion() {
+        return swVersion;
+    }
+
+    @Override
+    public int length() {
+        return buildKey.length();
     }
 
     @NotNull
@@ -91,46 +111,33 @@ public class BuildInformationHolder implements BuildInformation, CharSequence {
         return buildKey.subSequence(start, end);
     }
 
-    private static BuildInformationHolder fetchBuildInformation() {
-        try {
-            final Attributes manifestAttributes = getManifestAttributes();
-            return new BuildInformationHolder(
-                    getQuestDbVersion(manifestAttributes),
-                    getCommitHash(manifestAttributes),
-                    getJdkVersion(manifestAttributes)
-            );
-        } catch (IOException e) {
-            return new BuildInformationHolder();
-        }
+    @Override
+    public String toString() {
+        return buildKey;
     }
 
-    private static Attributes getManifestAttributes() throws IOException {
-        final Enumeration<URL> resources = ServerMain.class.getClassLoader()
-                .getResources("META-INF/MANIFEST.MF");
-        while (resources.hasMoreElements()) {
-            try (InputStream is = resources.nextElement().openStream()) {
-                final Manifest manifest = new Manifest(is);
-                final Attributes attributes = manifest.getMainAttributes();
-                if ("org.questdb".equals(attributes.getValue("Implementation-Vendor-Id"))) {
-                    return manifest.getMainAttributes();
+    private static String getAttr(final Attributes manifestAttributes, String attributeName, String defaultValue) {
+        final String value = manifestAttributes.getValue(attributeName);
+        return value != null ? value : defaultValue;
+    }
+
+    private static Attributes getManifestAttributes(Class<?> clazz) throws IOException {
+        InputStream is = clazz.getResourceAsStream("/META-INF/MANIFEST.MF");
+        if (is != null) {
+            try {
+                final Attributes attributes = new Manifest(is).getMainAttributes();
+                final String vendor = attributes.getValue("Implementation-Vendor-Id");
+                if (vendor != null && vendor.contains("questdb")) {
+                    return attributes;
                 }
+            } finally {
+                is.close();
             }
         }
         return new Attributes();
     }
 
-    private static CharSequence getQuestDbVersion(final Attributes manifestAttributes) {
-        final CharSequence version = manifestAttributes.getValue("Implementation-Version");
-        return version != null ? version : "[DEVELOPMENT]";
-    }
-
-    private static CharSequence getJdkVersion(final Attributes manifestAttributes) {
-        final CharSequence version = manifestAttributes.getValue("Build-Jdk");
-        return version != null ? version : "Unknown Version";
-    }
-
-    private static CharSequence getCommitHash(final Attributes manifestAttributes) {
-        final CharSequence version = manifestAttributes.getValue("Build-Commit-Hash");
-        return version != null ? version : "Unknown Version";
+    private String makeBuildKey(CharSequence swVersion, CharSequence commitHash, CharSequence jdkVersion) {
+        return swVersion + ":" + commitHash + ":" + jdkVersion;
     }
 }

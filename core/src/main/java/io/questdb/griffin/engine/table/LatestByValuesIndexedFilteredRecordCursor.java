@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +24,15 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
-import io.questdb.cairo.sql.DataFrame;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cairo.sql.RowCursor;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.DirectLongList;
@@ -35,86 +40,150 @@ import io.questdb.std.IntHashSet;
 import io.questdb.std.IntList;
 import io.questdb.std.Rows;
 import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
 
-class LatestByValuesIndexedFilteredRecordCursor extends AbstractRecordListCursor {
-
+class LatestByValuesIndexedFilteredRecordCursor extends AbstractPageFrameRecordCursor {
     private final int columnIndex;
-    private final IntHashSet found = new IntHashSet();
-    private final IntHashSet symbolKeys;
-    private final IntHashSet deferredSymbolKeys;
     private final Function filter;
+    private final IntList remainingKeys = new IntList();
+    private final DirectLongList rows;
+    private final IntHashSet symbolKeys;
+    private SqlExecutionCircuitBreaker circuitBreaker;
+    private long index;
+    private boolean isTreeMapBuilt;
+    private long lim;
 
     public LatestByValuesIndexedFilteredRecordCursor(
+            @NotNull CairoConfiguration configuration,
+            @NotNull RecordMetadata metadata,
             int columnIndex,
             DirectLongList rows,
             @NotNull IntHashSet symbolKeys,
-            @Nullable IntHashSet deferredSymbolKeys,
-            Function filter,
-            @NotNull IntList columnIndexes
+            Function filter
     ) {
-        super(rows, columnIndexes);
+        super(configuration, metadata);
+        this.rows = rows;
         this.columnIndex = columnIndex;
         this.symbolKeys = symbolKeys;
-        this.deferredSymbolKeys = deferredSymbolKeys;
         this.filter = filter;
     }
 
     @Override
-    public void toTop() {
-        super.toTop();
-        filter.toTop();
+    public void close() {
+        filter.cursorClosed();
+        // Free the shared rows list under the per-query tracker bound in of().
+        rows.close();
+        super.close();
     }
 
     @Override
-    protected void buildTreeMap(SqlExecutionContext executionContext) throws SqlException {
-        filter.init(this, executionContext);
-
-        int keyCount = symbolKeys.size();
-        if (deferredSymbolKeys != null) {
-            keyCount += deferredSymbolKeys.size();
+    public boolean hasNext() {
+        circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+        if (!isTreeMapBuilt) {
+            buildTreeMap();
+            isTreeMapBuilt = true;
         }
-        found.clear();
-        DataFrame frame;
-        // frame metadata is based on TableReader, which is "full" metadata
-        // this cursor works with subset of columns, which warrants column index remap
-        int frameColumnIndex = columnIndexes.getQuick(columnIndex);
-        while ((frame = this.dataFrameCursor.next()) != null && found.size() < keyCount) {
-            final int partitionIndex = frame.getPartitionIndex();
-            final BitmapIndexReader indexReader = frame.getBitmapIndexReader(frameColumnIndex, BitmapIndexReader.DIR_BACKWARD);
-            final long rowLo = frame.getRowLo();
-            final long rowHi = frame.getRowHi() - 1;
-            this.recordA.jumpTo(partitionIndex, 0);
-
-            for (int i = 0, n = symbolKeys.size(); i < n; i++) {
-                int symbolKey = symbolKeys.get(i);
-                addFoundKey(symbolKey, indexReader, partitionIndex, rowLo, rowHi);
-            }
-            if (deferredSymbolKeys != null) {
-                for (int i = 0, n = deferredSymbolKeys.size(); i < n; i++) {
-                    int symbolKey = deferredSymbolKeys.get(i);
-                    if (!symbolKeys.contains(symbolKey)) {
-                        addFoundKey(symbolKey, indexReader, partitionIndex, rowLo, rowHi);
-                    }
-                }
-            }
+        if (index < lim) {
+            long rowId = rows.get(index++);
+            // We inverted frame indexes when posting tasks.
+            final int frameIndex = Rows.MAX_SAFE_PARTITION_INDEX - Rows.toPartitionIndex(rowId);
+            frameMemoryPool.navigateTo(frameIndex, recordA);
+            recordA.setRowIndex(Rows.toLocalRowID(rowId));
+            return true;
         }
-        rows.sortAsUnsigned();
+        return false;
     }
 
-    private void addFoundKey(int symbolKey, BitmapIndexReader indexReader, int partitionIndex, long rowLo, long rowHi) {
-        int index = found.keyIndex(symbolKey);
-        if (index > -1) {
-            RowCursor cursor = indexReader.getCursor(false, symbolKey, rowLo, rowHi);
+    @Override
+    public void of(PageFrameCursor pageFrameCursor, SqlExecutionContext executionContext) throws SqlException {
+        this.frameCursor = pageFrameCursor;
+        recordA.of(pageFrameCursor);
+        recordB.of(pageFrameCursor);
+        filter.init(pageFrameCursor, executionContext);
+        circuitBreaker = executionContext.getCircuitBreaker();
+        rows.setMemoryTracker(executionContext.getMemoryTracker());
+        rows.reopen();
+        remainingKeys.clear();
+        isTreeMapBuilt = false;
+        // prepare for page frame iteration
+        super.init(executionContext.getMemoryTracker());
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return isTreeMapBuilt ? 1 : 0;
+    }
+
+    @Override
+    public long size() {
+        return isTreeMapBuilt ? lim : -1;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Index backward scan").meta("on").putColumnName(columnIndex);
+        sink.optAttr("filter", filter);
+    }
+
+    @Override
+    public void toTop() {
+        index = 0;
+        filter.toTop();
+    }
+
+    private boolean addFoundKey(int symbolKey, IndexReader indexReader, int frameIndex, long indexRowLo, long indexRowHi) {
+        try (RowCursor cursor = indexReader.getCursor(symbolKey, indexRowLo, indexRowHi)) {
             while (cursor.hasNext()) {
+                // Per the IndexReader.getCursor(key, minValue, maxValue) contract, returned rows are
+                // already relative to minValue == indexRowLo here, so cursor.next() is already
+                // frame-relative. Do not subtract indexRowLo again, or the record is positioned
+                // indexRowLo rows too early when indexRowLo > 0. For a COMPOSITE partition indexRowLo
+                // carries the piece's file-row shift, which is exactly the shift the frame's page
+                // addresses carry, so the un-subtracted row lines up there too.
                 final long row = cursor.next();
-                recordA.setRecordIndex(row);
+                recordA.setRowIndex(row);
                 if (filter.getBool(recordA)) {
-                    rows.add(Rows.toRowID(partitionIndex, row));
-                    found.addAt(index, symbolKey);
-                    break;
+                    rows.add(Rows.toRowID(frameIndex, row));
+                    return true;
                 }
             }
         }
+        return false;
+    }
+
+    private void buildTreeMap() {
+        remainingKeys.clear();
+        for (int i = 0, n = symbolKeys.size(); i < n; i++) {
+            remainingKeys.add(symbolKeys.get(i));
+        }
+
+        PageFrame frame;
+        while (remainingKeys.size() > 0 && (frame = frameCursor.next()) != null) {
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            final int frameIndex = frameCount;
+            final IndexReader indexReader = frame.getIndexReader(columnIndex, IndexReader.DIR_BACKWARD);
+            final long indexRowLo = frame.getIndexRowLo();
+            final long indexRowHi = frame.getIndexRowHi() - 1;
+
+            frameAddressCache.add(frameCount, frame);
+            frameMemoryPool.navigateTo(frameCount++, recordA);
+
+            // Invert page frame indexes, so that they grow asc in time order.
+            // That's to be able to do post-processing (sorting) of the result set.
+            final int invertedFrameIndex = Rows.MAX_SAFE_PARTITION_INDEX - frameIndex;
+            // Iterate backward with swap-remove: a found key is replaced by the current last entry and
+            // the list shrinks, so the next (older) frame only probes keys that are still unresolved.
+            for (int i = remainingKeys.size() - 1; i >= 0; i--) {
+                int symbolKey = remainingKeys.getQuick(i);
+                if (addFoundKey(symbolKey, indexReader, invertedFrameIndex, indexRowLo, indexRowHi)) {
+                    int last = remainingKeys.size() - 1;
+                    remainingKeys.setQuick(i, remainingKeys.getQuick(last));
+                    remainingKeys.setPos(last);
+                }
+            }
+        }
+
+        rows.sortAsUnsigned();
+        index = 0;
+        lim = rows.size();
     }
 }

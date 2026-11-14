@@ -1,0 +1,561 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cutlass.parquet;
+
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cutlass.text.CopyExportContext;
+import io.questdb.griffin.CompiledQuery;
+import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.SqlExecutionOwner;
+import io.questdb.griffin.engine.ops.CreateTableOperation;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
+import io.questdb.mp.AbstractQueueConsumerJob;
+import io.questdb.mp.Worker;
+import io.questdb.mp.continuation.FiberRuntime;
+import io.questdb.mp.continuation.FiberTask;
+import io.questdb.mp.continuation.LaunchResult;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.MemoryTrackerWorkload;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.Os;
+import io.questdb.std.datetime.MicrosecondClock;
+import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
+
+import java.io.Closeable;
+import java.util.concurrent.Callable;
+import java.util.function.Supplier;
+
+public class CopyExportRequestJob extends AbstractQueueConsumerJob<CopyExportRequestTask> implements Closeable {
+    private static final Log LOG = LogFactory.getLog(CopyExportRequestJob.class);
+    @TestOnly
+    private final @Nullable Callable<Exception> callback;
+    private final CopyExportContext copyContext;
+    private final CopyExportFiberTask copyExportFiberTask = new CopyExportFiberTask();
+    private final CairoEngine engine;
+    private final @Nullable FiberRuntime fiberRuntime;
+    private final StringSink fileName = new StringSink();
+    private final @NotNull MicrosecondClock microsecondClock;
+    private final SqlExecutionOwner owner = new SqlExecutionOwner();
+    private @Nullable MemoryTracker activeLegacyMemoryTracker;
+    private boolean isClosed;
+    private volatile boolean isFiberActive;
+    private volatile boolean isRequestLoaded;
+    private CopyExportRequestTask localTaskCopy;
+    private SQLSerialParquetExporter serialExporter;
+
+    public CopyExportRequestJob(final CairoEngine engine) {
+        this(engine, null, null, null);
+    }
+
+    public CopyExportRequestJob(final CairoEngine engine, @NotNull FiberRuntime fiberRuntime) {
+        this(engine, null, null, fiberRuntime);
+    }
+
+    @TestOnly
+    public CopyExportRequestJob(final CairoEngine engine, @Nullable Callable<Exception> callback) {
+        this(engine, callback, null, null);
+    }
+
+    @TestOnly
+    public CopyExportRequestJob(
+            final CairoEngine engine,
+            @Nullable Callable<Exception> callback,
+            @Nullable Supplier<SQLSerialParquetExporter> exporterFactory
+    ) {
+        this(engine, callback, exporterFactory, null);
+    }
+
+    @TestOnly
+    public CopyExportRequestJob(
+            final CairoEngine engine,
+            @Nullable Callable<Exception> callback,
+            @Nullable Supplier<SQLSerialParquetExporter> exporterFactory,
+            @Nullable FiberRuntime fiberRuntime
+    ) {
+        super(engine.getMessageBus().getCopyExportRequestQueue(), engine.getMessageBus().getCopyExportRequestSubSeq());
+        this.callback = callback;
+        this.copyContext = engine.getCopyExportContext();
+        this.engine = engine;
+        this.fiberRuntime = fiberRuntime;
+        microsecondClock = engine.getConfiguration().getMicrosecondClock();
+        localTaskCopy = new CopyExportRequestTask();
+        try {
+            serialExporter = exporterFactory != null
+                    ? exporterFactory.get()
+                    : new SQLSerialParquetExporter(engine);
+        } catch (Throwable t) {
+            final Throwable failure = Misc.freeBestEffort(t, localTaskCopy);
+            localTaskCopy = null;
+            CairoException.rethrowCleanupFailure(failure);
+        }
+    }
+
+    @Override
+    public io.questdb.mp.Job cloneInstance() {
+        return fiberRuntime != null
+                ? new CopyExportRequestJob(engine, fiberRuntime)
+                : new CopyExportRequestJob(engine);
+    }
+
+    @Override
+    public void close() {
+        if (isClosed) {
+            return;
+        }
+        isClosed = true;
+        Throwable cleanupFailure = null;
+        if (isRequestLoaded) {
+            try {
+                cancelLoadedRequest("copy export job closed");
+            } catch (Throwable th) {
+                cleanupFailure = th;
+            }
+        }
+        while (true) {
+            try {
+                if (!cancelQueuedRequest("copy export job closed")) {
+                    break;
+                }
+            } catch (Throwable th) {
+                cleanupFailure = Misc.foldCleanupFailure(cleanupFailure, th);
+            }
+        }
+        final SQLSerialParquetExporter exporter = serialExporter;
+        serialExporter = null;
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, exporter);
+        final CopyExportRequestTask task = localTaskCopy;
+        localTaskCopy = null;
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, task);
+        CairoException.rethrowCleanupFailure(cleanupFailure);
+    }
+
+    @Override
+    public void closeInstance() {
+        try {
+            close();
+        } catch (Throwable th) {
+            LOG.error().$("could not close copy export job [error=").$(th).I$();
+        }
+    }
+
+    @Override
+    protected boolean canRun() {
+        if (isFiberActive) {
+            return false;
+        }
+        if (isRequestLoaded) {
+            launchLoadedRequest();
+            return false;
+        }
+        return true;
+    }
+
+    @Override
+    protected boolean doRun(long cursor, WorkerContext workerContext) {
+        try {
+            final CopyExportRequestTask task = queue.get(cursor);
+            transferRequest(task);
+        } finally {
+            subSeq.done(cursor);
+        }
+
+        if (fiberRuntime == null) {
+            processRequest(workerContext.carrierId());
+        } else {
+            launchLoadedRequest();
+        }
+        return true;
+    }
+
+    private void cancelLoadedRequest(CharSequence message) {
+        if (!isRequestLoaded) {
+            return;
+        }
+        try {
+            copyContext.updateStatus(
+                    CopyExportRequestTask.Phase.WAITING,
+                    CopyExportRequestTask.Status.CANCELLED,
+                    null,
+                    Numbers.INT_NULL,
+                    message,
+                    -1,
+                    localTaskCopy.getTableName(),
+                    localTaskCopy.getCopyID()
+            );
+        } finally {
+            releaseRequest();
+        }
+    }
+
+    private void failLoadedRequest(CharSequence message) {
+        if (!isRequestLoaded) {
+            return;
+        }
+        try {
+            copyContext.updateStatus(
+                    CopyExportRequestTask.Phase.WAITING,
+                    failureStatus(localTaskCopy.getCircuitBreaker()),
+                    null,
+                    Numbers.INT_NULL,
+                    message,
+                    -1,
+                    localTaskCopy.getTableName(),
+                    localTaskCopy.getCopyID()
+            );
+        } finally {
+            releaseRequest();
+        }
+    }
+
+    private CopyExportRequestTask.Status failureStatus(SqlExecutionCircuitBreaker circuitBreaker) {
+        return CopyExportRequestTask.classifyFailureStatus(circuitBreaker);
+    }
+
+    private void launchLoadedRequest() {
+        assert fiberRuntime != null;
+        if (!isRequestLoaded || isFiberActive) {
+            return;
+        }
+        if (copyExportFiberTask.isDone()) {
+            copyExportFiberTask.reopen();
+        }
+        isFiberActive = true;
+        final LaunchResult result;
+        try {
+            result = fiberRuntime.launch(copyExportFiberTask);
+        } catch (Throwable th) {
+            isFiberActive = false;
+            try {
+                failLoadedRequest(th.getMessage());
+            } catch (Throwable cleanupFailure) {
+                th = Misc.foldCleanupFailure(th, cleanupFailure);
+            }
+            CairoException.rethrowCleanupFailure(th);
+            return;
+        }
+        switch (result) {
+            case ALREADY_OWNED, LAUNCHED -> {
+            }
+            case SATURATED -> isFiberActive = false;
+            case QUIESCING -> {
+                isFiberActive = false;
+                cancelLoadedRequest("copy export Fiber runtime is quiescing");
+            }
+            case RESOURCE_FAILURE -> {
+                isFiberActive = false;
+                failLoadedRequest("copy export Fiber launch failed");
+            }
+            case STALE_INCARNATION, TERMINAL -> {
+                isFiberActive = false;
+                failLoadedRequest("copy export Fiber task has an invalid lifecycle state");
+            }
+        }
+    }
+
+    private void processRequest(int carrierId) {
+        final CopyExportContext.ExportTaskEntry entry = localTaskCopy.getEntry();
+        final SqlExecutionCircuitBreaker circuitBreaker = localTaskCopy.getCircuitBreaker();
+        CopyExportRequestTask.Phase phase = CopyExportRequestTask.Phase.WAITING;
+        try {
+            if (entry.isCancellationRequested()) {
+                throw CopyExportException.instance(phase, -1)
+                        .put("cancelled by user")
+                        .setInterruption(true)
+                        .setCancellation(true);
+            }
+            serialExporter.of(localTaskCopy);
+            final SqlExecutionContextImpl executionContext = serialExporter.getSqlExecutionContext();
+            owner.begin(entry.getSqlText(), executionContext, CompiledQuery.SELECT);
+            final MemoryTracker memoryTracker;
+            if (owner.getId() > -1) {
+                memoryTracker = executionContext.getMemoryTracker();
+                if (memoryTracker == null) {
+                    throw new IllegalStateException("managed copy export owner has no memory tracker");
+                }
+                localTaskCopy.setMemoryTracker(memoryTracker);
+                owner.publish(entry.getSqlText(), entry.containsSecret());
+            } else {
+                memoryTracker = engine.getMemoryTrackerProvider().acquire(
+                        localTaskCopy.getSecurityContext(),
+                        localTaskCopy.getCopyID(),
+                        MemoryTrackerWorkload.QUERY
+                );
+                activeLegacyMemoryTracker = memoryTracker;
+                localTaskCopy.setMemoryTracker(memoryTracker);
+                executionContext.setMemoryTracker(memoryTracker);
+            }
+            if (entry.isCancellationRequested()) {
+                circuitBreaker.cancel();
+            }
+            if (callback != null) {
+                callback.call();
+            }
+            entry.setStartTime(microsecondClock.getTicks(), carrierId);
+            if (circuitBreaker.checkIfTrippedOrYield()) {
+                LOG.errorW().$("copy was cancelled [copyId=").$hexPadded(localTaskCopy.getCopyID()).$(']').$();
+                throw CopyExportException.instance(phase, -1).put("cancelled by user").setInterruption(true).setCancellation(true);
+            }
+            copyContext.updateStatus(
+                    CopyExportRequestTask.Phase.WAITING,
+                    CopyExportRequestTask.Status.FINISHED,
+                    null,
+                    Numbers.INT_NULL,
+                    "",
+                    0,
+                    localTaskCopy.getTableName(),
+                    localTaskCopy.getCopyID());
+            phase = serialExporter.process();
+
+            entry.setPhase(CopyExportRequestTask.Phase.SUCCESS);
+            copyContext.updateStatus(
+                    CopyExportRequestTask.Phase.SUCCESS,
+                    CopyExportRequestTask.Status.FINISHED,
+                    serialExporter.getExportPath(),
+                    serialExporter.getNumOfFiles(),
+                    null,
+                    0,
+                    localTaskCopy.getTableName(),
+                    localTaskCopy.getCopyID()
+            );
+        } catch (CopyExportException e) {
+            copyContext.updateStatus(
+                    e.getPhase(),
+                    failureStatus(circuitBreaker),
+                    null,
+                    Numbers.INT_NULL,
+                    e.getFlyweightMessage(),
+                    e.getErrno(),
+                    localTaskCopy.getTableName(),
+                    localTaskCopy.getCopyID()
+            );
+        } catch (Throwable e) {
+            copyContext.updateStatus(
+                    phase,
+                    failureStatus(circuitBreaker),
+                    null,
+                    Numbers.INT_NULL,
+                    e.getMessage(),
+                    -1,
+                    localTaskCopy.getTableName(),
+                    localTaskCopy.getCopyID()
+            );
+        } finally {
+            releaseRequest();
+        }
+    }
+
+    private boolean cancelQueuedRequest(CharSequence message) {
+        while (true) {
+            final long cursor = subSeq.next();
+            if (cursor == -1) {
+                return false;
+            }
+            if (cursor > -1) {
+                try {
+                    transferRequest(queue.get(cursor));
+                } finally {
+                    subSeq.done(cursor);
+                }
+                cancelLoadedRequest(message);
+                return true;
+            }
+            Os.pause();
+        }
+    }
+
+    private void releaseRequest() {
+        if (!isRequestLoaded) {
+            return;
+        }
+        final boolean isManaged = owner.getId() > -1;
+        final MemoryTracker legacyMemoryTracker = activeLegacyMemoryTracker;
+        activeLegacyMemoryTracker = null;
+        final CopyExportContext.ExportTaskEntry entry = localTaskCopy.getEntry();
+        Throwable cleanupFailure = null;
+        try {
+            localTaskCopy.clear();
+        } catch (Throwable th) {
+            cleanupFailure = th;
+        }
+        final SQLSerialParquetExporter exporter = serialExporter;
+        if (exporter != null) {
+            try {
+                exporter.clearMemoryTracker();
+            } catch (Throwable th) {
+                cleanupFailure = Misc.foldCleanupFailure(cleanupFailure, th);
+            }
+        }
+        try {
+            owner.end();
+        } catch (Throwable th) {
+            cleanupFailure = Misc.foldCleanupFailure(cleanupFailure, th);
+        }
+        if (!isManaged) {
+            cleanupFailure = Misc.freeBestEffort(cleanupFailure, legacyMemoryTracker);
+        }
+        try {
+            copyContext.releaseEntry(entry);
+        } catch (Throwable th) {
+            cleanupFailure = Misc.foldCleanupFailure(cleanupFailure, th);
+        } finally {
+            isRequestLoaded = false;
+        }
+        CairoException.rethrowCleanupFailure(cleanupFailure);
+    }
+
+    private class CopyExportFiberTask extends FiberTask {
+        @Override
+        protected void onAbandoned() {
+            try {
+                if (isRequestLoaded) {
+                    cancelLoadedRequest("copy export Fiber was abandoned");
+                }
+            } finally {
+                isFiberActive = false;
+            }
+        }
+
+        @Override
+        protected void onDone() {
+            isFiberActive = false;
+        }
+
+        @Override
+        protected void onError(Throwable th) {
+            try {
+                LOG.error().$("copy export Fiber failed [error=").$(th).I$();
+                if (isRequestLoaded) {
+                    failLoadedRequest(th.getMessage());
+                }
+            } finally {
+                isFiberActive = false;
+            }
+        }
+
+        @Override
+        protected boolean runStep() {
+            final Worker worker = Worker.current();
+            processRequest(worker != null ? worker.getWorkerId() : FiberRuntime.NO_WORKER);
+            return true;
+        }
+    }
+
+    private void transferRequest(CopyExportRequestTask task) {
+        final CopyExportContext.ExportTaskEntry entry = task.getEntry();
+        final long copyID = task.getCopyID();
+        final String tableName = task.getTableName();
+        CreateTableOperation createOp = null;
+        RecordCursorFactory selectFactory = null;
+        Throwable transferFailure = null;
+        try {
+            final CharSequence sourceFileName = task.getFileName();
+            fileName.clear();
+            if (sourceFileName != null) {
+                fileName.put(sourceFileName);
+            }
+            selectFactory = task.getSelectFactory();
+            task.setSelectFactory(null);
+            createOp = task.getCreateOp();
+            task.setCreateOp(null);
+            localTaskCopy.of(
+                    entry,
+                    createOp,
+                    tableName,
+                    sourceFileName != null ? fileName : null,
+                    task.getCompressionCodec(),
+                    task.getCompressionLevel(),
+                    task.getRowGroupSize(),
+                    task.getDataPageSize(),
+                    task.isStatisticsEnabled(),
+                    task.getParquetVersion(),
+                    task.isRawArrayEncoding(),
+                    task.getNowTimestampType(),
+                    task.getNow(),
+                    task.isDescending(),
+                    task.getPageFrameCursor(),
+                    task.getMetadata(),
+                    task.getWriteCallback(),
+                    task.getExportMode(),
+                    task.getSelectText(),
+                    task.getBloomFilterColumns(),
+                    task.getBloomFilterColumnsPosition(),
+                    task.getBloomFilterFpp(),
+                    task.getBindVariableService()
+            );
+            localTaskCopy.setSelectFactory(selectFactory);
+            isRequestLoaded = true;
+            createOp = null;
+            selectFactory = null;
+        } catch (Throwable th) {
+            transferFailure = th;
+        }
+        try {
+            task.clear();
+        } catch (Throwable th) {
+            transferFailure = Misc.foldCleanupFailure(transferFailure, th);
+        }
+        if (transferFailure != null) {
+            final CharSequence message = transferFailure.getMessage();
+            if (isRequestLoaded) {
+                try {
+                    failLoadedRequest(message);
+                } catch (Throwable cleanupFailure) {
+                    transferFailure = Misc.foldCleanupFailure(transferFailure, cleanupFailure);
+                }
+            } else {
+                transferFailure = Misc.freeBestEffort(transferFailure, selectFactory);
+                transferFailure = Misc.freeBestEffort(transferFailure, createOp);
+                try {
+                    copyContext.updateStatus(
+                            CopyExportRequestTask.Phase.WAITING,
+                            CopyExportRequestTask.Status.FAILED,
+                            null,
+                            Numbers.INT_NULL,
+                            message,
+                            -1,
+                            tableName,
+                            copyID
+                    );
+                } catch (Throwable statusFailure) {
+                    transferFailure = Misc.foldCleanupFailure(transferFailure, statusFailure);
+                }
+                try {
+                    copyContext.releaseEntry(entry);
+                } catch (Throwable cleanupFailure) {
+                    transferFailure = Misc.foldCleanupFailure(transferFailure, cleanupFailure);
+                }
+            }
+            CairoException.rethrowCleanupFailure(transferFailure);
+        }
+    }
+}

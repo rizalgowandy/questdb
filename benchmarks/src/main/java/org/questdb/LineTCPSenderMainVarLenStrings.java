@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,17 +26,22 @@ package org.questdb;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
-import io.questdb.cutlass.line.LineTcpSender;
+import io.questdb.client.cutlass.line.AbstractLineTcpSender;
+import io.questdb.client.cutlass.line.LineChannel;
+import io.questdb.client.cutlass.line.LineTcpSenderV2;
+import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
+import io.questdb.client.network.NetworkFacadeImpl;
 import io.questdb.network.Net;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.Misc;
 import io.questdb.std.Rnd;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
 
 public class LineTCPSenderMainVarLenStrings {
+    private static final char[] chars = new char[]{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', ' ', '"', '\\', '\n'};
     private static final StringSink sink = new StringSink();
-    private static final char[] chars = new char[] {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', ' ', '"', '\\', '\n'};
 
     public static void main(String[] args) {
         final long count = 2_000_000_000L;
@@ -47,29 +52,30 @@ public class LineTCPSenderMainVarLenStrings {
         final Rnd rnd = new Rnd();
         long start = System.nanoTime();
         FilesFacade ff = new FilesFacadeImpl();
-        try(Path path = new Path()) {
+        try (Path path = new Path()) {
             long logFd = -1;
             if (args.length == 1) {
-                path.put(args[0]).$();
-                logFd = ff.openRW(path, CairoConfiguration.O_NONE);
+                path.put(args[0]);
+                logFd = ff.openRW(path.$(), CairoConfiguration.O_NONE);
             }
-            try (LineTcpSender sender = new LoggingLineTcpSender(Net.parseIPv4(hostIPv4), port, bufferCapacity, logFd, ff)) {
+            PlainTcpLineChannel tcpLineChannel = new PlainTcpLineChannel(NetworkFacadeImpl.INSTANCE, Net.parseIPv4(hostIPv4), port, bufferCapacity * 2);
+            try (AbstractLineTcpSender sender = new LineTcpSenderV2(new LoggingLineChannel(tcpLineChannel, logFd, ff), bufferCapacity, 127)) {
                 for (int i = 0; i < count; i++) {
                     sender.metric("md_msgs");
                     sender
-                        .field("ts_nsec", rnd.nextPositiveLong())
-                        .field("pkt_size", rnd.nextPositiveInt())
-                        .field("pcap_file", nextString(rnd.nextPositiveInt() % 64, rnd))
-                        .field("raw_msg", nextString(rnd.nextPositiveInt() % 512, rnd))
-                        .field("Length", rnd.nextInt())
-                        .field("MsgSeqNum", i)
-                        .field("MsgType", rnd.nextInt() % 1000)
-                        .field("src_ip", rnd.nextString(rnd.nextPositiveInt() % 16))
-                        .field("dst_ip", rnd.nextString(rnd.nextPositiveInt() % 16))
-                        .field("src_port", rnd.nextInt() % 10000)
-                        .field("dst_port", rnd.nextInt() % 10000)
-                        .field("first_dir", rnd.nextBoolean())
-                        .$(i * 10_000_000L);
+                            .field("ts_nsec", rnd.nextPositiveLong())
+                            .field("pkt_size", rnd.nextPositiveInt())
+                            .field("pcap_file", nextString(rnd.nextPositiveInt() % 64, rnd))
+                            .field("raw_msg", nextString(rnd.nextPositiveInt() % 512, rnd))
+                            .field("Length", rnd.nextInt())
+                            .field("MsgSeqNum", i)
+                            .field("MsgType", rnd.nextInt() % 1000)
+                            .field("src_ip", rnd.nextString(rnd.nextPositiveInt() % 16))
+                            .field("dst_ip", rnd.nextString(rnd.nextPositiveInt() % 16))
+                            .field("src_port", rnd.nextInt() % 10000)
+                            .field("dst_port", rnd.nextInt() % 10000)
+                            .field("first_dir", rnd.nextBoolean())
+                            .$(i * 10_000_000L);
                 }
                 sender.flush();
             } finally {
@@ -90,26 +96,42 @@ public class LineTCPSenderMainVarLenStrings {
         return sink;
     }
 
-    private static class LoggingLineTcpSender extends LineTcpSender {
-        private final long outFileFd;
+    private static class LoggingLineChannel implements LineChannel {
         private final FilesFacade ff;
+        private final long outFileFd;
+        private LineChannel delegate;
         private long fileOffset = 0;
 
-        public LoggingLineTcpSender(int sendToIPv4Address, int sendToPort, int bufferCapacity, long outFileFd, FilesFacade ff) {
-            super(sendToIPv4Address, sendToPort, bufferCapacity);
+        private LoggingLineChannel(LineChannel delegate, long outFileFd, FilesFacade ff) {
+            this.delegate = delegate;
             this.outFileFd = outFileFd;
             this.ff = ff;
         }
 
         @Override
-        protected void sendToSocket(long fd, long lo, long sockaddr, int len) {
+        public void close() {
+            delegate = Misc.free(delegate);
+        }
+
+        @Override
+        public int errno() {
+            return delegate.errno();
+        }
+
+        @Override
+        public int receive(long ptr, int len) {
+            return delegate.receive(ptr, len);
+        }
+
+        @Override
+        public void send(long ptr, int len) {
             if (outFileFd > -1) {
-                if (ff.write(outFileFd, lo, len, fileOffset) != len) {
-                    throw CairoException.instance(ff.errno()).put("Cannot write to file");
+                if (ff.write(outFileFd, ptr, len, fileOffset) != len) {
+                    throw CairoException.critical(ff.errno()).put("Cannot write to file");
                 }
                 fileOffset += len;
             }
-            super.sendToSocket(fd, lo, sockaddr, len);
+            delegate.send(ptr, len);
         }
     }
 }

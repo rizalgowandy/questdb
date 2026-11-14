@@ -1,0 +1,64 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.groupby.vect;
+
+import io.questdb.MessageBus;
+import io.questdb.cairo.sql.async.QueryParallelFiberDispatcher;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
+import io.questdb.mp.AbstractQueueConsumerJob;
+import io.questdb.tasks.VectorAggregateTask;
+import org.jetbrains.annotations.NotNull;
+
+public class GroupByVectorAggregateJob extends AbstractQueueConsumerJob<VectorAggregateTask> {
+    private final static Log LOG = LogFactory.getLog(GroupByVectorAggregateJob.class);
+    private final MessageBus messageBus;
+
+    public GroupByVectorAggregateJob(MessageBus messageBus) {
+        super(messageBus.getVectorAggregateQueue(), messageBus.getVectorAggregateSubSeq());
+        this.messageBus = messageBus;
+    }
+
+    @Override
+    public boolean run(@NotNull WorkerContext workerContext) {
+        final QueryParallelFiberDispatcher dispatcher = messageBus.getQueryParallelFiberDispatcher();
+        return dispatcher != null
+                ? !dispatcher.consumeVectorAggregate(workerContext.carrierId())
+                : super.run(workerContext);
+    }
+
+    @Override
+    protected boolean doRun(long cursor, WorkerContext workerContext) {
+        final VectorAggregateTask task = queue.get(cursor);
+        final VectorAggregateEntry entry = task.entry;
+        task.clear();
+        try {
+            entry.run(workerContext.carrierId(), subSeq, cursor);
+        } catch (Throwable th) {
+            LOG.error().$("vectorized reduce error [ex=").$(th).I$();
+        }
+        return true;
+    }
+}

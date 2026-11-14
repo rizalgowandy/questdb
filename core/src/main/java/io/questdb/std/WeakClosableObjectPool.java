@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,13 +28,26 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.Closeable;
 
-public class WeakClosableObjectPool<T extends Closeable> extends WeakObjectPoolBase<T> implements Closeable {
+public class WeakClosableObjectPool<T> extends WeakObjectPoolBase<T> implements Pool<T>, Closeable {
     private final ObjectFactory<T> factory;
 
     public WeakClosableObjectPool(@NotNull ObjectFactory<T> factory, int initSize) {
+        this(factory, initSize, false);
+    }
+
+    public WeakClosableObjectPool(@NotNull ObjectFactory<T> factory, int initSize, boolean lazy) {
         super(initSize);
         this.factory = factory;
-        fill();
+        if (!lazy) {
+            fill();
+        }
+    }
+
+    @Override
+    public void close() {
+        while (cache.size() > 0) {
+            Misc.freeIfCloseable(cache.pop());
+        }
     }
 
     @Override
@@ -43,15 +56,8 @@ public class WeakClosableObjectPool<T extends Closeable> extends WeakObjectPoolB
     }
 
     @Override
-    public void close() {
-        while (cache.size() > 0) {
-            Misc.free(cache.pop());
-        }
-    }
-
-    @Override
     void close(T obj) {
-        Misc.free(obj);
+        Misc.freeIfCloseable(obj);
     }
 
     @Override

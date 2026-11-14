@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -43,15 +43,19 @@ public class ToLowercaseFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(final int position, final ObjList<Function> args, IntList argPositions, final CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
         return new ToLowercaseFunc(args.get(0));
     }
 
     private static class ToLowercaseFunc extends StrFunction implements UnaryFunction {
         private final Function arg;
-
         private final StringSink sinkA = new StringSink();
-
         private final StringSink sinkB = new StringSink();
 
         public ToLowercaseFunc(final Function arg) {
@@ -64,12 +68,16 @@ public class ToLowercaseFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public CharSequence getStr(final Record rec) {
-            CharSequence str = getArg().getStr(rec);
+        public String getName() {
+            return "to_lowercase";
+        }
+
+        @Override
+        public CharSequence getStrA(final Record rec) {
+            CharSequence str = getArg().getStrA(rec);
             if (str == null) {
                 return null;
             }
-
             sinkA.clear();
             Chars.toLowerCase(str, sinkA);
             return sinkA;
@@ -77,11 +85,10 @@ public class ToLowercaseFunctionFactory implements FunctionFactory {
 
         @Override
         public CharSequence getStrB(final Record rec) {
-            CharSequence str = getArg().getStr(rec);
+            CharSequence str = getArg().getStrA(rec);
             if (str == null) {
                 return null;
             }
-
             sinkB.clear();
             Chars.toLowerCase(str, sinkB);
             return sinkB;
@@ -90,6 +97,11 @@ public class ToLowercaseFunctionFactory implements FunctionFactory {
         @Override
         public int getStrLen(final Record rec) {
             return arg.getStrLen(rec);
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return false;
         }
     }
 }

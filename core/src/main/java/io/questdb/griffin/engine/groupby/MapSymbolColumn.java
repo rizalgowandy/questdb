@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,18 +28,19 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.StaticSymbolTable;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.SymbolTableSource;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.std.Misc;
 import org.jetbrains.annotations.Nullable;
 
 public class MapSymbolColumn extends SymbolFunction {
-    private final int mapColumnIndex;
     private final int cursorColumnIndex;
+    private final int mapColumnIndex;
     private final boolean symbolTableStatic;
+    private boolean ownSymbolTable;
     private SymbolTable symbolTable;
     private SymbolTableSource symbolTableSource;
-    private boolean ownSymbolTable;
 
     public MapSymbolColumn(int mapColumnIndex, int cursorColumnIndex, boolean symbolTableStatic) {
         this.mapColumnIndex = mapColumnIndex;
@@ -48,10 +49,34 @@ public class MapSymbolColumn extends SymbolFunction {
     }
 
     @Override
+    public void close() {
+        if (ownSymbolTable) {
+            symbolTable = Misc.freeIfCloseable(symbolTable);
+        }
+    }
+
+    @Override
     public int getInt(Record rec) {
         return rec.getInt(mapColumnIndex);
     }
 
+    @Override
+    public @Nullable StaticSymbolTable getStaticSymbolTable() {
+        if (symbolTable instanceof StaticSymbolTable) {
+            return (StaticSymbolTable) symbolTable;
+        }
+        if (symbolTable instanceof SymbolFunction) {
+            return ((SymbolFunction) symbolTable).getStaticSymbolTable();
+        }
+        return null;
+    }
+
+    // Unlike SymbolColumn, this does NOT short-circuit to rec.getSymA() for a dynamic table.
+    // SymbolColumn does so to avoid minting a key for a caller that only wants text, but here the
+    // key already sits in the map: getInt() reads it from mapColumnIndex, so resolving it costs a
+    // lookup and nothing more. The record is a map record keyed by mapColumnIndex while the symbol
+    // table belongs to cursorColumnIndex, so rec.getSymA() is not an equivalent read in the first
+    // place. The two classes differ deliberately; do not unify them.
     @Override
     public CharSequence getSymbol(Record rec) {
         return symbolTable.valueOf(getInt(rec));
@@ -63,27 +88,12 @@ public class MapSymbolColumn extends SymbolFunction {
     }
 
     @Override
-    public @Nullable StaticSymbolTable getStaticSymbolTable() {
-        return symbolTable instanceof StaticSymbolTable ? (StaticSymbolTable) symbolTable : null;
-    }
-
-    @Override
-    public @Nullable SymbolTable newSymbolTable() {
-        return symbolTableSource.newSymbolTable(cursorColumnIndex);
-    }
-
-    @Override
-    public boolean isSymbolTableStatic() {
-        return symbolTableStatic;
-    }
-
-    @Override
     public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
         this.symbolTableSource = symbolTableSource;
         if (executionContext.getCloneSymbolTables()) {
             if (symbolTable != null) {
                 assert ownSymbolTable;
-                symbolTable = Misc.free(symbolTable);
+                symbolTable = Misc.freeIfCloseable(symbolTable);
             }
             symbolTable = symbolTableSource.newSymbolTable(cursorColumnIndex);
             ownSymbolTable = true;
@@ -93,11 +103,33 @@ public class MapSymbolColumn extends SymbolFunction {
         }
         assert this.symbolTable != this;
         assert this.symbolTable != null;
+        // static symbol table must be non-null
+        assert !symbolTableStatic || getStaticSymbolTable() != null;
     }
 
     @Override
-    public CharSequence valueOf(int symbolKey) {
-        return symbolTable.valueOf(symbolKey);
+    public boolean isSymbolTableStatic() {
+        return symbolTableStatic;
+    }
+
+    @Override
+    public @Nullable SymbolTable newSymbolTable() {
+        return symbolTableSource.newSymbolTable(cursorColumnIndex);
+    }
+
+    @Override
+    public boolean supportsKeyValueAccess() {
+        return symbolTable != null && symbolTable.supportsKeyValueAccess();
+    }
+
+    @Override
+    public boolean supportsParallelism() {
+        return true;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.putColumnName(mapColumnIndex);
     }
 
     @Override
@@ -106,9 +138,7 @@ public class MapSymbolColumn extends SymbolFunction {
     }
 
     @Override
-    public void close() {
-        if (ownSymbolTable) {
-            symbolTable = Misc.free(symbolTable);
-        }
+    public CharSequence valueOf(int symbolKey) {
+        return symbolTable.valueOf(symbolKey);
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,16 +31,19 @@ import io.questdb.griffin.TypeConstant;
 import io.questdb.griffin.engine.functions.GeoByteFunction;
 
 public class GeoHashTypeConstant extends GeoByteFunction implements TypeConstant {
-    private final static GeoHashTypeConstant[] INSTANCES = new GeoHashTypeConstant[ColumnType.GEO_HASH_MAX_BITS_LENGTH];
+    private final static GeoHashTypeConstant[] INSTANCES = new GeoHashTypeConstant[ColumnType.GEOLONG_MAX_BITS];
+
+    private GeoHashTypeConstant(int typep) {
+        super(typep);
+    }
+
+    public static GeoHashTypeConstant getInstanceByPrecision(int bitPrecision) {
+        return INSTANCES[bitPrecision - 1];
+    }
 
     @Override
     public byte getGeoByte(Record rec) {
         return GeoHashes.BYTE_NULL;
-    }
-
-    @Override
-    public short getGeoShort(Record rec) {
-        return GeoHashes.SHORT_NULL;
     }
 
     @Override
@@ -53,17 +56,14 @@ public class GeoHashTypeConstant extends GeoByteFunction implements TypeConstant
         return GeoHashes.NULL;
     }
 
+    @Override
+    public short getGeoShort(Record rec) {
+        return GeoHashes.SHORT_NULL;
+    }
+
     static {
-        for(int i = 0; i < ColumnType.GEO_HASH_MAX_BITS_LENGTH; i++) {
+        for (int i = 0; i < ColumnType.GEOLONG_MAX_BITS; i++) {
             INSTANCES[i] = new GeoHashTypeConstant(ColumnType.getGeoHashTypeWithBits(i + 1));
         }
-    }
-
-    public static GeoHashTypeConstant getInstanceByPrecision(int bitPrecision) {
-        return INSTANCES[bitPrecision - 1];
-    }
-
-    private GeoHashTypeConstant(int typep) {
-        super(typep);
     }
 }

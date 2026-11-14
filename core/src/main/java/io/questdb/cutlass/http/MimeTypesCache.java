@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,14 +25,49 @@
 package io.questdb.cutlass.http;
 
 import io.questdb.std.*;
-import io.questdb.std.str.DirectByteCharSequence;
-import io.questdb.std.str.Path;
+import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.Utf8String;
+import io.questdb.std.str.Utf8s;
+import org.jetbrains.annotations.TestOnly;
 
-public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-    public MimeTypesCache(@Transient FilesFacade ff, @Transient Path path) {
+public final class MimeTypesCache extends Utf8SequenceObjHashMap<CharSequence> {
 
-        long fd = ff.openRO(path);
+    @TestOnly
+    public MimeTypesCache(InputStream inputStream) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+            String line = reader.readLine().trim();
+            String regex = "\\t+";
+            Pattern pattern = Pattern.compile(regex);
+
+            while (line != null) {
+                if (!line.isEmpty() && line.charAt(0) != '#') {
+                    Matcher matcher = pattern.matcher(line);
+                    String l = matcher.replaceAll("\t");
+                    String[] tuple = l.split("\t");
+                    final String type = tuple[0].trim();
+                    String[] suffixTuple = tuple[1].split(" ");
+                    for (int i = 0, n = suffixTuple.length; i < n; i++) {
+                        Utf8String s = new Utf8String(suffixTuple[i].trim());
+                        put(s, type);
+                    }
+                }
+                line = reader.readLine();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public MimeTypesCache(@Transient FilesFacade ff, @Transient LPSZ path) {
+        final long fd = ff.openRO(path);
         if (fd < 0) {
             throw HttpException.instance("could not open [file=").put(path).put(", errno=").put(ff.errno()).put(']');
         }
@@ -54,9 +89,8 @@ public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
             ff.close(fd);
         }
 
-        final DirectByteCharSequence dbcs = new DirectByteCharSequence();
+        final DirectUtf8String dus = new DirectUtf8String();
         try {
-
             long p = buffer;
             long hi = p + fileSize;
             long _lo = p;
@@ -67,7 +101,7 @@ public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
             CharSequence contentType = null;
 
             while (p < hi) {
-                char b = (char) Unsafe.getUnsafe().getByte(p++);
+                char b = (char) Unsafe.getByte(p++);
 
                 switch (b) {
                     case '#':
@@ -79,12 +113,12 @@ public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
                             if (newline || _lo == p - 1) {
                                 _lo = p;
                             } else {
-                                String s = dbcs.of(_lo, p - 1).toString();
+                                Utf8String s = Utf8String.newInstance(dus.of(_lo, p - 1));
                                 _lo = p;
                                 if (contentType == null) {
-                                    contentType = s;
+                                    contentType = Utf8s.toString(s);
                                 } else {
-                                    this.put(s, contentType);
+                                    put(s, contentType);
                                 }
                             }
                         }
@@ -94,8 +128,8 @@ public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
                         newline = true;
                         comment = false;
                         if (_lo < p - 1 && contentType != null) {
-                            String s = dbcs.of(_lo, p - 1).toString();
-                            this.put(s, contentType);
+                            Utf8String s = Utf8String.newInstance(dus.of(_lo, p - 1));
+                            put(s, contentType);
                         }
                         contentType = null;
                         _lo = p;
@@ -106,7 +140,12 @@ public final class MimeTypesCache extends CharSequenceObjHashMap<CharSequence> {
                         }
                         break;
                 }
+            }
 
+            // if there is no new line after last entry we may have this
+            if (contentType != null && _lo < p) {
+                Utf8String s = Utf8String.newInstance(dus.of(_lo, p));
+                put(s, contentType);
             }
         } finally {
             Unsafe.free(buffer, fileSize, MemoryTag.NATIVE_HTTP_CONN);

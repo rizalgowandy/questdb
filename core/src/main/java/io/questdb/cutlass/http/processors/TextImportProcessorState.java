@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,23 +31,21 @@ import io.questdb.std.Mutable;
 
 import java.io.Closeable;
 
-class TextImportProcessorState implements Mutable, Closeable {
+public class TextImportProcessorState implements Mutable, Closeable {
     public static final int STATE_OK = 0;
-    //    public static final int STATE_INVALID_FORMAT = 1;
-    public static final int STATE_DATA_ERROR = 2;
-    public TextLoaderCompletedState completeState;
-    TextLoader textLoader;
     public int columnIndex = 0;
-    long hi;
-    long lo;
-    String stateMessage;
+    public TextLoaderCompletedState completeState;
     boolean analysed = false;
+    CharSequence errorMessage;
+    boolean forceHeader = false;
+    long hi;
+    boolean json = false;
+    long lo;
     int messagePart = TextImportProcessor.MESSAGE_UNKNOWN;
     int responseState = TextImportProcessor.RESPONSE_PREFIX;
-    boolean forceHeader = false;
     int state;
-    boolean json = false;
-    CharSequence errorMessage;
+    String stateMessage;
+    TextLoader textLoader;
 
     TextImportProcessorState(CairoEngine engine) {
         this.textLoader = new TextLoader(engine);
@@ -56,9 +54,10 @@ class TextImportProcessorState implements Mutable, Closeable {
     @Override
     public void clear() {
         responseState = TextImportProcessor.RESPONSE_PREFIX;
-        columnIndex = 0;
         messagePart = TextImportProcessor.MESSAGE_UNKNOWN;
+        columnIndex = 0;
         analysed = false;
+        json = false;
         state = STATE_OK;
         textLoader.clear();
         errorMessage = null;
@@ -70,7 +69,7 @@ class TextImportProcessorState implements Mutable, Closeable {
         textLoader = Misc.free(textLoader);
     }
 
-    public void snapshotStateAndCloseWriter() {
+    void snapshotStateAndCloseWriter() {
         if (completeState == null) {
             completeState = new TextLoaderCompletedState();
         }

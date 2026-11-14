@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,9 +28,10 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.ByteFunction;
-import io.questdb.griffin.engine.functions.UnaryFunction;
+
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
@@ -45,7 +46,7 @@ public class NegByteFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends ByteFunction implements UnaryFunction {
+    private static class Func extends ByteFunction implements ArithmeticUnaryFunction {
         final Function arg;
 
         public Func(Function arg) {
@@ -60,6 +61,11 @@ public class NegByteFunctionFactory implements FunctionFactory {
         @Override
         public byte getByte(Record rec) {
             return (byte) -arg.getByte(rec);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val('-').val(arg);
         }
     }
 }

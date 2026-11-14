@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,16 @@
 
 package io.questdb.cutlass.http;
 
-import io.questdb.std.Chars;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.Utf8String;
+import io.questdb.std.str.Utf8s;
 
 public class HttpRangeParser {
-    private static final String BYTES = "bytes=";
-    private long lo;
+    private static final Utf8String BYTES = new Utf8String("bytes=");
     private long hi;
+    private long lo;
 
     public long getHi() {
         return hi;
@@ -41,23 +43,22 @@ public class HttpRangeParser {
         return lo;
     }
 
-    public boolean of(CharSequence range) {
-        if (!Chars.startsWith(range, BYTES)) {
+    public boolean of(DirectUtf8Sequence range) {
+        if (!Utf8s.startsWith(range, BYTES)) {
             return false;
         }
 
-        int n = Chars.indexOf(range, BYTES.length(), '-');
-
+        int n = Utf8s.indexOfAscii(range, BYTES.size(), '-');
         if (n == -1) {
             return false;
         }
 
         try {
-            this.lo = Numbers.parseLong(range, BYTES.length(), n);
-            if (n == range.length() - 1) {
+            this.lo = Numbers.parseLong(range, BYTES.size(), n);
+            if (n == range.size() - 1) {
                 this.hi = Long.MAX_VALUE;
             } else {
-                this.hi = Numbers.parseLong(range, n + 1, range.length());
+                this.hi = Numbers.parseLong(range, n + 1, range.size());
             }
             return true;
         } catch (NumericException e) {

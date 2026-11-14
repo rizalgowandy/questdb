@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,18 @@
 
 package io.questdb.std;
 
-import io.questdb.cairo.BinarySearch;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.Utf16Sink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.TestOnly;
 
 import java.util.Arrays;
 
-public class LongList implements Mutable, LongVec {
+public class LongList implements Mutable, LongVec, Sinkable {
     private static final int DEFAULT_ARRAY_SIZE = 16;
-    private static final long DEFAULT_NO_ENTRY_VALUE = -1;
+    private static final long DEFAULT_NO_ENTRY_VALUE = -1L;
+    private final int initialCapacity;
     private final long noEntryValue;
     private long[] data;
     private int pos = 0;
@@ -45,25 +49,35 @@ public class LongList implements Mutable, LongVec {
     }
 
     public LongList(int capacity, long noEntryValue) {
+        this.initialCapacity = capacity;
         this.data = new long[capacity];
         this.noEntryValue = noEntryValue;
     }
 
     public LongList(LongList other) {
-        this.data = new long[Math.max(other.size(), DEFAULT_ARRAY_SIZE)];
+        this.initialCapacity = Math.max(other.size(), DEFAULT_ARRAY_SIZE);
+        this.data = new long[initialCapacity];
         setPos(other.size());
         System.arraycopy(other.data, 0, this.data, 0, pos);
         this.noEntryValue = other.noEntryValue;
     }
 
+    public LongList(long[] other) {
+        this.initialCapacity = other.length;
+        this.data = new long[initialCapacity];
+        setPos(other.length);
+        System.arraycopy(other, 0, this.data, 0, pos);
+        this.noEntryValue = DEFAULT_NO_ENTRY_VALUE;
+    }
+
     public void add(long value) {
-        ensureCapacity(pos + 1);
+        checkCapacity(pos + 1);
         data[pos++] = value;
     }
 
     public void add(long value0, long value1) {
         int n = pos;
-        ensureCapacity(n + 2);
+        checkCapacity(n + 2);
         data[n++] = value0;
         data[n++] = value1;
         pos = n;
@@ -71,7 +85,7 @@ public class LongList implements Mutable, LongVec {
 
     public void add(long value0, long value1, long value2, long value3) {
         int n = pos;
-        ensureCapacity(n + 4);
+        checkCapacity(n + 4);
         data[n++] = value0;
         data[n++] = value1;
         data[n++] = value2;
@@ -81,7 +95,7 @@ public class LongList implements Mutable, LongVec {
 
     public void add(long value0, long value1, long value2, long value3, long value4, long value5, long value6, long value7) {
         int n = pos;
-        ensureCapacity(n + 8);
+        checkCapacity(n + 8);
         data[n++] = value0;
         data[n++] = value1;
         data[n++] = value2;
@@ -100,15 +114,22 @@ public class LongList implements Mutable, LongVec {
     public void add(LongList that, int lo, int hi) {
         int p = pos;
         int s = hi - lo;
-        ensureCapacity(p + s);
+        checkCapacity(p + s);
         System.arraycopy(that.data, lo, this.data, p, s);
         pos += s;
     }
 
     public void add(int index, long element) {
-        ensureCapacity(++pos);
+        checkCapacity(++pos);
         System.arraycopy(data, index, data, index + 1, pos - index - 1);
         data[index] = element;
+    }
+
+    public void addAll(LongList that) {
+        int p = pos;
+        int s = that.size();
+        setPos(p + s);
+        System.arraycopy(that.data, 0, this.data, p, s);
     }
 
     public void arrayCopy(int srcPos, int dstPos, int length) {
@@ -116,7 +137,6 @@ public class LongList implements Mutable, LongVec {
     }
 
     public int binarySearch(long value, int scanDir) {
-
         // this is the same algorithm as implemented in C (util.h)
         // template<class T, class V>
         // inline int64_t binary_search(T *data, V value, int64_t low, int64_t high, int32_t scan_dir)
@@ -125,7 +145,7 @@ public class LongList implements Mutable, LongVec {
         int low = 0;
         int high = pos - 1;
         while (high - low > 65) {
-            final int mid = (low + high) / 2;
+            final int mid = (low + high) >>> 1;
             final long midVal = data[mid];
 
             if (midVal < value) {
@@ -134,14 +154,14 @@ public class LongList implements Mutable, LongVec {
                 high = mid - 1;
             } else {
                 // In case of multiple equal values, find the first
-                return scanDir == BinarySearch.SCAN_UP ?
-                        scrollUp(mid, midVal) :
-                        scrollDown(mid, high, midVal);
+                return scanDir == Vect.BIN_SEARCH_SCAN_UP
+                        ? scrollUp(mid, midVal)
+                        : scrollDown(mid, high, midVal);
             }
         }
-        return scanDir == BinarySearch.SCAN_UP ?
-                scanUp(value, low, high + 1) :
-                scanDown(value, low, high + 1);
+        return scanDir == Vect.BIN_SEARCH_SCAN_UP
+                ? scanUp(value, low, high + 1)
+                : scanDown(value, low, high + 1);
     }
 
     public int binarySearchBlock(int shl, long value, int scanDir) {
@@ -159,10 +179,14 @@ public class LongList implements Mutable, LongVec {
         // inline int64_t binary_search(T *data, V value, int64_t low, int64_t high, int32_t scan_dir)
         // please ensure these implementations are in sync
 
-        int low = 0;
+        return binarySearchBlock(0, shl, value, scanDir);
+    }
+
+    public int binarySearchBlock(int offset, int shl, long value, int scanDir) {
+        int low = offset >> shl;
         int high = (pos - 1) >> shl;
         while (high - low > 65) {
-            final int mid = (low + high) / 2;
+            final int mid = (low + high) >>> 1;
             final long midVal = data[mid << shl];
 
             if (midVal < value) {
@@ -171,21 +195,21 @@ public class LongList implements Mutable, LongVec {
                 high = mid - 1;
             } else {
                 // In case of multiple equal values, find the first
-                return scanDir == BinarySearch.SCAN_UP ?
-                        scrollUpBlock(shl, mid, midVal) :
-                        scrollDownBlock(shl, mid, high, midVal);
+                return scanDir == Vect.BIN_SEARCH_SCAN_UP
+                        ? scrollUpBlock(shl, mid, midVal)
+                        : scrollDownBlock(shl, mid, high, midVal);
             }
         }
-        return scanDir == BinarySearch.SCAN_UP ?
-                scanUpBlock(shl, value, low, high + 1) :
-                scanDownBlock(shl, value, low, high + 1);
+        return scanDir == Vect.BIN_SEARCH_SCAN_UP
+                ? scanUpBlock(shl, value, low, high + 1)
+                : scanDownBlock(shl, value, low, high + 1);
     }
 
-    public void clear() {
-        pos = 0;
+    public int capacity() {
+        return data.length;
     }
 
-    public void ensureCapacity(int capacity) {
+    public void checkCapacity(int capacity) {
         if (capacity < 0) {
             throw new IllegalArgumentException("Negative capacity. Integer overflow may be?");
         }
@@ -193,10 +217,30 @@ public class LongList implements Mutable, LongVec {
         int l = data.length;
         if (capacity > l) {
             int newCap = Math.max(l << 1, capacity);
-            long[] buf = new long[newCap];
-            System.arraycopy(data, 0, buf, 0, l);
-            this.data = buf;
+            long[] newData = new long[newCap];
+            if (pos > 0) {
+                System.arraycopy(data, 0, newData, 0, Math.min(pos, l));
+            }
+            this.data = newData;
         }
+    }
+
+    /**
+     * Resets the size of this list to zero.
+     * <p>
+     * <strong>Does not overwrite the underlying array with empty values.</strong>
+     * Use <code>clear(0)</code> to overwrite it.
+     */
+    public void clear() {
+        pos = 0;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean equals(Object that) {
+        return this == that || that instanceof LongList && equals((LongList) that);
     }
 
     public void erase() {
@@ -204,8 +248,15 @@ public class LongList implements Mutable, LongVec {
         Arrays.fill(data, noEntryValue);
     }
 
+    /**
+     * Sets the value at index, extending the backing array if needed.
+     * <p>
+     * <strong>WARNING:</strong> does not initialize the newly revealed portion of
+     * the backing array! This may reveal values that were never set, or were set
+     * before calling <code>clear()</code>.
+     */
     public void extendAndSet(int index, long value) {
-        ensureCapacity(index + 1);
+        checkCapacity(index + 1);
         if (index >= pos) {
             pos = index + 1;
         }
@@ -241,16 +292,10 @@ public class LongList implements Mutable, LongVec {
         return noEntryValue;
     }
 
-    public void setLast(long value) {
-        if (pos > 0) {
-            data[pos - 1] = value;
-        }
-    }
-
     /**
      * Returns element at the specified position. This method does not do
      * bounds check and may cause memory corruption if index is out of bounds.
-     * Instead the responsibility to check bounds is placed on application code,
+     * Instead, the responsibility to check bounds is placed on application code,
      * which is often the case anyway, for example in indexed for() loop.
      *
      * @param index of the element
@@ -258,16 +303,6 @@ public class LongList implements Mutable, LongVec {
      */
     public long getQuick(int index) {
         return data[index];
-    }
-
-    public void setQuick(int index, long value) {
-        assert index < pos;
-        data[index] = value;
-    }
-
-    @Override
-    public LongVec newInstance() {
-        return new LongList(size());
     }
 
     /**
@@ -283,42 +318,41 @@ public class LongList implements Mutable, LongVec {
         return (int) hashCode;
     }
 
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public boolean equals(Object that) {
-        return this == that || that instanceof LongList && equals((LongList) that);
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public String toString() {
-        final CharSink sb = Misc.getThreadLocalBuilder();
-
-        sb.put('[');
-        for (int i = 0, k = pos; i < k; i++) {
-            if (i > 0) {
-                sb.put(',');
-            }
-            sb.put(get(i));
-        }
-        sb.put(']');
-        return sb.toString();
-    }
-
     public void increment(int index) {
         data[index] = data[index] + 1;
     }
 
+    public int indexOf(long o) {
+        for (int i = 0, n = pos; i < n; i++) {
+            if (o == getQuick(i)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
     public void insert(int index, int length) {
-        ensureCapacity(pos + length);
+        checkCapacity(pos + length);
         if (pos > index) {
             System.arraycopy(data, index, data, index + length, pos - index);
         }
         pos += length;
+    }
+
+    public void insertFromSource(int index, LongList src, int srcLo, int srcHi) {
+        assert index > -1 && index < pos + 1 && srcLo > -1 && srcHi - 1 < src.size();
+        int len = srcHi - srcLo;
+        if (len > 0) {
+            insert(index, len);
+            System.arraycopy(src.data, srcLo, data, index, len);
+        }
+    }
+
+    @Override
+    public LongVec newInstance() {
+        LongList newList = new LongList(size());
+        newList.setPos(pos);
+        return newList;
     }
 
     public void remove(long v) {
@@ -351,15 +385,29 @@ public class LongList implements Mutable, LongVec {
         Arrays.fill(data, pos, pos + slotSize, noEntryValue);
     }
 
+    public void restoreInitialCapacity() {
+        data = new long[initialCapacity];
+        pos = 0;
+    }
+
+    public void reverse() {
+        int n = size();
+        for (int i = 0, m = n / 2; i < m; i++) {
+            long tmp = data[i];
+            data[i] = data[n - i - 1];
+            data[n - i - 1] = tmp;
+        }
+    }
+
     public void seed(int capacity, long value) {
-        ensureCapacity(capacity);
+        checkCapacity(capacity);
         pos = capacity;
         fill(0, capacity, value);
     }
 
     public void seed(int fromIndex, int count, long value) {
         int capacity = fromIndex + count;
-        ensureCapacity(capacity);
+        checkCapacity(capacity);
         Arrays.fill(data, fromIndex, capacity, value);
     }
 
@@ -372,14 +420,36 @@ public class LongList implements Mutable, LongVec {
     }
 
     public void setAll(int capacity, long value) {
-        ensureCapacity(capacity);
+        checkCapacity(capacity);
         pos = capacity;
         Arrays.fill(data, value);
     }
 
-    final public void setPos(int pos) {
-        ensureCapacity(pos);
+    public void setLast(long value) {
+        if (pos > 0) {
+            data[pos - 1] = value;
+        }
+    }
+
+    public final void setPos(int pos) {
+        checkCapacity(pos);
         this.pos = pos;
+    }
+
+    public void setQuick(int index, long value) {
+        assert index < pos;
+        data[index] = value;
+    }
+
+    @TestOnly
+    public void shuffle(Rnd rnd, int sh) {
+        // sh is a power of 2 to indicate number of
+        // values stored per virtual "slot". E.g. if
+        // we store two values at a time, we want to shuffle pairs
+        int size = size() >> sh;
+        for (int i = size; i > 1; i--) {
+            swap(i - 1, rnd.nextInt(i), sh);
+        }
     }
 
     public int size() {
@@ -401,31 +471,75 @@ public class LongList implements Mutable, LongVec {
         return that;
     }
 
+    public void swap(int i, int j, int shl) {
+        int k = 1 << shl;
+        for (int k1 = 0; k1 < k; k1++) {
+            final int ii = (i << shl) + k1;
+            final int ji = (j << shl) + k1;
+            final long jv = getQuick(ji);
+            setQuick(ji, getQuick(ii));
+            setQuick(ii, jv);
+        }
+    }
+
+    @Override
+    public void toSink(@NotNull CharSink<?> sink) {
+        sink.putAscii('[');
+        for (int i = 0, k = pos; i < k; i++) {
+            if (i > 0) {
+                sink.putAscii(',');
+            }
+            sink.put(get(i));
+        }
+        sink.putAscii(']');
+    }
+
+    public void toSinkSorted(@NotNull CharSink<?> sink) {
+        LongList temp = new LongList(size());
+        temp.addAll(this);
+        temp.sort();
+        temp.toSink(sink);
+        temp.clear();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public String toString() {
+        final Utf16Sink sink = Misc.getThreadLocalSink();
+        sink.putAscii('[');
+        // Do not try to print too much, it can hang IntelliJ debugger.
+        for (int i = 0, k = Math.min(pos, 100); i < k; i++) {
+            if (i > 0) {
+                sink.putAscii(',');
+            }
+            sink.put(get(i));
+        }
+        if (pos > 100) {
+            sink.putAscii(", .. ");
+        }
+        sink.putAscii(']');
+        return sink.toString();
+    }
+
     public void zero(int value) {
         Arrays.fill(data, 0, pos, value);
     }
 
     private boolean equals(LongList that) {
-        if (this.pos == that.pos) {
-            for (int i = 0, n = pos; i < n; i++) {
-                long lhs = this.getQuick(i);
-                if (lhs == noEntryValue) {
-                    return that.getQuick(i) == noEntryValue;
-                } else if (lhs == that.getQuick(i)) {
-                    return true;
-                }
-            }
+        if (this.pos != that.pos) {
+            return false;
         }
-        return false;
-    }
-
-    public int indexOf(long o) {
+        if (this.noEntryValue != that.noEntryValue) {
+            return false;
+        }
         for (int i = 0, n = pos; i < n; i++) {
-            if (o == getQuick(i)) {
-                return i;
+            if (this.getQuick(i) != that.getQuick(i)) {
+                return false;
             }
         }
-        return -1;
+        return true;
     }
 
     private int scanDown(long v, int low, int high) {
@@ -500,6 +614,11 @@ public class LongList implements Mutable, LongVec {
             }
         } while (data[low << shl] == value);
         return (low - 1) << shl;
+    }
+
+    long[] resetCapacityInternal(int longCapacity) {
+        checkCapacity(longCapacity);
+        return data;
     }
 
     private int scrollUp(int high, long value) {

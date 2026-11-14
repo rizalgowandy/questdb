@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,16 +26,20 @@ package io.questdb.cairo.sql;
 
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
-import io.questdb.std.str.CharSink;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.Plannable;
+import io.questdb.std.str.Utf16Sink;
 
 /**
  * Retrieve metadata of a table record (row) such as the column count, the type of column by numeric index,
  * the name of a column by numeric index, the storage block capacity of
  * indexed symbols, and the numeric index of a designated timestamp column.
- *
+ * <p>
  * Types are defined in {@link io.questdb.cairo.ColumnType}
  */
-public interface RecordMetadata extends ColumnTypes {
+public interface RecordMetadata extends ColumnTypes, Plannable {
 
     int COLUMN_NOT_FOUND = -1;
 
@@ -43,15 +47,6 @@ public interface RecordMetadata extends ColumnTypes {
      * @return the number of columns in a record
      */
     int getColumnCount();
-
-    /**
-     * Return the type of column by index. Returns an integer defined
-     * in {@link io.questdb.cairo.ColumnType}
-     *
-     * @param columnIndex numeric index of a column
-     * @return integer value indicating the type of the column
-     */
-    int getColumnType(int columnIndex);
 
     /**
      * Gets the numeric index of a column by name
@@ -70,6 +65,11 @@ public interface RecordMetadata extends ColumnTypes {
     /**
      * Performs the same function as {@link #getColumnIndex(CharSequence)}
      * but will not throw an exception if the column does not exist.
+     * <p>
+     * The lookup is verbatim: no compiler-alias unquoting is applied, so ingestion and
+     * storage paths cannot have wire-supplied names redirected into other columns. SQL
+     * compilation code resolving projection aliases must use
+     * {@link io.questdb.griffin.SqlUtil#getColumnIndexQuiet(RecordMetadata, CharSequence)} instead.
      *
      * @param columnName name of the column
      * @return index of the column
@@ -79,17 +79,24 @@ public interface RecordMetadata extends ColumnTypes {
     }
 
     /**
-     * Gets the numeric index of a column by name.
-     * Will not throw an exception if the column does not exist.
+     * Gets the numeric index of a column by name over the {@code [lo, hi)} slice of the
+     * given sequence. Like {@link #getColumnIndexQuiet(CharSequence)}, no compiler-alias unquoting
+     * is applied. Most implementations match the slice verbatim; implementations that model composed
+     * {@code table.column} names (the join metadata used during SQL compilation) instead split the
+     * slice on an unquoted dot, so a caller needing a strictly verbatim match must not feed such a
+     * name to those implementations. Will not throw an exception if the column does not exist.
      *
      * @param columnName name of the column
-     * @param lo the low boundary index of the columnName chars, inclusive
-     * @param hi the hi boundary index of the columnName chars, exclusive
+     * @param lo         the low boundary index of the columnName chars, inclusive
+     * @param hi         the hi boundary index of the columnName chars, exclusive
      * @return index of the column
      */
     int getColumnIndexQuiet(CharSequence columnName, int lo, int hi);
 
-    /** Retrieves column name.
+    TableColumnMetadata getColumnMetadata(int columnIndex);
+
+    /**
+     * Retrieves column name.
      *
      * @param columnIndex numeric index of the column
      * @return name of the column
@@ -97,13 +104,13 @@ public interface RecordMetadata extends ColumnTypes {
     String getColumnName(int columnIndex);
 
     /**
-     * Retrieves column hash. Hash augments the name to ensure when column is removed and
-     * then added with the same name the clients do not perceive this event as no-change.
+     * Return the type of column by index. Returns an integer defined
+     * in {@link io.questdb.cairo.ColumnType}
      *
-     * @param columnIndex numeric index of the column
-     * @return hash value
+     * @param columnIndex numeric index of a column
+     * @return integer value indicating the type of the column
      */
-    long getColumnHash(int columnIndex);
+    int getColumnType(int columnIndex);
 
     /**
      * Return the type of column by name
@@ -116,8 +123,8 @@ public interface RecordMetadata extends ColumnTypes {
     }
 
     /**
-     * How many row IDs to store in a single storage block on disk for an indexed column.
-     * Fewer blocks used to store row IDs achieves better performance.
+     * The returned value defines how many row IDs to store in a single storage block on disk
+     * for an indexed column. Fewer blocks used to store row IDs achieves better performance.
      *
      * @param columnIndex numeric index of the column
      * @return number of row IDs per block
@@ -125,35 +132,14 @@ public interface RecordMetadata extends ColumnTypes {
     int getIndexValueBlockCapacity(int columnIndex);
 
     /**
-     * How many row IDs to store in a single storage block on disk for an indexed column.
-     * Fewer blocks used to store row IDs achieves better performance.
+     * The returned value defines how many row IDs to store in a single storage block on disk
+     * for an indexed column. Fewer blocks used to store row IDs achieves better performance.
      *
      * @param columnName name of the column
      * @return number of row IDs per block
      */
     default int getIndexValueBlockCapacity(CharSequence columnName) {
         return getIndexValueBlockCapacity(getColumnIndex(columnName));
-    }
-
-    /**
-     * @return the numeric index of the designated timestamp column.
-     */
-    int getTimestampIndex();
-
-    /**
-     * Writing index for the column
-     *
-     * @param columnIndex column index
-     * @return writing index
-     */
-    int getWriterIndex(int columnIndex);
-
-    /**
-     * @param columnName name of the column
-     * @return true if symbol table is static, otherwise false.
-     */
-    default boolean isSymbolTableStatic(CharSequence columnName) {
-        return isSymbolTableStatic(getColumnIndex(columnName));
     }
 
     /**
@@ -167,10 +153,61 @@ public interface RecordMetadata extends ColumnTypes {
     }
 
     /**
+     * @return the numeric index of the designated timestamp column.
+     */
+    int getTimestampIndex();
+
+    default int getTimestampType() {
+        int timestampIndex = getTimestampIndex();
+        if (timestampIndex < 0) {
+            return ColumnType.NULL;
+        }
+        return getColumnType(timestampIndex);
+    }
+
+    /**
+     * Writing index for the column
+     *
+     * @param columnIndex column index
+     * @return writing index
+     */
+    int getWriterIndex(int columnIndex);
+
+    /**
+     * @param columnIndex column index
+     * @return true if the column with the given column index is present, otherwise false.
+     */
+    boolean hasColumn(int columnIndex);
+
+    /**
+     * Returns the index type for the column.
+     *
+     * @param columnIndex numeric index of the column
+     * @return the index type (see {@link IndexType})
+     */
+    byte getColumnIndexType(int columnIndex);
+
+    /**
      * @param columnIndex numeric index of the column
      * @return true if column is indexed, otherwise false.
      */
-    boolean isColumnIndexed(int columnIndex);
+    default boolean isColumnIndexed(int columnIndex) {
+        return IndexType.isIndexed(getColumnIndexType(columnIndex));
+    }
+
+    /**
+     * @param columnIndex numeric index of the column
+     * @return true if column is part of deduplication key used in inserts.
+     */
+    boolean isDedupKey(int columnIndex);
+
+    /**
+     * @param columnName name of the column
+     * @return true if symbol table is static, otherwise false.
+     */
+    default boolean isSymbolTableStatic(CharSequence columnName) {
+        return isSymbolTableStatic(getColumnIndex(columnName));
+    }
 
     /**
      * @param columnIndex numeric index of the column
@@ -179,33 +216,65 @@ public interface RecordMetadata extends ColumnTypes {
     boolean isSymbolTableStatic(int columnIndex);
 
     /**
+     * @return true if the record is from WAL enabled table, otherwise false.
+     */
+    default boolean isWalEnabled() {
+        return false;
+    }
+
+    /**
+     * Whether {@link #getColumnIndexQuiet(CharSequence, int, int)} resolves a composed
+     * {@code table.column} name by splitting the slice on an unquoted dot (the join metadata used
+     * during SQL compilation), rather than matching the slice verbatim. A caller that strips
+     * compiler-protective quotes off a dotted alias and retries the bare slice must NOT feed it to
+     * such an implementation, or the content dot would be mis-split into a spurious {@code table.column}
+     * and bind to an unrelated column. Wrappers (e.g. PriorityMetadata) forward this to their delegate,
+     * so an {@code instanceof} check on the concrete type is not sufficient.
+     *
+     * @return true if the ranged lookup splits on an unquoted dot, false if it matches verbatim
+     */
+    default boolean splitsOnDot() {
+        return false;
+    }
+
+    /**
      * Create a JSON object with record metadata
      *
      * @param sink a character sink to write to
      */
-    default void toJson(CharSink sink) {
+    default void toJson(Utf16Sink sink) {
         sink.put('{');
-        sink.putQuoted("columnCount").put(':').put(getColumnCount());
+        sink.putAsciiQuoted("columnCount").put(':').put(getColumnCount());
         sink.put(',');
-        sink.putQuoted("columns").put(':');
+        sink.putAsciiQuoted("columns").put(':');
         sink.put('[');
         for (int i = 0, n = getColumnCount(); i < n; i++) {
             final int type = getColumnType(i);
             if (i > 0) {
-                sink.put(',');
+                sink.putAscii(',');
             }
             sink.put('{');
-            sink.putQuoted("index").put(':').put(i).put(',');
-            sink.putQuoted("name").put(':').putQuoted(getColumnName(i)).put(',');
-            sink.putQuoted("type").put(':').putQuoted(ColumnType.nameOf(type));
+            sink.putAsciiQuoted("index").putAscii(':').put(i).putAscii(',');
+            sink.putAsciiQuoted("name").putAscii(':').putQuoted(getColumnName(i)).putAscii(',');
+            sink.putAsciiQuoted("type").putAscii(':').putQuoted(ColumnType.nameOf(type));
             if (isColumnIndexed(i)) {
-                sink.put(',').putQuoted("indexed").put(":true");
-                sink.put(',').putQuoted("indexValueBlockCapacity").put(':').put(getIndexValueBlockCapacity(i));
+                sink.putAscii(',').putAsciiQuoted("indexed").putAscii(":true");
+                sink.putAscii(',').putAsciiQuoted("indexValueBlockCapacity").putAscii(':').put(getIndexValueBlockCapacity(i));
             }
-            sink.put('}');
+            sink.putAscii('}');
         }
-        sink.put(']');
-        sink.put(',').putQuoted("timestampIndex").put(':').put(getTimestampIndex());
-        sink.put('}');
+        sink.putAscii(']');
+        sink.putAscii(',').putAsciiQuoted("timestampIndex").putAscii(':').put(getTimestampIndex());
+        sink.putAscii('}');
+    }
+
+    @Override
+    default void toPlan(PlanSink sink) {
+        for (int i = 0, n = getColumnCount(); i < n; i++) {
+            if (i > 0) {
+                sink.val(',');
+            }
+            sink.val(getColumnName(i));
+        }
     }
 }

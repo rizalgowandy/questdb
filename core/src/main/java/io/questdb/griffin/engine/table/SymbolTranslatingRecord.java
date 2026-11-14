@@ -1,0 +1,302 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.table;
+
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.sql.DelegatingRecord;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.SymbolTableSource;
+import io.questdb.std.DirectIntIntPagedMap;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.QuietCloseable;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.Arrays;
+
+/**
+ * A record wrapper that translates master symbol IDs to slave symbol IDs
+ * for efficient integer-based key comparison in HORIZON and ASOF JOINs.
+ * <p>
+ * Instead of resolving symbol IDs to strings for comparison, this record
+ * intercepts {@link #getInt(int)} calls for symbol join key columns and
+ * returns the corresponding slave symbol ID via a lazily-populated cache.
+ * <p>
+ * Symbol tables are obtained lazily from the configured sources on first
+ * cache miss, following the same pattern as {@code PageFrameMemoryRecord}'s
+ * symbol table cache.
+ * <p>
+ * The translation caches live in native memory, so that a large cache built by
+ * one execution does not linger on the heap while the owning factory sits in the
+ * query cache. Each cache is a {@link DirectIntIntPagedMap}, which indexes pages
+ * of slots by the master symbol key where the keys form dense blocks, and hashes
+ * the other keys. {@link #close()} releases the caches together with the symbol
+ * tables, and {@link #initSources} reopens them at their initial capacity. The
+ * owning cursor must therefore call {@link #close()} when it closes and
+ * {@link #initSources} before the first {@link #getInt(int)} call of each
+ * execution.
+ * <p>
+ * Each cache stops allocating memory once it holds
+ * {@link CairoConfiguration#getSqlJoinSymbolTranslationCacheCapacity()} entries. Past that
+ * point, the record still caches the master symbol keys that fall into the allocated pages,
+ * since they cost no memory, and translates every other uncached master symbol key via its
+ * string value on each lookup.
+ * <p>
+ * Each instance is thread-unsafe and must be used by a single worker.
+ */
+public class SymbolTranslatingRecord extends DelegatingRecord implements QuietCloseable {
+    private static final int CACHE_INITIAL_HASH_CAPACITY = 16;
+    // 32 page table slots of 8 bytes take 256 bytes, as the 16-entry hash map does.
+    private static final int CACHE_INITIAL_PAGE_TABLE_CAPACITY = 32;
+    private static final double CACHE_LOAD_FACTOR = 0.5;
+    // Master symbol keys are non-negative, and translate() short-circuits VALUE_IS_NULL
+    // before a cache lookup, so VALUE_IS_NULL never appears as a real key.
+    private static final int NO_ENTRY_KEY = SymbolTable.VALUE_IS_NULL;
+    // keyOf() returns a non-negative slave key, VALUE_NOT_FOUND (-2) or VALUE_IS_NULL, so -1 is free.
+    private static final int NO_ENTRY_VALUE = -1;
+    // Closed until initSources() opens them; close() releases their native memory.
+    private final ObjList<DirectIntIntPagedMap> caches;
+    // Maps column index to cache/symbol table array index; -1 for non-symbol columns.
+    // Sized to the total number of master columns, so no bounds check is needed.
+    private final int[] columnToKeyIndex;
+    private final CairoConfiguration configuration;
+    // Master column indices for symbol key columns, used for symbol table source lookups.
+    private final int[] masterColumnIndices;
+    private final SymbolTable[] masterSymbolTableCache;
+    // Slave column indices for symbol key columns, used for symbol table source lookups.
+    private final int[] slaveColumnIndices;
+    private final StaticSymbolTable[] slaveSymbolTableCache;
+    private boolean hadNonExistentKey;
+    private SymbolTableSource masterSource;
+    // The number of entries at which a cache stores only the keys that cost no memory;
+    // initSources() re-reads it from the configuration.
+    private int maxCacheSize;
+    private SymbolTableSource slaveSource;
+
+    public SymbolTranslatingRecord(CairoConfiguration configuration, int maxColumnCount, int joinKeyCount) {
+        this.configuration = configuration;
+        this.caches = newCaches(joinKeyCount);
+        this.masterSymbolTableCache = new SymbolTable[joinKeyCount];
+        this.slaveSymbolTableCache = new StaticSymbolTable[joinKeyCount];
+        this.masterColumnIndices = new int[joinKeyCount];
+        this.slaveColumnIndices = new int[joinKeyCount];
+        this.columnToKeyIndex = new int[maxColumnCount];
+        Arrays.fill(this.columnToKeyIndex, -1);
+    }
+
+    /**
+     * @param configuration                configuration that provides the max cache size
+     * @param masterColumnCount            total number of columns in the master record metadata
+     * @param masterSymbolKeyColumnIndices master column indices for symbol key columns used in join
+     * @param slaveSymbolKeyColumnIndices  slave column indices for symbol key columns used in join
+     */
+    public SymbolTranslatingRecord(
+            CairoConfiguration configuration,
+            int masterColumnCount,
+            int[] masterSymbolKeyColumnIndices,
+            int[] slaveSymbolKeyColumnIndices
+    ) {
+        this.configuration = configuration;
+        final int joinColumnCount = masterSymbolKeyColumnIndices.length;
+        this.caches = newCaches(joinColumnCount);
+        this.masterSymbolTableCache = new SymbolTable[joinColumnCount];
+        this.slaveSymbolTableCache = new StaticSymbolTable[joinColumnCount];
+        this.masterColumnIndices = masterSymbolKeyColumnIndices;
+        this.slaveColumnIndices = slaveSymbolKeyColumnIndices;
+
+        columnToKeyIndex = new int[masterColumnCount];
+        Arrays.fill(columnToKeyIndex, -1);
+        for (int i = 0; i < joinColumnCount; i++) {
+            columnToKeyIndex[masterSymbolKeyColumnIndices[i]] = i;
+        }
+    }
+
+    /**
+     * Releases the native translation caches and the cached symbol tables. The
+     * instance stays reusable: the next {@link #initSources} call reopens the caches.
+     */
+    @Override
+    public void close() {
+        Misc.freeObjListAndKeepObjects(caches);
+        Misc.freeIfCloseable(masterSymbolTableCache);
+        Misc.freeIfCloseable(slaveSymbolTableCache);
+        masterSource = null;
+        slaveSource = null;
+    }
+
+    @Override
+    public int getInt(int col) {
+        int idx = columnToKeyIndex[col];
+        if (idx >= 0) {
+            int result = translate(idx, base.getInt(col));
+            if (result == SymbolTable.VALUE_NOT_FOUND) {
+                hadNonExistentKey = true;
+            }
+            return result;
+        }
+        return base.getInt(col);
+    }
+
+    /**
+     * Returns true if any {@link #getInt(int)} call since the last
+     * {@link #resetNonExistentKeyFlag()} returned {@link SymbolTable#VALUE_NOT_FOUND}.
+     * Use this after a {@link io.questdb.cairo.RecordSink#copy} pass to detect
+     * non-existent keys without a separate pre-scan.
+     */
+    public boolean hadNonExistentKey() {
+        return hadNonExistentKey;
+    }
+
+    /**
+     * Checks if any symbol key column in the current master record translates
+     * to a symbol that doesn't exist in the slave table.
+     *
+     * @return true if at least one symbol key translates to {@link SymbolTable#VALUE_NOT_FOUND}
+     */
+    public boolean hasNonExistentKey() {
+        for (int i = 0; i < masterColumnIndices.length; i++) {
+            int masterSymKey = base.getInt(masterColumnIndices[i]);
+            if (translate(i, masterSymKey) == SymbolTable.VALUE_NOT_FOUND) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Set the symbol table sources for lazy symbol table resolution.
+     * Must be called before any {@link #getInt(int)} call on symbol key columns.
+     */
+    public void initSources(SymbolTableSource masterSource, SymbolTableSource slaveSource) {
+        reopenCaches();
+        Misc.freeIfCloseable(masterSymbolTableCache);
+        Misc.freeIfCloseable(slaveSymbolTableCache);
+        this.masterSource = masterSource;
+        this.slaveSource = slaveSource;
+    }
+
+    /**
+     * Set symbol table sources and reconfigure column index mappings.
+     * Used by hash joins where the build/probe direction may change at runtime due to swap.
+     */
+    public void initSources(SymbolTableSource masterSource, SymbolTableSource slaveSource,
+                            int[] masterCols, int[] slaveCols) {
+        reopenCaches();
+        Misc.freeIfCloseable(masterSymbolTableCache);
+        Misc.freeIfCloseable(slaveSymbolTableCache);
+        this.masterSource = masterSource;
+        this.slaveSource = slaveSource;
+        Arrays.fill(columnToKeyIndex, -1);
+        System.arraycopy(masterCols, 0, this.masterColumnIndices, 0, masterCols.length);
+        System.arraycopy(slaveCols, 0, this.slaveColumnIndices, 0, slaveCols.length);
+        for (int i = 0; i < masterCols.length; i++) {
+            columnToKeyIndex[masterCols[i]] = i;
+        }
+    }
+
+    /**
+     * Resets the non-existent key flag. Call before a
+     * {@link io.questdb.cairo.RecordSink#copy} pass.
+     */
+    public void resetNonExistentKeyFlag() {
+        hadNonExistentKey = false;
+    }
+
+    /**
+     * Binds the per-query native memory tracker that the translation caches charge.
+     * Call before {@link #initSources}, so that the caches reopen under the tracker.
+     */
+    public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+        for (int i = 0, n = caches.size(); i < n; i++) {
+            caches.getQuick(i).setMemoryTracker(tracker);
+        }
+    }
+
+    private static ObjList<DirectIntIntPagedMap> newCaches(int joinKeyCount) {
+        final ObjList<DirectIntIntPagedMap> caches = new ObjList<>(joinKeyCount);
+        for (int i = 0; i < joinKeyCount; i++) {
+            caches.add(new DirectIntIntPagedMap(
+                    CACHE_INITIAL_PAGE_TABLE_CAPACITY,
+                    CACHE_INITIAL_HASH_CAPACITY,
+                    CACHE_LOAD_FACTOR,
+                    NO_ENTRY_KEY,
+                    NO_ENTRY_VALUE,
+                    MemoryTag.NATIVE_JOIN_MAP
+            ));
+        }
+        return caches;
+    }
+
+    private SymbolTable getMasterSymbolTable(int idx) {
+        SymbolTable st = masterSymbolTableCache[idx];
+        if (st == null) {
+            st = masterSource.newSymbolTable(masterColumnIndices[idx]);
+            masterSymbolTableCache[idx] = st;
+        }
+        return st;
+    }
+
+    private StaticSymbolTable getSlaveSymbolTable(int idx) {
+        StaticSymbolTable st = slaveSymbolTableCache[idx];
+        if (st == null) {
+            st = (StaticSymbolTable) slaveSource.newSymbolTable(slaveColumnIndices[idx]);
+            slaveSymbolTableCache[idx] = st;
+        }
+        return st;
+    }
+
+    private void reopenCaches() {
+        maxCacheSize = configuration.getSqlJoinSymbolTranslationCacheCapacity();
+        // restoreInitialCapacity() opens a closed cache, and shrinks and clears an open one,
+        // so a re-initialization within one execution (e.g. hash join swap) starts small too.
+        for (int i = 0, n = caches.size(); i < n; i++) {
+            caches.getQuick(i).restoreInitialCapacity();
+        }
+    }
+
+    private int translate(int idx, int masterSymKey) {
+        if (masterSymKey == SymbolTable.VALUE_IS_NULL) {
+            return SymbolTable.VALUE_IS_NULL;
+        }
+        final DirectIntIntPagedMap cache = caches.getQuick(idx);
+        final int cachedSlaveKey = cache.get(masterSymKey);
+        if (cachedSlaveKey != NO_ENTRY_VALUE) {
+            return cachedSlaveKey;
+        }
+        // Cache miss: resolve via string using lazily-obtained symbol tables
+        final CharSequence symValue = getMasterSymbolTable(idx).valueOf(masterSymKey);
+        final int slaveKey = getSlaveSymbolTable(idx).keyOf(symValue);
+        if (cache.size() < maxCacheSize) {
+            cache.put(masterSymKey, slaveKey);
+        } else {
+            // Past the capacity, the cache still stores the key when the key's page exists, which allocates nothing.
+            cache.putIfPageExists(masterSymKey, slaveKey);
+        }
+        return slaveKey;
+    }
+}

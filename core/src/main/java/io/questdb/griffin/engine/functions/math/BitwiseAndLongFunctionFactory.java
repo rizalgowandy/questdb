@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.LongFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
@@ -52,7 +52,7 @@ public class BitwiseAndLongFunctionFactory implements FunctionFactory {
         return new BitAndLongFunction(args.getQuick(0), args.getQuick(1));
     }
 
-    public static final class BitAndLongFunction extends LongFunction implements BinaryFunction {
+    public static final class BitAndLongFunction extends LongFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 
@@ -67,15 +67,20 @@ public class BitwiseAndLongFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public long getLong(Record rec) {
+            final long l = left.getLong(rec);
+            final long r = right.getLong(rec);
+            return l != Numbers.LONG_NULL && r != Numbers.LONG_NULL ? l & r : Numbers.LONG_NULL;
+        }
+
+        @Override
         public Function getRight() {
             return right;
         }
 
         @Override
-        public long getLong(Record rec) {
-            final long l = left.getLong(rec);
-            final long r = right.getLong(rec);
-            return l != Numbers.LONG_NaN && r != Numbers.LONG_NaN ? l & r : Numbers.LONG_NaN;
+        public void toPlan(PlanSink sink) {
+            sink.val(left).val('&').val(right);
         }
     }
 }

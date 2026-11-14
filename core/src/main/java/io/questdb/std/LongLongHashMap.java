@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,20 +26,18 @@ package io.questdb.std;
 
 import java.util.Arrays;
 
-public class LongLongHashMap extends AbstractLongHashSet {
-    private static final int noEntryValue = -1;
+/**
+ * Open-addressing hash map from {@code long} keys to {@code long} values, held on the Java heap.
+ * {@code noEntryKey} marks an empty slot, so it cannot be used as a key; {@link #get(long)} and
+ * {@link #valueAt(int)} return {@code noEntryValue} for a key the map does not hold.
+ */
+public class LongLongHashMap extends AbstractLongHashSet implements Mutable {
+    private final long noEntryValue;
     private long[] values;
 
-    public LongLongHashMap() {
-        this(8);
-    }
-
-    public LongLongHashMap(int initialCapacity) {
-        this(initialCapacity, 0.5f);
-    }
-
-    private LongLongHashMap(int initialCapacity, double loadFactor) {
-        super(initialCapacity, loadFactor);
+    public LongLongHashMap(int initialCapacity, double loadFactor, long noEntryKey, long noEntryValue) {
+        super(initialCapacity, loadFactor, noEntryKey);
+        this.noEntryValue = noEntryValue;
         values = new long[keys.length];
         clear();
     }
@@ -64,13 +62,43 @@ public class LongLongHashMap extends AbstractLongHashSet {
         }
     }
 
+    @Override
+    public void restoreInitialCapacity() {
+        super.restoreInitialCapacity();
+        values = new long[keys.length];
+    }
+
     public long valueAt(int index) {
         return index < 0 ? values[-index - 1] : noEntryValue;
     }
 
+    private void rehash() {
+        final int size = size();
+        final int newCapacity = capacity * 2;
+        free = capacity = newCapacity;
+        final int len = Numbers.ceilPow2((int) (newCapacity / loadFactor));
+
+        final long[] oldValues = values;
+        final long[] oldKeys = keys;
+        keys = new long[len];
+        values = new long[len];
+        Arrays.fill(keys, noEntryKeyValue);
+        mask = len - 1;
+
+        free -= size;
+        for (int i = oldKeys.length; i-- > 0; ) {
+            final long key = oldKeys[i];
+            if (key != noEntryKeyValue) {
+                final int index = keyIndex(key);
+                keys[index] = key;
+                values[index] = oldValues[i];
+            }
+        }
+    }
+
     @Override
     protected void erase(int index) {
-        keys[index] = this.noEntryKeyValue;
+        keys[index] = noEntryKeyValue;
     }
 
     @Override
@@ -78,29 +106,5 @@ public class LongLongHashMap extends AbstractLongHashSet {
         keys[to] = keys[from];
         values[to] = values[from];
         erase(from);
-    }
-
-    private void rehash() {
-        int size = size();
-        int newCapacity = capacity * 2;
-        free = capacity = newCapacity;
-        int len = Numbers.ceilPow2((int) (newCapacity / loadFactor));
-
-        long[] oldValues = values;
-        long[] oldKeys = keys;
-        this.keys = new long[len];
-        this.values = new long[len];
-        Arrays.fill(keys, noEntryKeyValue);
-        mask = len - 1;
-
-        free -= size;
-        for (int i = oldKeys.length; i-- > 0; ) {
-            long key = oldKeys[i];
-            if (key != noEntryKeyValue) {
-                final int index = keyIndex(key);
-                keys[index] = key;
-                values[index] = oldValues[i];
-            }
-        }
     }
 }

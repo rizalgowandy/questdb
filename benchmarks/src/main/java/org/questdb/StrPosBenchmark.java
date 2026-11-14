@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -45,25 +45,13 @@ import java.util.concurrent.TimeUnit;
 public class StrPosBenchmark {
 
     private static final int N = 1_000_000;
-
-    private final Record[] records;
-    private final String[] strings;
-    private final Function strFunc;
-    private final Function strConstFunc;
-    private final Function charFunc;
     private final Function charConstFunc;
+    private final Function charFunc;
+    private final Record[] records;
     private final Rnd rnd = new Rnd();
-
-    public static void main(String[] args) throws RunnerException {
-        Options opt = new OptionsBuilder()
-                .include(StrPosBenchmark.class.getSimpleName())
-                .warmupIterations(2)
-                .measurementIterations(3)
-                .forks(1)
-                .build();
-
-        new Runner(opt).run();
-    }
+    private final Function strConstFunc;
+    private final Function strFunc;
+    private final String[] strings;
 
     public StrPosBenchmark() {
         StringBuilder builder = new StringBuilder();
@@ -83,7 +71,7 @@ public class StrPosBenchmark {
             int finalI = i;
             records[i] = new Record() {
                 @Override
-                public String getStr(int col) {
+                public String getStrA(int col) {
                     return strings[finalI];
                 }
             };
@@ -91,18 +79,18 @@ public class StrPosBenchmark {
 
         final Function strInputFunc = new StrFunction() {
             @Override
-            public CharSequence getStr(Record rec) {
-                return rec.getStr(0);
+            public CharSequence getStrA(Record rec) {
+                return rec.getStrA(0);
             }
 
             @Override
             public CharSequence getStrB(Record rec) {
-                return rec.getStr(0);
+                return rec.getStrA(0);
             }
         };
         final Function substrStrInputFunc = new StrFunction() {
             @Override
-            public CharSequence getStr(Record rec) {
+            public CharSequence getStrA(Record rec) {
                 return ",";
             }
 
@@ -118,7 +106,7 @@ public class StrPosBenchmark {
             }
 
             @Override
-            public boolean isReadThreadSafe() {
+            public boolean isThreadSafe() {
                 return true;
             }
         };
@@ -129,21 +117,26 @@ public class StrPosBenchmark {
         charConstFunc = new StrPosCharFunctionFactory.ConstFunc(strInputFunc, ',');
     }
 
+    public static void main(String[] args) throws RunnerException {
+        Options opt = new OptionsBuilder()
+                .include(StrPosBenchmark.class.getSimpleName())
+                .warmupIterations(2)
+                .measurementIterations(3)
+                .forks(1)
+                .build();
+
+        new Runner(opt).run();
+    }
+
     @Benchmark
     public int testBaseline() {
         return rnd.nextInt(N);
     }
 
     @Benchmark
-    public int testStrOverload() {
+    public int testCharConstOverload() {
         int i = rnd.nextInt(N);
-        return strFunc.getInt(records[i]);
-    }
-
-    @Benchmark
-    public int testStrConstOverload() {
-        int i = rnd.nextInt(N);
-        return strConstFunc.getInt(records[i]);
+        return charConstFunc.getInt(records[i]);
     }
 
     @Benchmark
@@ -153,8 +146,14 @@ public class StrPosBenchmark {
     }
 
     @Benchmark
-    public int testCharConstOverload() {
+    public int testStrConstOverload() {
         int i = rnd.nextInt(N);
-        return charConstFunc.getInt(records[i]);
+        return strConstFunc.getInt(records[i]);
+    }
+
+    @Benchmark
+    public int testStrOverload() {
+        int i = rnd.nextInt(N);
+        return strFunc.getInt(records[i]);
     }
 }

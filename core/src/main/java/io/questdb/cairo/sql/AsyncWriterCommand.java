@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,39 +24,57 @@
 
 package io.questdb.cairo.sql;
 
-import io.questdb.cairo.AlterTableContextException;
-import io.questdb.cairo.TableWriter;
-import io.questdb.griffin.SqlException;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.wal.seq.TableMetadataChange;
 import io.questdb.tasks.TableWriterTask;
 
-public interface AsyncWriterCommand {
-    long apply(TableWriter tableWriter, boolean contextAllowsAnyStructureChanges) throws SqlException, AlterTableContextException;
+import java.io.Closeable;
+
+public interface AsyncWriterCommand extends TableMetadataChange, Closeable {
 
     AsyncWriterCommand deserialize(TableWriterTask task);
 
+    int getCmdType();
+
     String getCommandName();
-
-    int getTableId();
-
-    String getTableName();
-
-    int getTableNamePosition();
-
-    long getTableVersion();
 
     long getCorrelationId();
 
-    void startAsync();
+    int getTableId();
+
+    int getTableNamePosition();
+
+    TableToken getTableToken();
+
+    long getTableVersion();
+
+    boolean isStructural();
+
+    /**
+     * Returns a fresh consumer-side instance for commands whose state fully
+     * round-trips through {@link TableWriterTask#getData()} via
+     * {@link #serialize(TableWriterTask)}/{@link #deserialize(TableWriterTask)}.
+     * When non-null, the writer caches the returned instance by command type
+     * and deserializes subsequent tasks into it, allowing the producer to
+     * reuse its own instance immediately after publishing. The default
+     * returns {@code null}, meaning the writer keeps using the producer's
+     * instance reference from the task (no caching).
+     */
+    default AsyncWriterCommand newInstance() {
+        return null;
+    }
 
     void serialize(TableWriterTask task);
 
     void setCommandCorrelationId(long correlationId);
 
+    void startAsync();
+
     interface Error {
+        int CAIRO_ERROR = -3;
         int OK = 0;
         int READER_OUT_OF_DATE = -1;
         int STRUCTURE_CHANGE_NOT_ALLOWED = -2;
-        int SQL_OR_CAIRO_ERROR = -3;
         int UNEXPECTED_ERROR = -4;
     }
 }

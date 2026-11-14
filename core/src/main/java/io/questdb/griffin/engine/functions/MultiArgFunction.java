@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ package io.questdb.griffin.engine.functions;
 
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.SymbolTableSource;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.groupby.GroupByUtils;
@@ -34,27 +35,32 @@ import io.questdb.std.ObjList;
 
 public interface MultiArgFunction extends Function {
 
+    ObjList<Function> args();
+
     @Override
     default void close() {
-        Misc.freeObjList(getArgs());
+        Misc.freeObjList(args());
+    }
+
+    @Override
+    default int getComplexity() {
+        final ObjList<Function> args = args();
+        int total = 0;
+        for (int i = 0, n = args.size(); i < n; i++) {
+            total = Function.addComplexity(total, args.getQuick(i).getComplexity());
+        }
+        return total;
     }
 
     @Override
     default void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
-        Function.init(getArgs(), symbolTableSource, executionContext);
+        Function.init(args(), symbolTableSource, executionContext, null);
     }
-
-    @Override
-    default void toTop() {
-        GroupByUtils.toTop(getArgs());
-    }
-
-    ObjList<Function> getArgs();
 
     @Override
     default boolean isConstant() {
-        ObjList<Function> args = getArgs();
-        for(int i = 0, n = args.size(); i < n; i++) {
+        ObjList<Function> args = args();
+        for (int i = 0, n = args.size(); i < n; i++) {
             if (!args.getQuick(i).isConstant()) {
                 return false;
             }
@@ -63,8 +69,66 @@ public interface MultiArgFunction extends Function {
     }
 
     @Override
+    default boolean isEquivalentTo(Function other) {
+        if (other == this) {
+            return true;
+        }
+        if (other instanceof MultiArgFunction that) {
+            ObjList<Function> thatArgs = that.args();
+            ObjList<Function> thisArgs = args();
+            if (thatArgs.size() == thisArgs.size()) {
+                for (int i = 0, n = thisArgs.size(); i < n; i++) {
+                    if (!thisArgs.getQuick(i).isEquivalentTo(thatArgs.getQuick(i))) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    default boolean isNonDeterministic() {
+        final ObjList<Function> args = args();
+        for (int i = 0, n = args.size(); i < n; i++) {
+            final Function function = args.getQuick(i);
+            if (function.isNonDeterministic()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Within-execution stability composes independently of determinism: an arg may be
+    // non-deterministic yet stable (bind variable, now()), or appear deterministic through
+    // isNonDeterministic() yet be unstable (a cursor arg wrapping an rnd_* projection).
+    @Override
+    default boolean isStableWithinExecution() {
+        final ObjList<Function> args = args();
+        for (int i = 0, n = args.size(); i < n; i++) {
+            if (!args.getQuick(i).isStableWithinExecution()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    default boolean isRandom() {
+        final ObjList<Function> args = args();
+        for (int i = 0, n = args.size(); i < n; i++) {
+            final Function function = args.getQuick(i);
+            if (function.isRandom()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
     default boolean isRuntimeConstant() {
-        final ObjList<Function> args = getArgs();
+        final ObjList<Function> args = args();
         for (int i = 0, n = args.size(); i < n; i++) {
             final Function function = args.getQuick(i);
             if (!function.isRuntimeConstant() && !function.isConstant()) {
@@ -75,14 +139,61 @@ public interface MultiArgFunction extends Function {
     }
 
     @Override
-    default boolean isReadThreadSafe() {
-        final ObjList<Function> args = getArgs();
+    default boolean isThreadSafe() {
+        final ObjList<Function> args = args();
         for (int i = 0, n = args.size(); i < n; i++) {
             final Function function = args.getQuick(i);
-            if (!function.isReadThreadSafe()) {
+            if (!function.isThreadSafe()) {
                 return false;
             }
         }
         return true;
+    }
+
+    @Override
+    default void offerStateTo(Function that) {
+        if (that instanceof MultiArgFunction other) {
+            ObjList<Function> thatArgs = other.args();
+            ObjList<Function> thisArgs = args();
+            if (thatArgs.size() == thisArgs.size()) {
+                for (int i = 0; i < thisArgs.size(); i++) {
+                    thisArgs.getQuick(i).offerStateTo(thatArgs.getQuick(i));
+                }
+            }
+        }
+    }
+
+    @Override
+    default boolean shouldMemoize() {
+        final ObjList<Function> args = args();
+        for (int i = 0, n = args.size(); i < n; i++) {
+            final Function function = args.getQuick(i);
+            if (function.shouldMemoize()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    default boolean supportsParallelism() {
+        final ObjList<Function> args = args();
+        for (int i = 0, n = args.size(); i < n; i++) {
+            final Function function = args.getQuick(i);
+            if (!function.supportsParallelism()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    default void toPlan(PlanSink sink) {
+        sink.val(getName()).val('(').val(args()).val(')');
+    }
+
+    @Override
+    default void toTop() {
+        GroupByUtils.toTop(args());
     }
 }

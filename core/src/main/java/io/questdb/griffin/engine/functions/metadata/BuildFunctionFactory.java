@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,13 +29,14 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.StrFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
+import java.util.concurrent.atomic.AtomicReference;
+
 public class BuildFunctionFactory implements FunctionFactory {
-    private StrFunction instance;
+    private final AtomicReference<StrConstant> functionRef = new AtomicReference<>();
 
     @Override
     public String getSignature() {
@@ -48,27 +49,27 @@ public class BuildFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(final int position, final ObjList<Function> args,
-                                IntList argPositions, final CairoConfiguration configuration,
-                                final SqlExecutionContext sqlExecutionContext) {
+    public Function newInstance(
+            final int position,
+            final ObjList<Function> args,
+            IntList argPositions,
+            final CairoConfiguration configuration,
+            final SqlExecutionContext sqlExecutionContext
+    ) {
+        StrConstant that = functionRef.get();
+        if (that == null) {
+            // we are assuming build information is constant for the instance runtime
+            final BuildInformation buildInformation = configuration.getBuildInformation();
+            final CharSequence information = "Build Information: " +
+                    buildInformation.getSwName() + " " +
+                    buildInformation.getSwVersion() +
+                    ", JDK " +
+                    buildInformation.getJdkVersion() +
+                    ", Commit Hash " +
+                    buildInformation.getCommitHash();
 
-        if (instance == null) {
-            instance = createInstance(configuration);
+            functionRef.set(that = new StrConstant(information));
         }
-
-        return instance;
-    }
-
-    private StrFunction createInstance(final CairoConfiguration configuration) {
-        final BuildInformation buildInformation = configuration.getBuildInformation();
-
-        final CharSequence information = "Build Information: QuestDB " +
-                buildInformation.getQuestDbVersion() +
-                ", JDK " +
-                buildInformation.getJdkVersion() +
-                ", Commit Hash " +
-                buildInformation.getCommitHash();
-
-        return new StrConstant(information);
+        return that;
     }
 }

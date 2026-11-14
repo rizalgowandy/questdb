@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,7 +29,6 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.Long256Function;
 import io.questdb.std.IntList;
 import io.questdb.std.Long256;
@@ -48,11 +47,10 @@ public class AddLong256FunctionFactory implements FunctionFactory {
         return new AddLong256Func(args.getQuick(0), args.getQuick(1));
     }
 
-    private static class AddLong256Func extends Long256Function implements BinaryFunction {
+    private static class AddLong256Func extends Long256Function implements ArithmeticBinaryFunction {
+        final Function left;
         final Long256Impl long256A = new Long256Impl();
         final Long256Impl long256B = new Long256Impl();
-
-        final Function left;
         final Function right;
 
         public AddLong256Func(Function left, Function right) {
@@ -66,12 +64,7 @@ public class AddLong256FunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public Function getRight() {
-            return right;
-        }
-
-        @Override
-        public void getLong256(Record rec, CharSink sink) {
+        public void getLong256(Record rec, CharSink<?> sink) {
             Long256Impl v = (Long256Impl) getLong256A(rec);
             v.toSink(sink);
         }
@@ -84,6 +77,21 @@ public class AddLong256FunctionFactory implements FunctionFactory {
         @Override
         public Long256 getLong256B(Record rec) {
             return Long256Impl.add(long256B, left.getLong256B(rec), right.getLong256B(rec));
+        }
+
+        @Override
+        public String getName() {
+            return "+";
+        }
+
+        @Override
+        public Function getRight() {
+            return right;
+        }
+
+        @Override
+        public boolean isOperator() {
+            return true;
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,24 +29,26 @@ public interface Barrier {
 
     long current();
 
-    /**
-     * When barrier is added mid-flight, it should assume the current
-     * sequence of the publisher (otherwise known as barrier's barrier)
-     * as its own. Such behaviour should prevent the newly joined
-     * barrier from processing sequences since before the join time.
-     *
-     * Most notably this is called by FanOut when new consumer joins
-     * the cohort of existing consumers.
-     *
-     * @param value typically the sequence of the published
-     */
-    void setCurrent(long value);
+    Barrier getBarrier();
 
     WaitStrategy getWaitStrategy();
 
     Barrier root();
 
     void setBarrier(Barrier barrier);
+
+    /**
+     * When barrier is added mid-flight, it should assume the current
+     * sequence of the publisher (otherwise known as barrier's barrier)
+     * as its own. Such behaviour should prevent the newly joined
+     * barrier from processing sequences since before the join time.
+     * <p>
+     * Most notably this is called by FanOut when new consumer joins
+     * the cohort of existing consumers.
+     *
+     * @param value typically the sequence of the published
+     */
+    void setCurrent(long value);
 
     Barrier then(Barrier barrier);
 }

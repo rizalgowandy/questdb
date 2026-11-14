@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,22 +37,22 @@ import java.io.Closeable;
 public class LogFileWriter extends SynchronizedJob implements Closeable, LogWriter {
 
     private static final int DEFAULT_BUFFER_SIZE = 1024 * 1024;
-    private final RingQueue<LogRecordSink> ring;
-    private final SCSequence subSeq;
     private final int level;
+    private final RingQueue<LogRecordUtf8Sink> ring;
+    private final SCSequence subSeq;
+    private long _wptr;
+    private long buf;
+    private int bufSize;
+    private String bufferSize;
     private long fd = -1;
     private long lim;
-    private long buf;
-    private long _wptr;
-    private QueueConsumer<LogRecordSink> myConsumer = this::copyToBuffer;
     private String location;
+    private QueueConsumer<LogRecordUtf8Sink> myConsumer = this::copyToBuffer;
     // can be set via reflection
     @SuppressWarnings("unused")
     private String truncate;
-    private String bufferSize;
-    private int bufSize;
 
-    public LogFileWriter(RingQueue<LogRecordSink> ring, SCSequence subSeq, int level) {
+    public LogFileWriter(RingQueue<LogRecordUtf8Sink> ring, SCSequence subSeq, int level) {
         this.ring = ring;
         this.subSeq = subSeq;
         this.level = level;
@@ -69,14 +69,23 @@ public class LogFileWriter extends SynchronizedJob implements Closeable, LogWrit
         } else {
             bufSize = DEFAULT_BUFFER_SIZE;
         }
-        this.buf = _wptr = Unsafe.malloc(bufSize, MemoryTag.NATIVE_DEFAULT);
+        this.buf = _wptr = Unsafe.malloc(bufSize, MemoryTag.NATIVE_LOGGER);
         this.lim = buf + bufSize;
-        try (Path path = new Path().of(location).$()) {
+        int pidTokenIndex = location.indexOf("%p");
+        if (pidTokenIndex > -1) {
+            // The %p token expands to the JVM pid so concurrent or respawned processes
+            // (e.g. a surefire replacement fork after a fork death) never collide on the
+            // same log file; on Windows the dead process lazily holds its handle and a
+            // same-path reopen fails with ERROR_SHARING_VIOLATION.
+            location = location.substring(0, pidTokenIndex) + Os.getPid() + location.substring(pidTokenIndex + 2);
+        }
+        try (Path path = new Path()) {
+            path.of(location);
             if (truncate != null && Chars.equalsLowerCaseAscii(truncate, "true")) {
-                this.fd = Files.openRW(path);
+                this.fd = Files.openRW(path.$());
                 Files.truncate(fd, 0);
             } else {
-                this.fd = Files.openAppend(path);
+                this.fd = Files.openAppend(path.$());
             }
         }
         if (this.fd == -1) {
@@ -90,7 +99,7 @@ public class LogFileWriter extends SynchronizedJob implements Closeable, LogWrit
             if (_wptr > buf) {
                 flush();
             }
-            Unsafe.free(buf, bufSize, MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(buf, bufSize, MemoryTag.NATIVE_LOGGER);
             buf = 0;
         }
         if (this.fd != -1) {
@@ -101,6 +110,11 @@ public class LogFileWriter extends SynchronizedJob implements Closeable, LogWrit
 
     public int getBufSize() {
         return bufSize;
+    }
+
+    @TestOnly
+    public QueueConsumer<LogRecordUtf8Sink> getMyConsumer() {
+        return myConsumer;
     }
 
     @Override
@@ -125,30 +139,25 @@ public class LogFileWriter extends SynchronizedJob implements Closeable, LogWrit
         this.location = location;
     }
 
-    private void copyToBuffer(LogRecordSink sink) {
-        final int l = sink.length();
-        if ((sink.getLevel() & this.level) != 0 && l > 0) {
-            if (_wptr + l >= lim) {
+    @TestOnly
+    public void setMyConsumer(QueueConsumer<LogRecordUtf8Sink> myConsumer) {
+        this.myConsumer = myConsumer;
+    }
+
+    private void copyToBuffer(LogRecordUtf8Sink sink) {
+        final int size = sink.size();
+        if ((sink.getLevel() & this.level) != 0 && size > 0) {
+            if (_wptr + size >= lim) {
                 flush();
             }
 
-            Vect.memcpy(_wptr, sink.getAddress(), l);
-            _wptr += l;
+            Vect.memcpy(_wptr, sink.ptr(), size);
+            _wptr += size;
         }
     }
 
     private void flush() {
         Files.append(fd, buf, (int) (_wptr - buf));
         _wptr = buf;
-    }
-
-    @TestOnly
-    QueueConsumer<LogRecordSink> getMyConsumer() {
-        return myConsumer;
-    }
-
-    @TestOnly
-    void setMyConsumer(QueueConsumer<LogRecordSink> myConsumer) {
-        this.myConsumer = myConsumer;
     }
 }

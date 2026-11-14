@@ -1,0 +1,323 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin;
+
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.engine.functions.constants.ConstantFunction;
+import io.questdb.std.Interval;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
+import io.questdb.std.ObjStack;
+import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
+
+public abstract class BasePlanSink implements PlanSink {
+
+    protected final ObjStack<RecordCursorFactory> factoryStack;
+    protected final EscapingStringSink textSink;
+    protected int depth;
+    protected SqlExecutionContext executionContext;
+    protected RecordMetadata metadata;
+    protected int order;
+    protected EscapingStringSink sink;
+    protected boolean useBaseMetadata;
+
+    public BasePlanSink() {
+        this.textSink = new EscapingStringSink();
+        this.sink = textSink;
+        this.depth = 0;
+        this.factoryStack = new ObjStack<>();
+        this.order = -1;
+    }
+
+    @Override
+    public PlanSink child(Plannable p, int order) {
+        this.order = order;
+        child(p);
+        this.order = -1;
+
+        return this;
+    }
+
+    @Override
+    public void clear() {
+        this.sink.clear();
+        this.depth = 0;
+        this.factoryStack.clear();
+        this.executionContext = null;
+        this.order = -1;
+    }
+
+    @Override
+    public SqlExecutionContext getExecutionContext() {
+        return executionContext;
+    }
+
+    @Override
+    public RecordMetadata getMetadata() {
+        return metadata;
+    }
+
+    @Override
+    public int getOrder() {
+        return order;
+    }
+
+    @TestOnly
+    public StringSink getSink() {
+        return sink;
+    }
+
+    @Override
+    public boolean getUseBaseMetadata() {
+        return useBaseMetadata;
+    }
+
+    @Override
+    public PlanSink optAttr(CharSequence name, CharSequence value) {
+        if (value != null) {
+            attr(name).val(value);
+        }
+        return this;
+    }
+
+    @Override
+    public PlanSink optAttr(CharSequence name, Sinkable value) {
+        if (value != null) {
+            attr(name).val(value);
+        }
+        return this;
+    }
+
+    @Override
+    public PlanSink optAttr(CharSequence name, Plannable value) {
+        if (value != null) {
+            if (value instanceof ConstantFunction && ((ConstantFunction) value).isNullConstant()) {
+                return this;
+            }
+            attr(name).val(value);
+        }
+        return this;
+    }
+
+    @Override
+    public PlanSink optAttr(CharSequence name, Plannable value, boolean useBaseMetadata) {
+        // Save and restore instead of resetting to false: a rendered value can itself contain a
+        // nested factory plan (e.g. a cursor function rendering its sub-query), whose own optAttr
+        // calls must not clobber the flag for the remainder of the enclosing attribute.
+        final boolean wasUsingBaseMetadata = this.useBaseMetadata;
+        this.useBaseMetadata = useBaseMetadata;
+        try {
+            return optAttr(name, value);
+        } finally {
+            this.useBaseMetadata = wasUsingBaseMetadata;
+        }
+    }
+
+    @Override
+    public PlanSink optAttr(CharSequence name, ObjList<? extends Plannable> value) {
+        if (value != null && value.size() > 0) {
+            attr(name).val(value);
+        }
+        return this;
+    }
+
+    @Override
+    public PlanSink optAttr(CharSequence name, ObjList<? extends Plannable> value, boolean useBaseMetadata) {
+        // Save and restore instead of resetting to false: a list entry can itself contain a
+        // nested factory plan (e.g. a cursor function rendering its sub-query), whose own optAttr
+        // calls must not clobber the flag for the entries that follow it.
+        final boolean wasUsingBaseMetadata = this.useBaseMetadata;
+        this.useBaseMetadata = useBaseMetadata;
+        try {
+            return optAttr(name, value);
+        } finally {
+            this.useBaseMetadata = wasUsingBaseMetadata;
+        }
+    }
+
+    @Override
+    public PlanSink putBaseColumnName(int columnIndex) {
+        RecordCursorFactory factory = factoryStack.peek();
+        if (factory != null) {
+            return val(factory.getBaseColumnName(columnIndex));
+        }
+        // Fallback: no parent factory on stack (root-level toPlan call)
+        return putColumnName(columnIndex);
+    }
+
+    @Override
+    public PlanSink putColumnName(int columnIndex) {
+        if (useBaseMetadata) {
+            RecordCursorFactory factory = factoryStack.peek();
+            if (factory != null) {
+                return val(factory.getBaseColumnName(columnIndex));
+            }
+        }
+        if (metadata != null) {
+            val(metadata.getColumnName(columnIndex));
+        } else {
+            RecordCursorFactory factory = factoryStack.peek();
+            if (factory != null) {
+                val(factory.getMetadata().getColumnName(columnIndex));
+            } else {
+                val("[column ").val(columnIndex).val(']');
+            }
+        }
+        return this;
+    }
+
+    public void setMetadata(RecordMetadata metadata) {
+        this.metadata = metadata;
+    }
+
+    @Override
+    public void useBaseMetadata(boolean useBaseMetadata) {
+        this.useBaseMetadata = useBaseMetadata;
+    }
+
+    @Override
+    public PlanSink val(Plannable s, RecordCursorFactory factory) {
+        factoryStack.push(factory);
+        val(s);
+        factoryStack.pop();
+        return this;
+    }
+
+    @Override
+    public PlanSink val(ObjList<?> list) {
+        return val(list, 0, list.size());
+    }
+
+    @Override
+    public PlanSink val(ObjList<?> list, int from) {
+        return val(list, from, list.size());
+    }
+
+    @Override
+    public PlanSink val(ObjList<?> list, int from, int to) {
+        sink.put('[');
+        for (int i = from; i < to; i++) {
+            if (i > from) {
+                sink.put(',');
+            }
+            Object obj = list.getQuick(i);
+            switch (obj) {
+                case Plannable plannable -> plannable.toPlan(this);
+                case Sinkable sinkable -> sink.put(sinkable);
+                case null -> sink.put("null");
+                default -> sink.put(obj.toString());
+            }
+        }
+        sink.put(']');
+
+        return this;
+    }
+
+    @Override
+    public PlanSink valISODate(TimestampDriver driver, long l) {
+        sink.putISODate(driver, l);
+        return this;
+    }
+
+    @Override
+    public PlanSink valInterval(Interval interval, int intervalType) {
+        interval.toSink(sink, intervalType);
+        return this;
+    }
+
+    protected static class EscapingStringSink extends StringSink {
+
+        @Override
+        public StringSink put(@Nullable CharSequence cs) {
+            if (cs != null) {
+                put(cs, 0, cs.length());
+            }
+            return this;
+        }
+
+        @Override
+        public StringSink put(@NotNull CharSequence cs, int lo, int hi) {
+            for (int i = lo; i < hi; i++) {
+                escape(cs.charAt(i));
+            }
+            return this;
+        }
+
+        @Override
+        public StringSink put(char c) {
+            escape(c);
+            return this;
+        }
+
+        @Override
+        public StringSink put(char @NotNull [] chars, int start, int len) {
+            for (int i = start; i < start + len; i++) {
+                escape(chars[i]);
+            }
+            return this;
+        }
+
+        public StringSink putNoEsc(CharSequence cs) {
+            super.put(cs);
+            return this;
+        }
+
+        protected void escape(char c) {
+            if (c < 32) {
+                switch (c) {
+                    case '\b':
+                        super.put("\\b");
+                        break;
+                    case '\f':
+                        super.put("\\f");
+                        break;
+                    case '\n':
+                        super.put("\\n");
+                        break;
+                    case '\r':
+                        super.put("\\r");
+                        break;
+                    case '\t':
+                        super.put("\\t");
+                        break;
+                    default:
+                        super.put("\\u00");
+                        super.put(c >> 4);
+                        super.put(Numbers.hexDigits[c & 15]);
+                        break;
+                }
+            } else {
+                super.put(c);
+            }
+        }
+    }
+
+}

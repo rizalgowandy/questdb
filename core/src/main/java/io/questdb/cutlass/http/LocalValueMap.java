@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,22 +32,14 @@ import java.io.Closeable;
 public class LocalValueMap implements Closeable, Mutable {
 
     private static final int INITIAL_CAPACITY = 32;
-    private Entry[] table;
     private int size;
+    private Entry[] table;
     private int threshold;
 
     public LocalValueMap() {
         table = new Entry[INITIAL_CAPACITY];
         size = 0;
         setThreshold(INITIAL_CAPACITY);
-    }
-
-    private static int nextIndex(int i, int mod) {
-        return ((i + 1 < mod) ? i + 1 : 0);
-    }
-
-    private static int prevIndex(int i, int mod) {
-        return ((i - 1 > -1) ? i - 1 : mod - 1);
     }
 
     @Override
@@ -65,10 +57,19 @@ public class LocalValueMap implements Closeable, Mutable {
         for (int i = 0, n = table.length; i < n; i++) {
             Entry e = table[i];
             if (e != null) {
-                e.value = Misc.free(e.value);
+                e.value = Misc.freeIfCloseable(e.value);
                 e.k = null;
             }
             table[i] = null;
+        }
+    }
+
+    public void disconnect() {
+        for (int i = 0, n = table.length; i < n; i++) {
+            Entry e = table[i];
+            if (e != null && e.value instanceof ConnectionAware) {
+                ((ConnectionAware) e.value).onDisconnected();
+            }
         }
     }
 
@@ -90,7 +91,7 @@ public class LocalValueMap implements Closeable, Mutable {
             LocalValue<?> k = e.k;
 
             if (k == key) {
-                Misc.free(e.value);
+                Misc.freeIfCloseable(e.value);
                 e.value = value;
                 return;
             }
@@ -106,6 +107,14 @@ public class LocalValueMap implements Closeable, Mutable {
         if (!removeNullKeys(i, sz) && sz >= threshold) {
             rehash();
         }
+    }
+
+    private static int nextIndex(int i, int mod) {
+        return ((i + 1 < mod) ? i + 1 : 0);
+    }
+
+    private static int prevIndex(int i, int mod) {
+        return ((i - 1 > -1) ? i - 1 : mod - 1);
     }
 
     @SuppressWarnings("unchecked")
@@ -139,7 +148,7 @@ public class LocalValueMap implements Closeable, Mutable {
         Entry[] tab = table;
         int len = tab.length;
 
-        tab[index].value = Misc.free(tab[index].value);
+        tab[index].value = Misc.freeIfCloseable(tab[index].value);
         tab[index] = null;
         size--;
 
@@ -148,7 +157,7 @@ public class LocalValueMap implements Closeable, Mutable {
         for (i = nextIndex(index, len); (e = tab[i]) != null; i = nextIndex(i, len)) {
             LocalValue<?> k = e.k;
             if (k == null) {
-                e.value = Misc.free(e.value);
+                e.value = Misc.freeIfCloseable(e.value);
                 tab[i] = null;
                 size--;
             } else {
@@ -209,7 +218,7 @@ public class LocalValueMap implements Closeable, Mutable {
             LocalValue<?> k = e.k;
 
             if (k == key) {
-                Misc.free(e.value);
+                Misc.freeIfCloseable(e.value);
                 e.value = value;
 
                 tab[i] = tab[index];
@@ -227,7 +236,7 @@ public class LocalValueMap implements Closeable, Mutable {
             }
         }
 
-        tab[index].value = Misc.free(tab[index].value);
+        tab[index].value = Misc.freeIfCloseable(tab[index].value);
         tab[index] = new Entry(key, value);
 
         if (slotToExpunge != index) {
@@ -247,7 +256,7 @@ public class LocalValueMap implements Closeable, Mutable {
             if (e != null) {
                 LocalValue<?> k = e.k;
                 if (k == null) {
-                    e.value = Misc.free(e.value);
+                    e.value = Misc.freeIfCloseable(e.value);
                 } else {
                     int h = k.hashCode & (newLen - 1);
                     while (newTab[h] != null) {
@@ -269,9 +278,8 @@ public class LocalValueMap implements Closeable, Mutable {
     }
 
     static class Entry {
-        Object value;
-
         LocalValue<?> k;
+        Object value;
 
         Entry(LocalValue<?> k, Object v) {
             value = v;

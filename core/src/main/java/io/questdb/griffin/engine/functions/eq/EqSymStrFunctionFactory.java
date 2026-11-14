@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,15 @@
 package io.questdb.griffin.engine.functions.eq;
 
 import io.questdb.cairo.CairoConfiguration;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
@@ -39,6 +42,7 @@ import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
 public class EqSymStrFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "=(KS)";
@@ -50,7 +54,13 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
         // there are optimisation opportunities
         // 1. when one of args is constant null comparison can boil down to checking
         //    length of non-constant (must be -1)
@@ -67,7 +77,7 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
     }
 
     private Function createHalfConstantFunc(Function constFunc, Function varFunc) {
-        CharSequence constValue = constFunc.getStr(null);
+        CharSequence constValue = constFunc.getStrA(null);
         SymbolFunction func = (SymbolFunction) varFunc;
         if (func.getStaticSymbolTable() != null) {
             return new ConstCheckColumnFunc(func, constValue);
@@ -82,7 +92,112 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class NullCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
+    private static class ConstCheckColumnFunc extends ConstEqSymFunc {
+        private int valueIndex;
+
+        public ConstCheckColumnFunc(SymbolFunction arg, CharSequence constant) {
+            super(arg, constant);
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return negated != (arg.getInt(rec) == valueIndex);
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            arg.init(symbolTableSource, executionContext);
+            final StaticSymbolTable symbolTable = ((SymbolFunction) arg).getStaticSymbolTable();
+            assert symbolTable != null;
+            valueIndex = symbolTable.keyOf(constant);
+        }
+
+        @Override
+        public boolean isConstant() {
+            return valueIndex == SymbolTable.VALUE_NOT_FOUND;
+        }
+    }
+
+    private static class ConstCheckFunc extends ConstEqSymFunc {
+        public ConstCheckFunc(Function arg, CharSequence constant) {
+            super(arg, constant);
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return negated != Chars.equalsNc(constant, arg.getSymbol(rec));
+        }
+    }
+
+    private static abstract class ConstEqSymFunc extends NegatableBooleanFunction implements UnaryFunction {
+        protected final Function arg;
+        protected final CharSequence constant;
+
+        protected ConstEqSymFunc(Function arg, CharSequence constant) {
+            this.arg = arg;
+            this.constant = constant;
+        }
+
+        @Override
+        public Function getArg() {
+            return arg;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(arg);
+            if (negated) {
+                sink.val('!');
+            }
+            sink.val("='").val(constant).val('\'');
+        }
+    }
+
+    private static class ConstSymIntCheckFunc extends ConstEqSymFunc {
+        private boolean exists;
+        private int valueIndex;
+
+        public ConstSymIntCheckFunc(SymbolFunction arg, CharSequence constant) {
+            super(arg, constant);
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return negated != (exists && arg.getInt(rec) == valueIndex);
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            arg.init(symbolTableSource, executionContext);
+            StaticSymbolTable staticSymbolTable = ((SymbolFunction) arg).getStaticSymbolTable();
+            assert staticSymbolTable != null : "Static symbol table is null for func with static isSymbolTableStatic returning true";
+            valueIndex = staticSymbolTable.keyOf(constant);
+            exists = (valueIndex != SymbolTable.VALUE_NOT_FOUND);
+        }
+    }
+
+    static class Func extends AbstractEqBinaryFunction {
+
+        public Func(Function left, Function right) {
+            super(left, right);
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            // Read the two sides through distinct A/B flyweights. Both may resolve through the
+            // same symbol table, e.g. first(a) = last(a) over a UNION, and a non-static table
+            // (UNION, NOCACHE, ::symbol) reuses one view per flyweight slot.
+            final CharSequence a = left.getSymbol(rec);
+            final CharSequence b = right.getStrB(rec);
+
+            if (a == null) {
+                return negated != (b == null);
+            }
+            return negated != Chars.equalsNc(a, b);
+        }
+    }
+
+    public static class NullCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
         private final Function arg;
 
         public NullCheckFunc(Function arg) {
@@ -98,125 +213,15 @@ public class EqSymStrFunctionFactory implements FunctionFactory {
         public boolean getBool(Record rec) {
             return negated != (arg.getSymbol(rec) == null);
         }
-    }
-
-    private static class ConstCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
-        private final Function arg;
-        private final CharSequence constant;
-
-        public ConstCheckFunc(Function arg, CharSequence constant) {
-            this.arg = arg;
-            this.constant = constant;
-        }
 
         @Override
-        public Function getArg() {
-            return arg;
-        }
-
-        @Override
-        public boolean getBool(Record rec) {
-            return negated != Chars.equalsNc(constant, arg.getSymbol(rec));
-        }
-    }
-
-    private static class ConstSymIntCheckFunc extends NegatableBooleanFunction implements UnaryFunction {
-        private final SymbolFunction arg;
-        private final CharSequence constant;
-        private int valueIndex;
-        private boolean exists;
-
-        public ConstSymIntCheckFunc(SymbolFunction arg, CharSequence constant) {
-            this.arg = arg;
-            this.constant = constant;
-        }
-
-        @Override
-        public Function getArg() {
-            return arg;
-        }
-
-        @Override
-        public boolean getBool(Record rec) {
-            return negated != (exists && arg.getInt(rec) == valueIndex);
-        }
-
-        @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
-            arg.init(symbolTableSource, executionContext);
-            StaticSymbolTable staticSymbolTable = arg.getStaticSymbolTable();
-            assert staticSymbolTable != null : "Static symbol table is null for func with static isSymbolTableStatic returning true";
-            valueIndex = staticSymbolTable.keyOf(constant);
-            exists = valueIndex != SymbolTable.VALUE_NOT_FOUND;
-        }
-    }
-
-    private static class ConstCheckColumnFunc extends NegatableBooleanFunction implements UnaryFunction {
-        private final SymbolFunction arg;
-        private final CharSequence constant;
-        private int valueIndex;
-
-        public ConstCheckColumnFunc(SymbolFunction arg, CharSequence constant) {
-            this.arg = arg;
-            this.constant = constant;
-        }
-
-        @Override
-        public Function getArg() {
-            return arg;
-        }
-
-        @Override
-        public boolean getBool(Record rec) {
-            return negated != (arg.getInt(rec) == valueIndex);
-        }
-
-        @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
-            arg.init(symbolTableSource, executionContext);
-            final StaticSymbolTable symbolTable = arg.getStaticSymbolTable();
-            assert symbolTable != null;
-            valueIndex = symbolTable.keyOf(constant);
-        }
-
-        @Override
-        public boolean isConstant() {
-            return valueIndex == SymbolTable.VALUE_NOT_FOUND;
-        }
-    }
-
-    private static class Func extends NegatableBooleanFunction implements BinaryFunction {
-        private final Function left;
-        private final Function right;
-
-        public Func(Function left, Function right) {
-            this.left = left;
-            this.right = right;
-        }
-
-        @Override
-        public Function getLeft() {
-            return left;
-        }
-
-        @Override
-        public Function getRight() {
-            return right;
-        }
-
-        @Override
-        public boolean getBool(Record rec) {
-            // important to compare A and B strings in case
-            // these are columns of the same record
-            // records have re-usable character sequences
-            final CharSequence a = left.getSymbol(rec);
-            final CharSequence b = right.getStr(rec);
-
-            if (a == null) {
-                return negated != (b == null);
+        public void toPlan(PlanSink sink) {
+            sink.val(arg);
+            if (negated) {
+                sink.val(" is not null");
+            } else {
+                sink.val(" is null");
             }
-
-            return negated != Chars.equalsNc(a, b);
         }
     }
 }

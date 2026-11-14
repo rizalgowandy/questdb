@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,25 +35,29 @@ import io.questdb.std.Vect;
 import java.util.concurrent.atomic.LongAccumulator;
 import java.util.function.LongBinaryOperator;
 
-import static io.questdb.griffin.SqlCodeGenerator.GKK_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_MICRO_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_NANO_HOUR_INT;
 
 public class MaxIntVectorAggregateFunction extends IntFunction implements VectorAggregateFunction {
-
     public static final LongBinaryOperator MAX = Math::max;
-    private final LongAccumulator max = new LongAccumulator(
-            MAX, Integer.MIN_VALUE
-    );
     private final int columnIndex;
     private final DistinctFunc distinctFunc;
     private final KeyValueFunc keyValueFunc;
+    private final LongAccumulator max = new LongAccumulator(
+            MAX, Integer.MIN_VALUE
+    );
     private int valueOffset;
 
-    public MaxIntVectorAggregateFunction(int keyKind, int columnIndex, int workerCount) {
+    @SuppressWarnings("unused")
+    public MaxIntVectorAggregateFunction(int keyKind, int columnIndex, int timestampIndex, int workerCount) {
         super();
         this.columnIndex = columnIndex;
-        if (keyKind == GKK_HOUR_INT) {
-            this.distinctFunc = Rosti::keyedHourDistinct;
-            this.keyValueFunc = Rosti::keyedHourMaxInt;
+        if (keyKind == GKK_MICRO_HOUR_INT) {
+            this.distinctFunc = Rosti::keyedMicroHourDistinct;
+            this.keyValueFunc = Rosti::keyedMicroHourMaxInt;
+        } else if (keyKind == GKK_NANO_HOUR_INT) {
+            this.distinctFunc = Rosti::keyedNanoHourDistinct;
+            this.keyValueFunc = Rosti::keyedNanoHourMaxInt;
         } else {
             this.distinctFunc = Rosti::keyedIntDistinct;
             this.keyValueFunc = Rosti::keyedIntMaxInt;
@@ -61,24 +65,39 @@ public class MaxIntVectorAggregateFunction extends IntFunction implements Vector
     }
 
     @Override
-    public void aggregate(long address, long addressSize, int columnSizeHint, int workerId) {
+    public void aggregate(long address, long frameRowCount, int workerId) {
         if (address != 0) {
-            max.accumulate(Vect.maxInt(address, addressSize / Integer.BYTES));
+            max.accumulate(Vect.maxInt(address, frameRowCount));
         }
     }
 
     @Override
-    public void aggregate(long pRosti, long keyAddress, long valueAddress, long valueAddressSize, int columnSizeShr, int workerId) {
+    public boolean aggregate(long pRosti, long keyAddress, long valueAddress, long frameRowCount) {
         if (valueAddress == 0) {
-            distinctFunc.run(pRosti, keyAddress, valueAddressSize / Integer.BYTES);
+            return distinctFunc.run(pRosti, keyAddress, frameRowCount);
         } else {
-            keyValueFunc.run(pRosti, keyAddress, valueAddress, valueAddressSize / Integer.BYTES, valueOffset);
+            return keyValueFunc.run(pRosti, keyAddress, valueAddress, frameRowCount, valueOffset);
         }
+    }
+
+    @Override
+    public void clear() {
+        max.reset();
     }
 
     @Override
     public int getColumnIndex() {
         return columnIndex;
+    }
+
+    @Override
+    public int getInt(Record rec) {
+        return max.intValue();
+    }
+
+    @Override
+    public String getName() {
+        return "max";
     }
 
     @Override
@@ -88,12 +107,12 @@ public class MaxIntVectorAggregateFunction extends IntFunction implements Vector
 
     @Override
     public void initRosti(long pRosti) {
-        Unsafe.getUnsafe().putInt(Rosti.getInitialValueSlot(pRosti, valueOffset), Integer.MIN_VALUE);
+        Unsafe.putInt(Rosti.getInitialValueSlot(pRosti, valueOffset), Integer.MIN_VALUE);
     }
 
     @Override
-    public void merge(long pRostiA, long pRostiB) {
-        Rosti.keyedIntMaxIntMerge(pRostiA, pRostiB, valueOffset);
+    public boolean merge(long pRostiA, long pRostiB) {
+        return Rosti.keyedIntMaxIntMerge(pRostiA, pRostiB, valueOffset);
     }
 
     @Override
@@ -103,22 +122,7 @@ public class MaxIntVectorAggregateFunction extends IntFunction implements Vector
     }
 
     @Override
-    public void wrapUp(long pRosti) {
-        Rosti.keyedIntMaxIntWrapUp(pRosti, valueOffset, max.intValue());
-    }
-
-    @Override
-    public void clear() {
-        max.reset();
-    }
-
-    @Override
-    public int getInt(Record rec) {
-        return max.intValue();
-    }
-
-    @Override
-    public boolean isReadThreadSafe() {
-        return false;
+    public boolean wrapUp(long pRosti) {
+        return Rosti.keyedIntMaxIntWrapUp(pRosti, valueOffset, max.intValue());
     }
 }

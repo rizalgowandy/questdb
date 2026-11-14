@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,14 +33,14 @@ import java.util.Iterator;
 public class ObjIntHashMap<K> implements Iterable<ObjIntHashMap.Entry<K>>, Mutable {
     private static final int MIN_INITIAL_CAPACITY = 16;
     private static final Object noEntryValue = new Object();
-    private final int noKeyValue;
-    private final double loadFactor;
     private final EntryIterator iterator = new EntryIterator();
-    private K[] keys;
-    private int[] values;
-    private int free;
+    private final double loadFactor;
+    private final int noKeyValue;
     private int capacity;
+    private int free;
+    private K[] keys;
     private int mask;
+    private int[] values;
 
     public ObjIntHashMap() {
         this(8);
@@ -55,33 +55,22 @@ public class ObjIntHashMap<K> implements Iterable<ObjIntHashMap.Entry<K>>, Mutab
         this.capacity = Math.max(initialCapacity, MIN_INITIAL_CAPACITY);
         this.loadFactor = loadFactor;
         this.noKeyValue = noKeyValue;
-        keys = getKeys();
+        keys = createKeys();
         values = new int[keys.length];
         mask = keys.length - 1;
         clear();
     }
 
+    public int capacity() {
+        return capacity;
+    }
+
     @Override
     public final void clear() {
-        free = capacity;
-        Arrays.fill(keys, noEntryValue);
-    }
-
-    public void clear(int newCapacity) {
-        if (newCapacity <= capacity) {
-            clear();
-        } else {
-            free = capacity = Numbers.ceilPow2(newCapacity);
-            keys = getKeys();
-            values = new int[keys.length];
-            mask = keys.length - 1;
+        if (free != capacity) {
+            free = capacity;
             Arrays.fill(keys, noEntryValue);
         }
-    }
-
-    @SuppressWarnings("unchecked")
-    private K[] getKeys() {
-        return (K[]) new Object[Numbers.ceilPow2((int) (this.capacity / this.loadFactor))];
     }
 
     public int get(K key) {
@@ -114,6 +103,16 @@ public class ObjIntHashMap<K> implements Iterable<ObjIntHashMap.Entry<K>>, Mutab
         putAt(keyIndex(key), key, value);
     }
 
+    public void putAll(ObjIntHashMap<K> other) {
+        K[] otherKeys = other.keys;
+        int[] otherValues = other.values;
+        for (int i = 0, n = otherKeys.length; i < n; i++) {
+            if (otherKeys[i] != noEntryValue) {
+                put(otherKeys[i], otherValues[i]);
+            }
+        }
+    }
+
     public void putAt(int index, K key, int value) {
         if (index < 0) {
             values[-index - 1] = value;
@@ -140,6 +139,11 @@ public class ObjIntHashMap<K> implements Iterable<ObjIntHashMap.Entry<K>>, Mutab
         return index < 0 ? values[index1] : noKeyValue;
     }
 
+    @SuppressWarnings("unchecked")
+    private K[] createKeys() {
+        return (K[]) new Object[Numbers.ceilPow2((int) (this.capacity / this.loadFactor))];
+    }
+
     private int probe(K key, int index) {
         do {
             index = (index + 1) & mask;
@@ -163,7 +167,6 @@ public class ObjIntHashMap<K> implements Iterable<ObjIntHashMap.Entry<K>>, Mutab
 
     @SuppressWarnings({"unchecked"})
     private void rehash() {
-
         free = capacity = this.capacity * 2;
         int[] oldValues = values;
         K[] oldKeys = keys;

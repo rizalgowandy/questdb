@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,9 +26,10 @@ package io.questdb.std;
 
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import io.questdb.std.bytes.Bytes;
 import io.questdb.std.ex.BytecodeException;
-import io.questdb.std.str.AbstractCharSink;
-import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8Sink;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.FileOutputStream;
@@ -37,55 +38,57 @@ import java.nio.ByteOrder;
 
 public class BytecodeAssembler {
 
-    private static final int ACC_PUBLIC = 0x01;
     private static final int ACC_PRIVATE = 0x02;
+    private static final int ACC_PUBLIC = 0x01;
     private static final Log LOG = LogFactory.getLog(BytecodeAssembler.class);
+    private static final int O_POOL_COUNT = 8;
     private static final int aload = 0x19;
     private static final int aload_0 = 0x2a;
     private static final int aload_1 = 0x2b;
     private static final int aload_2 = 0x2c;
     private static final int aload_3 = 0x2d;
-    private static final int istore = 0x36;
-    private static final int istore_0 = 0x3b;
-    private static final int istore_1 = 0x3c;
-    private static final int istore_2 = 0x3d;
-    private static final int istore_3 = 0x3e;
-    private static final int lstore = 0x37;
-    private static final int lstore_0 = 0x3f;
-    private static final int lstore_1 = 0x40;
-    private static final int lstore_2 = 0x41;
-    private static final int lstore_3 = 0x42;
+    private static final int bipush = 0x10;
+    private static final int iconst_0 = 3;
+    private static final int iconst_m1 = 2;
     private static final int iinc = 0x84;
-    private static final int lload = 0x16;
-    private static final int lload_0 = 0x1e;
-    private static final int lload_1 = 0x1f;
-    private static final int lload_2 = 0x20;
-    private static final int lload_3 = 0x21;
     private static final int iload = 0x15;
     private static final int iload_0 = 0x1a;
     private static final int iload_1 = 0x1b;
     private static final int iload_2 = 0x1c;
     private static final int iload_3 = 0x1d;
-    private static final int iconst_m1 = 2;
-    private static final int iconst_0 = 3;
-    private static final int bipush = 0x10;
-    private static final int sipush = 0x11;
     private static final int invokespecial = 183;
-    private static final int O_POOL_COUNT = 8;
+    private static final int istore = 0x36;
+    private static final int istore_0 = 0x3b;
+    private static final int istore_1 = 0x3c;
+    private static final int istore_2 = 0x3d;
+    private static final int istore_3 = 0x3e;
+    private static final int lload = 0x16;
+    private static final int lload_0 = 0x1e;
+    private static final int lload_1 = 0x1f;
+    private static final int lload_2 = 0x20;
+    private static final int lload_3 = 0x21;
+    private static final int lstore = 0x37;
+    private static final int lstore_0 = 0x3f;
+    private static final int lstore_1 = 0x40;
+    private static final int lstore_2 = 0x41;
+    private static final int lstore_3 = 0x42;
+    private static final int new_ = 0xbb;
+    private static final int sipush = 0x11;
+    private final ObjIntHashMap<Class<?>> classCache = new ObjIntHashMap<>();
     private final Utf8Appender utf8Appender = new Utf8Appender();
     private final CharSequenceIntHashMap utf8Cache = new CharSequenceIntHashMap();
-    private final ObjIntHashMap<Class<?>> classCache = new ObjIntHashMap<>();
     private ByteBuffer buf;
-    private int poolCount;
-    private int objectClassIndex;
-    private int defaultConstructorNameIndex;
-    private int defaultConstructorDescIndex;
-    private int defaultConstructorMethodIndex;
     private int codeAttributeIndex;
     private int codeAttributeStart;
     private int codeStart;
-    private int stackMapTableCut;
+    private int defaultConstructorDescIndex;
+    private int defaultConstructorMethodIndex;
+    private int defaultConstructorNameIndex;
+    private int defaultConstructorSigIndex;
     private Class<?> host;
+    private int objectClassIndex;
+    private int poolCount;
+    private int stackMapTableCut;
 
     public BytecodeAssembler() {
         this.buf = ByteBuffer.allocate(1024 * 1024).order(ByteOrder.BIG_ENDIAN);
@@ -101,22 +104,27 @@ public class BytecodeAssembler {
         putShort(offset);
     }
 
+    @SuppressWarnings("unused")
     public void athrow() {
         putByte(0xbf);
     }
 
+    @SuppressWarnings("unused")
     public void d2f() {
         putShort(0x90);
     }
 
+    @SuppressWarnings("unused")
     public void d2i() {
         putShort(0x8E);
     }
 
+    @SuppressWarnings("unused")
     public void d2l() {
         putShort(0x8F);
     }
 
+    @SuppressWarnings("unused")
     public void dcmpg() {
         putByte(0x98);
     }
@@ -143,8 +151,7 @@ public class BytecodeAssembler {
         startMethod(defaultConstructorNameIndex, defaultConstructorDescIndex, 1, 1);
         // code
         aload(0);
-        putByte(invokespecial);
-        putShort(superIndex);
+        invokespecial(superIndex);
         return_();
         endMethodCode();
         // exceptions
@@ -171,7 +178,7 @@ public class BytecodeAssembler {
             buf.limit(l);
             buf.position(p);
         } catch (Exception e) {
-            e.printStackTrace();
+            e.printStackTrace(System.err);
         }
     }
 
@@ -179,8 +186,13 @@ public class BytecodeAssembler {
         putByte(0x59);
     }
 
+    @SuppressWarnings("unused")
     public void dup2() {
         putByte(0x5c);
+    }
+
+    public void dup_x2() {
+        putByte(0x5b);
     }
 
     public void endMethod() {
@@ -204,10 +216,12 @@ public class BytecodeAssembler {
         putShort(0x8D);
     }
 
+    @SuppressWarnings("unused")
     public void f2i() {
         putShort(0x8B);
     }
 
+    @SuppressWarnings("unused")
     public void f2l() {
         putShort(0x8C);
     }
@@ -227,6 +241,40 @@ public class BytecodeAssembler {
 
     public int getCodeStart() {
         return codeStart;
+    }
+
+    public int getDefaultConstructorDescIndex() {
+        return defaultConstructorDescIndex;
+    }
+
+    public int getDefaultConstructorNameIndex() {
+        return defaultConstructorNameIndex;
+    }
+
+    public int getDefaultConstructorSigIndex() {
+        return defaultConstructorSigIndex;
+    }
+
+    /**
+     * Returns the size of the current method's bytecode in bytes.
+     * This is the value that matters for JVM's HugeMethodLimit (default 8000).
+     * Call this after endMethodCode() to get the final size.
+     */
+    public int getMethodCodeSize() {
+        return position() - codeStart;
+    }
+
+    public int getObjectInitMethodIndex() {
+        return defaultConstructorMethodIndex;
+    }
+
+    public int getPoolCount() {
+        return poolCount;
+    }
+
+    public void getStatic(int index) {
+        putByte(178);
+        putShort(index);
     }
 
     public void getfield(int index) {
@@ -267,14 +315,15 @@ public class BytecodeAssembler {
             putByte(iconst_m1);
         } else if (v > -1 && v < 6) {
             putByte(iconst_0 + v);
-        } else if (v < 0) {
+        } else if (v < 0 && v >= Short.MIN_VALUE) {
             putByte(sipush);
             putShort(v);
-        } else if (v < 128) {
+        } else if (v < 128 && v >= Short.MIN_VALUE) {
             putByte(bipush);
             putByte(v);
         } else {
             putByte(sipush);
+            assert v >= Short.MIN_VALUE && v <= Short.MAX_VALUE;
             putShort(v);
         }
     }
@@ -287,6 +336,7 @@ public class BytecodeAssembler {
         return genericGoto(0xa0);
     }
 
+    @SuppressWarnings("unused")
     public int ifle() {
         return genericGoto(0x9e);
     }
@@ -351,6 +401,11 @@ public class BytecodeAssembler {
         putShort(index);
     }
 
+    public void invokespecial(int index) {
+        putByte(invokespecial);
+        putShort(index);
+    }
+
     public void irem() {
         putByte(0x70);
     }
@@ -388,8 +443,12 @@ public class BytecodeAssembler {
     }
 
     public void ldc(int index) {
-        putByte(0x12);
-        putByte(index);
+        if (index < 256) {
+            putByte(0x12);
+            putByte(index);
+        } else {
+            ldc_w(index);
+        }
     }
 
     public void ldc2_w(int index) {
@@ -410,12 +469,10 @@ public class BytecodeAssembler {
         putByte(0x69);
     }
 
-    @SuppressWarnings("unchecked")
-    @Nullable
-    public <T> Class<T> loadClass(Class<?> host) {
-        byte[] b = new byte[position()];
-        System.arraycopy(buf.array(), 0, b, 0, b.length);
-        return (Class<T>) Unsafe.defineAnonymousClass(host, b);
+    public <T> Class<T> loadClass() {
+        Class<T> x = loadClass(host);
+        assert x != null;
+        return x;
     }
 
     public void lreturn() {
@@ -439,6 +496,11 @@ public class BytecodeAssembler {
             LOG.critical().$("could not create an instance of ").$(host.getName()).$(", cause: ").$(e).$();
             throw BytecodeException.INSTANCE;
         }
+    }
+
+    public void new_(int classIndex) {
+        putByte(new_);
+        putShort(classIndex);
     }
 
     public int poolClass(int classIndex) {
@@ -469,8 +531,22 @@ public class BytecodeAssembler {
         return classCache.valueAt(index);
     }
 
+    public int poolDoubleConst(double value) {
+        putByte(0x06);
+        putDouble(value);
+        int index = poolCount;
+        poolCount += 2;
+        return index;
+    }
+
     public int poolField(int classIndex, int nameAndTypeIndex) {
         return poolRef(0x09, classIndex, nameAndTypeIndex);
+    }
+
+    public void poolIntConst(int value) {
+        putByte(0x03);
+        putInt(value);
+        poolCount += 1;
     }
 
     public int poolInterfaceMethod(Class<?> clazz, String name, String sig) {
@@ -481,12 +557,8 @@ public class BytecodeAssembler {
         return poolInterfaceMethod(classIndex, poolNameAndType(poolUtf8(name), poolUtf8(sig)));
     }
 
-    public int poolDoubleConst(double value) {
-        putByte(0x06);
-        putDouble(value);
-        int index = poolCount;
-        poolCount += 2;
-        return index;
+    public int poolInterfaceMethod(int classIndex, int nameAndTypeIndex) {
+        return poolRef(0x0B, classIndex, nameAndTypeIndex);
     }
 
     public int poolLongConst(long value) {
@@ -574,6 +646,13 @@ public class BytecodeAssembler {
         buf.put((byte) b);
     }
 
+    public void putDouble(double value) {
+        if (buf.remaining() < 4) {
+            resize();
+        }
+        buf.putDouble(value);
+    }
+
     public void putITEM_Integer() {
         putByte(0x01);
     }
@@ -589,13 +668,6 @@ public class BytecodeAssembler {
 
     public void putITEM_Top() {
         putByte(0);
-    }
-
-    public void putDouble(double value) {
-        if (buf.remaining() < 4) {
-            resize();
-        }
-        buf.putDouble(value);
     }
 
     public void putLong(long value) {
@@ -645,9 +717,10 @@ public class BytecodeAssembler {
 
         // add standard stuff
         objectClassIndex = poolClass(Object.class);
-        defaultConstructorMethodIndex = poolMethod(objectClassIndex, poolNameAndType(
-                defaultConstructorNameIndex = poolUtf8("<init>"),
-                defaultConstructorDescIndex = poolUtf8("()V"))
+        defaultConstructorMethodIndex = poolMethod(objectClassIndex, defaultConstructorSigIndex = poolNameAndType(
+                        defaultConstructorNameIndex = poolUtf8("<init>"),
+                        defaultConstructorDescIndex = poolUtf8("()V")
+                )
         );
         codeAttributeIndex = poolUtf8("Code");
     }
@@ -655,6 +728,33 @@ public class BytecodeAssembler {
     public void startMethod(int nameIndex, int descriptorIndex, int maxStack, int maxLocal) {
         // access flags
         putShort(ACC_PUBLIC);
+        // name index
+        putShort(nameIndex);
+        // descriptor index
+        putShort(descriptorIndex);
+        // attribute count
+        putShort(1);
+
+        // code
+        putShort(codeAttributeIndex);
+
+        // attribute len
+        putInt(0);
+        // come back to this later
+        this.codeAttributeStart = position();
+        // max stack
+        putShort(maxStack);
+        // max locals
+        putShort(maxLocal);
+
+        // code len
+        putInt(0);
+        this.codeStart = position();
+    }
+
+    public void startPrivateMethod(int nameIndex, int descriptorIndex, int maxStack, int maxLocal) {
+        // access flags
+        putShort(ACC_PRIVATE);
         // name index
         putShort(nameIndex);
         // descriptor index
@@ -724,6 +824,14 @@ public class BytecodeAssembler {
         return pos;
     }
 
+    @SuppressWarnings("unchecked")
+    @Nullable
+    private <T> Class<T> loadClass(Class<?> host) {
+        byte[] b = new byte[position()];
+        System.arraycopy(buf.array(), 0, b, 0, b.length);
+        return (Class<T>) Unsafe.defineAnonymousClass(host, b);
+    }
+
     private void optimisedIO(int code0, int code1, int code2, int code3, int code, int value) {
         switch (value) {
             case 0:
@@ -743,10 +851,6 @@ public class BytecodeAssembler {
                 putByte(value);
                 break;
         }
-    }
-
-    private int poolInterfaceMethod(int classIndex, int nameAndTypeIndex) {
-        return poolRef(0x0B, classIndex, nameAndTypeIndex);
     }
 
     private int poolRef(int op, int name, int type) {
@@ -781,9 +885,10 @@ public class BytecodeAssembler {
         buf = b;
     }
 
-    public class Utf8Appender extends AbstractCharSink implements CharSink {
-        private int utf8len = 0;
+    public class Utf8Appender implements Utf8Sink {
         private int lenpos;
+        private int[] ryuE10;
+        private int utf8len = 0;
 
         public int $() {
             putShort(lenpos, utf8len);
@@ -791,35 +896,69 @@ public class BytecodeAssembler {
         }
 
         @Override
-        public Utf8Appender put(CharSequence cs) {
-            int n = cs.length();
-            for (int i = 0; i < n; i++) {
-                BytecodeAssembler.this.putByte(cs.charAt(i));
+        public Utf8Sink put(@Nullable Utf8Sequence us) {
+            if (us != null) {
+                int size = us.size();
+                for (int i = 0; i < size; i++) {
+                    BytecodeAssembler.this.putByte(us.byteAt(i));
+                }
+                utf8len += size;
             }
-            utf8len += n;
             return this;
         }
 
         @Override
-        public Utf8Appender put(char c) {
-            BytecodeAssembler.this.putByte(c);
+        public Utf8Appender put(byte b) {
+            BytecodeAssembler.this.putByte(b);
             utf8len++;
             return this;
         }
 
         @Override
         public Utf8Appender put(int value) {
-            super.put(value);
+            Utf8Sink.super.put(value);
             return this;
         }
 
         @Override
-        public CharSink put(char[] chars, int start, int len) {
-            for (int i = 0; i < len; i++) {
-                BytecodeAssembler.this.putByte(chars[i + start]);
-            }
-            utf8len += len;
+        public Utf8Appender put(@Nullable CharSequence cs) {
+            Utf8Sink.super.put(cs);
             return this;
+        }
+
+        @Override
+        public Utf8Appender putAscii(char c) {
+            Utf8Sink.super.putAscii(c);
+            return this;
+        }
+
+        @Override
+        public Utf8Appender putAscii(@Nullable CharSequence cs) {
+            if (cs != null) {
+                int len = cs.length();
+                for (int i = 0; i < len; i++) {
+                    BytecodeAssembler.this.putByte(cs.charAt(i));
+                }
+                utf8len += len;
+            }
+            return this;
+        }
+
+        @Override
+        public Utf8Appender putNonAscii(long lo, long hi) {
+            Bytes.checkedLoHiSize(lo, hi, BytecodeAssembler.this.position());
+            for (long p = lo; p < hi; p++) {
+                BytecodeAssembler.this.putByte(Unsafe.getByte(p));
+            }
+            return this;
+        }
+
+        @Override
+        public int[] ryuScratch() {
+            if (ryuE10 == null) {
+                ryuE10 = new int[1];
+            }
+            return ryuE10;
         }
     }
 }

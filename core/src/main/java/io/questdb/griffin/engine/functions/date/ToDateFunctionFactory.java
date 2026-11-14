@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.DateFunction;
@@ -38,11 +39,9 @@ import io.questdb.std.NumericException;
 import io.questdb.std.ObjList;
 import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.DateLocale;
-import io.questdb.std.datetime.millitime.DateFormatCompiler;
+import io.questdb.std.datetime.millitime.DateFormatFactory;
 
 public class ToDateFunctionFactory implements FunctionFactory {
-    private static final ThreadLocal<DateFormatCompiler> tlCompiler = ThreadLocal.withInitial(DateFormatCompiler::new);
-
     @Override
     public String getSignature() {
         return "to_date(Ss)";
@@ -51,23 +50,24 @@ public class ToDateFunctionFactory implements FunctionFactory {
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
         final Function arg = args.getQuick(0);
-        final CharSequence pattern = args.getQuick(1).getStr(null);
+        final CharSequence pattern = args.getQuick(1).getStrA(null);
         if (pattern == null) {
             throw SqlException.$(argPositions.getQuick(1), "pattern is required");
         }
-        return new ToDateFunction(arg, tlCompiler.get().compile(pattern), configuration.getDefaultDateLocale());
+        return new ToDateFunction(arg, DateFormatFactory.INSTANCE.get(pattern), configuration.getDefaultDateLocale(), pattern);
     }
 
     private static final class ToDateFunction extends DateFunction implements UnaryFunction {
-
         private final Function arg;
         private final DateFormat dateFormat;
         private final DateLocale locale;
+        private final CharSequence pattern;
 
-        public ToDateFunction(Function arg, DateFormat dateFormat, DateLocale locale) {
+        public ToDateFunction(Function arg, DateFormat dateFormat, DateLocale locale, CharSequence pattern) {
             this.arg = arg;
             this.dateFormat = dateFormat;
             this.locale = locale;
+            this.pattern = pattern;
         }
 
         @Override
@@ -77,14 +77,19 @@ public class ToDateFunctionFactory implements FunctionFactory {
 
         @Override
         public long getDate(Record rec) {
-            CharSequence value = arg.getStr(rec);
+            CharSequence value = arg.getStrA(rec);
             try {
                 if (value != null) {
                     return dateFormat.parse(value, locale);
                 }
             } catch (NumericException ignore) {
             }
-            return Numbers.LONG_NaN;
+            return Numbers.LONG_NULL;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("to_date(").val(arg).val(',').val(pattern).val(')');
         }
     }
 }

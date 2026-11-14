@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,168 +24,390 @@
 
 package io.questdb.griffin.engine.ops;
 
-import io.questdb.cairo.*;
-import io.questdb.cairo.sql.RecordMetadata;
-import io.questdb.griffin.SqlException;
+import io.questdb.cairo.AlterTableContextException;
+import io.questdb.cairo.AttachDetachStatus;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.EntryUnavailableException;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.vm.MemoryFCRImpl;
+import io.questdb.cairo.vm.api.MemoryA;
+import io.questdb.cairo.vm.api.MemoryCR;
+import io.questdb.cairo.wal.MetadataService;
+import io.questdb.griffin.QueryRegistry;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
-import io.questdb.std.str.CharSink;
-import io.questdb.std.str.DirectCharSequence;
+import io.questdb.log.LogRecord;
+import io.questdb.std.Chars;
+import io.questdb.std.LongList;
+import io.questdb.std.Mutable;
+import io.questdb.std.ObjList;
+import io.questdb.std.str.DirectString;
 import io.questdb.tasks.TableWriterTask;
 
-public class AlterOperation extends AbstractOperation implements Mutable, QuietClosable {
-
-    public final static short DO_NOTHING = 1;
-    public final static short ADD_COLUMN = 3;
-    public final static short DROP_PARTITION = 4;
-    public final static short ATTACH_PARTITION = 5;
-    public final static short ADD_INDEX = 6;
-    public final static short ADD_SYMBOL_CACHE = 7;
-    public final static short REMOVE_SYMBOL_CACHE = 8;
-    public final static short DROP_COLUMN = 9;
-    public final static short RENAME_COLUMN = 10;
-    public final static short SET_PARAM_MAX_UNCOMMITTED_ROWS = 11;
-    public final static short SET_PARAM_COMMIT_LAG = 12;
-
-    private final static Log LOG = LogFactory.getLog(AlterOperation.class);
-
-    private final ObjCharSequenceList objCharList;
-    private final DirectCharSequenceList directCharList = new DirectCharSequenceList();
-    private final LongList longList;
-    // This is only used to serialize Partition name in form 2020-02-12 or 2020-02 or 2020
-    // to exception message using TableUtils.setSinkForPartition
-    private final ExceptionSinkAdapter exceptionSinkAdapter = new ExceptionSinkAdapter();
+public class AlterOperation extends AbstractOperation implements Mutable {
+    public final static short DO_NOTHING = 0;
+    public final static short ADD_COLUMN = DO_NOTHING + 1; // 1
+    public final static short DROP_PARTITION = ADD_COLUMN + 1; // 2
+    public final static short ATTACH_PARTITION = DROP_PARTITION + 1; // 3
+    public final static short ADD_INDEX = ATTACH_PARTITION + 1; // 4
+    public final static short DROP_INDEX = ADD_INDEX + 1; // 5
+    public final static short ADD_SYMBOL_CACHE = DROP_INDEX + 1; // 6
+    public final static short REMOVE_SYMBOL_CACHE = ADD_SYMBOL_CACHE + 1; // 7
+    public final static short DROP_COLUMN = REMOVE_SYMBOL_CACHE + 1; // 8
+    public final static short RENAME_COLUMN = DROP_COLUMN + 1; // 9
+    public final static short SET_PARAM_MAX_UNCOMMITTED_ROWS = RENAME_COLUMN + 1; // 10
+    public final static short SET_PARAM_COMMIT_LAG = SET_PARAM_MAX_UNCOMMITTED_ROWS + 1; // 11
+    public final static short DETACH_PARTITION = SET_PARAM_COMMIT_LAG + 1; // 12
+    public final static short SQUASH_PARTITIONS = DETACH_PARTITION + 1; // 13
+    public final static short RENAME_TABLE = SQUASH_PARTITIONS + 1; // 14
+    public final static short SET_DEDUP_ENABLE = RENAME_TABLE + 1; // 15
+    public final static short SET_DEDUP_DISABLE = SET_DEDUP_ENABLE + 1; // 16
+    public final static short CHANGE_COLUMN_TYPE = SET_DEDUP_DISABLE + 1; // 17
+    public final static short CONVERT_PARTITION_TO_PARQUET = CHANGE_COLUMN_TYPE + 1; // 18
+    public final static short CONVERT_PARTITION_TO_NATIVE = CONVERT_PARTITION_TO_PARQUET + 1; // 19
+    public final static short FORCE_DROP_PARTITION = CONVERT_PARTITION_TO_NATIVE + 1; // 20
+    public final static short SET_TTL = FORCE_DROP_PARTITION + 1; // 21
+    public final static short CHANGE_SYMBOL_CAPACITY = SET_TTL + 1; // 22
+    public final static short SET_MAT_VIEW_REFRESH_LIMIT = CHANGE_SYMBOL_CAPACITY + 1; // 23
+    public final static short SET_MAT_VIEW_REFRESH_TIMER = SET_MAT_VIEW_REFRESH_LIMIT + 1; // 24
+    public final static short SET_MAT_VIEW_REFRESH = SET_MAT_VIEW_REFRESH_TIMER + 1; // 25
+    public final static short SET_PARQUET_ENCODING = SET_MAT_VIEW_REFRESH + 1; // 26
+    public final static short SET_TABLE_FORMAT = SET_PARQUET_ENCODING + 1; // 27
+    public final static short SET_EXPIRE = SET_TABLE_FORMAT + 1; // 28
+    // node-local, never written to the WAL, see isForceWalBypass()
+    public final static short FORCE_REINDEX = SET_EXPIRE + 1; // 29
+    // Same as SET_DEDUP_ENABLE, but carries the dedup mode: extraInfo is [dedupMode, dedup key writer indexes...].
+    // SET_DEDUP_ENABLE, which carries only the dedup key writer indexes, implies the UPSERT mode. The builder
+    // keeps emitting SET_DEDUP_ENABLE for UPSERT so that versions predating the dedup mode can still apply it.
+    public final static short SET_DEDUP_ENABLE_WITH_MODE = FORCE_REINDEX + 1; // 30
+    // V2 layout (this branch onwards): index type fits in low 3 bits, dedup
+    // key sits at bit 3, and bit 63 is the format-version marker that
+    // distinguishes v2 payloads from any pre-v2 ALTER message still queued in
+    // the WAL across an upgrade. v1 layout (pre-POSTING): only BIT_INDEXED
+    // (0x1) and BIT_DEDUP_KEY (0x2) were used; bit 63 was always zero. Future
+    // bit-layout changes must bump FLAGS_FORMAT_V_CURRENT and add a decode
+    // branch for the previous version, never silently re-interpret existing
+    // bit patterns.
+    private static final long BIT_DEDUP_KEY = 0x08L;
+    private static final long FLAGS_FORMAT_V2 = 1L << 63;
+    private static final long FLAGS_FORMAT_V_CURRENT = FLAGS_FORMAT_V2;
+    private static final long FLAGS_V1_BIT_DEDUP_KEY = 0x02L;
+    private static final long FLAGS_V1_BIT_INDEXED = 0x01L;
+    private static final long INDEX_TYPE_MASK = 0x07L;
+    private static final Log LOG = LogFactory.getLog(AlterOperation.class);
+    private final ObjList<CharSequence> authColumnNames = new ObjList<>();
+    // scratch list, the dedup key writer indexes of SET_DEDUP_ENABLE / SET_DEDUP_ENABLE_WITH_MODE
+    private final LongList dedupKeyColumnIndexes = new LongList();
+    private final DirectCharSequenceList directExtraStrInfo = new DirectCharSequenceList();
+    // This is only used to serialize partition name in form 2020-02-12 or 2020-02 or 2020
+    // to exception message using TableUtils.setSinkForPartition.
+    private final LongList extraInfo;
+    private final ObjCharSequenceList extraStrInfo;
+    private CharSequenceList activeExtraStrInfo;
     private short command;
-    private CharSequenceList charSequenceList;
+    private MemoryFCRImpl deserializeMem;
+    private boolean keepMatViewsValid;
 
     public AlterOperation() {
         this(new LongList(), new ObjList<>());
     }
 
-    public AlterOperation(LongList longList, ObjList<CharSequence> charSequenceObjList) {
-        this.longList = longList;
-        this.objCharList = new ObjCharSequenceList(charSequenceObjList);
+    public AlterOperation(LongList extraInfo, ObjList<CharSequence> extraStrInfo) {
+        this.extraInfo = extraInfo;
+        this.extraStrInfo = new ObjCharSequenceList(extraStrInfo);
+        this.command = DO_NOTHING;
+    }
+
+    /**
+     * Decodes the index-type byte from a serialized ALTER ADD_COLUMN /
+     * CHANGE_COLUMN_TYPE flags long. Detects the layout version via the
+     * format-marker bit and falls back to the v1 layout when the marker is
+     * absent (in-flight WAL payloads written before this branch).
+     * Public for testing across the JPMS test/main module boundary.
+     */
+    public static byte decodeIndexType(long flags) {
+        if ((flags & FLAGS_FORMAT_V2) != 0) {
+            return (byte) (flags & INDEX_TYPE_MASK);
+        }
+        // v1: only BIT_INDEXED (0x1) and BIT_DEDUP_KEY (0x2) were ever set,
+        // and "indexed" implied BITMAP (the only index type at the time).
+        return (flags & FLAGS_V1_BIT_INDEXED) != 0 ? IndexType.BITMAP : IndexType.NONE;
+    }
+
+    /**
+     * See {@link #decodeIndexType(long)}.
+     */
+    public static boolean decodeIsDedupKey(long flags) {
+        if ((flags & FLAGS_FORMAT_V2) != 0) {
+            return (flags & BIT_DEDUP_KEY) == BIT_DEDUP_KEY;
+        }
+        return (flags & FLAGS_V1_BIT_DEDUP_KEY) == FLAGS_V1_BIT_DEDUP_KEY;
+    }
+
+    public static long getFlags(byte indexType, boolean dedupKey) {
+        long flags = FLAGS_FORMAT_V_CURRENT | (indexType & INDEX_TYPE_MASK);
+        if (dedupKey) {
+            flags |= BIT_DEDUP_KEY;
+        }
+        return flags;
+    }
+
+    // todo: supply bitset to indicate which ops are supported and which arent
+    //     "structural changes" doesn't cover is as "add column" is supported
+    @Override
+    public long apply(MetadataService svc, boolean contextAllowsAnyStructureChanges) throws AlterTableContextException {
+        final QueryRegistry queryRegistry = sqlExecutionContext != null ? getCairoEngine().getQueryRegistry() : null;
+        keepMatViewsValid = false;
+        long queryId = -1;
+        try {
+            if (queryRegistry != null) {
+                queryId = queryRegistry.register(sqlText, sqlExecutionContext);
+            }
+            doApply(svc, contextAllowsAnyStructureChanges);
+        } catch (EntryUnavailableException ex) {
+            throw ex;
+        } catch (CairoException e) {
+            boolean isCritical = e.isCritical();
+            // "duplicate column name:" is BAU when column is added from ILP, don't log it as an error
+            boolean isInfo = command == ADD_COLUMN && e.isMetadataValidation();
+
+            final LogRecord log = isInfo ? LOG.info() : (isCritical ? LOG.critical() : LOG.error());
+            log.$("could not alter table [table=").$(svc.getTableToken())
+                    .$(", command=").$(command)
+                    .$(", msg=").$safe(e.getFlyweightMessage())
+                    .$(", errno=").$(e.getErrno())
+                    .I$();
+            throw e;
+        } finally {
+            if (queryRegistry != null) {
+                queryRegistry.unregister(queryId, sqlExecutionContext);
+            }
+        }
+        return 0;
     }
 
     @Override
-    public long apply(TableWriter tableWriter, boolean contextAllowsAnyStructureChanges) throws SqlException, AlterTableContextException {
-        try {
-            switch (command) {
-                case ADD_COLUMN:
-                    applyAddColumn(tableWriter);
-                    break;
-                case DROP_PARTITION:
-                    applyDropPartition(tableWriter);
-                    break;
-                case ATTACH_PARTITION:
-                    applyAttachPartition(tableWriter);
-                    break;
-                case ADD_INDEX:
-                    applyAddIndex(tableWriter);
-                    break;
-                case ADD_SYMBOL_CACHE:
-                    applySetSymbolCache(tableWriter, true);
-                    break;
-                case REMOVE_SYMBOL_CACHE:
-                    applySetSymbolCache(tableWriter, false);
-                    break;
-                case DROP_COLUMN:
-                    if (!contextAllowsAnyStructureChanges) {
-                        throw AlterTableContextException.INSTANCE;
-                    }
-                    applyDropColumn(tableWriter);
-                    break;
-                case RENAME_COLUMN:
-                    if (!contextAllowsAnyStructureChanges) {
-                        throw AlterTableContextException.INSTANCE;
-                    }
-                    applyRenameColumn(tableWriter);
-                    break;
-                case SET_PARAM_MAX_UNCOMMITTED_ROWS:
-                    applyParamUncommittedRows(tableWriter);
-                    break;
-                case SET_PARAM_COMMIT_LAG:
-                    applyParamCommitLag(tableWriter);
-                    break;
-                default:
-                    LOG.error().$("Invalid alter table command [code=").$(command).$(" ,table=").$(tableName).I$();
-                    throw SqlException.$(tableNamePosition, "Invalid alter table command [code=").put(command).put(']');
-            }
-        } catch (EntryUnavailableException | SqlException ex) {
-            throw ex;
-        } catch (CairoException e2) {
-            LOG.error().$("table '")
-                    .$(tableName)
-                    .$("' could not be altered [")
-                    .$(e2.getErrno())
-                    .$("] ")
-                    .$(e2.getFlyweightMessage())
-                    .$();
-
-            throw SqlException.$(tableNamePosition, "table '")
-                    .put(tableName)
-                    .put("' could not be altered: [")
-                    .put(e2.getErrno())
-                    .put("] ")
-                    .put(e2.getFlyweightMessage());
+    public void authorize() {
+        final SecurityContext securityContext = this.securityContext;
+        if (securityContext == null) {
+            throw CairoException.nonCritical()
+                    .put("alter security context is empty [table=")
+                    .put(getTableToken().getTableName())
+                    .put(']');
         }
-        return 0;
+        final TableToken tableToken = getTableToken();
+        switch (command) {
+            case ADD_COLUMN -> securityContext.authorizeAlterTableAddColumn(tableToken);
+            case DROP_COLUMN -> securityContext.authorizeAlterTableDropColumn(tableToken, getAuthColumnNames());
+            case RENAME_COLUMN -> securityContext.authorizeAlterTableRenameColumn(tableToken, getAuthColumnNames());
+            case CHANGE_COLUMN_TYPE ->
+                    securityContext.authorizeAlterTableAlterColumnType(tableToken, getAuthColumnNames());
+            case CHANGE_SYMBOL_CAPACITY ->
+                    securityContext.authorizeAlterTableAlterSymbolCapacity(tableToken, getAuthColumnNames());
+            case ADD_INDEX -> securityContext.authorizeAlterTableAddIndex(tableToken, getAuthIndexedColumn());
+            case DROP_INDEX -> securityContext.authorizeAlterTableDropIndex(tableToken, getAuthColumnNames());
+            case ADD_SYMBOL_CACHE, REMOVE_SYMBOL_CACHE ->
+                    securityContext.authorizeAlterTableAlterColumnCache(tableToken, getAuthColumnNames());
+            case DROP_PARTITION, FORCE_DROP_PARTITION, SQUASH_PARTITIONS ->
+                    securityContext.authorizeAlterTableDropPartition(tableToken);
+            case ATTACH_PARTITION -> securityContext.authorizeAlterTableAttachPartition(tableToken);
+            case DETACH_PARTITION -> securityContext.authorizeAlterTableDetachPartition(tableToken);
+            case SET_PARAM_MAX_UNCOMMITTED_ROWS, SET_PARAM_COMMIT_LAG, SET_TTL, SET_EXPIRE ->
+                    securityContext.authorizeAlterTableSetParam(tableToken);
+            case SET_TABLE_FORMAT -> securityContext.authorizeAlterTableSetFormat(tableToken);
+            case SET_DEDUP_ENABLE, SET_DEDUP_ENABLE_WITH_MODE ->
+                    securityContext.authorizeAlterTableDedupEnable(tableToken);
+            case SET_DEDUP_DISABLE -> securityContext.authorizeAlterTableDedupDisable(tableToken);
+            case CONVERT_PARTITION_TO_PARQUET ->
+                    securityContext.authorizeAlterTableConvertPartitionToParquet(tableToken);
+            case CONVERT_PARTITION_TO_NATIVE -> securityContext.authorizeAlterTableConvertPartitionToNative(tableToken);
+            case SET_PARQUET_ENCODING -> securityContext.authorizeAlterTableSetParquetSettings(tableToken);
+            case SET_MAT_VIEW_REFRESH_LIMIT -> securityContext.authorizeAlterMatViewSetRefreshLimit(tableToken);
+            case SET_MAT_VIEW_REFRESH_TIMER, SET_MAT_VIEW_REFRESH ->
+                    securityContext.authorizeAlterMatViewSetRefreshType(tableToken);
+            case FORCE_REINDEX -> securityContext.authorizeTableReindex(tableToken, getAuthColumnNames());
+            default -> {
+                // DO_NOTHING, RENAME_TABLE (handled by engine directly)
+            }
+        }
+    }
+
+    @Override
+    public void clear() {
+        authColumnNames.clear();
+        command = DO_NOTHING;
+        sqlExecutionContext = null;
+        clearSecurityContext();
+        extraStrInfo.clear();
+        directExtraStrInfo.clear();
+        activeExtraStrInfo = extraStrInfo;
+        extraInfo.clear();
+        keepMatViewsValid = false;
+        clearCommandCorrelationId();
+    }
+
+    public AlterOperation deepClone() {
+        final LongList extraInfo = new LongList(this.extraInfo);
+        final ObjList<CharSequence> charSequenceObjList = new ObjList<>(this.activeExtraStrInfo.size());
+        for (int i = 0, n = this.activeExtraStrInfo.size(); i < n; i++) {
+            charSequenceObjList.add(Chars.toString(this.activeExtraStrInfo.getStrA(i)));
+        }
+
+        final AlterOperation alterOperation = newInstance(extraInfo, charSequenceObjList);
+        alterOperation.command = this.command;
+        alterOperation.activeExtraStrInfo = alterOperation.extraStrInfo;
+        alterOperation.init(this.getCmdType(), this.getCommandName(), this.tableToken, this.getTableId(), this.getTableVersion(), this.tableNamePosition);
+        return alterOperation;
     }
 
     @Override
     public AlterOperation deserialize(TableWriterTask event) {
         clear();
 
-        tableName = event.getTableName();
+        tableToken = event.getTableToken();
         long readPtr = event.getData();
-        final long hi = readPtr + event.getDataSize();
+        long length = event.getDataSize();
+        final long hi = readPtr + length;
 
         // This is not hot path, do safe deserialization
         if (readPtr + 10 >= hi) {
-            throw CairoException.instance(0).put("invalid alter statement serialized to writer queue [1]");
+            throw CairoException.critical(0).put("invalid alter statement serialized to writer queue [1]");
         }
-        command = Unsafe.getUnsafe().getShort(readPtr);
-        readPtr += 2;
-        tableNamePosition = Unsafe.getUnsafe().getInt(readPtr);
-        readPtr += 4;
-        int longSize = Unsafe.getUnsafe().getInt(readPtr);
-        readPtr += 4;
-        if (longSize < 0 || readPtr + longSize * 8L >= hi) {
-            throw CairoException.instance(0).put("invalid alter statement serialized to writer queue [2]");
+
+        if (deserializeMem == null) {
+            deserializeMem = new MemoryFCRImpl();
         }
-        for (int i = 0; i < longSize; i++) {
-            longList.add(Unsafe.getUnsafe().getLong(readPtr));
-            readPtr += 8;
-        }
-        directCharList.of(readPtr, hi);
-        charSequenceList = directCharList;
+        deserializeMem.of(readPtr, length);
+        deserializeBody(deserializeMem, 0L, length);
         return this;
     }
 
-    @Override
-    public void startAsync() {
+    public void deserializeBody(MemoryCR buffer, long offsetLo, long offsetHi) {
+        clear();
+        long readPtr = offsetLo;
+        if (readPtr + 10 > offsetHi) {
+            throw CairoException
+                    .critical(0)
+                    .put("cannot read alter statement serialized, data is too short to read 10 bytes header [offset=")
+                    .put(offsetLo)
+                    .put(", size=")
+                    .put(offsetHi - offsetLo)
+                    .put(']');
+        }
+        command = buffer.getShort(readPtr);
+        readPtr += 2;
+        tableNamePosition = buffer.getInt(readPtr);
+        readPtr += 4;
+        int longSize = buffer.getInt(readPtr);
+        readPtr += 4;
+        if (longSize < 0 || readPtr + longSize * 8L >= offsetHi) {
+            throw CairoException.critical(0).put("invalid alter statement serialized to writer queue [2]");
+        }
+        extraInfo.clear();
+        for (int i = 0; i < longSize; i++) {
+            extraInfo.add(buffer.getLong(readPtr));
+            readPtr += 8;
+        }
+        directExtraStrInfo.of(buffer, readPtr, offsetHi);
+        activeExtraStrInfo = directExtraStrInfo;
+    }
+
+    public short getCommand() {
+        return command;
     }
 
     @Override
-    public void clear() {
-        command = DO_NOTHING;
-        objCharList.clear();
-        directCharList.clear();
-        charSequenceList = objCharList;
-        setCommandCorrelationId(-1);
-        longList.clear();
+    public boolean isForceWalBypass() {
+        return command == FORCE_DROP_PARTITION || command == FORCE_REINDEX;
+    }
+
+    @Override
+    public boolean isForceableWhenSuspended() {
+        // Any non-structural change may be force-applied directly to a hard-suspended table,
+        // mirroring FORCE DROP PARTITION. Structural changes must stay versioned through the WAL.
+        return !isStructural();
+    }
+
+    @Override
+    public boolean isStructural() {
+        return switch (command) {
+            case ADD_COLUMN, RENAME_COLUMN, DROP_COLUMN, RENAME_TABLE, SET_DEDUP_DISABLE, SET_DEDUP_ENABLE,
+                 SET_DEDUP_ENABLE_WITH_MODE, CHANGE_COLUMN_TYPE -> true;
+            default -> false;
+        };
+    }
+
+    @Override
+    public String matViewInvalidationReason() {
+        // Don't invalidate mat views in case when the operation was "harmless".
+        if (keepMatViewsValid) {
+            return null;
+        }
+        // Table rename is not in the list since it's handled by the engine directly. That's because the invalidation
+        // looks up dependent views by table name which has already changed at this point, not directory name.
+        return switch (command) {
+            case DROP_COLUMN -> "drop column operation";
+            case RENAME_COLUMN -> "rename column operation";
+            case CHANGE_COLUMN_TYPE -> "change column type operation";
+            case DROP_PARTITION -> "drop partition operation";
+            case DETACH_PARTITION -> "detach partition operation";
+            case ATTACH_PARTITION -> "attach partition operation";
+            default -> null;
+        };
+    }
+
+    public AlterOperation newInstance(LongList extraInfo, ObjList<CharSequence> extraStrInfo) {
+        return new AlterOperation(extraInfo, extraStrInfo);
     }
 
     public AlterOperation of(
+            int cmdType,
             short command,
-            String tableName,
+            TableToken tableToken,
             int tableId,
             int tableNamePosition
     ) {
-        init(TableWriterTask.CMD_ALTER_TABLE, "ALTER TABLE", tableName, tableId, -1, tableNamePosition);
+        init(cmdType, TableWriterTask.getCommandName(cmdType), tableToken, tableId, -1, tableNamePosition);
         this.command = command;
+        this.activeExtraStrInfo = this.extraStrInfo;
         return this;
+    }
+
+    public void ofAddColumn(
+            int tableId,
+            TableToken tableToken,
+            int tableNamePosition,
+            CharSequence columnName,
+            int columnNamePosition,
+            int columnType,
+            int symbolCapacity,
+            boolean cache,
+            byte indexType,
+            int indexValueBlockCapacity,
+            boolean dedupKey
+    ) {
+        of(TableWriterTask.CMD_ALTER_TABLE, AlterOperation.ADD_COLUMN, tableToken, tableId, tableNamePosition);
+        assert columnName != null && !columnName.isEmpty();
+        extraStrInfo.strings.add(Chars.toString(columnName));
+        extraInfo.add(columnType);
+        extraInfo.add(symbolCapacity);
+        extraInfo.add(cache ? 1 : -1);
+        extraInfo.add(getFlags(indexType, dedupKey));
+        extraInfo.add(indexValueBlockCapacity);
+        extraInfo.add(columnNamePosition);
+    }
+
+    public void ofRenameTable(TableToken fromTableToken, CharSequence toTableName) {
+        of(TableWriterTask.CMD_ALTER_TABLE, AlterOperation.RENAME_TABLE, fromTableToken, fromTableToken.getTableId(), 0);
+        assert toTableName != null && !toTableName.isEmpty();
+        extraStrInfo.strings.add(fromTableToken.getTableName());
+        extraStrInfo.strings.add(toTableName);
     }
 
     @Override
@@ -193,184 +415,602 @@ public class AlterOperation extends AbstractOperation implements Mutable, QuietC
         super.serialize(event);
         event.putShort(command);
         event.putInt(tableNamePosition);
-        event.putInt(longList.size());
-        for (int i = 0, n = longList.size(); i < n; i++) {
-            event.putLong(longList.getQuick(i));
+        event.putInt(extraInfo.size());
+        for (int i = 0, n = extraInfo.size(); i < n; i++) {
+            event.putLong(extraInfo.getQuick(i));
         }
 
-        event.putInt(objCharList.size());
-        for (int i = 0, n = objCharList.size(); i < n; i++) {
-            event.putStr(objCharList.getStrA(i));
+        event.putInt(extraStrInfo.size());
+        for (int i = 0, n = extraStrInfo.size(); i < n; i++) {
+            event.putStr(extraStrInfo.getStrA(i));
         }
     }
 
-    private void applyAddColumn(TableWriter tableWriter) throws SqlException {
+    public void serializeBody(MemoryA sink) {
+        sink.putShort(command);
+        sink.putInt(tableNamePosition);
+        sink.putInt(extraInfo.size());
+        for (int i = 0, n = extraInfo.size(); i < n; i++) {
+            sink.putLong(extraInfo.getQuick(i));
+        }
+
+        sink.putInt(extraStrInfo.size());
+        for (int i = 0, n = extraStrInfo.size(); i < n; i++) {
+            sink.putStr(extraStrInfo.getStrA(i));
+        }
+    }
+
+    @Override
+    public boolean shouldCompileDependentViews() {
+        return switch (command) {
+            case ADD_COLUMN, RENAME_COLUMN, DROP_COLUMN, RENAME_TABLE, CHANGE_COLUMN_TYPE -> true;
+            default -> false;
+        };
+    }
+
+    @Override
+    public void startAsync() {
+    }
+
+    private void applyAddColumn(MetadataService svc) {
         int lParam = 0;
-        for (int i = 0, n = charSequenceList.size(); i < n; i++) {
-            CharSequence columnName = charSequenceList.getStrA(i);
-            int type = (int) longList.get(lParam++);
-            int symbolCapacity = (int) longList.get(lParam++);
-            boolean symbolCacheFlag = longList.get(lParam++) > 0;
-            boolean isIndexed = longList.get(lParam++) > 0;
-            int indexValueBlockCapacity = (int) longList.get(lParam++);
+        for (int i = 0, n = activeExtraStrInfo.size(); i < n; i++) {
+            CharSequence columnName = activeExtraStrInfo.getStrA(i);
+            int type = (int) extraInfo.get(lParam++);
+            int symbolCapacity = (int) extraInfo.get(lParam++);
+            boolean symbolCacheFlag = extraInfo.get(lParam++) > 0;
+            long flags = extraInfo.get(lParam++);
+            byte indexType = decodeIndexType(flags);
+            boolean isDedupKey = decodeIsDedupKey(flags);
+            assert !isDedupKey; // adding column as dedup key is not supported in SQL yet.
+            int indexValueBlockCapacity = (int) extraInfo.get(lParam++);
+            int columnNamePosition = (int) extraInfo.get(lParam++);
             try {
-                tableWriter.addColumn(
+                svc.addColumn(
                         columnName,
                         type,
                         symbolCapacity,
                         symbolCacheFlag,
-                        isIndexed,
+                        indexType,
                         indexValueBlockCapacity,
-                        false
+                        false,
+                        isDedupKey,
+                        securityContext
                 );
             } catch (CairoException e) {
-                LOG.error().$("Cannot add column '").$(tableWriter.getTableName()).$('.').$(columnName).$("'. Exception: ").$((Sinkable) e).$();
-                throw SqlException.$(tableNamePosition, "could not add column [error=").put(e.getFlyweightMessage())
-                        .put(", errno=").put(e.getErrno())
-                        .put(']');
-            }
-        }
-    }
-
-    private void applyAddIndex(TableWriter tableWriter) throws SqlException {
-        CharSequence columnName = charSequenceList.getStrA(0);
-        try {
-            int indexValueBlockSize = (int) longList.get(0);
-            tableWriter.addIndex(columnName, indexValueBlockSize);
-        } catch (CairoException e) {
-            throw SqlException.position(tableNamePosition).put(e.getFlyweightMessage())
-                    .put("[errno=").put(e.getErrno()).put(']');
-        }
-    }
-
-    private void applyAttachPartition(TableWriter tableWriter) throws SqlException {
-        for (int i = 0, n = longList.size(); i < n; i++) {
-            long partitionTimestamp = longList.getQuick(i);
-            try {
-                int statusCode = tableWriter.attachPartition(partitionTimestamp);
-                switch (statusCode) {
-                    case StatusCode.OK:
-                        break;
-                    case StatusCode.CANNOT_ATTACH_MISSING_PARTITION:
-                        throw putPartitionName(
-                                SqlException.$(tableNamePosition, "attach partition failed, folder '"),
-                                tableWriter.getPartitionBy(),
-                                partitionTimestamp)
-                                .put("' does not exist");
-                    case StatusCode.TABLE_HAS_SYMBOLS:
-                        throw SqlException.$(tableNamePosition, "attaching partitions to tables with symbol columns not supported");
-                    case StatusCode.PARTITION_EMPTY:
-                        throw putPartitionName(
-                                SqlException.$(tableNamePosition, "failed to attach partition '"),
-                                tableWriter.getPartitionBy(),
-                                partitionTimestamp)
-                                .put("', data does not correspond to the partition folder or partition is empty");
-                    case StatusCode.PARTITION_ALREADY_ATTACHED:
-                        throw putPartitionName(
-                                SqlException.$(tableNamePosition, "failed to attach partition '"),
-                                tableWriter.getPartitionBy(),
-                                partitionTimestamp)
-                                .put("', partition already attached to the table");
-                    default:
-                        throw putPartitionName(
-                                SqlException.$(tableNamePosition, "attach partition  '"),
-                                tableWriter.getPartitionBy(),
-                                partitionTimestamp)
-                                .put(statusCode);
-                }
-            } catch (CairoException e) {
-                LOG.error().$("failed to drop partition [table=").$(tableName)
-                        .$(",ts=").$ts(partitionTimestamp)
-                        .$(",errno=").$(e.getErrno())
-                        .$(",error=").$(e.getFlyweightMessage())
-                        .I$();
-
+                e.position(columnNamePosition);
                 throw e;
             }
         }
     }
 
-    private void applyDropColumn(TableWriter writer) throws SqlException {
-        for (int i = 0, n = charSequenceList.size(); i < n; i++) {
-            CharSequence columnName = charSequenceList.getStrA(i);
-            RecordMetadata metadata = writer.getMetadata();
-            if (metadata.getColumnIndexQuiet(columnName) == -1) {
-                throw SqlException.invalidColumn(tableNamePosition, columnName);
-            }
-            try {
-                writer.removeColumn(columnName);
-            } catch (CairoException e) {
-                LOG.error().$("cannot drop column '").$(writer.getTableName()).$('.').$(columnName).$("'. Exception: ").$((Sinkable) e).$();
-                throw SqlException.$(tableNamePosition, "cannot drop column. Try again later [errno=").put(e.getErrno()).put(']');
-            }
-        }
-    }
-
-    private void applyDropPartition(TableWriter tableWriter) throws SqlException {
-        for (int i = 0, n = longList.size(); i < n; i++) {
-            long partitionTimestamp = longList.getQuick(i);
-            try {
-                if (!tableWriter.removePartition(partitionTimestamp)) {
-                    throw putPartitionName(SqlException.$(tableNamePosition, "could not remove partition '"),
-                            tableWriter.getPartitionBy(),
-                            partitionTimestamp).put('\'');
+    private void applyAddIndex(MetadataService svc) {
+        final CharSequence columnName = activeExtraStrInfo.getStrA(0);
+        try {
+            byte indexType = extraInfo.size() > 1 ? (byte) extraInfo.get(1) : IndexType.BITMAP;
+            int coverCount = extraInfo.size() > 2 ? (int) extraInfo.get(2) : 0;
+            ObjList<CharSequence> coveringColumnNames = null;
+            if (coverCount > 0) {
+                coveringColumnNames = new ObjList<>(coverCount);
+                for (int i = 0; i < coverCount; i++) {
+                    coveringColumnNames.add(activeExtraStrInfo.getStrA(1 + i));
                 }
-            } catch (CairoException e) {
-                LOG.error().$("failed to drop partition [table=").$(tableName)
-                        .$(",ts=").$ts(partitionTimestamp)
-                        .$(",errno=").$(e.getErrno())
-                        .$(",error=").$(e.getFlyweightMessage())
-                        .I$();
+            }
+            svc.addIndex(columnName, (int) extraInfo.get(0), indexType, coveringColumnNames);
+        } catch (CairoException e) {
+            // augment exception with table position
+            e.position(tableNamePosition);
+            throw e;
+        }
+    }
 
-                throw putPartitionName(SqlException.$(tableNamePosition, "could not remove partition '"),
-                        tableWriter.getPartitionBy(),
-                        partitionTimestamp).put("'. ")
-                        .put(e.getFlyweightMessage());
+    private void applyAttachPartition(MetadataService svc) {
+        boolean attached = false;
+        try {
+            for (int i = 0, n = extraInfo.size() / 2; i < n; i++) {
+                final long partitionTimestamp = extraInfo.getQuick(i * 2);
+                final int partitionPosition = (int) extraInfo.getQuick(i * 2 + 1);
+                final AttachDetachStatus attachDetachStatus;
+                try {
+                    attachDetachStatus = svc.attachPartition(partitionTimestamp);
+                } catch (CairoException e) {
+                    // The writer does not know the SQL text; an error it throws points at the partition literal too
+                    throw e.position(partitionPosition);
+                }
+                if (AttachDetachStatus.OK != attachDetachStatus) {
+                    throw attachDetachStatus.getException(
+                            partitionPosition,
+                            attachDetachStatus,
+                            tableToken,
+                            svc.getTimestampType(),
+                            svc.getPartitionBy(),
+                            partitionTimestamp
+                    );
+                }
+                attached = true;
+            }
+        } finally {
+            // An attach consumes its .attachable directory, so no WAL replay can redo it. One durable epoch covers
+            // the whole list, including the partitions attached before a failure.
+            if (attached) {
+                svc.advanceDurableEpochAfter("attach partition");
             }
         }
     }
 
-    private void applyParamCommitLag(TableWriter tableWriter) {
-        long commitLag = longList.get(0);
-        tableWriter.setMetaCommitLag(commitLag);
+    private void applyConvertPartition(MetadataService svc, boolean toParquet) {
+        // Check if we have bloom filter options (only for toParquet conversion)
+        // Data layout with bloom filter: extraInfo = [ts1, pos1, ts2, pos2, ..., fpp_bits], extraStrInfo = [bloomFilterColumns]
+        // Data layout without bloom filter: extraInfo = [ts1, pos1, ts2, pos2, ...], extraStrInfo = []
+        CharSequence bloomFilterColumns = null;
+        double fpp = Double.NaN;
+        int partitionCount;
+
+        if (toParquet && activeExtraStrInfo.size() > 0) {
+            bloomFilterColumns = activeExtraStrInfo.getStrA(0);
+            fpp = Double.longBitsToDouble(extraInfo.getQuick(extraInfo.size() - 1));
+            partitionCount = (extraInfo.size() - 1) / 2;
+        } else {
+            partitionCount = extraInfo.size() / 2;
+        }
+
+        boolean converted = false;
+        try {
+            for (int i = 0; i < partitionCount; i++) {
+                long partitionTimestamp = extraInfo.getQuick(i * 2);
+                final boolean result;
+                if (toParquet) {
+                    result = svc.convertPartitionNativeToParquet(partitionTimestamp, bloomFilterColumns, fpp);
+                } else {
+                    result = svc.convertPartitionParquetToNative(partitionTimestamp);
+                }
+                if (!result) {
+                    throw CairoException.partitionManipulationRecoverable()
+                            .put("could not convert partition to")
+                            .put(toParquet ? "parquet" : "native")
+                            .put("[table=")
+                            .put(getTableToken().getTableName())
+                            .put(", partitionTimestamp=").ts(svc.getMetadata().getTimestampType(), partitionTimestamp)
+                            .put(", partitionBy=").put(PartitionBy.toString(svc.getPartitionBy()))
+                            .put(']')
+                            .position((int) extraInfo.getQuick(i * 2 + 1));
+                }
+                converted = true;
+            }
+        } finally {
+            // One durable epoch covers the whole list, including the partitions converted before a failure, and
+            // lets the writer remove the superseded partition directories.
+            if (converted) {
+                svc.advanceDurableEpochAfter("partition convert");
+            }
+        }
     }
 
-    private void applyParamUncommittedRows(TableWriter tableWriter) {
-        int maxUncommittedRows = (int) longList.get(0);
-        tableWriter.setMetaMaxUncommittedRows(maxUncommittedRows);
+    private void applyDetachPartition(MetadataService svc) {
+        boolean detached = false;
+        try {
+            for (int i = 0, n = extraInfo.size() / 2; i < n; i++) {
+                final long partitionTimestamp = extraInfo.getQuick(i * 2);
+                final int partitionPosition = (int) extraInfo.getQuick(i * 2 + 1);
+                final AttachDetachStatus attachDetachStatus;
+                try {
+                    attachDetachStatus = svc.detachPartition(partitionTimestamp);
+                } catch (CairoException e) {
+                    // The writer does not know the SQL text; an error it throws points at the partition literal too
+                    throw e.position(partitionPosition);
+                }
+                if (AttachDetachStatus.OK != attachDetachStatus) {
+                    throw attachDetachStatus.getException(
+                            partitionPosition,
+                            attachDetachStatus,
+                            tableToken,
+                            svc.getTimestampType(),
+                            svc.getPartitionBy(),
+                            partitionTimestamp
+                    );
+                }
+                detached = true;
+            }
+        } finally {
+            // One durable epoch covers the whole list, including the partitions detached before a failure, and
+            // lets the writer remove the detached partition directories.
+            if (detached) {
+                svc.advanceDurableEpochAfter("detach partition");
+            }
+        }
     }
 
-    private void applyRenameColumn(TableWriter writer) throws SqlException {
-        // To not store 2 var len fields, store only new name as CharSequence
-        // and index of existing column store as
-        int i = 0, n = charSequenceList.size();
+    private void applyDropColumn(MetadataService svc) {
+        for (int i = 0, n = activeExtraStrInfo.size(); i < n; i++) {
+            removeColumn(svc, activeExtraStrInfo.getStrA(i));
+        }
+    }
+
+    private void applyDropIndex(MetadataService svc) {
+        final CharSequence columnName = activeExtraStrInfo.getStrA(0);
+        final int columnNamePosition = (int) extraInfo.get(0);
+        try {
+            svc.dropIndex(columnName);
+        } catch (CairoException e) {
+            e.position(columnNamePosition);
+            throw e;
+        }
+    }
+
+    private void applyDropPartition(MetadataService svc) {
+        // long list is a set of two longs per partition - (timestamp, partitionNamePosition)
+        for (int i = 0, n = extraInfo.size() / 2; i < n; i++) {
+            long partitionTimestamp = extraInfo.getQuick(i * 2);
+            if (!svc.removePartition(partitionTimestamp)) {
+                throw CairoException.partitionManipulationRecoverable()
+                        .put("could not remove partition [table=").put(getTableToken().getTableName())
+                        .put(", partitionTimestamp=").ts(svc.getMetadata().getTimestampType(), partitionTimestamp)
+                        .put(", partitionBy=").put(PartitionBy.toString(svc.getPartitionBy()))
+                        .put(']')
+                        .position((int) extraInfo.getQuick(i * 2 + 1));
+            }
+        }
+    }
+
+    private void applyDropPartitionForce(MetadataService svc) {
+        svc.forceRemovePartitions(extraInfo);
+    }
+
+    private void applyForceReindex(MetadataService svc) {
+        // extraInfo: (partition timestamp, partition name position) pairs, none for every partition
+        svc.forceReindex(
+                activeExtraStrInfo.size() > 0 ? activeExtraStrInfo.getStrA(0) : null,
+                extraInfo,
+                tableNamePosition,
+                sqlExecutionContext != null ? sqlExecutionContext.getCircuitBreaker() : null
+        );
+    }
+
+    private void applyParamO3MaxLag(MetadataService svc) {
+        long o3MaxLag = extraInfo.get(0);
+        try {
+            svc.setMetaO3MaxLag(o3MaxLag);
+        } catch (CairoException e) {
+            LOG.error().$("could not change o3MaxLag [table=").$(getTableToken())
+                    .$(", msg=").$safe(e.getFlyweightMessage())
+                    .$(", errno=").$(e.getErrno())
+                    .I$();
+            throw e;
+        }
+    }
+
+    private void applyParamUncommittedRows(MetadataService svc) {
+        int maxUncommittedRows = (int) extraInfo.get(0);
+        try {
+            svc.setMetaMaxUncommittedRows(maxUncommittedRows);
+        } catch (CairoException e) {
+            e.position(tableNamePosition);
+            throw e;
+        }
+    }
+
+    private void applyRenameColumn(MetadataService svc) {
+        // To avoid storing 2 var len fields, store only new name as CharSequence
+        // and index of existing column.
+        int i = 0, n = activeExtraStrInfo.size();
         while (i < n) {
-            CharSequence columnName = charSequenceList.getStrA(i++);
-            CharSequence newName = charSequenceList.getStrB(i++);
-            try {
-                writer.renameColumn(columnName, newName);
-            } catch (CairoException e) {
-                LOG.error().$("cannot rename column '").$(writer.getTableName()).$('.').$(columnName).$("'. Exception: ").$((Sinkable) e).$();
-                throw SqlException.$(tableNamePosition, "cannot rename column \"").put(columnName).put("\"; ").put(e.getFlyweightMessage());
+            CharSequence columnName = activeExtraStrInfo.getStrA(i++);
+            CharSequence newName = activeExtraStrInfo.getStrB(i++);
+            svc.renameColumn(columnName, newName, securityContext);
+        }
+    }
+
+    private void applyRenameTable(MetadataService svc) {
+        svc.renameTable(activeExtraStrInfo.getStrA(0), activeExtraStrInfo.getStrB(1));
+    }
+
+    private void applySetSymbolCache(MetadataService svc, boolean isCacheOn) {
+        CharSequence columnName = activeExtraStrInfo.getStrA(0);
+        svc.changeCacheFlag(
+                svc.getMetadata().getColumnIndex(columnName),
+                isCacheOn
+        );
+    }
+
+    private void applySetExpire(MetadataService svc) {
+        String predicate = Chars.toString(activeExtraStrInfo.getStrA(0));
+        if (predicate != null && predicate.isEmpty()) {
+            predicate = null;
+        }
+        final long cleanupIntervalMicros = extraInfo.get(0);
+        try {
+            svc.setMetaExpiry(predicate, cleanupIntervalMicros);
+        } catch (CairoException e) {
+            e.position(tableNamePosition);
+            throw e;
+        }
+    }
+
+    private void applyTableFormat(MetadataService svc) {
+        final int tableFormat = (int) extraInfo.get(0);
+        try {
+            svc.setMetaTableFormat(tableFormat);
+        } catch (CairoException e) {
+            e.position(tableNamePosition);
+            throw e;
+        }
+    }
+
+    private void applyTtl(MetadataService svc) {
+        final int ttlHoursOrMonths = (int) extraInfo.get(0);
+        try {
+            svc.setMetaTtl(ttlHoursOrMonths);
+            if (svc instanceof TableWriter) {
+                ((TableWriter) svc).enforceTtl();
             }
+        } catch (CairoException e) {
+            e.position(tableNamePosition);
+            throw e;
         }
     }
 
-    private void applySetSymbolCache(TableWriter tableWriter, boolean isCacheOn) throws SqlException {
-        CharSequence columnName = charSequenceList.getStrA(0);
-        int columnIndex = tableWriter.getMetadata().getColumnIndexQuiet(columnName);
-        if (columnIndex == -1) {
-            throw SqlException.invalidColumn(tableNamePosition, columnName);
+    private void changeColumnType(MetadataService svc) {
+        if (activeExtraStrInfo.size() != 1) {
+            throw CairoException.nonCritical().put("invalid change column type alter statement");
         }
-        tableWriter.changeCacheFlag(columnIndex, isCacheOn);
+        CharSequence columnName = activeExtraStrInfo.getStrA(0);
+        int lParam = 0;
+        int newType = (int) extraInfo.get(lParam++);
+        int symbolCapacity = (int) extraInfo.get(lParam++);
+        boolean symbolCacheFlag = extraInfo.get(lParam++) > 0;
+        long flags = extraInfo.get(lParam++);
+        byte indexType = decodeIndexType(flags);
+        boolean isDedupKey = decodeIsDedupKey(flags);
+        assert !isDedupKey; // adding column as dedup key is not supported in SQL yet.
+        int indexValueBlockCapacity = (int) extraInfo.get(lParam++);
+        int columnNamePosition = (int) extraInfo.get(lParam);
+
+        try {
+            svc.changeColumnType(
+                    columnName,
+                    newType,
+                    symbolCapacity,
+                    symbolCacheFlag,
+                    indexType,
+                    indexValueBlockCapacity,
+                    false,
+                    securityContext
+            );
+        } catch (CairoException e) {
+            e.position(columnNamePosition);
+            throw e;
+        }
     }
 
-    private SqlException putPartitionName(SqlException ex, int partitionBy, long timestamp) {
-        PartitionBy.setSinkForPartition(exceptionSinkAdapter.of(ex), partitionBy, timestamp, false);
-        return ex;
+    private void changeSymbolCapacity(MetadataService svc) {
+        if (activeExtraStrInfo.size() != 1) {
+            throw CairoException.nonCritical().put("invalid change symbol capacity alter statement");
+        }
+        CharSequence columnName = activeExtraStrInfo.getStrA(0);
+        int newCapacity = (int) extraInfo.get(1);
+        svc.changeSymbolCapacity(columnName, newCapacity, securityContext);
     }
 
-    interface CharSequenceList extends Mutable {
+    private void doApply(MetadataService svc, boolean contextAllowsAnyStructureChanges) {
+        switch (command) {
+            case ADD_COLUMN:
+                applyAddColumn(svc);
+                break;
+            case DROP_COLUMN:
+                if (!contextAllowsAnyStructureChanges) {
+                    throw AlterTableContextException.INSTANCE;
+                }
+                applyDropColumn(svc);
+                break;
+            case RENAME_COLUMN:
+                if (!contextAllowsAnyStructureChanges) {
+                    throw AlterTableContextException.INSTANCE;
+                }
+                applyRenameColumn(svc);
+                break;
+            case DROP_PARTITION:
+                applyDropPartition(svc);
+                break;
+            case CONVERT_PARTITION_TO_PARQUET:
+                applyConvertPartition(svc, true);
+                break;
+            case CONVERT_PARTITION_TO_NATIVE:
+                applyConvertPartition(svc, false);
+                break;
+            case DETACH_PARTITION:
+                applyDetachPartition(svc);
+                break;
+            case ATTACH_PARTITION:
+                applyAttachPartition(svc);
+                break;
+            case FORCE_DROP_PARTITION:
+                applyDropPartitionForce(svc);
+                break;
+            case FORCE_REINDEX:
+                applyForceReindex(svc);
+                break;
+            case ADD_INDEX:
+                applyAddIndex(svc);
+                break;
+            case DROP_INDEX:
+                applyDropIndex(svc);
+                break;
+            case ADD_SYMBOL_CACHE:
+                applySetSymbolCache(svc, true);
+                break;
+            case REMOVE_SYMBOL_CACHE:
+                applySetSymbolCache(svc, false);
+                break;
+            case SET_PARAM_MAX_UNCOMMITTED_ROWS:
+                applyParamUncommittedRows(svc);
+                break;
+            case SET_PARAM_COMMIT_LAG:
+                applyParamO3MaxLag(svc);
+                break;
+            case SET_TTL:
+                applyTtl(svc);
+                break;
+            case SET_EXPIRE:
+                applySetExpire(svc);
+                break;
+            case RENAME_TABLE:
+                applyRenameTable(svc);
+                break;
+            case SQUASH_PARTITIONS:
+                squashPartitions(svc);
+                break;
+            case SET_DEDUP_ENABLE:
+                keepMatViewsValid = enableDeduplication(svc, false);
+                break;
+            case SET_DEDUP_ENABLE_WITH_MODE:
+                keepMatViewsValid = enableDeduplication(svc, true);
+                break;
+            case SET_DEDUP_DISABLE:
+                svc.disableDeduplication();
+                break;
+            case CHANGE_COLUMN_TYPE:
+                if (!contextAllowsAnyStructureChanges) {
+                    throw AlterTableContextException.INSTANCE;
+                }
+                changeColumnType(svc);
+                break;
+            case CHANGE_SYMBOL_CAPACITY:
+                changeSymbolCapacity(svc);
+                break;
+            case SET_MAT_VIEW_REFRESH_LIMIT:
+                setMatViewRefreshLimit(svc);
+                break;
+            case SET_MAT_VIEW_REFRESH_TIMER:
+                // legacy operation, kept for compat purposes
+                setMatViewRefreshTimer(svc);
+                break;
+            case SET_MAT_VIEW_REFRESH:
+                setMatViewRefresh(svc);
+                break;
+            case SET_PARQUET_ENCODING:
+                setParquetEncoding(svc);
+                break;
+            case SET_TABLE_FORMAT:
+                applyTableFormat(svc);
+                break;
+            default:
+                LOG.error()
+                        .$("invalid alter table command [code=").$(command)
+                        .$(" ,table=").$(svc.getTableToken())
+                        .I$();
+                throw CairoException.critical(0).put("invalid alter table command [code=").put(command).put(']');
+        }
+    }
+
+    private boolean enableDeduplication(MetadataService svc, boolean hasMode) {
+        // SET_DEDUP_ENABLE_WITH_MODE carries the dedup mode ahead of the dedup key writer indexes,
+        // SET_DEDUP_ENABLE carries the indexes only and implies UPSERT
+        final int keyColumnIndexesLo = hasMode ? 1 : 0;
+        if (extraInfo.size() <= keyColumnIndexesLo) {
+            throw CairoException.critical(0).put("invalid dedup enable statement, no dedup keys [table=")
+                    .put(svc.getTableToken().getTableName()).put(']');
+        }
+        final int dedupMode = hasMode ? (int) extraInfo.getQuick(0) : TableUtils.DEDUP_MODE_UPSERT;
+        if (dedupMode != TableUtils.DEDUP_MODE_UPSERT && dedupMode != TableUtils.DEDUP_MODE_SKIP) {
+            throw CairoException.critical(0).put("invalid dedup mode [table=").put(svc.getTableToken().getTableName())
+                    .put(", mode=").put(dedupMode).put(']');
+        }
+        // copy, the service is free to modify the list, e.g. sort it
+        dedupKeyColumnIndexes.clear();
+        for (int i = keyColumnIndexesLo, n = extraInfo.size(); i < n; i++) {
+            dedupKeyColumnIndexes.add(extraInfo.getQuick(i));
+        }
+        return svc.enableDeduplication(dedupKeyColumnIndexes, dedupMode);
+    }
+
+    private ObjList<CharSequence> getAuthColumnNames() {
+        authColumnNames.clear();
+        for (int i = 0, n = activeExtraStrInfo.size(); i < n; i++) {
+            authColumnNames.add(Chars.toString(activeExtraStrInfo.getStrA(i)));
+        }
+        return authColumnNames;
+    }
+
+    // ADD INDEX stores [indexedColumn, cov1, cov2, ...] in extraStrInfo.
+    // Authorization only covers the indexed column; covering INCLUDE columns
+    // are not part of the ADD INDEX privilege.
+    private ObjList<CharSequence> getAuthIndexedColumn() {
+        authColumnNames.clear();
+        if (activeExtraStrInfo.size() > 0) {
+            authColumnNames.add(Chars.toString(activeExtraStrInfo.getStrA(0)));
+        }
+        return authColumnNames;
+    }
+
+    private CairoEngine getCairoEngine() {
+        assert sqlExecutionContext != null;
+        return sqlExecutionContext.getCairoEngine();
+    }
+
+    private void removeColumn(MetadataService svc, CharSequence columnName) {
+        svc.removeColumn(columnName, securityContext);
+    }
+
+    private void setMatViewRefresh(MetadataService svc) {
+        final int refreshType = (int) extraInfo.get(0);
+        final int timerInterval = (int) extraInfo.get(1);
+        final char timerUnit = (char) extraInfo.get(2);
+        final long timerStartUs = extraInfo.get(3);
+        final int periodLength = (int) extraInfo.get(4);
+        final char periodLengthUnit = (char) extraInfo.get(5);
+        final int periodDelay = (int) extraInfo.get(6);
+        final char periodDelayUnit = (char) extraInfo.get(7);
+        final CharSequence timerTimeZone = activeExtraStrInfo.getStrA(0);
+
+        svc.setMatViewRefresh(
+                refreshType,
+                timerInterval,
+                timerUnit,
+                timerStartUs,
+                timerTimeZone,
+                periodLength,
+                periodLengthUnit,
+                periodDelay,
+                periodDelayUnit
+        );
+    }
+
+    private void setMatViewRefreshLimit(MetadataService svc) {
+        final int limitHoursOrMonths = (int) extraInfo.get(0);
+        try {
+            svc.setMatViewRefreshLimit(limitHoursOrMonths);
+        } catch (CairoException e) {
+            e.position(tableNamePosition);
+            throw e;
+        }
+    }
+
+    private void setMatViewRefreshTimer(MetadataService svc) {
+        final long startUs = extraInfo.get(0);
+        final int interval = (int) extraInfo.get(1);
+        final char unit = (char) extraInfo.get(2);
+        try {
+            svc.setMatViewRefreshTimer(startUs, interval, unit);
+        } catch (CairoException e) {
+            e.position(tableNamePosition);
+            throw e;
+        }
+    }
+
+    private void setParquetEncoding(MetadataService svc) {
+        if (activeExtraStrInfo.size() != 1) {
+            throw CairoException.nonCritical().put("invalid set parquet encoding alter statement");
+        }
+        CharSequence columnName = activeExtraStrInfo.getStrA(0);
+        int parquetEncodingConfig = (int) extraInfo.get(0);
+        svc.setColumnParquetEncoding(columnName, parquetEncodingConfig);
+    }
+
+    private void squashPartitions(MetadataService svc) {
+        svc.squashPartitions();
+    }
+
+    private interface CharSequenceList extends Mutable {
         CharSequence getStrA(int i);
 
         CharSequence getStrB(int i);
@@ -378,86 +1018,10 @@ public class AlterOperation extends AbstractOperation implements Mutable, QuietC
         int size();
     }
 
-    // This is only used to serialize Partition name in form 2020-02-12 or 2020-02 or 2020
-    // to exception message using TableUtils.setSinkForPartition
-    private static class ExceptionSinkAdapter implements CharSink {
-        private SqlException ex;
-
-        @Override
-        public int encodeSurrogate(char c, CharSequence in, int pos, int hi) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public char[] getDoubleDigitsBuffer() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public CharSink put(CharSequence cs) {
-            ex.put(cs);
-            return this;
-        }
-
-        @Override
-        public CharSink put(char c) {
-            ex.put(c);
-            return this;
-        }
-
-        @Override
-        public CharSink put(int c) {
-            ex.put(c);
-            return this;
-        }
-
-        @Override
-        public CharSink put(long c) {
-            ex.put(c);
-            return this;
-        }
-
-        ExceptionSinkAdapter of(SqlException ex) {
-            this.ex = ex;
-            return this;
-        }
-    }
-
-    private static class ObjCharSequenceList implements CharSequenceList {
-        private final ObjList<CharSequence> strings;
-
-        public ObjCharSequenceList(ObjList<CharSequence> strings) {
-            this.strings = strings;
-        }
-
-        public void add(CharSequence ch) {
-            strings.add(ch);
-        }
-
-        @Override
-        public void clear() {
-            strings.clear();
-        }
-
-        public CharSequence getStrA(int i) {
-            return strings.get(i);
-        }
-
-        @Override
-        public CharSequence getStrB(int i) {
-            return strings.get(i);
-        }
-
-        @Override
-        public int size() {
-            return strings.size();
-        }
-    }
-
     private static class DirectCharSequenceList implements CharSequenceList {
         private final LongList offsets = new LongList();
-        private final DirectCharSequence strA = new DirectCharSequence();
-        private final DirectCharSequence strB = new DirectCharSequence();
+        private final DirectString strA = new DirectString();
+        private final DirectString strB = new DirectString();
 
         @Override
         public void clear() {
@@ -479,35 +1043,52 @@ public class AlterOperation extends AbstractOperation implements Mutable, QuietC
             return strB;
         }
 
+        public void of(MemoryCR buffer, long lo, long hi) {
+            if (lo + Integer.BYTES > hi) {
+                throw CairoException.critical(0).put("invalid alter statement serialized to writer queue [11]");
+            }
+            int size = buffer.getInt(lo);
+            lo += 4;
+            for (int i = 0; i < size; i++) {
+                if (lo + Integer.BYTES > hi) {
+                    throw CairoException.critical(0).put("invalid alter statement serialized to writer queue [12]");
+                }
+                int stringSize = 2 * buffer.getInt(lo);
+                lo += 4;
+                if (lo + stringSize > hi) {
+                    throw CairoException.critical(0).put("invalid alter statement serialized to writer queue [13]");
+                }
+                long address = buffer.addressOf(lo);
+                offsets.add(address, address + stringSize);
+                lo += stringSize;
+            }
+        }
+
         @Override
         public int size() {
             return offsets.size() / 2;
         }
-
-        public long of(long lo, long hi) {
-            long initialAddress = lo;
-            if (lo + Integer.BYTES >= hi) {
-                throw CairoException.instance(0).put("invalid alter statement serialized to writer queue [11]");
-            }
-            int size = Unsafe.getUnsafe().getInt(lo);
-            lo += 4;
-            for (int i = 0; i < size; i++) {
-                if (lo + Integer.BYTES >= hi) {
-                    throw CairoException.instance(0).put("invalid alter statement serialized to writer queue [12]");
-                }
-                int stringSize = 2 * Unsafe.getUnsafe().getInt(lo);
-                lo += 4;
-                if (lo + stringSize >= hi) {
-                    throw CairoException.instance(0).put("invalid alter statement serialized to writer queue [13]");
-                }
-                offsets.add(lo, lo + stringSize);
-                lo += stringSize;
-            }
-            return lo - initialAddress;
-        }
     }
 
-    @Override
-    public void close() {
+    private record ObjCharSequenceList(ObjList<CharSequence> strings) implements CharSequenceList {
+
+        @Override
+        public void clear() {
+            strings.clear();
+        }
+
+        public CharSequence getStrA(int i) {
+            return strings.get(i);
+        }
+
+        @Override
+        public CharSequence getStrB(int i) {
+            return strings.get(i);
+        }
+
+        @Override
+        public int size() {
+            return strings.size();
+        }
     }
 }

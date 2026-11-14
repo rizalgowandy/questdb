@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,14 +27,14 @@ package io.questdb.std;
 import java.util.Arrays;
 
 public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutable {
-    protected static final CharSequence noEntryKey = null;
     protected static final int MIN_INITIAL_CAPACITY = 16;
+    protected static final CharSequence noEntryKey = null;
     protected final double loadFactor;
-    protected int mask;
-    protected int free;
     protected int capacity;
+    protected int free;
     // exposed for testing only
     protected CharSequence[] keys;
+    protected int mask;
 
     public AbstractLowerCaseAsciiCharSequenceHashSet(int initialCapacity, double loadFactor) {
         if (loadFactor <= 0d || loadFactor >= 1d) {
@@ -53,6 +53,10 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
         free = this.capacity;
     }
 
+    public boolean contains(CharSequence key) {
+        return keyIndex(key) < 0;
+    }
+
     public boolean excludes(CharSequence key) {
         return keyIndex(key) > -1;
     }
@@ -61,18 +65,12 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
         return keyIndex(key, lo, hi) > -1;
     }
 
-    public int keyIndex(CharSequence key) {
-        int index = Chars.lowerCaseAsciiHashCode(key) & mask;
+    public CharSequence getKey(int index) {
+        return keys[index];
+    }
 
-        if (keys[index] == noEntryKey) {
-            return index;
-        }
-
-        if (Chars.equalsLowerCaseAscii(key, keys[index])) {
-            return -index - 1;
-        }
-
-        return probe(key, index);
+    public int getKeyCount() {
+        return keys.length;
     }
 
     public int keyIndex(CharSequence key, int lo, int hi) {
@@ -87,6 +85,20 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
             return -index - 1;
         }
         return probe(key, lo, hi, index);
+    }
+
+    public int keyIndex(CharSequence key) {
+        int index = Chars.lowerCaseAsciiHashCode(key) & mask;
+
+        if (keys[index] == noEntryKey) {
+            return index;
+        }
+
+        if (Chars.equalsLowerCaseAscii(key, keys[index])) {
+            return -index - 1;
+        }
+
+        return probe(key, index);
     }
 
     public int remove(CharSequence key) {
@@ -138,15 +150,6 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
         return capacity - free;
     }
 
-    /**
-     * Erases entry in array.
-     *
-     * @param index always positive, no arithmetic required.
-     */
-    abstract protected void erase(int index);
-
-    abstract protected void move(int from, int to);
-
     private int probe(CharSequence key, int index) {
         do {
             index = (index + 1) & mask;
@@ -171,4 +174,13 @@ public abstract class AbstractLowerCaseAsciiCharSequenceHashSet implements Mutab
             }
         } while (true);
     }
+
+    /**
+     * Erases entry in array.
+     *
+     * @param index always positive, no arithmetic required.
+     */
+    abstract protected void erase(int index);
+
+    abstract protected void move(int from, int to);
 }

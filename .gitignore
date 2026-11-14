@@ -5,21 +5,61 @@
 .ignore
 out
 benchmarks/target
+benchmarks/*.png
 core/target
 utils/target
+utils/dependency-reduced-pom.xml
+examples/target
+compat/target
 core/node
 core/src/main/resources/io/questdb/site/public.zip
 deploy*.bat
 win64svc/cmake-build-debug
 win64svc/build
 win64svc/CMakeCache.txt
+win64svc/cmake-build-release
+core/src/main/resources/io/questdb/bin/linux/libasm.a
+core/questdb/bin-local
 core/cmake-build-debug
+core/cmake-build-debug-coverage
 core/cmake-build-release
 core/cmake-build-minsizerel
 core/CMakeCache.txt
+core/rust/parquet2/target
 **/.project
 **/.settings
 **/.classpath
 **/build
 **/CMakeFiles
 .envrc
+.vscode
+core/rust/qdb-core/target
+core/rust/qdbr/target
+core/rust/parquet2/parquet-tools/target/
+
+# Rust native binaries (libquestdbr): Maven builds them into core/target/classes; nothing
+# writes them here any more, so stray manual copies must never be committed again.
+core/src/main/resources/io/questdb/bin/*/libquestdbr.so
+core/src/main/resources/io/questdb/bin/*/libquestdbr.dylib
+core/src/main/resources/io/questdb/bin/*/questdbr.dll
+
+# pi agent artifacts (.pi/skills/ stays tracked)
+.pi-subagents/
+.pi/subagents/
+# pgwire compatibility tests - build artifacts
+compat/src/test/rust-tokio/target/
+compat/src/test/rust-sqlx/target/
+compat/src/test/python/__pycache__/
+venv/
+compat/src/test/csharp/bin/
+compat/src/test/csharp/obj/
+compat/src/test/csharp/Folder.DotSettings.user
+compat/src/test/nodejs-pg/node_modules
+compat/src/test/nodejs-postgres/node_modules
+compat/src/test/php/vendor/
+compat/src/test/php/composer.lock
+compat/src/test/golang/gorunner
+compat/src/test/rust/scenarios/target/
+
+# Python bytecode caches written by the CI helper scripts and their fixtures
+__pycache__/

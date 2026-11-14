@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,16 +29,18 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.TimestampFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
 public class NowFunctionFactory implements FunctionFactory {
+    private static final String SIGNATURE = "now()";
 
     @Override
     public String getSignature() {
-        return "now()";
+        return SIGNATURE;
     }
 
     @Override
@@ -47,16 +49,36 @@ public class NowFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
-        return new Func();
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
+        return new Func(sqlExecutionContext.getNowTimestampType());
     }
 
     private static class Func extends TimestampFunction implements Function {
-        private SqlExecutionContext context;
+        private long now;
+
+        public Func(int timestampType) {
+            super(timestampType);
+        }
 
         @Override
         public long getTimestamp(Record rec) {
-            return context.getNow();
+            return now;
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
+            now = executionContext.getNow(getType());
+        }
+
+        @Override
+        public boolean isNonDeterministic() {
+            return true;
         }
 
         @Override
@@ -64,15 +86,21 @@ public class NowFunctionFactory implements FunctionFactory {
             return true;
         }
 
+        // init() reads the timestamp snapshot frozen by SqlExecutionContext.initNow() at
+        // statement entry, so every init() within one execution observes the same value.
         @Override
-        public boolean isReadThreadSafe() {
+        public boolean isStableWithinExecution() {
             return true;
         }
 
         @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
-            executionContext.initNow();
-            context = executionContext;
+        public boolean isThreadSafe() {
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(SIGNATURE);
         }
     }
 }

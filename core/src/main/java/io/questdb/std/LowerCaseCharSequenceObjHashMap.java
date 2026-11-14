@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,9 @@
 
 package io.questdb.std;
 
-
 import java.util.Arrays;
 
-
-public class LowerCaseCharSequenceObjHashMap<T> extends AbstractLowerCaseCharSequenceHashSet {
-    private final ObjList<CharSequence> list;
+public class LowerCaseCharSequenceObjHashMap<T> extends AbstractLowerCaseCharSequenceHashMap {
     private T[] values;
 
     public LowerCaseCharSequenceObjHashMap() {
@@ -44,52 +41,47 @@ public class LowerCaseCharSequenceObjHashMap<T> extends AbstractLowerCaseCharSeq
     public LowerCaseCharSequenceObjHashMap(int initialCapacity, double loadFactor) {
         super(initialCapacity, loadFactor);
         values = (T[]) new Object[keys.length];
-        this.list = new ObjList<>(capacity);
         clear();
     }
 
-    public final void clear() {
+    public void clear() {
         super.clear();
-        list.clear();
         Arrays.fill(values, null);
     }
 
-    public ObjList<CharSequence> keys() {
-        return list;
-    }
-
-    @Override
-    protected void erase(int index) {
-        keys[index] = noEntryKey;
-        values[index] = null;
-    }
-
-    @Override
-    public void removeAt(int index) {
-        if (index < 0) {
-            CharSequence key = keys[-index - 1];
-            super.removeAt(index);
-            list.remove(key);
+    public void forEach(CharSequenceObjConsumer<T> action) {
+        for (int i = 0, n = values.length; i < n; i++) {
+            if (keys[i] == null) {
+                continue;
+            }
+            action.accept(keys[i], values[i]);
         }
-    }
-
-    public boolean contains(CharSequence key) {
-        return keyIndex(key) < 0;
     }
 
     public T get(CharSequence key) {
         return valueAt(keyIndex(key));
     }
 
-    @Override
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        values[to] = values[from];
-        erase(from);
+    public T get(CharSequence key, int lo, int hi) {
+        return valueAt(keyIndex(key, lo, hi));
+    }
+
+    public CharSequence keyAt(int index) {
+        return index < 0 ? keys[-index - 1] : null;
     }
 
     public boolean put(CharSequence key, T value) {
         return putAt(keyIndex(key), key, value);
+    }
+
+    public void putAll(LowerCaseCharSequenceObjHashMap<T> other) {
+        CharSequence[] otherKeys = other.keys;
+        T[] otherValues = other.values;
+        for (int i = 0, n = otherKeys.length; i < n; i++) {
+            if (otherKeys[i] != noEntryKey) {
+                put(otherKeys[i], otherValues[i]);
+            }
+        }
     }
 
     public boolean putAt(int index, CharSequence key, T value) {
@@ -99,7 +91,6 @@ public class LowerCaseCharSequenceObjHashMap<T> extends AbstractLowerCaseCharSeq
         }
 
         putAt0(index, key, value);
-        list.add(key);
         return true;
     }
 
@@ -119,15 +110,26 @@ public class LowerCaseCharSequenceObjHashMap<T> extends AbstractLowerCaseCharSeq
     }
 
     private void putAt0(int index, CharSequence key, T value) {
-        keys[index] = key;
         values[index] = value;
-        if (--free == 0) {
-            rehash();
-        }
+        putAt0(index, key);
+    }
+
+    @Override
+    protected void erase(int index) {
+        keys[index] = noEntryKey;
+        values[index] = null;
+    }
+
+    @Override
+    protected void move(int from, int to) {
+        keys[to] = keys[from];
+        values[to] = values[from];
+        erase(from);
     }
 
     @SuppressWarnings("unchecked")
-    private void rehash() {
+    @Override
+    protected void rehash() {
         int size = size();
         int newCapacity = capacity * 2;
         free = capacity = newCapacity;
@@ -150,13 +152,8 @@ public class LowerCaseCharSequenceObjHashMap<T> extends AbstractLowerCaseCharSeq
         }
     }
 
-    public void putAll(LowerCaseCharSequenceObjHashMap<T> other) {
-        CharSequence[] otherKeys = other.keys;
-        T[] otherValues = other.values;
-        for (int i = 0, n = otherKeys.length; i < n; i++) {
-            if (otherKeys[i] != noEntryKey) {
-                put(otherKeys[i], otherValues[i]);
-            }
-        }
+    @FunctionalInterface
+    public interface CharSequenceObjConsumer<V> {
+        void accept(CharSequence key, V value);
     }
 }

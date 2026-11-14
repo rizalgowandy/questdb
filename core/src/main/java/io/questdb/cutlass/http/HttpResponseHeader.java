@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,16 +26,18 @@ package io.questdb.cutlass.http;
 
 import io.questdb.network.PeerDisconnectedException;
 import io.questdb.network.PeerIsSlowToReadException;
-import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sink;
 
-public interface HttpResponseHeader extends CharSink {
+public interface HttpResponseHeader extends Utf8Sink {
     void send() throws PeerDisconnectedException, PeerIsSlowToReadException;
 
-    String status(CharSequence httpProtocolVersion, int code, CharSequence contentType, long contentLength);
+    void setCookie(CharSequence name, CharSequence value);
 
     default void setKeepAlive(CharSequence keepAliveHeader) {
         if (keepAliveHeader != null) {
             put(keepAliveHeader);
         }
     }
+
+    void status(CharSequence httpProtocolVersion, int code, CharSequence contentType, long contentLength);
 }

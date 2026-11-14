@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.SymbolFunction;
@@ -50,11 +51,11 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
         final Function arg = args.getQuick(0);
         if (arg.isConstant()) {
-            final StringSink sink = Misc.getThreadLocalBuilder();
-            sink.put(arg.getDouble(null), configuration.getDoubleToStrCastScale());
+            final StringSink sink = Misc.getThreadLocalSink();
+            sink.put(arg.getDouble(null));
             return SymbolConstant.newInstance(sink);
         }
-        return new Func(arg, configuration.getDoubleToStrCastScale());
+        return new Func(arg);
     }
 
     private static class Func extends SymbolFunction implements UnaryFunction {
@@ -62,13 +63,11 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
         private final StringSink sink = new StringSink();
         private final LongIntHashMap symbolTableShortcut = new LongIntHashMap();
         private final ObjList<String> symbols = new ObjList<>();
-        private final int scale;
         private int next = 1;
 
-        public Func(Function arg, int scale) {
+        public Func(Function arg) {
             this.arg = arg;
             symbols.add(null);
-            this.scale = scale;
         }
 
         @Override
@@ -79,7 +78,7 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
         @Override
         public int getInt(Record rec) {
             final double value = arg.getDouble(rec);
-            if (Double.isNaN(value)) {
+            if (Numbers.isNull(value)) {
                 return SymbolTable.VALUE_IS_NULL;
             }
 
@@ -91,7 +90,7 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
 
             symbolTableShortcut.putAt(keyIndex, key, next);
             sink.clear();
-            sink.put(value, scale);
+            sink.put(value);
             symbols.add(Chars.toString(sink));
             return next++ - 1;
         }
@@ -99,7 +98,7 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
         @Override
         public CharSequence getSymbol(Record rec) {
             final double value = arg.getDouble(rec);
-            if (Double.isNaN(value)) {
+            if (Numbers.isNull(value)) {
                 return null;
             }
 
@@ -111,9 +110,9 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
 
             symbolTableShortcut.putAt(keyIndex, key, next++);
             sink.clear();
-            sink.put(value, scale);
+            sink.put(value);
             final String str = Chars.toString(sink);
-            symbols.add(Chars.toString(sink));
+            symbols.add(str);
             return str;
         }
 
@@ -137,8 +136,26 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public CharSequence valueOf(int symbolKey) {
-            return symbols.getQuick(TableUtils.toIndexKey(symbolKey));
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
+        public @Nullable SymbolTable newSymbolTable() {
+            return new CastToSymbolTable(symbols);
+        }
+
+        @Override
+        public boolean supportsKeyValueAccess() {
+            // getInt() mints a key with one probe on the decoded scalar, never by hashing the row's
+            // text, and valueOf() resolves it by indexing symbols. A key consumer such as QWP egress
+            // should therefore encode each distinct value once instead of re-encoding it per row.
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(arg).val("::symbol");
         }
 
         @Override
@@ -147,13 +164,8 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public @Nullable SymbolTable newSymbolTable() {
-            Func copy = new Func(arg, scale);
-            copy.symbolTableShortcut.putAll(this.symbolTableShortcut);
-            copy.symbols.clear();
-            copy.symbols.addAll(this.symbols);
-            copy.next = this.next;
-            return copy;
+        public CharSequence valueOf(int symbolKey) {
+            return symbols.getQuick(TableUtils.toIndexKey(symbolKey));
         }
     }
 }

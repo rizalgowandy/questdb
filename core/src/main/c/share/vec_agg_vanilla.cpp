@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,24 @@
 #include "util.h"
 #include "vec_agg_vanilla.h"
 
+int64_t countInt_Vanilla(int32_t *pi, int64_t count) {
+    if (count == 0) {
+        return 0;
+    }
+    int32_t *pi1 = pi;
+    const int32_t *lim = pi1 + count;
+    int64_t cnt = 0;
+    for (; pi1 < lim; pi1++) {
+        const int32_t i = *pi1;
+        cnt += (i != I_MIN);
+    }
+    return cnt;
+}
+
 int64_t sumInt_Vanilla(int32_t *pi, int64_t count) {
+    if (count == 0) {
+        return L_MIN;
+    }
     int32_t *pi1 = pi;
     const int32_t *lim = pi1 + count;
     int64_t sum = 0;
@@ -43,21 +60,40 @@ int64_t sumInt_Vanilla(int32_t *pi, int64_t count) {
     return hasData ? sum : L_MIN;
 }
 
-int32_t minInt_Vanilla(int32_t *pi, int64_t count) {
+double sumIntAcc_Vanilla(int32_t *pi, int64_t count, int64_t *accCount) {
     const int32_t *lim = pi + count;
-    int32_t min = I_MAX;
-    bool hasData = false;
+    double sum = 0;
+    int64_t c = 0;
     for (; pi < lim; pi++) {
         const int32_t i = *pi;
-        if (i != I_MIN && i < min) {
-            min = i;
-            hasData = true;
+        if (i != I_MIN) {
+            sum += (double) i;
+            ++c;
         }
     }
-    return hasData ? min : I_MIN;
+    *accCount = c;
+    return c > 0 ? sum : NAN;
+}
+
+int32_t minInt_Vanilla(int32_t *pi, int64_t count) {
+    if (count == 0) {
+        return I_MIN;
+    }
+    const int32_t *lim = pi + count;
+    int32_t min = I_MIN;
+    for (; pi < lim; pi++) {
+        const int32_t i = *pi;
+        if (i != I_MIN && (i < min || min == I_MIN)) {
+            min = i;
+        }
+    }
+    return min;
 }
 
 int32_t maxInt_Vanilla(int32_t *pi, int64_t count) {
+    if (count == 0) {
+        return I_MIN;
+    }
     int32_t *pi1 = pi;
     const int32_t *lim = pi1 + count;
     int32_t max = I_MIN;
@@ -70,14 +106,48 @@ int32_t maxInt_Vanilla(int32_t *pi, int64_t count) {
     return max;
 }
 
+int64_t minMaxCountInt_Vanilla(int32_t *pi, int64_t count, int32_t *minMax) {
+    const int32_t *lim = pi + count;
+    int32_t min = I_MAX;
+    int32_t max = I_MIN;
+    int64_t nonNulls = 0;
+    for (; pi < lim; pi++) {
+        const int32_t i = *pi;
+        const bool isValue = i != I_MIN;
+        min = isValue && i < min ? i : min;
+        max = i > max ? i : max;
+        nonNulls += isValue;
+    }
+    minMax[0] = nonNulls > 0 ? min : I_MIN;
+    minMax[1] = max;
+    return nonNulls;
+}
+
+int64_t countDouble_Vanilla(double *d, int64_t count) {
+    if (count == 0) {
+        return 0;
+    }
+    const double *lim = d + count;
+    int64_t cnt = 0;
+    for (; d < lim; d++) {
+        const double v = *d;
+        if (!std::isnan(v)) {
+            cnt += 1;
+        }
+    }
+    return cnt;
+}
 
 double sumDouble_Vanilla(double *d, int64_t count) {
+    if (count == 0) {
+        return NAN;
+    }
     const double *lim = d + count;
     double sum = 0;
     bool hasData = false;
     for (; d < lim; d++) {
         const double v = *d;
-        if (v == v) {
+        if (!std::isnan(v)) {
             sum += v;
             hasData = true;
         }
@@ -85,7 +155,25 @@ double sumDouble_Vanilla(double *d, int64_t count) {
     return hasData ? sum : NAN;
 }
 
+double sumDoubleAcc_Vanilla(double *d, int64_t count, int64_t *accCount) {
+    const double *lim = d + count;
+    double sum = 0;
+    int64_t c = 0;
+    for (; d < lim; d++) {
+        double v = *d;
+        if (!std::isnan(v)) {
+            sum += v;
+            ++c;
+        }
+    }
+    *accCount = c;
+    return c > 0 ? sum : NAN;
+}
+
 double sumDoubleKahan_Vanilla(double *d, int64_t count) {
+    if (count == 0) {
+        return NAN;
+    }
     const double *lim = d + count;
     double sum = 0;
     double c = 0;
@@ -104,6 +192,9 @@ double sumDoubleKahan_Vanilla(double *d, int64_t count) {
 }
 
 double sumDoubleNeumaier_Vanilla(double *d, int64_t count) {
+    if (count == 0) {
+        return NAN;
+    }
     const double *lim = d + count;
     double sum = 0;
     double c = 0;
@@ -125,36 +216,60 @@ double sumDoubleNeumaier_Vanilla(double *d, int64_t count) {
 }
 
 double minDouble_Vanilla(double *d, int64_t count) {
+    if (count == 0) {
+        return NAN;
+    }
     const double *ext = d + count;
-    double min = LDBL_MAX;
+    double min = D_MAX;
     double *pd = d;
-    bool hasData = false;
     for (; pd < ext; pd++) {
         double x = *pd;
-        if (x < min) {
+        if (!std::isnan(x) && x < min) {
             min = x;
-            hasData = true;
         }
     }
-    return hasData ? min : NAN;
+    if (min < D_MAX) {
+        return min;
+    }
+    return NAN;
 }
 
 double maxDouble_Vanilla(double *d, int64_t count) {
+    if (count == 0) {
+        return NAN;
+    }
     const double *ext = d + count;
-    double max = LDBL_MIN;
+    double max = D_MIN;
     double *pd = d;
-    bool hasData = false;
     for (; pd < ext; pd++) {
         double x = *pd;
-        if (x > max) {
+        if (!std::isnan(x) && x > max) {
             max = x;
-            hasData = true;
         }
     }
-    return hasData ? max : NAN;
+    if (max > D_MIN) {
+        return max;
+    }
+    return NAN;
+}
+
+int64_t countLong_Vanilla(int64_t *pl, int64_t count) {
+    if (count == 0) {
+        return 0;
+    }
+    const int64_t *lim = pl + count;
+    int64_t cnt = 0;
+    for (; pl < lim; pl++) {
+        const int64_t l = *pl;
+        cnt += (l != L_MIN);
+    }
+    return cnt;
 }
 
 int64_t sumLong_Vanilla(int64_t *pl, int64_t count) {
+    if (count == 0) {
+        return L_MIN;
+    }
     const int64_t *lim = pl + count;
     int64_t sum = 0;
     bool hasData = false;
@@ -168,20 +283,40 @@ int64_t sumLong_Vanilla(int64_t *pl, int64_t count) {
     return hasData ? sum : L_MIN;
 }
 
-int64_t minLong_Vanilla(int64_t *pl, int64_t count) {
+double sumLongAcc_Vanilla(int64_t *pl, int64_t count, int64_t *accCount) {
     const int64_t *lim = pl + count;
-    int64_t min = L_MAX;
+    double sum = 0;
+    int64_t c = 0;
     for (; pl < lim; pl++) {
-        int64_t l = *pl;
-        if (l != L_MIN && l < min) {
+        const int64_t l = *pl;
+        if (l != L_MIN) {
+            sum += (double) l;
+            ++c;
+        }
+    }
+    *accCount = c;
+    return c > 0 ? sum : NAN;
+}
+
+int64_t minLong_Vanilla(int64_t *pl, int64_t count) {
+    if (count == 0) {
+        return L_MIN;
+    }
+    const int64_t *lim = pl + count;
+    int64_t min = L_MIN;
+    for (; pl < lim; pl++) {
+        const int64_t l = *pl;
+        if (l != L_MIN && (l < min || min == L_MIN)) {
             min = l;
         }
     }
-    // all null?
-    return min == L_MAX ? L_MIN : min;
+    return min;
 }
 
 int64_t maxLong_Vanilla(int64_t *pl, int64_t count) {
+    if (count == 0) {
+        return L_MIN;
+    }
     const int64_t *lim = pl + count;
     int64_t max = L_MIN;
     for (; pl < lim; pl++) {
@@ -193,64 +328,45 @@ int64_t maxLong_Vanilla(int64_t *pl, int64_t count) {
     return max;
 }
 
-bool hasNull_Vanilla(int32_t *pi, int64_t count) {
-    const int32_t *lim = pi + count;
-    for (; pi < lim; pi++) {
-        const int32_t i = *pi;
-        if (i == I_MIN) {
-            return true;
-        }
+int64_t sumShort_Vanilla(int16_t *ps, int64_t count) {
+    if (count == 0) {
+        return L_MIN;
     }
-    return false;
+    const int16_t *lim = ps + count;
+    int64_t sum = 0;
+    for (; ps < lim; ps++) {
+        const int16_t s = *ps;
+        sum += s;
+    }
+    return sum;
 }
 
-extern "C" {
-
-JNIEXPORT jdouble JNICALL
-Java_io_questdb_std_Vect_avgIntAcc(JNIEnv *env, jclass cl, jlong pi, jlong count, jlong pCount) {
-    auto *ppi = reinterpret_cast<int32_t *>(pi);
-    double_t avg = 0;
-    double_t c = 1;
-    for (uint32_t i = 0; i < count; i++) {
-        int32_t v = ppi[i];
-        if (v != I_MIN) {
-            avg += (v - avg) / c;
-            ++c;
+int32_t minShort_Vanilla(int16_t *ps, int64_t count) {
+    if (count == 0) {
+        return I_MIN;
+    }
+    const int16_t *lim = ps + count;
+    int32_t min = I_MAX;
+    for (; ps < lim; ps++) {
+        const int16_t s = *ps;
+        if (s < min) {
+            min = s;
         }
     }
-    *(reinterpret_cast<jlong *>(pCount)) = ((jlong) c - 1);
-    return avg;
+    return min;
 }
 
-JNIEXPORT jdouble JNICALL
-Java_io_questdb_std_Vect_avgLongAcc(JNIEnv *env, jclass cl, jlong pi, jlong count, jlong pCount) {
-    auto *ppi = reinterpret_cast<int64_t *>(pi);
-    double_t avg = 0;
-    double_t c = 1;
-    for (uint32_t i = 0; i < count; i++) {
-        int64_t v = ppi[i];
-        if (v != L_MIN) {
-            avg += (v - avg) / c;
-            ++c;
+int32_t maxShort_Vanilla(int16_t *ps, int64_t count) {
+    if (count == 0) {
+        return I_MIN;
+    }
+    const int16_t *lim = ps + count;
+    int32_t max = I_MIN;
+    for (; ps < lim; ps++) {
+        const int16_t s = *ps;
+        if (s > max) {
+            max = s;
         }
     }
-    *(reinterpret_cast<jlong *>(pCount)) = ((jlong) c - 1);
-    return avg;
+    return max;
 }
-
-JNIEXPORT jdouble JNICALL
-Java_io_questdb_std_Vect_avgDoubleAcc(JNIEnv *env, jclass cl, jlong pi, jlong count, jlong pCount) {
-    auto *ppi = reinterpret_cast<double_t *>(pi);
-    double_t avg = 0;
-    double_t c = 1;
-    for (uint32_t i = 0; i < count; i++) {
-        double_t v = ppi[i];
-        if (v == v) {
-            avg += (v - avg) / c;
-            ++c;
-        }
-    }
-    *(reinterpret_cast<jlong *>(pCount)) = ((jlong) c - 1);
-    return avg;
-}
-};

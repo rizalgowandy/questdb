@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,28 +24,27 @@
 
 package io.questdb.griffin.engine.functions.catalogue;
 
+import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.SingleValueRecordCursor;
 
-public class ShowMaxIdentifierLengthCursorFactory implements RecordCursorFactory {
+public class ShowMaxIdentifierLengthCursorFactory extends AbstractRecordCursorFactory {
     private final static GenericRecordMetadata METADATA = new GenericRecordMetadata();
     private final static IntValueRecord RECORD = new IntValueRecord(63);
     private final SingleValueRecordCursor cursor = new SingleValueRecordCursor(RECORD);
 
-    @Override
-    public RecordCursor getCursor(SqlExecutionContext executionContext) {
-        cursor.toTop();
-        return cursor;
+    public ShowMaxIdentifierLengthCursorFactory() {
+        super(METADATA);
     }
 
     @Override
-    public RecordMetadata getMetadata() {
-        return METADATA;
+    public RecordCursor getCursor(SqlExecutionContext executionContext) {
+        return cursor.of(executionContext.getCircuitBreaker());
     }
 
     @Override
@@ -53,7 +52,12 @@ public class ShowMaxIdentifierLengthCursorFactory implements RecordCursorFactory
         return false;
     }
 
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("max_identifier_length");
+    }
+
     static {
-        METADATA.add(new TableColumnMetadata("max_identifier_length", 1, ColumnType.INT));
+        METADATA.add(new TableColumnMetadata("max_identifier_length", ColumnType.INT));
     }
 }

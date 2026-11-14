@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,16 +25,20 @@
 package io.questdb.griffin.engine.functions.cast;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.StrFunction;
-import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
-import io.questdb.std.*;
-import io.questdb.std.str.CharSink;
+import io.questdb.std.Chars;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
 import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.Nullable;
 
 public class CastTimestampToStrFunctionFactory implements FunctionFactory {
     @Override
@@ -46,57 +50,41 @@ public class CastTimestampToStrFunctionFactory implements FunctionFactory {
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
         Function func = args.getQuick(0);
         if (func.isConstant()) {
-            StringSink sink = Misc.getThreadLocalBuilder();
-            sink.put(func.getTimestamp(null));
+            StringSink sink = Misc.getThreadLocalSink();
+            ColumnType.getTimestampDriver(func.getType()).append(sink, func.getTimestamp(null));
             return new StrConstant(Chars.toString(sink));
         }
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends StrFunction implements UnaryFunction {
-        private final Function arg;
+    public static class Func extends AbstractCastToStrFunction {
         private final StringSink sinkA = new StringSink();
         private final StringSink sinkB = new StringSink();
+        private final TimestampDriver timestampDriver;
 
         public Func(Function arg) {
-            this.arg = arg;
+            super(arg);
+            timestampDriver = ColumnType.getTimestampDriver(arg.getType());
         }
 
         @Override
-        public Function getArg() {
-            return arg;
-        }
-
-        @Override
-        public CharSequence getStr(Record rec) {
-            final long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
-                return null;
-            }
-            sinkA.clear();
-            sinkA.put(value);
-            return sinkA;
+        public CharSequence getStrA(Record rec) {
+            return toSink(sinkA, rec);
         }
 
         @Override
         public CharSequence getStrB(Record rec) {
-            final long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
-                return null;
-            }
-            sinkB.clear();
-            sinkB.put(value);
-            return sinkB;
+            return toSink(sinkB, rec);
         }
 
-        @Override
-        public void getStr(Record rec, CharSink sink) {
+        private @Nullable StringSink toSink(StringSink sink, Record rec) {
+            sink.clear();
             final long value = arg.getTimestamp(rec);
-            if (value == Numbers.LONG_NaN) {
-                return;
+            if (value == Numbers.LONG_NULL) {
+                return null;
             }
-
-            sink.put(value);
+            timestampDriver.append(sink, value);
+            return sink;
         }
     }
 }

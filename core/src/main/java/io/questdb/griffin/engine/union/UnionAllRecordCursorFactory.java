@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,54 +24,32 @@
 
 package io.questdb.griffin.engine.union;
 
-import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
-import io.questdb.griffin.SqlException;
-import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
 
-public class UnionAllRecordCursorFactory implements RecordCursorFactory {
-    private final RecordMetadata metadata;
-    private final RecordCursorFactory masterFactory;
-    private final RecordCursorFactory slaveFactory;
-    private final UnionAllRecordCursor cursor;
+public class UnionAllRecordCursorFactory extends AbstractSetRecordCursorFactory {
 
     public UnionAllRecordCursorFactory(
             RecordMetadata metadata,
-            RecordCursorFactory masterFactory,
-            RecordCursorFactory slaveFactory
+            RecordCursorFactory factoryA,
+            RecordCursorFactory factoryB,
+            ObjList<Function> castFunctionsA,
+            ObjList<Function> castFunctionsB
     ) {
-        this.metadata = metadata;
-        this.masterFactory = masterFactory;
-        this.slaveFactory = slaveFactory;
-        this.cursor = new UnionAllRecordCursor();
-    }
-
-    @Override
-    public void close() {
-        Misc.free(masterFactory);
-        Misc.free(slaveFactory);
-    }
-
-    @Override
-    public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        RecordCursor masterCursor = masterFactory.getCursor(executionContext);
-        RecordCursor slaveCursor = null;
+        super(metadata, factoryA, factoryB, castFunctionsA, castFunctionsB);
         try {
-            slaveCursor = slaveFactory.getCursor(executionContext);
-            cursor.of(masterCursor, slaveCursor);
-            return cursor;
-        } catch (Throwable e) {
-            Misc.free(slaveCursor);
-            Misc.free(masterCursor);
-            throw e;
+            this.cursor = new UnionAllRecordCursor(castFunctionsA, castFunctionsB);
+        } catch (Throwable th) {
+            close();
+            throw th;
         }
     }
 
     @Override
-    public RecordMetadata getMetadata() {
-        return metadata;
+    public boolean fragmentedSymbolTables() {
+        return true;
     }
 
     @Override
@@ -79,8 +57,7 @@ public class UnionAllRecordCursorFactory implements RecordCursorFactory {
         return false;
     }
 
-    @Override
-    public boolean fragmentedSymbolTables() {
-        return true;
+    protected String getOperation() {
+        return "Union All";
     }
 }

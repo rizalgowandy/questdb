@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,39 +29,34 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.StaticSymbolTable;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.std.Numbers;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class FirstSymbolGroupByFunction extends SymbolFunction implements GroupByFunction, UnaryFunction {
-    private final SymbolFunction arg;
-    private int valueIndex;
+    protected final SymbolFunction arg;
+    protected int valueIndex;
 
     public FirstSymbolGroupByFunction(@NotNull SymbolFunction arg) {
         this.arg = arg;
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
-        mapValue.putInt(this.valueIndex, this.arg.getInt(record));
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
+        mapValue.putLong(valueIndex, rowId);
+        mapValue.putInt(valueIndex + 1, arg.getInt(record));
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
-    }
-
-    @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
-        this.valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.INT);
-    }
-
-    @Override
-    public void setNull(MapValue mapValue) {
-        mapValue.putInt(this.valueIndex, SymbolTable.VALUE_IS_NULL);
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
+        if (rowId < mapValue.getLong(valueIndex)) {
+            computeFirst(mapValue, record, rowId);
+        }
     }
 
     @Override
@@ -71,7 +66,17 @@ public class FirstSymbolGroupByFunction extends SymbolFunction implements GroupB
 
     @Override
     public int getInt(Record rec) {
-        return rec.getInt(this.valueIndex);
+        return rec.getInt(valueIndex + 1);
+    }
+
+    @Override
+    public String getName() {
+        return "first";
+    }
+
+    @Override
+    public @Nullable StaticSymbolTable getStaticSymbolTable() {
+        return arg.getStaticSymbolTable();
     }
 
     @Override
@@ -85,13 +90,71 @@ public class FirstSymbolGroupByFunction extends SymbolFunction implements GroupB
     }
 
     @Override
+    public int getValueIndex() {
+        return valueIndex;
+    }
+
+    @Override
+    public void initValueIndex(int valueIndex) {
+        this.valueIndex = valueIndex;
+    }
+
+    @Override
+    public void initValueTypes(ArrayColumnTypes columnTypes) {
+        this.valueIndex = columnTypes.getColumnCount();
+        columnTypes.add(ColumnType.LONG); // row id
+        columnTypes.add(ColumnType.INT);  // value
+    }
+
+    @Override
+    public boolean isConstant() {
+        return false;
+    }
+
+    @Override
     public boolean isSymbolTableStatic() {
         return arg.isSymbolTableStatic();
     }
 
     @Override
-    public CharSequence valueOf(int key) {
-        return arg.valueOf(key);
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
+    }
+
+    @Override
+    public void merge(MapValue destValue, MapValue srcValue) {
+        long srcRowId = srcValue.getLong(valueIndex);
+        long destRowId = destValue.getLong(valueIndex);
+        if (srcRowId != Numbers.LONG_NULL && (srcRowId < destRowId || destRowId == Numbers.LONG_NULL)) {
+            destValue.putLong(valueIndex, srcRowId);
+            destValue.putInt(valueIndex + 1, srcValue.getInt(valueIndex + 1));
+        }
+    }
+
+    @Override
+    public @Nullable SymbolTable newSymbolTable() {
+        // this implementation does not have its own symbol table
+        // it fully relies on the argument
+        return arg.newSymbolTable();
+    }
+
+    @Override
+    public void setNull(MapValue mapValue) {
+        mapValue.putLong(valueIndex, Numbers.LONG_NULL);
+        mapValue.putInt(valueIndex + 1, SymbolTable.VALUE_IS_NULL);
+    }
+
+    @Override
+    public boolean supportsKeyValueAccess() {
+        // The key is already materialised in the aggregation map, so getInt() is a plain map read
+        // and valueOf() resolves it through the aggregated argument - neither touches the row's
+        // text. A key consumer such as QWP egress should encode each distinct value once.
+        return true;
+    }
+
+    @Override
+    public boolean supportsParallelism() {
+        return UnaryFunction.super.supportsParallelism();
     }
 
     @Override
@@ -100,9 +163,7 @@ public class FirstSymbolGroupByFunction extends SymbolFunction implements GroupB
     }
 
     @Override
-    public @Nullable SymbolTable newSymbolTable() {
-        // this implementation does not have its own symbol table
-        // it fully relies on the argument
-        return arg.newSymbolTable();
+    public CharSequence valueOf(int key) {
+        return arg.valueOf(key);
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,16 +24,24 @@
 
 package io.questdb.cutlass.http;
 
+import io.questdb.network.PeerIsSlowToReadException;
+import io.questdb.network.PeerIsSlowToWriteException;
+import io.questdb.network.ServerDisconnectException;
+
 import java.io.Closeable;
 
 public interface Retry extends Closeable {
+    default boolean claimRetryClose(long taskIncarnation) {
+        return isRetryCloseOwner(taskIncarnation);
+    }
+
     /**
      * Notify client that re-run failed
      *
      * @param selector processor selector
      * @param e        exception information
      */
-    void fail(HttpRequestProcessorSelector selector, HttpException e);
+    void fail(HttpRequestProcessorSelector selector, HttpException e) throws PeerIsSlowToReadException, ServerDisconnectException;
 
     /**
      * Provides retry information
@@ -42,6 +50,14 @@ public interface Retry extends Closeable {
      */
     RetryAttemptAttributes getAttemptDetails();
 
+    default boolean isRetryCloseOwner(long taskIncarnation) {
+        return isRetryCurrent(taskIncarnation);
+    }
+
+    default boolean isRetryCurrent(long taskIncarnation) {
+        return true;
+    }
+
     /**
      * Retries context that could not acquire resource during regular execution.
      *
@@ -49,5 +65,5 @@ public interface Retry extends Closeable {
      * @param rescheduleContext context to be retried
      * @return success indicator
      */
-    boolean tryRerun(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext);
+    boolean tryRerun(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, PeerIsSlowToWriteException, ServerDisconnectException;
 }

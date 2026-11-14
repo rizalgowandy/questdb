@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.DateFunction;
@@ -47,14 +48,14 @@ public class RndDateCCCFunctionFactory implements FunctionFactory {
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
         final long lo = args.getQuick(0).getDate(null);
         final long hi = args.getQuick(1).getDate(null);
-        final int nanRate = args.getQuick(2).getInt(null);
+        final int nullRate = args.getQuick(2).getInt(null);
 
-        if (nanRate < 0) {
+        if (nullRate < 0) {
             throw SqlException.$(argPositions.getQuick(2), "invalid NaN rate");
         }
 
         if (lo < hi) {
-            return new Func(lo, hi, nanRate);
+            return new Func(lo, hi, nullRate);
         }
 
         throw SqlException.$(position, "invalid range");
@@ -62,8 +63,8 @@ public class RndDateCCCFunctionFactory implements FunctionFactory {
 
     private static class Func extends DateFunction implements Function {
         private final long lo;
-        private final long range;
         private final int nanRate;
+        private final long range;
         private Rnd rnd;
 
         public Func(long lo, long hi, int nanRate) {
@@ -75,19 +76,29 @@ public class RndDateCCCFunctionFactory implements FunctionFactory {
         @Override
         public long getDate(Record rec) {
             if ((rnd.nextInt() % nanRate) == 1) {
-                return Numbers.LONG_NaN;
+                return Numbers.LONG_NULL;
             }
             return lo + rnd.nextPositiveLong() % range;
         }
 
         @Override
-        public boolean isReadThreadSafe() {
-            return false;
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
+            this.rnd = executionContext.getRandom();
         }
 
         @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) {
-            this.rnd = executionContext.getRandom();
+        public boolean isNonDeterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean isRandom() {
+            return true;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("rnd_date(").val(lo).val(',').val(range).val(',').val(nanRate).val(')');
         }
     }
 }

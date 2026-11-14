@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,28 +25,55 @@
 package io.questdb.griffin.engine;
 
 import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.TableToken;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Misc;
 
 public class EmptyTableRecordCursorFactory extends AbstractRecordCursorFactory {
+    private final TableToken tableToken;
+
     public EmptyTableRecordCursorFactory(RecordMetadata metadata) {
-        super(metadata);
+        this(metadata, null);
     }
 
-    @Override
-    public void close() {
-        Misc.free(getMetadata());
+    public EmptyTableRecordCursorFactory(RecordMetadata metadata, TableToken tableToken) {
+        super(metadata);
+        this.tableToken = tableToken;
     }
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) {
-        return EmptyTableRecordCursor.INSTANCE;
+        // The cursor is empty, so it never iterates and never consults the circuit breaker on its own.
+        // Honor cancellation once at open time, so a query that optimized down to an empty result still
+        // observes a tripped breaker instead of silently ignoring it.
+        executionContext.getCircuitBreaker().statefulThrowExceptionIfTrippedTimeThrottledOrYield();
+        return EmptyTableRandomRecordCursor.INSTANCE;
     }
 
     @Override
     public boolean recordCursorSupportsRandomAccess() {
-        return false;
+        return true;
+    }
+
+    @Override
+    public boolean supportsUpdateRowId(TableToken tableToken) {
+        return this.tableToken == null || this.tableToken == tableToken;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        if (tableToken != null) {
+            sink.type("on").val(": ").val(tableToken.getTableName());
+        } else {
+            sink.type("Empty table");
+        }
+    }
+
+    @Override
+    protected void _close() {
+        Misc.freeIfCloseable(getMetadata());
     }
 }

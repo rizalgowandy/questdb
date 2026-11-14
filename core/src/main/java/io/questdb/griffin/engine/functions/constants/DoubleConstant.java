@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,11 +24,15 @@
 
 package io.questdb.griffin.engine.functions.constants;
 
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.engine.functions.DoubleFunction;
+import io.questdb.std.Numbers;
 
 public class DoubleConstant extends DoubleFunction implements ConstantFunction {
     public static final DoubleConstant NULL = new DoubleConstant(Double.NaN);
+    public static final DoubleConstant ONE = new DoubleConstant(1.0);
 
     private final double value;
 
@@ -37,11 +41,33 @@ public class DoubleConstant extends DoubleFunction implements ConstantFunction {
     }
 
     public static DoubleConstant newInstance(double value) {
-        return  value == value ? new DoubleConstant(value) : DoubleConstant.NULL;
+        return Numbers.isFinite(value) ? new DoubleConstant(value) : DoubleConstant.NULL;
     }
 
     @Override
     public double getDouble(Record rec) {
         return value;
+    }
+
+    @Override
+    public boolean isEquivalentTo(Function obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (obj instanceof DoubleConstant that) {
+            return this.value == that.value;
+        }
+        return false;
+    }
+
+    @Override
+    public boolean isNullConstant() {
+        // NaN is used as a marker for NULL
+        return Numbers.isNull(value);
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.val(value);
     }
 }

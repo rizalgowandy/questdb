@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,15 +34,13 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 
 /**
- * 
- * This lock is not re-entrant. 
- * If a thread holds a write lock and it tries to grab a lock again it will deadlock. 
+ * This lock is not reentrant.
+ * If a thread holds a write lock, and it tries to grab a lock again it will deadlock.
  * If a thread holding a read lock tries to upgrade its lock to a write lock it must first release its read lock or it will deadlock.
  * Threads waiting on a write lock have priority over threads waiting on a read lock.
  * Threads waiting on a write lock are not resumed fairly.
- * 
- * @author Patrick Mackinlay
  *
+ * @author Patrick Mackinlay
  */
 public class SimpleReadWriteLock implements ReadWriteLock {
     private final int MAX_READERS = Integer.MAX_VALUE / 2 - 1;
@@ -52,13 +50,17 @@ public class SimpleReadWriteLock implements ReadWriteLock {
     private final ReadLock readLock = new ReadLock();
     private final WriteLock writeLock = new WriteLock();
 
+    public boolean isWriteLocked() {
+        return lock.get();
+    }
+
     @Override
-    public Lock readLock() {
+    public @NotNull Lock readLock() {
         return readLock;
     }
 
     @Override
-    public Lock writeLock() {
+    public @NotNull Lock writeLock() {
         return writeLock;
     }
 
@@ -67,7 +69,7 @@ public class SimpleReadWriteLock implements ReadWriteLock {
         public void lock() {
             while (nReaders.incrementAndGet() >= MAX_READERS) {
                 nReaders.decrementAndGet();
-                Os.pause();
+                Thread.yield();
             }
         }
 
@@ -77,7 +79,7 @@ public class SimpleReadWriteLock implements ReadWriteLock {
         }
 
         @Override
-        public boolean tryLock() {
+        public @NotNull Condition newCondition() {
             throw new UnsupportedOperationException();
         }
 
@@ -87,13 +89,13 @@ public class SimpleReadWriteLock implements ReadWriteLock {
         }
 
         @Override
-        public void unlock() {
-            nReaders.decrementAndGet();
+        public boolean tryLock() {
+            throw new UnsupportedOperationException();
         }
 
         @Override
-        public Condition newCondition() {
-            throw new UnsupportedOperationException();
+        public void unlock() {
+            nReaders.decrementAndGet();
         }
     }
 
@@ -101,7 +103,7 @@ public class SimpleReadWriteLock implements ReadWriteLock {
         @Override
         public void lock() {
             while (!lock.compareAndSet(false, true)) {
-                Os.pause();
+                Thread.yield();
             }
             int n = nReaders.addAndGet(MAX_READERS);
             while (n != MAX_READERS) {
@@ -111,6 +113,16 @@ public class SimpleReadWriteLock implements ReadWriteLock {
 
         @Override
         public void lockInterruptibly() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public @NotNull Condition newCondition() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean tryLock(long time, @NotNull TimeUnit unit) {
             throw new UnsupportedOperationException();
         }
 
@@ -129,20 +141,9 @@ public class SimpleReadWriteLock implements ReadWriteLock {
         }
 
         @Override
-        public boolean tryLock(long time, @NotNull TimeUnit unit) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
         public void unlock() {
             nReaders.addAndGet(-MAX_READERS);
             lock.set(false);
         }
-
-        @Override
-        public Condition newCondition() {
-            throw new UnsupportedOperationException();
-        }
-
     }
 }

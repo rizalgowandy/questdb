@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,24 +35,30 @@ import io.questdb.std.Vect;
 import java.util.concurrent.atomic.LongAccumulator;
 import java.util.function.LongBinaryOperator;
 
-import static io.questdb.griffin.SqlCodeGenerator.GKK_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_MICRO_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_NANO_HOUR_INT;
 
 public class MaxTimestampVectorAggregateFunction extends TimestampFunction implements VectorAggregateFunction {
-
     public static final LongBinaryOperator MAX = Math::max;
-    private final LongAccumulator max = new LongAccumulator(
+    private final LongAccumulator accumulator = new LongAccumulator(
             MAX, Long.MIN_VALUE
     );
     private final int columnIndex;
     private final DistinctFunc distinctFunc;
+    private final boolean isDesignated;
     private final KeyValueFunc keyValueFunc;
     private int valueOffset;
 
-    public MaxTimestampVectorAggregateFunction(int keyKind, int columnIndex, int workerCount) {
+    public MaxTimestampVectorAggregateFunction(int keyKind, int columnIndex, int timestampType, int timestampIndex) {
+        super(timestampType);
         this.columnIndex = columnIndex;
-        if (keyKind == GKK_HOUR_INT) {
-            this.distinctFunc = Rosti::keyedHourDistinct;
-            this.keyValueFunc = Rosti::keyedHourMaxLong;
+        this.isDesignated = columnIndex == timestampIndex;
+        if (keyKind == GKK_MICRO_HOUR_INT) {
+            this.distinctFunc = Rosti::keyedMicroHourDistinct;
+            this.keyValueFunc = Rosti::keyedMicroHourMaxLong;
+        } else if (keyKind == GKK_NANO_HOUR_INT) {
+            this.distinctFunc = Rosti::keyedNanoHourDistinct;
+            this.keyValueFunc = Rosti::keyedNanoHourMaxLong;
         } else {
             this.distinctFunc = Rosti::keyedIntDistinct;
             this.keyValueFunc = Rosti::keyedIntMaxLong;
@@ -60,24 +66,44 @@ public class MaxTimestampVectorAggregateFunction extends TimestampFunction imple
     }
 
     @Override
-    public void aggregate(long address, long addressSize, int columnSizeHint, int workerId) {
+    public void aggregate(long address, long frameRowCount, int workerId) {
         if (address != 0) {
-            max.accumulate(Vect.maxLong(address, addressSize / Long.BYTES));
+            if (isDesignated) {
+                final long value = Unsafe.getLong(address + 8L * (frameRowCount - 1));
+                accumulator.accumulate(value);
+            } else {
+                accumulator.accumulate(Vect.maxLong(address, frameRowCount));
+            }
         }
     }
 
     @Override
-    public void aggregate(long pRosti, long keyAddress, long valueAddress, long valueAddressSize, int columnSizeShr, int workerId) {
+    public boolean aggregate(long pRosti, long keyAddress, long valueAddress, long frameRowCount) {
         if (valueAddress == 0) {
-            distinctFunc.run(pRosti, keyAddress, valueAddressSize / Long.BYTES);
+            return distinctFunc.run(pRosti, keyAddress, frameRowCount);
         } else {
-            keyValueFunc.run(pRosti, keyAddress, valueAddress, valueAddressSize / Long.BYTES, valueOffset);
+            return keyValueFunc.run(pRosti, keyAddress, valueAddress, frameRowCount, valueOffset);
         }
+    }
+
+    @Override
+    public void clear() {
+        accumulator.reset();
     }
 
     @Override
     public int getColumnIndex() {
         return columnIndex;
+    }
+
+    @Override
+    public String getName() {
+        return isDesignated ? "max_designated" : "max";
+    }
+
+    @Override
+    public long getTimestamp(Record rec) {
+        return accumulator.longValue();
     }
 
     @Override
@@ -87,12 +113,12 @@ public class MaxTimestampVectorAggregateFunction extends TimestampFunction imple
 
     @Override
     public void initRosti(long pRosti) {
-        Unsafe.getUnsafe().putLong(Rosti.getInitialValueSlot(pRosti, valueOffset), Long.MIN_VALUE);
+        Unsafe.putLong(Rosti.getInitialValueSlot(pRosti, valueOffset), Long.MIN_VALUE);
     }
 
     @Override
-    public void merge(long pRostiA, long pRostiB) {
-        Rosti.keyedIntMaxLongMerge(pRostiA, pRostiB, valueOffset);
+    public boolean merge(long pRostiA, long pRostiB) {
+        return Rosti.keyedIntMaxLongMerge(pRostiA, pRostiB, valueOffset);
     }
 
     @Override
@@ -102,22 +128,7 @@ public class MaxTimestampVectorAggregateFunction extends TimestampFunction imple
     }
 
     @Override
-    public void wrapUp(long pRosti) {
-        Rosti.keyedIntMaxLongWrapUp(pRosti, valueOffset, max.longValue());
-    }
-
-    @Override
-    public void clear() {
-        max.reset();
-    }
-
-    @Override
-    public long getTimestamp(Record rec) {
-        return max.longValue();
-    }
-
-    @Override
-    public boolean isReadThreadSafe() {
-        return false;
+    public boolean wrapUp(long pRosti) {
+        return Rosti.keyedIntMaxLongWrapUp(pRosti, valueOffset, accumulator.longValue());
     }
 }

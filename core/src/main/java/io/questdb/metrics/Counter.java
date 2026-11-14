@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,14 +26,16 @@ package io.questdb.metrics;
 
 import org.jetbrains.annotations.TestOnly;
 
-public interface Counter extends Scrapable {
+public interface Counter extends Target {
+
+    void add(long value);
+
+    long getValue();
 
     default void inc() {
         add(1);
     }
 
-    void add(long value);
-
     @TestOnly
-    long get();
+    void reset();
 }

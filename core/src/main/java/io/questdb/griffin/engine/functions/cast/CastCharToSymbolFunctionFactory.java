@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,9 +33,7 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.constants.SymbolConstant;
 import io.questdb.std.Chars;
 import io.questdb.std.IntList;
-import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
-import io.questdb.std.str.StringSink;
 
 public class CastCharToSymbolFunctionFactory implements FunctionFactory {
     @Override
@@ -51,14 +49,12 @@ public class CastCharToSymbolFunctionFactory implements FunctionFactory {
             if (value == 0) {
                 return SymbolConstant.NULL;
             }
-            final StringSink sink = Misc.getThreadLocalBuilder();
-            sink.put(value);
-            return SymbolConstant.newInstance(Chars.toString(sink));
+            return SymbolConstant.newInstance(Chars.toString(value));
         }
         return new Func(arg);
     }
 
-    private static class Func extends AbstractToSymbolCastFunction {
+    public static class Func extends AbstractCastToSymbolFunction {
 
         public Func(Function arg) {
             super(arg);
@@ -79,23 +75,13 @@ public class CastCharToSymbolFunctionFactory implements FunctionFactory {
             if (value == 0) {
                 return null;
             }
-
-            final int keyIndex = symbolTableShortcut.keyIndex(value);
-            if (keyIndex < 0) {
-                return symbols.getQuick(symbolTableShortcut.valueAt(keyIndex));
-            }
-
-            symbolTableShortcut.putAt(keyIndex, value, next++);
-            sink.clear();
-            sink.put(value);
-            final String str = Chars.toString(sink);
-            symbols.add(Chars.toString(sink));
-            return str;
+            return getSymbol0(value);
         }
 
         @Override
-        protected AbstractToSymbolCastFunction newFunc() {
-            return new Func(arg);
+        protected String symbolOf(int key) {
+            // The shortcut keys on the code point, so render the character it stands for.
+            return Chars.toString((char) key);
         }
     }
 }

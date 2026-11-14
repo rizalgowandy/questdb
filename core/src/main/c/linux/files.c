@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,18 +25,30 @@
 #define _GNU_SOURCE
 
 #include "../share/files.h"
+#include "../share/sysutil.h"
 #include <sys/mman.h>
 #include <errno.h>
+
+// MADV_POPULATE_WRITE was added in Linux 5.14
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/sendfile.h>
 #include <unistd.h>
-#include <sys/stat.h>
 #include <sys/fcntl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <sys/vfs.h>
+#include <fcntl.h>
+#include <stdint.h>
 
 static inline jlong _io_questdb_std_Files_mremap0
-        (jlong fd, jlong address, jlong previousLen, jlong newLen, jlong offset, jint flags) {
+        (jint fd, jlong address, jlong previousLen, jlong newLen, jlong offset, jint flags) {
     void *orgAddr = (void *) address;
     void *newAddr = mremap(orgAddr, (size_t) previousLen, (size_t) newLen, MREMAP_MAYMOVE);
     if (newAddr == MAP_FAILED) {
@@ -45,13 +57,8 @@ static inline jlong _io_questdb_std_Files_mremap0
     return (jlong) newAddr;
 }
 
-JNIEXPORT jlong JNICALL JavaCritical_io_questdb_std_Files_mremap0
-        (jlong fd, jlong address, jlong previousLen, jlong newLen, jlong offset, jint flags) {
-    return _io_questdb_std_Files_mremap0(fd, address, previousLen, newLen, offset, flags);
-}
-
 JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_mremap0
-        (JNIEnv *e, jclass cl, jlong fd, jlong address, jlong previousLen, jlong newLen, jlong offset, jint flags) {
+        (JNIEnv *e, jclass cl, jint fd, jlong address, jlong previousLen, jlong newLen, jlong offset, jint flags) {
     return _io_questdb_std_Files_mremap0(fd, address, previousLen, newLen, offset, flags);
 }
 
@@ -71,15 +78,88 @@ JNIEXPORT jint JNICALL Java_io_questdb_std_Files_copy
     }
 
     // On linux sendfile can accept file as well as sockets
-    off_t offset = 0;
     struct stat fileStat = {0};
     fstat(input, &fileStat);
-    int result = sendfile(output, input, &offset, fileStat.st_size);
+
+    size_t len = fileStat.st_size;
+    while (len > 0) {
+        ssize_t writtenLen;
+        RESTARTABLE(sendfile(output, input, NULL, len > MAX_RW_COUNT ? MAX_RW_COUNT : len), writtenLen);
+
+        if (writtenLen <= 0) {
+            break;
+        }
+        len -= writtenLen;
+    }
 
     close(input);
     close(output);
 
-    return result;
+    return len == 0 ? 0 : -1;
+}
+
+size_t copyData0(int srcFd, long dstFd, off_t srcOffset, off_t dstOffset, int64_t length) {
+    lseek64(dstFd, dstOffset, SEEK_SET);
+
+    size_t len = length > 0 ? (size_t)length : SIZE_MAX;
+    off_t offset = srcOffset;
+
+    while (len > 0) {
+        ssize_t writtenLen = sendfile64((int) dstFd, (int) srcFd, &offset, len > MAX_RW_COUNT ? MAX_RW_COUNT : len);
+        if (writtenLen <= 0
+            // Signals should not interrupt sendfile on Linux but just to align with POSIX standards
+            && errno != EINTR) {
+            break;
+        }
+        len -= writtenLen;
+        // offset is already increased
+    }
+
+    return offset - srcOffset;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_copyData
+        (JNIEnv *e, jclass cls, jint srcFd, jint destFd, jlong srcOffset, jlong length) {
+    return (jlong) copyData0((int) srcFd, (int) destFd, (off_t) srcOffset, 0, (int64_t) length);
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_copyDataToOffset
+        (JNIEnv *e, jclass cls, jint srcFd, jint destFd, jlong srcOffset, jlong dstOffset, jlong length) {
+    return (jlong) copyData0((int) srcFd, (int) destFd, (off_t) srcOffset, (off_t) dstOffset, (int64_t) length);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_fadvise0
+        (JNIEnv *e, jclass cls, jint fd, jlong offset, jlong len, jint advise) {
+    return posix_fadvise((int) fd, (off_t) offset, (off_t) len, advise);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixFadvRandom(JNIEnv *e, jclass cls) {
+    return POSIX_FADV_RANDOM;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixFadvSequential(JNIEnv *e, jclass cls) {
+    return POSIX_FADV_SEQUENTIAL;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_madvise0
+        (JNIEnv *e, jclass cls, jlong address, jlong len, jint advise) {
+    return madvise((void *) address, (size_t) len, advise);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getMadvPopulateWrite(JNIEnv *e, jclass cls) {
+    return MADV_POPULATE_WRITE;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixMadvRandom(JNIEnv *e, jclass cls) {
+    return MADV_RANDOM;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixMadvSequential(JNIEnv *e, jclass cls) {
+    return MADV_SEQUENTIAL;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixMadvDontneed(JNIEnv *e, jclass cls) {
+    return MADV_DONTNEED;
 }
 
 JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getFileSystemStatus
@@ -215,7 +295,7 @@ JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getFileSystemStatus
                 return sb.f_type;
             case 0x794c7630:
                 strcpy((char *) lpszName, "OVERLAYFS");
-                return -1 * ((jlong) sb.f_type);
+                return FLAG_FS_SUPPORTED * ((jlong) sb.f_type);
             case 0x50495045:
                 strcpy((char *) lpszName, "PIPEFS");
                 return sb.f_type;
@@ -287,7 +367,7 @@ JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getFileSystemStatus
                 return sb.f_type;
             case 0x01021997:
                 strcpy((char *) lpszName, "V9FS");
-                return -1 * ((jlong) sb.f_type);
+                return FLAG_FS_SUPPORTED * ((jlong) sb.f_type);
             case 0xa501fcf5:
                 strcpy((char *) lpszName, "VXFS");
                 return sb.f_type;
@@ -297,16 +377,127 @@ JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getFileSystemStatus
             case 0x012ff7b4:
                 strcpy((char *) lpszName, "XENIX");
                 return sb.f_type;
+            case 0x2Fc12fc1:
+                strcpy((char *) lpszName, "ZFS");
+                return FLAG_FS_SUPPORTED * ((jlong) sb.f_type);
             case 0x58465342:
                 strcpy((char *) lpszName, "XFS");
-                return sb.f_type;
+                return FLAG_FS_SUPPORTED * ((jlong) sb.f_type);
             case 0xEF53: // ext2, ext3, ext4
                 strcpy((char *) lpszName, "ext4");
-                return -1 * ((jlong) sb.f_type);
+                return FLAG_FS_SUPPORTED * ((jlong) sb.f_type);
             default:
                 strcpy((char *) lpszName, "unknown");
                 return sb.f_type;
         }
+    }
+    return 0;
+}
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_std_Files_setLastModified
+        (JNIEnv *e, jclass cl, jlong lpszName, jlong millis) {
+    struct timeval t[2];
+    gettimeofday(&t[0], NULL);
+    t[1].tv_sec = millis / 1000;
+    t[1].tv_usec = ((millis % 1000) * 1000);
+    return (jboolean) (utimes((const char *) lpszName, t) == 0);
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getDiskSize(JNIEnv *e, jclass cl, jlong lpszPath) {
+    struct statvfs buf;
+    if (statvfs((const char *) lpszPath, &buf) == 0) {
+        return (jlong) buf.f_bavail * (jlong )buf.f_bsize;
+    }
+    return -1;
+}
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_std_Files_allocate
+        (JNIEnv *e, jclass cl, jint fd, jlong len) {
+    int rc = posix_fallocate(fd, 0, len);
+    if (rc == 0) {
+        return JNI_TRUE;
+    }
+    if (rc == EINVAL && len > 0) {
+        // Some file systems (such as ZFS) do not support posix_fallocate
+        struct stat st;
+        int rc = fstat((int) fd, &st);
+        if (rc != 0) {
+            return JNI_FALSE;
+        }
+        if (st.st_size < len) {
+            rc = ftruncate(fd, len);
+            if (rc != 0) {
+                return JNI_FALSE;
+            }
+        }
+        return JNI_TRUE;
+    }
+
+    errno = rc; // communicate errno to caller
+    return JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_std_Files_allocateRange
+        (JNIEnv *e, jclass cl, jint fd, jlong offset, jlong len) {
+    // Grows the file to len, allocating only [offset, len): the caller knows the file already holds offset bytes.
+    // posix_fallocate() is not free over a range that is already allocated - XFS opens a transaction for every
+    // extent in it - so growing a fragmented file from offset 0 costs time in proportion to the whole file, rather
+    // than to the growth.
+    if (len <= offset) {
+        return JNI_TRUE;
+    }
+    int rc = posix_fallocate(fd, offset, len - offset);
+    if (rc == 0) {
+        return JNI_TRUE;
+    }
+    if (rc == EINVAL) {
+        // Some file systems (such as ZFS) do not support posix_fallocate
+        struct stat st;
+        if (fstat((int) fd, &st) != 0) {
+            return JNI_FALSE;
+        }
+        if (st.st_size < len && ftruncate(fd, len) != 0) {
+            return JNI_FALSE;
+        }
+        return JNI_TRUE;
+    }
+
+    errno = rc; // communicate errno to caller
+    return JNI_FALSE;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getLastModified
+        (JNIEnv *e, jclass cl, jlong pchar) {
+    struct stat st;
+    int r = stat((const char *) pchar, &st);
+    return r == 0 ? ((1000 * st.st_mtim.tv_sec) + (st.st_mtim.tv_nsec / 1000000)) : r;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getFileLimit
+        (JNIEnv *e, jclass cl) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+        if (limit.rlim_cur == RLIM_INFINITY) {
+            // Remap RLIM_INFINITY (~0UL, unsigned) to LONG_MAX (signed).
+            return LONG_MAX;
+        }
+        return (jlong) limit.rlim_cur;
+    }
+    return -1;
+}
+
+JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getMapCountLimit
+        (JNIEnv *e, jclass cl) {
+    FILE* fd = fopen("/proc/sys/vm/max_map_count", "r");
+    if (fd == NULL) {
+        return 0;
+    }
+    long limit = 0L;
+    int res = fscanf(fd, "%ld", &limit);
+    fclose(fd);
+
+    if (res == 1) {
+        return limit;
     }
     return 0;
 }

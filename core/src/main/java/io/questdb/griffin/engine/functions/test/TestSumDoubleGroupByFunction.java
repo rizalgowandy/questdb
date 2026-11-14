@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -48,19 +48,49 @@ public class TestSumDoubleGroupByFunction extends DoubleFunction implements Grou
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
         mapValue.putDouble(valueIndex, arg.getDouble(record));
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
         mapValue.putDouble(valueIndex, mapValue.getDouble(valueIndex) + arg.getDouble(record));
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
+    public Function getArg() {
+        return arg;
+    }
+
+    @Override
+    public double getDouble(Record rec) {
+        return rec.getDouble(valueIndex);
+    }
+
+    @Override
+    public String getName() {
+        return "sumx";
+    }
+
+    @Override
+    public int getValueIndex() {
+        return valueIndex;
+    }
+
+    @Override
+    public void initValueIndex(int valueIndex) {
+        this.valueIndex = valueIndex;
+    }
+
+    @Override
+    public void initValueTypes(ArrayColumnTypes columnTypes) {
         this.valueIndex = columnTypes.getColumnCount();
         columnTypes.add(ColumnType.DOUBLE);
+    }
+
+    @Override
+    public boolean isConstant() {
+        return false;
     }
 
     @Override
@@ -74,12 +104,7 @@ public class TestSumDoubleGroupByFunction extends DoubleFunction implements Grou
     }
 
     @Override
-    public double getDouble(Record rec) {
-        return rec.getDouble(valueIndex);
-    }
-
-    @Override
-    public Function getArg() {
-        return arg;
+    public boolean supportsParallelism() {
+        return false;
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,12 +28,12 @@ import io.questdb.cairo.TableUtils;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.str.Path;
 
-import static io.questdb.cairo.TableUtils.META_OFFSET_COMMIT_LAG;
 import static io.questdb.cairo.TableUtils.META_OFFSET_MAX_UNCOMMITTED_ROWS;
+import static io.questdb.cairo.TableUtils.META_OFFSET_O3_MAX_LAG;
 
 final class Mig600 {
     static void migrate(MigrationContext migrationContext) {
-        MigrationActions.LOG.info().$("configuring default commit lag [table=").$(migrationContext.getTablePath()).I$();
+        MigrationActions.LOG.info().$("configuring default o3MaxLag [table=").$(migrationContext.getTablePath()).I$();
         final Path path = migrationContext.getTablePath();
         final FilesFacade ff = migrationContext.getFf();
         final long tempMem = migrationContext.getTempMemory(8);
@@ -51,8 +51,8 @@ final class Mig600 {
         TableUtils.writeLongOrFail(
                 ff,
                 fd,
-                META_OFFSET_COMMIT_LAG,
-                migrationContext.getConfiguration().getCommitLag(),
+                META_OFFSET_O3_MAX_LAG,
+                migrationContext.getConfiguration().getO3MaxLag(),
                 tempMem,
                 path
         );

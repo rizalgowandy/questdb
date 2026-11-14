@@ -1,0 +1,77 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cutlass.pgwire;
+
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.security.AllowAllSecurityContext;
+import io.questdb.cairo.security.PrincipalContext;
+import io.questdb.cairo.security.ReadOnlySecurityContext;
+import io.questdb.cairo.security.SecurityContextFactory;
+import io.questdb.std.Chars;
+import io.questdb.std.Transient;
+import org.jetbrains.annotations.NotNull;
+
+public final class ReadOnlyUsersAwareSecurityContextFactory implements SecurityContextFactory {
+    private final boolean httpReadOnly;
+    private final boolean pgWireReadOnly;
+    private final String pgWireReadOnlyUser;
+    private final boolean settingsReadOnly;
+
+    public ReadOnlyUsersAwareSecurityContextFactory(boolean pgWireReadOnly, String pgWireReadOnlyUser, boolean httpReadOnly) {
+        this(pgWireReadOnly, pgWireReadOnlyUser, httpReadOnly, false);
+    }
+
+    public ReadOnlyUsersAwareSecurityContextFactory(boolean pgWireReadOnly, String pgWireReadOnlyUser, boolean httpReadOnly, boolean settingsReadOnly) {
+        this.pgWireReadOnly = pgWireReadOnly;
+        this.pgWireReadOnlyUser = pgWireReadOnlyUser;
+        this.httpReadOnly = httpReadOnly;
+        this.settingsReadOnly = settingsReadOnly;
+    }
+
+    @Override
+    public SecurityContext getInstance(@Transient @NotNull PrincipalContext principalContext, byte interfaceId) {
+        final CharSequence principal = principalContext.getPrincipal();
+        return switch (interfaceId) {
+            case SecurityContextFactory.HTTP -> httpReadOnly
+                    ? (settingsReadOnly ? ReadOnlySecurityContext.SETTINGS_READ_ONLY : ReadOnlySecurityContext.INSTANCE).forPrincipal(principal)
+                    : (settingsReadOnly ? AllowAllSecurityContext.SETTINGS_READ_ONLY : AllowAllSecurityContext.INSTANCE).forPrincipal(principal);
+            case SecurityContextFactory.PGWIRE ->
+                    isReadOnlyPgWireUser(principal) ? ReadOnlySecurityContext.INSTANCE.forPrincipal(principal) : AllowAllSecurityContext.INSTANCE.forPrincipal(principal);
+            // ILP does NOT route its principal. With a line auth db configured the ILP principal is a JWK key
+            // id -- a transport credential, not an ACL identity -- so hand back the bare shared singleton
+            // rather than deriving a per-principal context. Routing it would retain every key id in the
+            // process-lifetime per-principal cache, which hangs off a singleton shared by all three protocols:
+            // a fleet of devices would saturate the cache bound and push the HTTP and PGWire users onto the
+            // uncached, allocate-per-call path. ILP has no query surface to read current_user() back anyway.
+            // The enterprise mirror does the same -- see EntReadOnlyUsersAwareSecurityContextFactory.
+            case SecurityContextFactory.ILP -> AllowAllSecurityContext.INSTANCE;
+            default -> AllowAllSecurityContext.INSTANCE.forPrincipal(principal);
+        };
+    }
+
+    private boolean isReadOnlyPgWireUser(CharSequence principal) {
+        return pgWireReadOnly || (pgWireReadOnlyUser != null && principal != null && Chars.equals(pgWireReadOnlyUser, principal));
+    }
+}

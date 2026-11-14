@@ -1,0 +1,392 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.cutlass.text;
+
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.sql.BindVariableService;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.VirtualRecord;
+import io.questdb.griffin.QueryFutureUpdateListener;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.window.WindowContext;
+import io.questdb.griffin.model.RuntimeIntrinsicIntervalModel;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Decimal64;
+import io.questdb.std.Rnd;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public record SqlExecutionContextStub(CairoEngine engine) implements SqlExecutionContext {
+    public SqlExecutionContextStub(@NotNull CairoEngine engine) {
+        this.engine = engine;
+    }
+
+    @Override
+    public boolean allowNonDeterministicFunctions() {
+        return true;
+    }
+
+    @Override
+    public void changePageFrameSizes(int minRows, int maxRows) {
+    }
+
+    @Override
+    public void clearWindowContext() {
+    }
+
+    @Override
+    public void configureWindowContext(
+            @Nullable VirtualRecord partitionByRecord,
+            @Nullable RecordSink partitionBySink,
+            @Nullable ColumnTypes keyTypes,
+            boolean isOrdered,
+            int orderByDirection,
+            int orderByPos,
+            boolean baseSupportsRandomAccess,
+            int framingMode,
+            long rowsLo,
+            char rowsLoUnit,
+            int rowsLoExprPos,
+            int rowsLoKindPos,
+            long rowsHi,
+            char rowsHiUnit,
+            int rowsHiExprPos,
+            int rowsHiKindPos,
+            int exclusionKind,
+            int exclusionKindPos,
+            int timestampIndex,
+            int timestampType,
+            boolean ignoreNulls,
+            int nullsDescPos
+    ) {
+    }
+
+    @Override
+    public BindVariableService getBindVariableService() {
+        return null;
+    }
+
+    @Override
+    public @NotNull CairoEngine getCairoEngine() {
+        return engine;
+    }
+
+    @Override
+    public @NotNull SqlExecutionCircuitBreaker getCircuitBreaker() {
+        return SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
+    }
+
+    @Override
+    public boolean getCloneSymbolTables() {
+        return false;
+    }
+
+    public Decimal128 getDecimal128() {
+        return null;
+    }
+
+    public Decimal256 getDecimal256() {
+        return null;
+    }
+
+    public Decimal64 getDecimal64() {
+        return null;
+    }
+
+    @Override
+    public int getIntervalFunctionType() {
+        return ColumnType.INTERVAL_TIMESTAMP_MICRO;
+    }
+
+    @Override
+    public int getJitMode() {
+        return 0;
+    }
+
+    @Override
+    public long getMicrosecondTimestamp() {
+        return 0L;
+    }
+
+    @Override
+    public long getNanosecondTimestamp() {
+        return 0L;
+    }
+
+    @Override
+    public long getNow(int timestampType) {
+        return 0L;
+    }
+
+    @Override
+    public int getNowTimestampType() {
+        return ColumnType.TIMESTAMP_MICRO;
+    }
+
+    @Override
+    public int getPageFrameMaxRows() {
+        return engine.getConfiguration().getSqlPageFrameMaxRows();
+    }
+
+    @Override
+    public int getPageFrameMinRows() {
+        return engine.getConfiguration().getSqlPageFrameMinRows();
+    }
+
+    @Override
+    public QueryFutureUpdateListener getQueryFutureUpdateListener() {
+        return null;
+    }
+
+    @Override
+    public Rnd getRandom() {
+        return null;
+    }
+
+    @Override
+    public long getRequestFd() {
+        return 0;
+    }
+
+    @Override
+    public @NotNull SecurityContext getSecurityContext() {
+        return engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext();
+    }
+
+    @Override
+    public int getSharedQueryWorkerCount() {
+        return 0;
+    }
+
+    @Override
+    public @NotNull SqlExecutionCircuitBreaker getSimpleCircuitBreaker() {
+        return SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
+    }
+
+    @Override
+    public WindowContext getWindowContext() {
+        return null;
+    }
+
+    @Override
+    public int hasInterval() {
+        return 0;
+    }
+
+    @Override
+    public void initNow() {
+    }
+
+    @Override
+    public boolean isCacheHit() {
+        return false;
+    }
+
+    @Override
+    public boolean isExpiryReadFilterEnabled() {
+        return true;
+    }
+
+    @Override
+    public boolean isParallelFilterEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isParallelGroupByEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isParallelHashJoinGroupByEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isParallelReadParquetEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isParquetRowGroupPruningEnabled() {
+        return true;
+    }
+
+    @Override
+    public boolean isParallelTopKEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isParallelHorizonJoinEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isParallelWindowJoinEnabled() {
+        return false;
+    }
+
+    @Override
+    public boolean isTimestampRequired() {
+        return false;
+    }
+
+    @Override
+    public boolean isValidationOnly() {
+        return false;
+    }
+
+    @Override
+    public boolean isWalApplication() {
+        return false;
+    }
+
+    @Override
+    public RuntimeIntrinsicIntervalModel peekIntervalModel() {
+        return null;
+    }
+
+    @Override
+    public void popHasInterval() {
+    }
+
+    @Override
+    public void popIntervalModel() {
+    }
+
+    @Override
+    public void popTimestampRequiredFlag() {
+    }
+
+    @Override
+    public void popWindowContext() {
+    }
+
+    @Override
+    public void pushHasInterval(int hasInterval) {
+    }
+
+    @Override
+    public void pushIntervalModel(RuntimeIntrinsicIntervalModel intervalModel) {
+    }
+
+    @Override
+    public void pushTimestampRequiredFlag(boolean flag) {
+    }
+
+    @Override
+    public void pushWindowContext() {
+    }
+
+    @Override
+    public void reset() {
+    }
+
+    @Override
+    public void restoreToDefaultPageFrameSizes() {
+    }
+
+    @Override
+    public void setAllowNonDeterministicFunction(boolean value) {
+    }
+
+    @Override
+    public void setCacheHit(boolean value) {
+    }
+
+    @Override
+    public void setCancelledFlag(AtomicBoolean cancelled) {
+    }
+
+    @Override
+    public void setCloneSymbolTables(boolean cloneSymbolTables) {
+    }
+
+    @Override
+    public void setExpiryReadFilterEnabled(boolean enabled) {
+        // This stub only drives already-compiled cursors, so no compile can toggle the filter through it.
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void setIntervalFunctionType(int intervalFunctionType) {
+    }
+
+    @Override
+    public void setJitMode(int jitMode) {
+    }
+
+    @Override
+    public void setNowAndFixClock(long now, int nowTimestampType) {
+    }
+
+    @Override
+    public void setParallelFilterEnabled(boolean parallelFilterEnabled) {
+    }
+
+    @Override
+    public void setParallelGroupByEnabled(boolean parallelGroupByEnabled) {
+    }
+
+    @Override
+    public void setParallelHashJoinGroupByEnabled(boolean isEnabled) {
+    }
+
+    @Override
+    public void setParallelReadParquetEnabled(boolean parallelReadParquetEnabled) {
+    }
+
+    @Override
+    public void setParquetRowGroupPruningEnabled(boolean parquetRowGroupPruningEnabled) {
+    }
+
+    @Override
+    public void setParallelTopKEnabled(boolean parallelTopKEnabled) {
+    }
+
+    @Override
+    public void setParallelHorizonJoinEnabled(boolean parallelHorizonJoinEnabled) {
+    }
+
+    @Override
+    public void setParallelWindowJoinEnabled(boolean parallelWindowJoinEnabled) {
+    }
+
+    @Override
+    public void setRandom(Rnd rnd) {
+    }
+
+    @Override
+    public void setUseSimpleCircuitBreaker(boolean value) {
+    }
+}

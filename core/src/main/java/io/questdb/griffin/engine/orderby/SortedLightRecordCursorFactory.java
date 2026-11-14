@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,53 +24,103 @@
 
 package io.questdb.griffin.engine.orderby;
 
+import io.questdb.PropertyKey;
 import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ListColumnFilter;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.RecordComparator;
+import io.questdb.std.DirectIntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
 
 public class SortedLightRecordCursorFactory extends AbstractRecordCursorFactory {
-    private final RecordCursorFactory base;
-    private final LongTreeChain chain;
-    private final SortedLightRecordCursor cursor;
+    private final ListColumnFilter sortColumnFilter;
+    private RecordCursorFactory base;
+    private SortedLightRecordCursor cursor;
 
     public SortedLightRecordCursorFactory(
             CairoConfiguration configuration,
             RecordMetadata metadata,
             RecordCursorFactory base,
-            RecordComparator comparator
+            RecordComparator comparator,
+            ListColumnFilter sortColumnFilter
     ) {
         super(metadata);
-        this.chain = new LongTreeChain(
-                configuration.getSqlSortKeyPageSize(),
-                configuration.getSqlSortKeyMaxPages(),
-                configuration
-                        .getSqlSortLightValuePageSize(),
-                configuration.getSqlSortLightValueMaxPages());
         this.base = base;
-        this.cursor = new SortedLightRecordCursor(chain, comparator);
+        this.sortColumnFilter = sortColumnFilter;
+        LongTreeChain chain = null;
+        ObjList<DirectIntList> rankMaps = null;
+        try {
+            // Lazy variant: the chain skeleton is constructed but the key/value
+            // heaps are not allocated until the first cursor's of() binds a
+            // MemoryTracker and calls reopen(). This keeps malloc/free symmetric
+            // on the per-query counter from the very first cursor.
+            chain = new LongTreeChain(
+                    configuration.getSqlSortKeyPageSize(),
+                    configuration.getSqlSortKeyMaxBytes(),
+                    configuration.getSqlSortLightValuePageSize(),
+                    configuration.getSqlSortLightValueMaxBytes(),
+                    PropertyKey.CAIRO_SQL_SORT_KEY_MAX_BYTES.getPropertyPath(),
+                    PropertyKey.CAIRO_SQL_SORT_LIGHT_VALUE_MAX_BYTES.getPropertyPath(),
+                    false
+            );
+            // Hoist rankMaps into a named local so the catch can free the
+            // (native-memory-owning) list if the cursor ctor below throws after
+            // createRankMaps succeeds. On success, ownership passes to the cursor.
+            rankMaps = SortKeyEncoder.createRankMaps(metadata, sortColumnFilter);
+            this.cursor = new SortedLightRecordCursor(chain, comparator, rankMaps);
+        } catch (Throwable th) {
+            Misc.free(chain);
+            Misc.freeObjList(rankMaps);
+            close();
+            throw th;
+        }
+    }
+
+    public static void addSortKeys(PlanSink sink, ListColumnFilter filter) {
+        sink.attr("keys").val('[');
+        filter.toPlan(sink);
+        sink.val(']');
     }
 
     @Override
-    public void close() {
-        base.close();
-        chain.close();
+    public RecordCursorFactory getBaseFactory() {
+        return base;
+    }
+
+    // Sorting re-orders the base rows without introducing value sources.
+    @Override
+    public boolean isNonDeterministic() {
+        return base.isNonDeterministic();
+    }
+
+    @Override
+    public boolean isStableWithinExecution() {
+        return base.isStableWithinExecution();
     }
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        RecordCursor baseCursor = base.getCursor(executionContext);
+        final RecordCursor baseCursor = base.getCursor(executionContext);
         try {
             cursor.of(baseCursor, executionContext);
             return cursor;
-        } catch (RuntimeException ex) {
-            baseCursor.close();
-            throw ex;
+        } catch (Throwable th) {
+            cursor.close();
+            throw th;
         }
+    }
+
+    @Override
+    public int getScanDirection() {
+        return SortedRecordCursorFactory.getScanDirection(sortColumnFilter);
     }
 
     @Override
@@ -79,7 +129,30 @@ public class SortedLightRecordCursorFactory extends AbstractRecordCursorFactory 
     }
 
     @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Sort light");
+        addSortKeys(sink, sortColumnFilter);
+        sink.child(base);
+    }
+
+    @Override
     public boolean usesCompiledFilter() {
         return base.usesCompiledFilter();
+    }
+
+    @Override
+    public boolean usesIndex() {
+        return base.usesIndex();
+    }
+
+    @Override
+    protected void _close() {
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final SortedLightRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        Throwable failure = Misc.freeBestEffort(null, base);
+        failure = Misc.freeBestEffort(failure, cursor);
+        CairoException.rethrowCleanupFailure(failure);
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,17 +24,42 @@
 
 package io.questdb.std;
 
+import io.questdb.cairo.CairoException;
+import io.questdb.log.Log;
 import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.MutableUtf8Sink;
 import io.questdb.std.str.Path;
+import io.questdb.std.str.Utf8Sequence;
 
 public interface FilesFacade {
     long MAP_FAILED = -1;
 
-    long append(long fd, long buf, int len);
+    boolean allocate(long fd, long size);
+
+    /**
+     * Grows the file to {@code size} bytes, allocating only from {@code allocatedSize}, a length the caller knows the
+     * file already has - see {@link Files#allocate(long, long, long)}. A facade that does not implement it allocates
+     * the whole file, which is what {@link #allocate(long, long)} promises and more.
+     */
+    default boolean allocate(long fd, long allocatedSize, long size) {
+        return allocate(fd, size);
+    }
+
+    boolean allowMixedIO(CharSequence root);
+
+    long append(long fd, long buf, long len);
 
     boolean close(long fd);
 
+    boolean closeRemove(long fd, LPSZ path);
+
     int copy(LPSZ from, LPSZ to);
+
+    long copyData(long srcFd, long destFd, long offsetSrc, long length);
+
+    long copyData(long srcFd, long destFd, long offsetSrc, long destOffset, long length);
+
+    int copyRecursive(Path src, Path dst, int dirMode);
 
     int errno();
 
@@ -42,7 +67,9 @@ public interface FilesFacade {
 
     boolean exists(long fd);
 
-    void findClose(long findPtr);
+    void fadvise(long fd, long offset, long len, int advise);
+
+    long findClose(long findPtr);
 
     long findFirst(LPSZ path);
 
@@ -52,13 +79,85 @@ public interface FilesFacade {
 
     int findType(long findPtr);
 
+    void fdatasync(long fd);
+
+    /**
+     * Ordering barrier only, see {@link Files#barrierFsync(long)}. A commit is not durable on this alone;
+     * pair it with {@link #fdatasync(long)} at the commit point. The default calls {@link #fdatasync(long)},
+     * the stronger barrier.
+     */
+    default void barrierFsync(long fd) {
+        fdatasync(fd);
+    }
+
+    void fsync(long fd);
+
+    /**
+     * {@link #fsync(long)} semantics (data and metadata) with the device write cache flushed. Not
+     * interchangeable with {@link #fdatasync(long)}, which may skip metadata not needed to read the data
+     * back. The default calls {@link #fsync(long)}.
+     */
+    default void fsyncDurable(long fd) {
+        fsync(fd);
+    }
+
+    void fsyncAndClose(long fd);
+
+    /**
+     * Linux sync_file_range(2): starts writeback of the file's page-cache pages over
+     * {@code [offset, offset+nbytes)} to the device cache without a device flush (see the
+     * {@code Files.SYNC_FILE_RANGE_*} flags). A no-op returning 0 off Linux; durability still needs a
+     * following device flush.
+     */
+    default int syncFileRange(long fd, long offset, long nbytes, int flags) {
+        return Files.syncFileRange(fd, offset, nbytes, flags);
+    }
+
+    /**
+     * Linux syncfs(2): makes the filesystem containing {@code fd} durable in one device flush. It writes back
+     * all dirty data and journals every pending metadata change (including ext4 extent conversions), then
+     * flushes the device cache. Off Linux it flushes {@code fd} only (see {@link #isSyncfsFileSystemWide()}
+     * and {@link Files#syncfs(long)}).
+     */
+    default void syncfs(long fd) {
+        int res = Files.syncfs(fd);
+        if (res == 0) {
+            return;
+        }
+        throw CairoException.dataSyncFailureOfFd(this, fd, Os.errno(), "syncfs", "could not syncfs");
+    }
+
+    /**
+     * Returns whether {@link #syncfs(long)} flushes the entire filesystem containing {@code fd}.
+     * Linux provides that guarantee; the macOS and Windows implementations flush only the supplied file.
+     */
+    default boolean isSyncfsFileSystemWide() {
+        return Os.isLinux();
+    }
+
+    /**
+     * Whether {@link #syncFileRange(long, long, long, int)} is worth issuing against {@code root}. On ZFS
+     * the page-cache model does not match (durability is a txg commit), so the call buys nothing and is
+     * skipped; callers must still take a real barrier afterwards regardless.
+     *
+     * @param root an existing path on the filesystem in question
+     * @return {@code true} if a drain pass is likely to help
+     */
+    default boolean isSyncFileRangeEffective(Utf8Sequence root) {
+        return Os.isLinux();
+    }
+
+    long getDirSize(Path path);
+
+    long getDiskFreeSpace(LPSZ path);
+
+    long getFileLimit();
+
+    int getFileSystemStatus(LPSZ lpszName);
+
     long getLastModified(LPSZ path);
 
-    int msync(long addr, long len, boolean async);
-
-    int fsync(long fd);
-
-    int sync();
+    long getMapCountLimit();
 
     long getMapPageSize();
 
@@ -66,7 +165,21 @@ public interface FilesFacade {
 
     long getPageSize();
 
+    int hardLink(LPSZ src, LPSZ hardLink);
+
+    int hardLinkDirRecursive(Path src, Path dst, int dirMode);
+
+    boolean isCrossDeviceCopyError(int errno);
+
+    boolean isDirOrSoftLinkDir(LPSZ path);
+
+    boolean isDirOrSoftLinkDirNoDots(Path path, int rootLen, long pUtf8NameZ, int type);
+
+    boolean isDirOrSoftLinkDirNoDots(Path path, int rootLen, long pUtf8NameZ, int type, MutableUtf8Sink nameSink);
+
     boolean isRestrictedFileSystem();
+
+    boolean isSoftLink(LPSZ softLink);
 
     void iterateDir(LPSZ path, FindVisitor func);
 
@@ -76,41 +189,95 @@ public interface FilesFacade {
 
     int lock(long fd);
 
-    int mkdir(Path path, int mode);
+    void madvise(long address, long len, int advise);
+
+    int mkdir(LPSZ path, int mode);
 
     int mkdirs(Path path, int mode);
 
     long mmap(long fd, long len, long offset, int flags, int memoryTag);
 
-    long mmap(long fd, long len, long offset, int flags, long baseAddress, int memoryTag);
+    /**
+     * Memory map without using the MmapCache. Useful for streaming reads where
+     * we want each mapping to be independent and release page cache via madvise.
+     */
+    long mmapNoCache(long fd, long len, long offset, int flags, int memoryTag);
 
     long mremap(long fd, long addr, long previousSize, long newSize, long offset, int mode, int memoryTag);
+
+    /**
+     * Remap memory without using the MmapCache. Useful for streaming reads.
+     */
+    long mremapNoCache(long fd, long addr, long previousSize, long newSize, long offset, int mode, int memoryTag);
+
+    void msync(long addr, long len, boolean async);
 
     void munmap(long address, long size, int memoryTag);
 
     long openAppend(LPSZ name);
 
+    long openCleanRW(LPSZ name, long size);
+
     long openRO(LPSZ name);
 
-    long openRW(LPSZ name, long opts);
+    long openRONoCache(LPSZ path);
 
-    long openCleanRW(LPSZ name, long size);
+    long openRW(LPSZ name, int opts);
+
+    /**
+     * Opens an existing file for reading and writing without creating it; see {@link Files#openRWExisting}.
+     */
+    long openRWExisting(LPSZ name);
+
+    long openRWNoCache(LPSZ name, int opts);
 
     long read(long fd, long buf, long size, long offset);
 
-    long readULong(long fd, long offset);
+    long readIntAsUnsignedLong(long fd, long offset);
 
-    boolean remove(LPSZ name);
+    boolean readLink(Path softLink, Path readTo);
 
-    boolean rename(LPSZ from, LPSZ to);
+    byte readNonNegativeByte(long fd, long offset);
 
-    int rmdir(Path name);
+    int readNonNegativeInt(long fd, long offset);
+
+    long readNonNegativeLong(long fd, long offset);
+
+    void remove(LPSZ name);
+
+    boolean removeQuiet(LPSZ name);
+
+    int rename(LPSZ from, LPSZ to);
+
+    /**
+     * The publish-by-rename barrier: the rename is durable when this returns. On POSIX this is
+     * {@link #rename(LPSZ, LPSZ)}, with the caller fsyncing the parent directory afterwards; Windows asks the
+     * move itself to write through. The default calls {@link #rename(LPSZ, LPSZ)}, so a facade that
+     * intercepts {@code rename} intercepts this too.
+     */
+    default int renameDurable(LPSZ from, LPSZ to) {
+        return rename(from, to);
+    }
+
+    boolean rmdir(Path name);  // Implementation-specific laziness.
+
+    boolean rmdir(Path name, boolean haltOnError);
+
+    int softLink(LPSZ src, LPSZ softLink);
+
+    int sync();
 
     boolean touch(LPSZ path);
 
     boolean truncate(long fd, long size);
 
-    boolean allocate(long fd, long size);
+    int typeDirOrSoftLinkDirNoDots(Path path, int rootLen, long pUtf8NameZ, int type, MutableUtf8Sink nameSink);
+
+    int unlink(LPSZ softLink);
+
+    boolean unlinkOrRemove(Path path, Log LOG);
+
+    boolean unlinkOrRemove(Path path, int checkedType, Log LOG);
 
     void walk(Path src, FindVisitor func);
 

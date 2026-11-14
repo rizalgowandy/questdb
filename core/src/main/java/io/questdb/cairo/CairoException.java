@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,32 +24,411 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
 import io.questdb.std.FlyweightMessageContainer;
-import io.questdb.std.Sinkable;
-import io.questdb.std.ThreadLocal;
+import io.questdb.std.Os;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public class CairoException extends RuntimeException implements Sinkable, FlyweightMessageContainer {
+
+    public static final int ERRNO_ACCESS_DENIED_WIN = 5;
+    // MoveFileW reports this when it refuses an existing destination, where POSIX
+    // rename would have replaced it. A destination that is merely delete-pending
+    // reports ERRNO_ACCESS_DENIED_WIN instead, which is indistinguishable from a
+    // real permission failure and so is not treated as a collision.
+    public static final int ERRNO_ALREADY_EXISTS_WIN = 183;
+    public static final int ERRNO_EACCES_LINUX = 13;
+    public static final int ERRNO_EACCES_MACOS = 13;
+    public static final int ERRNO_EPERM_LINUX = 1;
+    public static final int ERRNO_EPERM_MACOS = 1;
     public static final int ERRNO_FILE_DOES_NOT_EXIST = 2;
+    public static final int ERRNO_FILE_DOES_NOT_EXIST_WIN = 3;
+    // Not reachable from MoveFileW today - CreateFile and CopyFile raise it - but
+    // cheap to accept alongside ERRNO_ALREADY_EXISTS_WIN, and no POSIX rename can
+    // produce either value.
+    public static final int ERRNO_FILE_EXISTS_WIN = 80;
+    // psync_cvcontinue sets two bits in the error code to indicate whether the wait timed out (0x100) or there were no waiters (0x200).
+    // Error #316 (0x13C) is the timed out bit bitwise OR'd with ETIMEDOUT (60).
+    public static final int ERRNO_FILE_READ_TIMEOUT_MACOS = 316;
     public static final int METADATA_VALIDATION = -100;
-
-    private static final ThreadLocal<CairoException> tlException = new ThreadLocal<>(CairoException::new);
+    public static final int ILLEGAL_OPERATION = METADATA_VALIDATION - 1;
+    private static final int TABLE_DROPPED = ILLEGAL_OPERATION - 1;
+    public static final int METADATA_VALIDATION_RECOVERABLE = TABLE_DROPPED - 1;
+    public static final int PARTITION_MANIPULATION_RECOVERABLE = METADATA_VALIDATION_RECOVERABLE - 1;
+    public static final int TABLE_DOES_NOT_EXIST = PARTITION_MANIPULATION_RECOVERABLE - 1;
+    public static final int VIEW_DOES_NOT_EXIST = TABLE_DOES_NOT_EXIST - 1;
+    public static final int MAT_VIEW_DOES_NOT_EXIST = VIEW_DOES_NOT_EXIST - 1;
+    public static final int TXN_BLOCK_APPLY_FAILED = MAT_VIEW_DOES_NOT_EXIST - 1;
+    public static final int METADATA_VERSION_MISMATCH = TXN_BLOCK_APPLY_FAILED - 1;
+    public static final int FILE_TOO_SMALL = METADATA_VERSION_MISMATCH - 1;
+    public static final int SEQUENCER_METADATA_OPEN_FAILED = FILE_TOO_SMALL - 1;
+    private static final int TABLE_SUSPENDED = SEQUENCER_METADATA_OPEN_FAILED - 1;
+    // PARTITION_SNAPSHOT_STALE (-113) and PARTITION_SNAPSHOT_ID_MISSING (-114) cross
+    // the JNI boundary: the enterprise cold-storage decoder throws them from Rust,
+    // which hardcodes the literals in qdb-ent/src/cold_storage/jni/decoder.rs and
+    // cannot see this chain. Append new codes below rather than inserting them
+    // above, so these two keep their values; ColdErrnoContractTest pins them.
+    public static final int PARTITION_SNAPSHOT_STALE = TABLE_SUSPENDED - 1;
+    public static final int PARTITION_SNAPSHOT_ID_MISSING = PARTITION_SNAPSHOT_STALE - 1;
+    // The on-disk _lv / _lv.s carry a format version newer than this build
+    // supports. The catalogue load path catches this and surfaces the view as
+    // version_unsupported rather than hiding it; distinct from structural
+    // corruption so the two map to different operator-visible outcomes.
+    public static final int LV_FILE_VERSION_UNSUPPORTED = PARTITION_SNAPSHOT_ID_MISSING - 1;
+    // A live-view versioned checkpoint timeline artifact failed structural
+    // validation: a torn/foreign _timeline superblock slot, or a metadata page
+    // whose framing, bounds, or per-page checksum did not hold. Timeline state is
+    // derived and rebuildable, so this is a recovery-quality signal rather than a
+    // compatibility break: a bad superblock slot falls back to the other slot, and
+    // a bad metadata page invalidates only that one root version and schedules its
+    // reconstruction. Distinct from LV_FILE_VERSION_UNSUPPORTED, which covers
+    // required state and does surface to the operator.
+    public static final int LV_CHECKPOINT_TIMELINE_INVALID = LV_FILE_VERSION_UNSUPPORTED - 1;
+    // A reader found the version-selected _txn area torn under a version word that held still: a crash made
+    // part of the last commit's _txn write durable. The table writer rolls back to the intact previous
+    // transaction when it opens the table, which is how the engine repairs a non-WAL table on read.
+    public static final int TXN_LIVE_AREA_TORN = LV_CHECKPOINT_TIMELINE_INVALID - 1;
+    // A reader found that _cv cannot serve the column version an intact _txn record names: a crash tore its
+    // live area, or left the whole file behind _txn. The table writer continues from the previous transaction
+    // when that is safe and refuses to open otherwise; the engine repairs the table on read by opening it.
+    public static final int CV_TORN = TXN_LIVE_AREA_TORN - 1;
+    public static final int NON_CRITICAL = -1;
+    // Single source of truth for the write-refusal message a read-only node emits. Both a static
+    // read-only OSS instance and an enterprise node acting as a read-only replica reach this
+    // message, so the wording stays in one place to keep every emitter consistent and to make a
+    // future role-neutral reword a one-line change. The wording is retained as-is because the
+    // string is asserted across roughly twenty OSS/enterprise/e2e test files; centralizing the
+    // literal first lets any later reword land without scattering the change.
+    public static final String READ_ONLY_ACCESS_MESSAGE = "replica access is read-only";
     private static final StackTraceElement[] EMPTY_STACK_TRACE = {};
+    private static final int FLAG_AUTHORIZATION_ERROR = 1;
+    private static final int FLAG_CACHEABLE = 1 << 1;
+    private static final int FLAG_CANCELLATION = 1 << 2; // query was explicitly cancelled by the user
+    private static final int FLAG_HOUSEKEEPING = 1 << 3;
+    private static final int FLAG_INTERRUPTION = 1 << 4; // query execution was interrupted
+    private static final int FLAG_MALFORMED_UTF8 = 1 << 5; // rejected value, not a broken writer
+    private static final int FLAG_OUT_OF_MEMORY = 1 << 6;
+    private static final int FLAG_PREFERENCES_OUT_OF_DATE_ERROR = 1 << 7;
+    private static final int FLAG_READ_ONLY_ACCESS_REFUSAL = 1 << 8;
+    private static final int FLAG_SCHEMA_MISMATCH = 1 << 9;
+    private static final int FLAG_DATA_SYNC_FAILURE = 1 << 10;
     protected final StringSink message = new StringSink();
-    private int errno;
-    private boolean cacheable;
-    private boolean interruption;
+    protected final StringSink nativeBacktrace = new StringSink();
+    protected int errno;
+    private String dataSyncOperation;
+    private int flags;
+    private int interruptionReason;
+    private int messagePosition;
 
-    public static CairoException instance(int errno) {
-        CairoException ex = tlException.get();
-        // This is to have correct stack trace in local debugging with -ea option
-        assert (ex = new CairoException()) != null;
-        ex.message.clear();
-        ex.errno = errno;
-        ex.cacheable = false;
-        ex.interruption = false;
-        return ex;
+    public static CairoException authorization() {
+        return nonCritical().setAuthorizationError();
+    }
+
+    public static CairoException critical(int errno) {
+        return instance(errno);
+    }
+
+    public static CairoException cvTorn() {
+        return critical(CV_TORN);
+    }
+
+    /**
+     * A failed flush ({@code fsync}, {@code fdatasync}, {@code syncfs}, {@code sync_file_range}, a synchronous
+     * {@code msync}, {@code sync}) of a file through {@code ff}, the one way Java code raises one. The failure is
+     * recorded where it is created: every live engine whose files facade is {@code ff} is told at once and stops if
+     * its commit mode requires it, so a path that later drops, counts or wraps the exception cannot lose the stop.
+     */
+    public static CairoException dataSyncFailure(FilesFacade ff, int errno, String operation, CharSequence message) {
+        return dataSyncFailure(ff, null, errno, operation, message);
+    }
+
+    /**
+     * {@link #dataSyncFailure(FilesFacade, int, String, CharSequence)} for a flush of the file or directory at
+     * {@code path}, or null when it is not known. The path names the file in the message and, when engines share
+     * {@code ff}, picks the engine whose roots hold it.
+     */
+    public static CairoException dataSyncFailure(FilesFacade ff, @Nullable CharSequence path, int errno, String operation, CharSequence message) {
+        final CairoException exception = dataSyncFailureCarry(errno, operation).put(message);
+        if (path != null) {
+            exception.put(" [path=").put(path).put(']');
+        }
+        CairoEngine.recordDataSyncFailure(ff, path, exception);
+        return exception;
+    }
+
+    /**
+     * A failed flush that {@link #dataSyncFailure(FilesFacade, int, String, CharSequence)} already recorded, raised
+     * again by the code that carries it: a task failure the writer rethrows, the sequencer's fenced frontier. It
+     * does not tell the engines again.
+     */
+    public static CairoException dataSyncFailureCarry(int errno, String operation) {
+        CairoException exception = critical(errno);
+        exception.dataSyncOperation = operation;
+        exception.flags |= FLAG_DATA_SYNC_FAILURE;
+        return exception;
+    }
+
+    /**
+     * A failed flush of {@code fd}: the message names the descriptor and, where the OS can tell, the file.
+     */
+    public static CairoException dataSyncFailureOfFd(FilesFacade ff, long fd, int errno, String operation, CharSequence message) {
+        return dataSyncFailure(ff, Files.findPathOfFd(fd), errno, operation, message + " [fd=" + fd + ']');
+    }
+
+    /**
+     * A failed flush ({@code msync}) of the memory mapped at {@code address}: the message names the file where the
+     * OS can tell.
+     */
+    public static CairoException dataSyncFailureOfMapping(FilesFacade ff, long address, int errno, String operation, CharSequence message) {
+        return dataSyncFailure(ff, Files.findPathOfMapping(address), errno, operation, message);
+    }
+
+    public static CairoException detachedColumnMetadataMismatch(int columnIndex, CharSequence columnName, CharSequence attribute) {
+        return critical(METADATA_VALIDATION)
+                .put("Detached column [index=")
+                .put(columnIndex)
+                .put(", name=")
+                .put(columnName)
+                .put(", attribute=")
+                .put(attribute)
+                .put("] does not match current table metadata");
+    }
+
+    public static CairoException detachedMetadataMismatch(CharSequence attribute) {
+        return critical(METADATA_VALIDATION)
+                .put("Detached partition metadata [")
+                .put(attribute)
+                .put("] is not compatible with current table metadata");
+    }
+
+    public static CairoException duplicateColumn(CharSequence column, CharSequence columnAlias) {
+        CairoException exception = critical(METADATA_VALIDATION).put("duplicate column [name=").put(column);
+        if (columnAlias != null) {
+            exception.put(", alias=").put(columnAlias);
+        }
+        return exception.put(']');
+    }
+
+    public static CairoException duplicateColumn(CharSequence columnName) {
+        return duplicateColumn(columnName, null);
+    }
+
+    @SuppressWarnings("unused")
+    public static CairoException entityIsDisabled(CharSequence entityName) {
+        return authorization().put("entity is disabled [name=").put(entityName).put(']');
+    }
+
+    public static CairoException fileNotFound() {
+        return instance(Os.errno());
+    }
+
+    public static CairoException fileTooSmall(long size, long required) {
+        return critical(FILE_TOO_SMALL).put("File is too small, size=").put(size).put(", required=").put(required);
+    }
+
+    public static CairoException invalidMetadataRecoverable(@NotNull CharSequence msg, @NotNull CharSequence columnName) {
+        return critical(METADATA_VALIDATION_RECOVERABLE).put(msg).put(" [column=").put(columnName).put(']');
+    }
+
+    public static boolean isCairoOomError(Throwable t) {
+        return t instanceof CairoException && ((CairoException) t).isOutOfMemory();
+    }
+
+    public static boolean isDataSyncFailure(Throwable t) {
+        while (t != null) {
+            if (t instanceof CairoException cairoException && cairoException.isDataSyncFailure()) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * Raised when a value cannot be stored because its UTF-8 is malformed. Every such site uses
+     * this factory, so {@link #isMalformedUtf8()} is correct by construction.
+     */
+    public static CairoException malformedUtf8() {
+        return nonCritical().setMalformedUtf8();
+    }
+
+    public static CairoException malformedUtf8(@NotNull Utf8Sequence value) {
+        return malformedUtf8().put("invalid UTF8 in value for ").put(value);
+    }
+
+    public static CairoException matViewDoesNotExist(CharSequence matViewName) {
+        return critical(MAT_VIEW_DOES_NOT_EXIST).put("materialized view does not exist [view=").put(matViewName).put(']');
+    }
+
+    public static CairoException metadataVersionMismatch(Utf8Sequence metaPath, int expectedVersion, int actualVersion) {
+        return critical(METADATA_VERSION_MISMATCH)
+                .put("metadata version does not match runtime version [path=").put(metaPath)
+                .put(", expectedVersion=").put(expectedVersion)
+                .put(", actualVersion=").put(actualVersion)
+                .put(']');
+    }
+
+    public static CairoException nonCritical() {
+        return instance(NON_CRITICAL);
+    }
+
+    public static CairoException partitionManipulationRecoverable() {
+        return instance(PARTITION_MANIPULATION_RECOVERABLE);
+    }
+
+    public static CairoException preferencesOutOfDate(long currentVersion, long expectedVersion) {
+        return nonCritical().setPreferencesOutOfDateError()
+                .put("preferences view is out of date [currentVersion=")
+                .put(currentVersion)
+                .put(", expectedVersion=")
+                .put(expectedVersion)
+                .put(']');
+    }
+
+    public static CairoException queryCancelled(long fd) {
+        CairoException exception = nonCritical()
+                .put("cancelled by user")
+                .setInterruptionReason(SqlExecutionCircuitBreaker.STATE_CANCELLED);
+        if (fd > -1) {
+            exception.put(" [fd=").put(fd).put(']');
+        }
+        return exception;
+    }
+
+    public static CairoException queryCancelled() {
+        return nonCritical()
+                .put("cancelled by user")
+                .setInterruptionReason(SqlExecutionCircuitBreaker.STATE_CANCELLED);
+    }
+
+    public static CairoException queryDisconnected(long fd) {
+        CairoException exception = nonCritical().put("remote disconnected, query aborted");
+        if (fd > -1) {
+            exception.put(" [fd=").put(fd).put(']');
+        }
+        return exception.setInterruptionReason(SqlExecutionCircuitBreaker.STATE_BROKEN_CONNECTION);
+    }
+
+    public static CairoException queryTimedOut(long fd, long runtime, long timeout) {
+        return nonCritical()
+                .put("timeout, query aborted [fd=").put(fd)
+                .put(", runtime=").put(runtime).put("ms")
+                .put(", timeout=").put(timeout).put("ms")
+                .put(']').setInterruptionReason(SqlExecutionCircuitBreaker.STATE_TIMEOUT);
+    }
+
+    public static CairoException queryTimedOut() {
+        return nonCritical()
+                .put("timeout, query aborted")
+                .setInterruptionReason(SqlExecutionCircuitBreaker.STATE_TIMEOUT);
+    }
+
+    /**
+     * A write refused BECAUSE the node is read-only -- statically
+     * ({@code readonly=true} in the server configuration) or dynamically (the
+     * role-derived read-only of an enterprise replica, including a demote in
+     * flight). Carries the authorization flag, the canonical
+     * {@link #READ_ONLY_ACCESS_MESSAGE} and the read-only-refusal marker
+     * ({@link #isReadOnlyAccessRefusal()}) in lockstep, so the refusal's CAUSE
+     * travels with the exception.
+     * <p>
+     * Protocol layers that must tell a transient role-demote refusal apart from
+     * a genuine ACL denial (e.g. the QWP NACK classification) key on the marker.
+     * They must NOT re-read live engine state at catch time -- that races with a
+     * demote revert (the drain-timeout PRIMARY restore can land between the
+     * throw and the catch; nothing fences the propagation) -- and must NOT match
+     * the message text, which is brittle. Every "node is read-only" refusal site
+     * uses this factory so the marker is correct by construction; sites must not
+     * hand-roll {@code authorization().put(READ_ONLY_ACCESS_MESSAGE)}.
+     */
+    public static CairoException readOnlyAccess() {
+        return authorization().setReadOnlyAccessRefusal().put(READ_ONLY_ACCESS_MESSAGE);
+    }
+
+    /**
+     * Rethrows a failure after a best-effort Cairo/SQL resource cleanup has attempted every
+     * close. Unchecked failures retain their identity. The checked branch handles defensive
+     * cases such as a sneaky checked exception escaping a Closeable implementation.
+     */
+    public static void rethrowCleanupFailure(@Nullable Throwable failure) {
+        switch (failure) {
+            case null -> {
+                return;
+            }
+            case RuntimeException runtimeException -> throw runtimeException;
+            case Error error -> throw error;
+            default -> {
+                final CairoException exception = nonCritical().put("resource cleanup failed");
+                exception.initCause(failure);
+                throw exception;
+            }
+        }
+    }
+
+    /**
+     * A non-critical error raised BECAUSE the frame's own content is
+     * fundamentally incompatible with what it names: the wire value's type,
+     * shape or precision does not fit the target column (an unsupported type
+     * coercion, a geohash precision mismatch), or the named target is not a
+     * writable table at all (a view, materialized view or live view, or a
+     * non-WAL table on a WAL-only ingestion path). The
+     * refusal is DETERMINISTIC under byte-identical replay -- the same bytes
+     * produce the same rejection every time -- so protocol layers that must
+     * tell a permanent data error apart from a transient write refusal (the
+     * QWP NACK classification) key on {@link #isSchemaMismatch()} to reject
+     * it terminally instead of retrying. Every such site uses this factory so
+     * the marker is correct by construction; callers must not re-derive the
+     * distinction from message text.
+     */
+    public static CairoException schemaMismatch() {
+        return nonCritical().setSchemaMismatch();
+    }
+
+    public static CairoException sequencerMetadataOpenFailed(TableToken tableToken, int causeErrno, CharSequence causeMessage) {
+        return critical(SEQUENCER_METADATA_OPEN_FAILED)
+                .put("could not open sequencer metadata [table=").put(tableToken)
+                .put(", errno=").put(causeErrno)
+                .put(", error=").put(causeMessage)
+                .put(']');
+    }
+
+    public static CairoException tableDoesNotExist(CharSequence tableName) {
+        return critical(TABLE_DOES_NOT_EXIST).put("table does not exist [table=").put(tableName).put(']');
+    }
+
+    public static CairoException tableDropped(TableToken tableToken) {
+        return critical(TABLE_DROPPED)
+                .put("table is dropped [dirName=").put(tableToken.getDirName())
+                .put(", tableName=").put(tableToken.getTableName())
+                .put(']');
+    }
+
+    public static CairoException tableSuspended(TableToken tableToken) {
+        return critical(TABLE_SUSPENDED)
+                .put("table is suspended [dirName=").put(tableToken.getDirName())
+                .put(", tableName=").put(tableToken.getTableName())
+                .put(']');
+    }
+
+    public static CairoException txnApplyBlockError(TableToken tableToken) {
+        return critical(TXN_BLOCK_APPLY_FAILED)
+                .put("sorting transaction block failed, need to be re-run in 1 by 1 apply mode [dirName=").put(tableToken.getDirName())
+                .put(", tableName=").put(tableToken.getTableName()).put(']');
+    }
+
+    public static CairoException txnLiveAreaTorn() {
+        return critical(TXN_LIVE_AREA_TORN);
+    }
+
+    public static CairoException viewDoesNotExist(CharSequence viewName) {
+        return critical(VIEW_DOES_NOT_EXIST).put("view does not exist [view=").put(viewName).put(']');
     }
 
     public int getErrno() {
@@ -61,34 +440,155 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
         return message;
     }
 
+    public String getDataSyncOperation() {
+        return dataSyncOperation;
+    }
+
+    public int getInterruptionReason() {
+        return interruptionReason;
+    }
+
     @Override
     public String getMessage() {
         return "[" + errno + "] " + message;
     }
 
     @Override
+    public int getPosition() {
+        return messagePosition;
+    }
+
+    @Override
     public StackTraceElement[] getStackTrace() {
         StackTraceElement[] result = EMPTY_STACK_TRACE;
-        // This is to have correct stack trace reported in CI 
+        // This is to have correct stack trace reported in CI
         assert (result = super.getStackTrace()) != null;
         return result;
     }
 
-    public boolean isCacheable() {
-        return cacheable;
+    public boolean isAuthorizationError() {
+        return (flags & FLAG_AUTHORIZATION_ERROR) != 0;
     }
 
-    public CairoException setCacheable(boolean cacheable) {
-        this.cacheable = cacheable;
-        return this;
+    public boolean isBlockApplyError() {
+        return errno == TXN_BLOCK_APPLY_FAILED;
+    }
+
+    public boolean isCacheable() {
+        return (flags & FLAG_CACHEABLE) != 0;
+    }
+
+    public boolean isCancellation() {
+        return (flags & FLAG_CANCELLATION) != 0;
+    }
+
+    public boolean isCritical() {
+        return errno != NON_CRITICAL
+                && errno != PARTITION_MANIPULATION_RECOVERABLE
+                && errno != METADATA_VALIDATION_RECOVERABLE
+                && errno != TABLE_DROPPED
+                && errno != TABLE_SUSPENDED
+                && errno != MAT_VIEW_DOES_NOT_EXIST
+                && errno != VIEW_DOES_NOT_EXIST
+                && errno != TABLE_DOES_NOT_EXIST;
+    }
+
+    public boolean isCvTorn() {
+        return errno == CV_TORN;
+    }
+
+    public boolean isDataSyncFailure() {
+        return (flags & FLAG_DATA_SYNC_FAILURE) != 0;
+    }
+
+    public boolean isFileCannotRead() {
+        return Files.isErrnoFileCannotRead(errno);
+    }
+
+    public boolean isFileTooSmall() {
+        return errno == FILE_TOO_SMALL;
+    }
+
+    public boolean isHousekeeping() {
+        return (flags & FLAG_HOUSEKEEPING) != 0;
     }
 
     public boolean isInterruption() {
-        return interruption;
+        return (flags & FLAG_INTERRUPTION) != 0;
     }
 
-    public CairoException setInterruption(boolean interruption) {
-        this.interruption = interruption;
+    /**
+     * Distinguishes a rejected value from a failing writer, so an ingestion path can drop the
+     * offending value without tearing down its writer.
+     */
+    public boolean isMalformedUtf8() {
+        return (flags & FLAG_MALFORMED_UTF8) != 0;
+    }
+
+    public boolean isMetadataValidation() {
+        return errno == METADATA_VALIDATION
+                || errno == METADATA_VALIDATION_RECOVERABLE
+                || errno == METADATA_VERSION_MISMATCH;
+    }
+
+    public boolean isMetadataVersionMismatch() {
+        return errno == METADATA_VERSION_MISMATCH;
+    }
+
+    public boolean isOutOfMemory() {
+        return (flags & FLAG_OUT_OF_MEMORY) != 0;
+    }
+
+    public boolean isPreferencesOutOfDateError() {
+        return (flags & FLAG_PREFERENCES_OUT_OF_DATE_ERROR) != 0;
+    }
+
+    /**
+     * Whether this refusal was raised BECAUSE the node is read-only (set only by
+     * {@link #readOnlyAccess()}). Implies {@link #isAuthorizationError()}. False
+     * for genuine ACL denials.
+     */
+    public boolean isReadOnlyAccessRefusal() {
+        return (flags & FLAG_READ_ONLY_ACCESS_REFUSAL) != 0;
+    }
+
+    /**
+     * Whether this refusal is a deterministic wire-value/column-type mismatch,
+     * or names a target that is not a writable table (set only by
+     * {@link #schemaMismatch()}). Implies the error is non-critical and
+     * permanent -- replay of the same bytes cannot succeed.
+     */
+    public boolean isSchemaMismatch() {
+        return (flags & FLAG_SCHEMA_MISMATCH) != 0;
+    }
+
+    public boolean isSequencerMetadataOpenFailed() {
+        return errno == SEQUENCER_METADATA_OPEN_FAILED;
+    }
+
+    public boolean isTableDoesNotExist() {
+        return errno == TABLE_DOES_NOT_EXIST;
+    }
+
+    public boolean isTableDropped() {
+        return errno == TABLE_DROPPED;
+    }
+
+    public boolean isTableSuspended() {
+        return errno == TABLE_SUSPENDED;
+    }
+
+    public boolean isTxnLiveAreaTorn() {
+        return errno == TXN_LIVE_AREA_TORN;
+    }
+
+    // logged and skipped by WAL applying code
+    public boolean isWALTolerable() {
+        return errno == PARTITION_MANIPULATION_RECOVERABLE || errno == METADATA_VALIDATION_RECOVERABLE;
+    }
+
+    public CairoException position(int position) {
+        this.messagePosition = position;
         return this;
     }
 
@@ -97,8 +597,23 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
         return this;
     }
 
-    public CairoException put(CharSequence cs) {
+    public CairoException put(double value) {
+        message.put(value);
+        return this;
+    }
+
+    public CairoException put(@Nullable CharSequence cs) {
         message.put(cs);
+        return this;
+    }
+
+    public CairoException put(@Nullable Utf8Sequence us) {
+        message.put(us);
+        return this;
+    }
+
+    public CairoException put(Sinkable sinkable) {
+        sinkable.toSink(message);
         return this;
     }
 
@@ -107,8 +622,165 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
         return this;
     }
 
+    public CairoException put(boolean value) {
+        message.put(value);
+        return this;
+    }
+
+    public CairoException putAsPrintable(CharSequence nonPrintable) {
+        message.putAsPrintable(nonPrintable);
+        return this;
+    }
+
+    public CairoException setCacheable(boolean cacheable) {
+        setFlag(FLAG_CACHEABLE, cacheable);
+        return this;
+    }
+
+    public CairoException setCancellation(boolean cancellation) {
+        setFlag(FLAG_CANCELLATION, cancellation);
+        if (cancellation) {
+            interruptionReason = SqlExecutionCircuitBreaker.STATE_CANCELLED;
+        } else if (interruptionReason == SqlExecutionCircuitBreaker.STATE_CANCELLED) {
+            interruptionReason = isInterruption()
+                    ? SqlExecutionCircuitBreaker.STATE_TIMEOUT
+                    : SqlExecutionCircuitBreaker.STATE_OK;
+        }
+        return this;
+    }
+
+    public void setHousekeeping(boolean housekeeping) {
+        setFlag(FLAG_HOUSEKEEPING, housekeeping);
+    }
+
+    public CairoException setInterruption(boolean interruption) {
+        setFlag(FLAG_INTERRUPTION, interruption);
+        if (interruption) {
+            if (!isCancellation() && interruptionReason == SqlExecutionCircuitBreaker.STATE_OK) {
+                interruptionReason = SqlExecutionCircuitBreaker.STATE_TIMEOUT;
+            }
+        } else if (!isCancellation()) {
+            interruptionReason = SqlExecutionCircuitBreaker.STATE_OK;
+        }
+        return this;
+    }
+
+    public CairoException setInterruptionReason(int interruptionReason) {
+        switch (interruptionReason) {
+            case SqlExecutionCircuitBreaker.STATE_OK -> {
+                setFlag(FLAG_CANCELLATION, false);
+                setFlag(FLAG_INTERRUPTION, false);
+            }
+            case SqlExecutionCircuitBreaker.STATE_TIMEOUT, SqlExecutionCircuitBreaker.STATE_BROKEN_CONNECTION -> {
+                setFlag(FLAG_CANCELLATION, false);
+                setFlag(FLAG_INTERRUPTION, true);
+            }
+            case SqlExecutionCircuitBreaker.STATE_CANCELLED -> {
+                setFlag(FLAG_CANCELLATION, true);
+                setFlag(FLAG_INTERRUPTION, true);
+            }
+            default -> throw new IllegalArgumentException(
+                    "invalid interruption reason [reason=" + interruptionReason + ']'
+            );
+        }
+        this.interruptionReason = interruptionReason;
+        return this;
+    }
+
+    public CairoException setOutOfMemory(boolean outOfMemory) {
+        setFlag(FLAG_OUT_OF_MEMORY, outOfMemory);
+        return this;
+    }
+
+    public boolean tableDoesNotExist() {
+        return errno == TABLE_DOES_NOT_EXIST;
+    }
+
     @Override
-    public void toSink(CharSink sink) {
-        sink.put('[').put(errno).put("]: ").put(message);
+    public void toSink(@NotNull CharSink<?> sink) {
+        sink.putAscii('[').put(errno).putAscii("]: ").put(message);
+    }
+
+    public CairoException ts(int timestampType, long timestamp) {
+        ColumnType.getTimestampDriver(timestampType).append(message, timestamp);
+        return this;
+    }
+
+    public CairoException ts(TimestampDriver driver, long timestamp) {
+        driver.append(message, timestamp);
+        return this;
+    }
+
+    private static CairoException instance(int errno) {
+        // With continuations there is a possibility that multiple
+        // threads use the same instance with thread local / carrier local.
+        // Abolish ThreadLocal exception idea
+        CairoException ex = new CairoException();
+        ex.clear(errno);
+        return ex;
+    }
+
+    // N.B.: Change the API with care! This method is called from native code via JNI.
+    // See `struct CairoException` in the `qdb-core` Rust crate.
+    @SuppressWarnings("unused")
+    private static CairoException paramInstance(
+            int errno, // pass `NON_CRITICAL` (-1) to create a non-critical exception
+            boolean outOfMemory,
+            CharSequence message,
+            @Nullable CharSequence nativeBacktrace
+    ) {
+        CairoException ex = instance(errno)
+                .setOutOfMemory(outOfMemory)
+                .put(message);
+        ex.nativeBacktrace.put(nativeBacktrace);
+        return ex;
+    }
+
+    private CairoException setAuthorizationError() {
+        this.flags |= FLAG_AUTHORIZATION_ERROR;
+        return this;
+    }
+
+    private void setFlag(int flag, boolean value) {
+        if (value) {
+            this.flags |= flag;
+        } else {
+            this.flags &= ~flag;
+        }
+    }
+
+    private CairoException setMalformedUtf8() {
+        this.flags |= FLAG_MALFORMED_UTF8;
+        return this;
+    }
+
+    private CairoException setPreferencesOutOfDateError() {
+        this.flags |= FLAG_PREFERENCES_OUT_OF_DATE_ERROR;
+        return this;
+    }
+
+    private CairoException setReadOnlyAccessRefusal() {
+        this.flags |= FLAG_READ_ONLY_ACCESS_REFUSAL;
+        return this;
+    }
+
+    private CairoException setSchemaMismatch() {
+        this.flags |= FLAG_SCHEMA_MISMATCH;
+        return this;
+    }
+
+    protected void clear(int errno) {
+        message.clear();
+        nativeBacktrace.clear();
+        this.errno = errno;
+        // clear() fully resets state so the instance starts from a clean slate. The base
+        // CairoException.instance() allocates a fresh object every call, so for it these resets
+        // are belt-and-suspenders. They are load-bearing for subclasses that still recycle a pooled
+        // flyweight through this method (e.g. LineProtocolException via ThreadLocal): without a full
+        // reset a stale flag would leak onto the next exception built on the same flyweight.
+        dataSyncOperation = null;
+        flags = 0;
+        interruptionReason = SqlExecutionCircuitBreaker.STATE_OK;
+        messagePosition = 0;
     }
 }

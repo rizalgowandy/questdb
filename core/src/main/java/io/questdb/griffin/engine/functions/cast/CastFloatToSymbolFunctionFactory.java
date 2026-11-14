@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,36 +34,49 @@ import io.questdb.griffin.engine.functions.constants.SymbolConstant;
 import io.questdb.std.Chars;
 import io.questdb.std.IntList;
 import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 import io.questdb.std.str.StringSink;
 
 public class CastFloatToSymbolFunctionFactory implements FunctionFactory {
+    // floatToIntBits(-0.0f) == INT_NULL, so the default sentinel would make every -0.0f
+    // row collide with the empty slot. floatToIntBits canonicalises NaN to 0x7FC00000,
+    // so 0x7FC00001 is a key it can never produce.
+    private static final int NO_KEY_SENTINEL = 0x7FC00001;
+
     @Override
     public String getSignature() {
         return "cast(Fk)";
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
+    public Function newInstance(
+            int position,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
         final Function arg = args.getQuick(0);
         if (arg.isConstant()) {
-            final StringSink sink = Misc.getThreadLocalBuilder();
-            sink.put(arg.getFloat(null), 4);
+            final StringSink sink = Misc.getThreadLocalSink();
+            sink.put(arg.getFloat(null));
             return SymbolConstant.newInstance(sink);
         }
         return new Func(arg);
     }
 
-    private static class Func extends AbstractToSymbolCastFunction {
+    private static class Func extends AbstractCastToSymbolFunction {
 
         public Func(Function arg) {
-            super(arg);
+            super(arg, NO_KEY_SENTINEL);
         }
 
         @Override
         public int getInt(Record rec) {
             final float value = arg.getFloat(rec);
-            if (Float.isNaN(value)) {
+            if (Numbers.isNull(value)) {
                 return SymbolTable.VALUE_IS_NULL;
             }
             final int key = Float.floatToIntBits(value);
@@ -73,27 +86,18 @@ public class CastFloatToSymbolFunctionFactory implements FunctionFactory {
         @Override
         public CharSequence getSymbol(Record rec) {
             final float value = arg.getFloat(rec);
-            if (Float.isNaN(value)) {
+            if (Numbers.isNull(value)) {
                 return null;
             }
-
-            final int key = Float.floatToIntBits(value);
-            final int keyIndex = symbolTableShortcut.keyIndex(key);
-            if (keyIndex < 0) {
-                return symbols.getQuick(symbolTableShortcut.valueAt(keyIndex));
-            }
-
-            symbolTableShortcut.putAt(keyIndex, key, next++);
-            sink.clear();
-            sink.put(value, 4);
-            final String str = Chars.toString(sink);
-            symbols.add(Chars.toString(sink));
-            return str;
+            return getSymbol0(Float.floatToIntBits(value));
         }
 
         @Override
-        protected AbstractToSymbolCastFunction newFunc() {
-            return new Func(arg);
+        protected String symbolOf(int key) {
+            // The shortcut keys on the raw bits, so render the float they encode.
+            sink.clear();
+            sink.put(Float.intBitsToFloat(key));
+            return Chars.toString(sink);
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.StrFunction;
@@ -36,7 +37,6 @@ import io.questdb.std.BinarySequence;
 import io.questdb.std.Chars;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
-import io.questdb.std.str.CharSink;
 import io.questdb.std.str.StringSink;
 
 public class Base64FunctionFactory implements FunctionFactory {
@@ -64,11 +64,10 @@ public class Base64FunctionFactory implements FunctionFactory {
     }
 
     private static class Base64Func extends StrFunction implements UnaryFunction {
-        private final StringSink sinkA = new StringSink();
-        private final StringSink sinkB = new StringSink();
-
         private final Function data;
         private final int maxLength;
+        private final StringSink sinkA = new StringSink();
+        private final StringSink sinkB = new StringSink();
 
         public Base64Func(final Function data, final int maxLength) {
             this.data = data;
@@ -81,8 +80,11 @@ public class Base64FunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public CharSequence getStr(final Record rec) {
+        public CharSequence getStrA(final Record rec) {
             final BinarySequence sequence = getArg().getBin(rec);
+            if (sequence == null) {
+                return null;
+            }
             sinkA.clear();
             Chars.base64Encode(sequence, this.maxLength, sinkA);
             return sinkA;
@@ -91,15 +93,22 @@ public class Base64FunctionFactory implements FunctionFactory {
         @Override
         public CharSequence getStrB(final Record rec) {
             final BinarySequence sequence = getArg().getBin(rec);
+            if (sequence == null) {
+                return null;
+            }
             sinkB.clear();
             Chars.base64Encode(sequence, this.maxLength, sinkB);
             return sinkB;
         }
 
         @Override
-        public void getStr(Record rec, CharSink sink) {
-            final BinarySequence sequence = getArg().getBin(rec);
-            Chars.base64Encode(sequence, this.maxLength, sink);
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("base64(").val(data).val(',').val(maxLength).val(')');
         }
     }
 }

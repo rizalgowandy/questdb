@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,13 +25,22 @@
 package io.questdb.griffin.engine.functions;
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.cairo.sql.ScalarFunction;
 import io.questdb.std.BinarySequence;
-import io.questdb.std.str.CharSink;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
 
-public abstract class Long256Function implements ScalarFunction {
+public abstract class Long256Function implements Function {
+    @Override
+    public ArrayView getArray(Record rec) {
+        throw new UnsupportedOperationException();
+    }
 
     @Override
     public final BinarySequence getBin(Record rec) {
@@ -64,6 +73,36 @@ public abstract class Long256Function implements ScalarFunction {
     }
 
     @Override
+    public final void getDecimal128(Record rec, Decimal128 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final short getDecimal16(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final void getDecimal256(Record rec, Decimal256 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final int getDecimal32(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final long getDecimal64(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final byte getDecimal8(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public final double getDouble(Record rec) {
         throw new UnsupportedOperationException();
     }
@@ -74,13 +113,53 @@ public abstract class Long256Function implements ScalarFunction {
     }
 
     @Override
+    public byte getGeoByte(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int getGeoInt(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long getGeoLong(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public short getGeoShort(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final int getIPv4(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public final int getInt(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public @NotNull Interval getInterval(Record rec) {
         throw new UnsupportedOperationException();
     }
 
     @Override
     public final long getLong(Record rec) {
         return getLong256A(rec).getLong0();
+    }
+
+    @Override
+    public long getLong128Hi(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public long getLong128Lo(Record rec) {
+        throw new UnsupportedOperationException();
     }
 
     @Override
@@ -94,12 +173,7 @@ public abstract class Long256Function implements ScalarFunction {
     }
 
     @Override
-    public final CharSequence getStr(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public final void getStr(Record rec, CharSink sink) {
+    public final CharSequence getStrA(Record rec) {
         throw new UnsupportedOperationException();
     }
 
@@ -128,34 +202,23 @@ public abstract class Long256Function implements ScalarFunction {
         throw new UnsupportedOperationException();
     }
 
-
-    @Override
-    public byte getGeoByte(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public short getGeoShort(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public int getGeoInt(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public long getGeoLong(Record rec) {
-        throw new UnsupportedOperationException();
-    }
-
     @Override
     public final int getType() {
         return ColumnType.LONG256;
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return false;
+    public Utf8Sequence getVarcharA(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Utf8Sequence getVarcharB(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final int getVarcharSize(Record rec) {
+        throw new UnsupportedOperationException();
     }
 }

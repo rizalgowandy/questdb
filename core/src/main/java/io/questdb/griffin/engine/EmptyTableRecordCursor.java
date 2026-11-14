@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,14 @@
 
 package io.questdb.griffin.engine;
 
+import io.questdb.cairo.EmptySymbolMapReader;
 import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.VirtualRecordNoRowid;
 import io.questdb.std.ObjList;
 
-final public class EmptyTableRecordCursor implements NoRandomAccessRecordCursor {
+public final class EmptyTableRecordCursor implements NoRandomAccessRecordCursor {
     public static final EmptyTableRecordCursor INSTANCE = new EmptyTableRecordCursor();
 
     private final Record record = new VirtualRecordNoRowid(new ObjList<>());
@@ -44,16 +46,31 @@ final public class EmptyTableRecordCursor implements NoRandomAccessRecordCursor 
     }
 
     @Override
+    public SymbolTable getSymbolTable(int columnIndex) {
+        return EmptySymbolMapReader.INSTANCE;
+    }
+
+    @Override
     public boolean hasNext() {
         return false;
     }
 
     @Override
-    public void toTop() {
+    public SymbolTable newSymbolTable(int columnIndex) {
+        return EmptySymbolMapReader.INSTANCE;
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return 0;
     }
 
     @Override
     public long size() {
         return 0;
+    }
+
+    @Override
+    public void toTop() {
     }
 }

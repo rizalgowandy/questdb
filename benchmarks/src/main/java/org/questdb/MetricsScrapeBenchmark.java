@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +24,23 @@
 
 package org.questdb;
 
-import io.questdb.metrics.*;
-import io.questdb.std.Sinkable;
-import io.questdb.std.str.CharSink;
-import org.openjdk.jmh.annotations.*;
+import io.questdb.metrics.Counter;
+import io.questdb.metrics.LongGauge;
+import io.questdb.metrics.MetricsRegistry;
+import io.questdb.metrics.MetricsRegistryImpl;
+import io.questdb.std.bytes.NativeByteSink;
+import io.questdb.std.str.BorrowableUtf8Sink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8Sink;
+import org.jetbrains.annotations.NotNull;
+import org.openjdk.jmh.annotations.Benchmark;
+import org.openjdk.jmh.annotations.BenchmarkMode;
+import org.openjdk.jmh.annotations.Group;
+import org.openjdk.jmh.annotations.GroupThreads;
+import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.annotations.OutputTimeUnit;
+import org.openjdk.jmh.annotations.Scope;
+import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
@@ -42,8 +55,8 @@ public class MetricsScrapeBenchmark {
 
     private static final MetricsRegistry metricsRegistry = new MetricsRegistryImpl();
     private static final Counter counter = metricsRegistry.newCounter("counter");
-    private static final Gauge gauge = metricsRegistry.newGauge("gauge");
-    private static final CharSink sink = new NullCharSink();
+    private static final LongGauge gauge = metricsRegistry.newLongGauge("gauge");
+    private static final NullUtf8Sink sink = new NullUtf8Sink();
 
     public static void main(String[] args) throws RunnerException {
         Options opt = new OptionsBuilder()
@@ -55,13 +68,6 @@ public class MetricsScrapeBenchmark {
                 .build();
 
         new Runner(opt).run();
-    }
-
-    @Benchmark
-    @Group
-    @GroupThreads()
-    public void testScrape() {
-        metricsRegistry.scrapeIntoPrometheus(sink);
     }
 
     @Benchmark
@@ -78,106 +84,52 @@ public class MetricsScrapeBenchmark {
         gauge.inc();
     }
 
-    private static class NullCharSink implements CharSink {
+    @Benchmark
+    @Group
+    @GroupThreads()
+    public void testScrape() {
+        metricsRegistry.scrapeIntoPrometheus(sink);
+    }
+
+    private static class NullUtf8Sink implements BorrowableUtf8Sink {
+        private int[] ryuE10;
 
         @Override
-        public CharSink encodeUtf8(CharSequence cs) {
+        public @NotNull NativeByteSink borrowDirectByteSink() {
+            return new NativeByteSink() {
+                @Override
+                public void close() {
+
+                }
+
+                @Override
+                public long ptr() {
+                    return 0;
+                }
+            };
+        }
+
+        @Override
+        public Utf8Sink put(Utf8Sequence us) {
             return this;
         }
 
         @Override
-        public CharSink encodeUtf8(CharSequence cs, int lo, int hi) {
+        public Utf8Sink put(byte b) {
             return this;
         }
 
         @Override
-        public CharSink encodeUtf8AndQuote(CharSequence cs) {
+        public Utf8Sink putNonAscii(long lo, long hi) {
             return this;
         }
 
         @Override
-        public char[] getDoubleDigitsBuffer() {
-            return new char[0];
-        }
-
-        @Override
-        public CharSink put(char c) {
-            return this;
-        }
-
-        @Override
-        public CharSink putUtf8(char c) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(int value) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(long value) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(float value, int scale) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(double value) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(double value, int scale) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(boolean value) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(Throwable e) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(Sinkable sinkable) {
-            return this;
-        }
-
-        @Override
-        public CharSink putISODate(long value) {
-            return this;
-        }
-
-        @Override
-        public CharSink putISODateMillis(long value) {
-            return this;
-        }
-
-        @Override
-        public CharSink putQuoted(CharSequence cs) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(char[] chars, int start, int len) {
-            return this;
-        }
-
-        @Override
-        public CharSink put(CharSequence cs) {
-            return this;
-        }
-
-        @Override
-        public int encodeSurrogate(char c, CharSequence in, int pos, int hi) {
-            return 0;
+        public int[] ryuScratch() {
+            if (ryuE10 == null) {
+                ryuE10 = new int[1];
+            }
+            return ryuE10;
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,36 +27,48 @@ package io.questdb.cutlass.text.types;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cutlass.text.TextConfiguration;
+import io.questdb.std.Decimal256;
 import io.questdb.std.IntList;
 import io.questdb.std.Mutable;
 import io.questdb.std.ObjList;
 import io.questdb.std.ObjectPool;
 import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.DateLocale;
-import io.questdb.std.str.DirectCharSink;
+import io.questdb.std.datetime.microtime.MicrosFormatFactory;
+import io.questdb.std.datetime.nanotime.NanosFormatFactory;
+import io.questdb.std.str.DirectUtf16Sink;
+import io.questdb.std.str.DirectUtf8Sink;
 
 public class TypeManager implements Mutable {
-    private final ObjList<TypeAdapter> probes = new ObjList<>();
-    private final int probeCount;
-    private final StringAdapter stringAdapter;
-    private final SymbolAdapter indexedSymbolAdapter;
-    private final SymbolAdapter notIndexedSymbolAdapter;
     private final ObjectPool<DateUtf8Adapter> dateAdapterPool;
-    private final ObjectPool<TimestampUtf8Adapter> timestampUtf8AdapterPool;
-    private final ObjectPool<TimestampAdapter> timestampAdapterPool;
+    private final ObjectPool<DecimalAdapter> decimalAdapterPool;
+    private final DecimalAdapter defaultDecimalAdapter;
+    private final SymbolAdapter indexedSymbolAdapter;
     private final InputFormatConfiguration inputFormatConfiguration;
+    private final SymbolAdapter notIndexedSymbolAdapter;
+    private final int probeCount;
+    private final ObjList<TypeAdapter> probes = new ObjList<>();
+    private final StringAdapter stringAdapter;
+    private final ObjectPool<TimestampAdapter> timestampAdapterPool;
+    private final ObjectPool<TimestampUtf8Adapter> timestampUtf8AdapterPool;
+    private final VarcharAdapter varcharAdapter;
 
     public TypeManager(
             TextConfiguration configuration,
-            DirectCharSink utf8Sink
+            DirectUtf16Sink utf16Sink,
+            DirectUtf8Sink utf8Sink,
+            Decimal256 decimal256
     ) {
-        this.dateAdapterPool = new ObjectPool<>(() -> new DateUtf8Adapter(utf8Sink), configuration.getDateAdapterPoolCapacity());
-        this.timestampUtf8AdapterPool = new ObjectPool<>(() -> new TimestampUtf8Adapter(utf8Sink), configuration.getTimestampAdapterPoolCapacity());
+        this.dateAdapterPool = new ObjectPool<>(() -> new DateUtf8Adapter(utf16Sink), configuration.getDateAdapterPoolCapacity());
+        this.timestampUtf8AdapterPool = new ObjectPool<>(() -> new TimestampUtf8Adapter(utf16Sink), configuration.getTimestampAdapterPoolCapacity());
         this.timestampAdapterPool = new ObjectPool<>(TimestampAdapter::new, configuration.getTimestampAdapterPoolCapacity());
+        this.decimalAdapterPool = new ObjectPool<>(() -> new DecimalAdapter(decimal256), configuration.getDecimalAdapterPoolCapacity());
         this.inputFormatConfiguration = configuration.getInputFormatConfiguration();
-        this.stringAdapter = new StringAdapter(utf8Sink);
-        this.indexedSymbolAdapter = new SymbolAdapter(utf8Sink, true);
-        this.notIndexedSymbolAdapter = new SymbolAdapter(utf8Sink, false);
+        this.stringAdapter = new StringAdapter(utf16Sink);
+        this.varcharAdapter = new VarcharAdapter(utf8Sink);
+        this.indexedSymbolAdapter = new SymbolAdapter(utf16Sink, true);
+        this.notIndexedSymbolAdapter = new SymbolAdapter(utf16Sink, false);
+        this.defaultDecimalAdapter = new DecimalAdapter(decimal256).of(ColumnType.DECIMAL_DEFAULT_TYPE);
         addDefaultProbes();
 
         final ObjList<DateFormat> dateFormats = inputFormatConfiguration.getDateFormats();
@@ -64,23 +76,37 @@ public class TypeManager implements Mutable {
         final IntList dateUtf8Flags = inputFormatConfiguration.getDateUtf8Flags();
         for (int i = 0, n = dateFormats.size(); i < n; i++) {
             if (dateUtf8Flags.getQuick(i) == 1) {
-                probes.add(new DateUtf8Adapter(utf8Sink).of(dateFormats.getQuick(i), dateLocales.getQuick(i)));
+                probes.add(new DateUtf8Adapter(utf16Sink).of(dateFormats.getQuick(i), dateLocales.getQuick(i)));
             } else {
                 probes.add(new DateAdapter().of(dateFormats.getQuick(i), dateLocales.getQuick(i)));
             }
         }
 
         final ObjList<DateFormat> timestampFormats = inputFormatConfiguration.getTimestampFormats();
+        final ObjList<String> timestampPatterns = inputFormatConfiguration.getTimestampPatterns();
         final ObjList<DateLocale> timestampLocales = inputFormatConfiguration.getTimestampLocales();
         final IntList timestampUtf8Flags = inputFormatConfiguration.getTimestampUtf8Flags();
         for (int i = 0, n = timestampFormats.size(); i < n; i++) {
             if (timestampUtf8Flags.getQuick(i) == 1) {
-                probes.add(new TimestampUtf8Adapter(utf8Sink).of(timestampFormats.getQuick(i), timestampLocales.getQuick(i)));
+                probes.add(new TimestampUtf8Adapter(utf16Sink).of(timestampFormats.getQuick(i), timestampLocales.getQuick(i), timestampPatterns.getQuick(i)));
             } else {
-                probes.add(new TimestampAdapter().of(timestampFormats.getQuick(i), timestampLocales.getQuick(i)));
+                probes.add(new TimestampAdapter().of(timestampFormats.getQuick(i), timestampLocales.getQuick(i), timestampPatterns.getQuick(i)));
             }
         }
         this.probeCount = probes.size();
+    }
+
+    /**
+     * Adaptively selects the appropriate timestamp format factory based on the precision
+     * requirements detected in the input pattern.
+     */
+    public static DateFormat adaptiveGetTimestampFormat(CharSequence pattern) {
+        boolean requiresNanoseconds = requiresNanosecondPrecision(pattern);
+        if (requiresNanoseconds) {
+            return NanosFormatFactory.INSTANCE.get(pattern);
+        } else {
+            return MicrosFormatFactory.INSTANCE.get(pattern);
+        }
     }
 
     @Override
@@ -88,6 +114,11 @@ public class TypeManager implements Mutable {
         dateAdapterPool.clear();
         timestampUtf8AdapterPool.clear();
         timestampAdapterPool.clear();
+        decimalAdapterPool.clear();
+    }
+
+    public ObjList<TypeAdapter> getAllAdapters() {
+        return probes;
     }
 
     public InputFormatConfiguration getInputFormatConfiguration() {
@@ -126,6 +157,12 @@ public class TypeManager implements Mutable {
                 return nextSymbolAdapter(false);
             case ColumnType.LONG256:
                 return Long256Adapter.INSTANCE;
+            case ColumnType.UUID:
+                return UuidAdapter.INSTANCE;
+            case ColumnType.IPv4:
+                return IPv4Adapter.INSTANCE;
+            case ColumnType.VARCHAR:
+                return varcharAdapter;
             case ColumnType.GEOBYTE:
             case ColumnType.GEOSHORT:
             case ColumnType.GEOINT:
@@ -135,7 +172,11 @@ public class TypeManager implements Mutable {
                     return adapter;
                 }
             default:
-                throw CairoException.instance(0).put("no adapter for type [id=").put(columnType).put(", name=").put(ColumnType.nameOf(columnType)).put(']');
+                // the bare DECIMAL tag is a surrogate, it has no storage size
+                if (ColumnType.isDecimalType(ColumnType.tagOf(columnType))) {
+                    return nextDecimalAdapter(columnType);
+                }
+                throw CairoException.nonCritical().put("no adapter for type [id=").put(columnType).put(", name=").put(ColumnType.nameOf(columnType)).put(']');
         }
     }
 
@@ -143,20 +184,57 @@ public class TypeManager implements Mutable {
         return dateAdapterPool.next();
     }
 
-    public TypeAdapter nextTimestampAdapter(boolean decodeUtf8, DateFormat format, DateLocale locale) {
-        if (decodeUtf8) {
-            TimestampUtf8Adapter adapter = timestampUtf8AdapterPool.next();
-            adapter.of(format, locale);
-            return adapter;
-        }
-
-        TimestampAdapter adapter = timestampAdapterPool.next();
-        adapter.of(format, locale);
+    public DecimalAdapter nextDecimalAdapter(int columnType) {
+        DecimalAdapter adapter = decimalAdapterPool.next();
+        adapter.of(columnType);
         return adapter;
     }
 
     public TypeAdapter nextSymbolAdapter(boolean indexed) {
         return indexed ? indexedSymbolAdapter : notIndexedSymbolAdapter;
+    }
+
+    public TypeAdapter nextTimestampAdapter(boolean decodeUtf8, DateFormat format, DateLocale locale, String pattern) {
+        if (decodeUtf8) {
+            TimestampUtf8Adapter adapter = timestampUtf8AdapterPool.next();
+            adapter.of(format, locale, pattern);
+            return adapter;
+        }
+
+        TimestampAdapter adapter = timestampAdapterPool.next();
+        adapter.of(format, locale, pattern);
+        return adapter;
+    }
+
+    private static boolean requiresNanosecondPrecision(CharSequence pattern) {
+        if (pattern == null) {
+            return false;
+        }
+
+        for (int i = 0, n = pattern.length(); i < n; i++) {
+            char c = pattern.charAt(i);
+
+            if (c == 'N') {
+                // N+
+                if (i + 1 < n && pattern.charAt(i + 1) == '+') {
+                    return true;
+                }
+
+                int nCount = 1;
+                while (i + nCount < n && pattern.charAt(i + nCount) == 'N') {
+                    nCount++;
+                }
+
+                // Only N and NNN are valid nanos patterns
+                if (nCount == 1 || nCount == 3) {
+                    return true;
+                }
+
+                i += nCount - 1;
+            }
+        }
+
+        return false;
     }
 
     private void addDefaultProbes() {
@@ -166,9 +244,9 @@ public class TypeManager implements Mutable {
         probes.add(getTypeAdapter(ColumnType.DOUBLE));
         probes.add(getTypeAdapter(ColumnType.BOOLEAN));
         probes.add(getTypeAdapter(ColumnType.LONG256));
-    }
-
-    ObjList<TypeAdapter> getAllAdapters() {
-        return probes;
+        probes.add(getTypeAdapter(ColumnType.UUID));
+        probes.add(getTypeAdapter(ColumnType.IPv4));
+        // probes double as write adapters, so this one cannot be shared between type managers
+        probes.add(defaultDecimalAdapter);
     }
 }

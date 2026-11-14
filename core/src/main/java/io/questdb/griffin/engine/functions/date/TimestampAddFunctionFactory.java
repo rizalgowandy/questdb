@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,24 +25,51 @@
 package io.questdb.griffin.engine.functions.date;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BinaryFunction;
+import io.questdb.griffin.engine.functions.MonotonicTimestampFunction;
 import io.questdb.griffin.engine.functions.TernaryFunction;
 import io.questdb.griffin.engine.functions.TimestampFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
-import io.questdb.griffin.engine.functions.constants.TimestampConstant;
 import io.questdb.std.IntList;
+import io.questdb.std.Interval;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
-import io.questdb.std.datetime.microtime.Timestamps;
+import io.questdb.std.datetime.CommonUtils;
 
+/**
+ * Factory for the dateadd function: dateadd(char period, int stride, timestamp).
+ *
+ * <p><b>IMPORTANT - Optimizer Integration:</b></p>
+ * <p>The SqlOptimiser intrinsically understands this function and pushes timestamp predicates
+ * through it when the timestamp column is wrapped in dateadd. For example:</p>
+ * <pre>
+ *   SELECT * FROM (SELECT dateadd('h', -1, timestamp) as ts FROM t) WHERE ts > '2022-01-01'
+ * </pre>
+ * <p>The optimizer detects the dateadd pattern and pushes the predicate down with an offset
+ * adjustment, enabling efficient interval scans on the underlying table.</p>
+ *
+ * <p><b>If this function's signature changes, the optimizer must be updated accordingly.</b></p>
+ * <p>Specifically, the following components depend on this function's signature:</p>
+ * <ul>
+ *   <li>{@code SqlOptimiser.detectTimestampOffset()} - extracts offset info from dateadd</li>
+ *   <li>{@code SqlOptimiser.isDateaddTimestampExpression()} - pattern matching</li>
+ *   <li>{@code QueryModel.timestampOffsetValue} - stores the stride as int</li>
+ *   <li>{@code WhereClauseParser.analyzeAndOffset()} - applies offset during interval extraction</li>
+ * </ul>
+ *
+ * @see io.questdb.griffin.SqlOptimiser
+ * @see io.questdb.griffin.model.QueryModel
+ */
 public class TimestampAddFunctionFactory implements FunctionFactory {
-
-    private static final ObjList<LongAddIntFunction> addFunctions = new ObjList<>();
-    private static final int addFunctionsMax;
 
     @Override
     public String getSignature() {
@@ -50,138 +77,207 @@ public class TimestampAddFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
+    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
+        Function periodFunc = args.getQuick(0);
+        Function strideFunc = args.getQuick(1);
+        Function timestampFunc = args.getQuick(2);
+        int stride;
+        int timestampType = ColumnType.getHigherPrecisionTimestampType(ColumnType.getTimestampType(timestampFunc.getType()), ColumnType.TIMESTAMP_MICRO);
 
-        Function period = args.getQuick(0);
-        Function interval = args.getQuick(1);
-        if (period.isConstant()) {
-            char periodValue = period.getChar(null);
-            if (periodValue < addFunctionsMax) {
-                LongAddIntFunction func = addFunctions.getQuick(periodValue);
-                if (func != null) {
-                    if (interval.isConstant()) {
-                        if (interval.getInt(null) != Numbers.INT_NaN) {
-                            return new AddLongIntVarConstFunction(args.getQuick(2), interval.getInt(null), func);
-                        }
-                        return TimestampConstant.NULL;
-                    }
-                    return new AddLongIntVarVarFunction(args.getQuick(2), args.getQuick(1), func);
+        if (periodFunc.isConstant()) {
+            char period = periodFunc.getChar(null);
+            TimestampDriver.TimestampAddMethod periodAddFunc = ColumnType.getTimestampDriver(timestampType).getAddMethod(period);
+            if (periodAddFunc == null) {
+                throw SqlException.$(argPositions.getQuick(0), "invalid time period [unit=").put(period).put(']');
+            }
+
+            if (strideFunc.isConstant()) {
+                if ((stride = strideFunc.getInt(null)) != Numbers.INT_NULL) {
+                    return new TimestampAddConstConstVar(period, periodAddFunc, stride, timestampFunc, timestampType);
+                } else {
+                    throw SqlException.$(argPositions.getQuick(1), "`null` is not a valid stride");
                 }
             }
-            return TimestampConstant.NULL;
+            return new TimestampAddConstVarVar(period, periodAddFunc, strideFunc, timestampFunc, timestampType);
         }
-        return new DateAddFunc(args.getQuick(2), args.getQuick(0), args.getQuick(1));
+        return new TimestampAddFunc(periodFunc, strideFunc, argPositions.getQuick(1), timestampFunc, timestampType);
     }
 
-    @FunctionalInterface
-    private interface LongAddIntFunction {
-        long add(long a, int b);
-    }
+    private static class TimestampAddConstConstVar extends TimestampFunction implements UnaryFunction, MonotonicTimestampFunction {
+        private final char period;
+        private final TimestampDriver.TimestampAddMethod periodAddFunction;
+        private final int stride;
+        private final Function timestampFunc;
 
-    private static class AddLongIntVarVarFunction extends TimestampFunction implements BinaryFunction {
-        private final Function left;
-        private final Function right;
-        private final LongAddIntFunction func;
-
-        public AddLongIntVarVarFunction(Function left, Function right, LongAddIntFunction func) {
-            this.left = left;
-            this.right = right;
-            this.func = func;
-        }
-
-        @Override
-        public Function getLeft() {
-            return left;
-        }
-
-        @Override
-        public Function getRight() {
-            return right;
-        }
-
-        @Override
-        public long getTimestamp(Record rec) {
-            final long l = left.getTimestamp(rec);
-            final int r = right.getInt(rec);
-            if (l == Numbers.LONG_NaN || r == Numbers.INT_NaN) {
-                return Numbers.LONG_NaN;
-            }
-            return func.add(l, r);
-        }
-    }
-
-    private static class AddLongIntVarConstFunction extends TimestampFunction implements UnaryFunction {
-        private final Function arg;
-        private final int interval;
-        private final LongAddIntFunction func;
-
-        public AddLongIntVarConstFunction(Function left, int right, LongAddIntFunction func) {
-            this.arg = left;
-            this.interval = right;
-            this.func = func;
+        public TimestampAddConstConstVar(char period, TimestampDriver.TimestampAddMethod periodAddFunction, int stride, Function timestampFunc, int timestampType) {
+            super(timestampType);
+            this.period = period;
+            this.periodAddFunction = periodAddFunction;
+            this.stride = stride;
+            this.timestampFunc = timestampFunc;
         }
 
         @Override
         public Function getArg() {
-            return arg;
+            return timestampFunc;
         }
 
         @Override
         public long getTimestamp(Record rec) {
-            final long l = arg.getTimestamp(rec);
-            if (l == Numbers.LONG_NaN) {
-                return Numbers.LONG_NaN;
+            final long timestamp = timestampFunc.getTimestamp(rec);
+            if (timestamp == Numbers.LONG_NULL) {
+                return Numbers.LONG_NULL;
             }
-            return func.add(l, interval);
+            return periodAddFunction.add(timestamp, stride);
+        }
+
+        @Override
+        public Function getTimestampArg() {
+            return timestampFunc;
+        }
+
+        @Override
+        public int invertTimestampInterval(Interval io) {
+            if (stride == Integer.MIN_VALUE) {
+                return NONE;
+            }
+            long lo = io.getLo();
+            long hi = io.getHi();
+            if (period == 'M' || period == 'y') {
+                // Calendar add clamps day-of-month, so it is non-monotonic by up to
+                // one unit; widen the naive inverse and keep the residual filter.
+                if (MonotonicTimestampFunction.calendarShiftWrapsIntoRange(stride, lo, hi)) {
+                    return NONE;
+                }
+                if (lo != Numbers.LONG_NULL) {
+                    final long m = periodAddFunction.add(lo, -stride);
+                    final long w = periodAddFunction.add(m, -1);
+                    if (addOverflows(lo, m, -stride) || w >= m) {
+                        return NONE;
+                    }
+                    lo = w;
+                }
+                if (hi != Long.MAX_VALUE) {
+                    final long m = periodAddFunction.add(hi, -stride);
+                    final long w = periodAddFunction.add(m, 1);
+                    if (addOverflows(hi, m, -stride) || w <= m) {
+                        return NONE;
+                    }
+                    hi = w;
+                }
+                io.of(lo, hi);
+                return SUPERSET;
+            }
+            if (CommonUtils.isFixedDurationUnit(period)) {
+                // a fixed unit adds the same constant to every timestamp
+                return MonotonicTimestampFunction.invertConstantShift(io, periodAddFunction.add(0, stride), shiftInputCeiling(getType()));
+            }
+            return NONE;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("dateadd('").val(period).val("',").val(stride).val(',').val(timestampFunc).val(')');
+        }
+
+        private static boolean addOverflows(long base, long result, int units) {
+            return units > 0 ? result <= base : units < 0 && result >= base;
         }
     }
 
-    private static class DateAddFunc extends TimestampFunction implements TernaryFunction {
-        final Function left;
-        final Function center;
-        final Function right;
+    private static class TimestampAddConstVarVar extends TimestampFunction implements BinaryFunction {
+        private final char period;
+        private final TimestampDriver.TimestampAddMethod periodAddFunc;
+        private final Function strideFunc;
+        private final Function timestampFunc;
 
-        public DateAddFunc(Function left, Function center, Function right) {
-            this.left = left;
-            this.center = center;
-            this.right = right;
+        public TimestampAddConstVarVar(char period, TimestampDriver.TimestampAddMethod periodAddFunc, Function strideFunc, Function timestampFunc, int timestampType) {
+            super(timestampType);
+            this.period = period;
+            this.periodAddFunc = periodAddFunc;
+            this.strideFunc = strideFunc;
+            this.timestampFunc = timestampFunc;
         }
 
         @Override
         public Function getLeft() {
-            return left;
-        }
-
-        @Override
-        public Function getCenter() {
-            return center;
+            return timestampFunc;
         }
 
         @Override
         public Function getRight() {
-            return right;
+            return strideFunc;
         }
 
         @Override
         public long getTimestamp(Record rec) {
-            final long l = left.getTimestamp(rec);
-            final char c = center.getChar(rec);
-            final int r = right.getInt(rec);
-            if (l == Numbers.LONG_NaN || r == Numbers.INT_NaN) {
-                return Numbers.LONG_NaN;
+            final int stride = strideFunc.getInt(rec);
+            final long timestamp = timestampFunc.getTimestamp(rec);
+            if (timestamp == Numbers.LONG_NULL || stride == Numbers.INT_NULL) {
+                return Numbers.LONG_NULL;
             }
-            return Timestamps.addPeriod(l, c, r);
+            return periodAddFunc.add(timestamp, stride);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("dateadd('").val(period).val("',").val(strideFunc).val(',').val(timestampFunc).val(')');
         }
     }
 
-    static {
-        addFunctions.extendAndSet('s', Timestamps::addSeconds);
-        addFunctions.extendAndSet('m', Timestamps::addMinutes);
-        addFunctions.extendAndSet('h', Timestamps::addHours);
-        addFunctions.extendAndSet('d', Timestamps::addDays);
-        addFunctions.extendAndSet('w', Timestamps::addWeeks);
-        addFunctions.extendAndSet('M', Timestamps::addMonths);
-        addFunctions.extendAndSet('y', Timestamps::addYear);
-        addFunctionsMax = addFunctions.size();
+    private static class TimestampAddFunc extends TimestampFunction implements TernaryFunction {
+        private final Function periodFunc;
+        private final Function strideFunc;
+        private final int stridePosition;
+        private final Function timestampFunc;
+
+        public TimestampAddFunc(Function periodFunc, Function strideFunc, int stridePosition, Function timestampFunc, int timestampType) {
+            super(timestampType);
+            this.periodFunc = periodFunc;
+            this.strideFunc = strideFunc;
+            this.stridePosition = stridePosition;
+            this.timestampFunc = timestampFunc;
+        }
+
+        @Override
+        public Function getCenter() {
+            return strideFunc;
+        }
+
+        @Override
+        public Function getLeft() {
+            return periodFunc;
+        }
+
+        @Override
+        public String getName() {
+            return "dateadd";
+        }
+
+        @Override
+        public Function getRight() {
+            return timestampFunc;
+        }
+
+        @Override
+        public long getTimestamp(Record rec) {
+            final char period = periodFunc.getChar(rec);
+            final int stride = strideFunc.getInt(rec);
+            final long timestamp = timestampFunc.getTimestamp(rec);
+
+            if (stride == Numbers.INT_NULL) {
+                throw CairoException.nonCritical().position(stridePosition).put("`null` is not a valid stride");
+            }
+
+            if (timestamp == Numbers.LONG_NULL) {
+                return Numbers.LONG_NULL;
+            }
+            return timestampDriver.add(timestamp, period, stride);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("dateadd('").val(periodFunc).val("',").val(strideFunc).val(',').val(timestampFunc).val(')');
+        }
     }
 }

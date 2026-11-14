@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,37 +24,38 @@
 
 package io.questdb.griffin.engine.functions.catalogue;
 
+import io.questdb.cairo.sql.FunctionExtension;
 import io.questdb.cairo.sql.Record;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.engine.functions.StrArrayFunction;
 import io.questdb.std.Chars;
 import io.questdb.std.GenericLexer;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
-import io.questdb.std.str.CharSink;
 import io.questdb.std.str.StringSink;
 import org.jetbrains.annotations.NotNull;
 
-class StringToStringArrayFunction extends StrArrayFunction {
-    private static final int BRANCH_BEFORE_ITEM = 0;
-    private static final int BRANCH_ITEM = 1;
+public class StringToStringArrayFunction extends StrArrayFunction implements FunctionExtension {
     private static final int BRANCH_AFTER_ITEM = 2;
     private static final int BRANCH_AFTER_LAST_ITEM = 3;
+    private static final int BRANCH_BEFORE_ITEM = 0;
     private static final int BRANCH_DOUBLE_QUOTE = 4;
+    private static final int BRANCH_ITEM = 1;
 
     private final ObjList<CharSequence> items = new ObjList<>();
+    private final StringSink sink = new StringSink();
 
-    StringToStringArrayFunction(int position, CharSequence type) throws SqlException {
+    public StringToStringArrayFunction(int position, CharSequence type) throws SqlException {
         if (type == null) {
             throw SqlException.$(position, "NULL is not allowed");
         }
-
         int charIndex = findArrayOpeningBracketIndex(position, type);
         int branch = BRANCH_BEFORE_ITEM;
         int stringStartIndex = -1;
         int stringEndIndex = -1;
         int lastBackslashIndex = -1;
-        StringSink sink = Misc.getThreadLocalBuilder();
+        StringSink sink = Misc.getThreadLocalSink();
         int len = type.length();
 
         out:
@@ -146,28 +147,48 @@ class StringToStringArrayFunction extends StrArrayFunction {
     }
 
     @Override
+    public FunctionExtension extendedOps() {
+        return this;
+    }
+
+    @Override
     public int getArrayLength() {
         return items.size();
     }
 
     @Override
-    public CharSequence getStr(Record rec, int arrayIndex) {
+    public Record getRecord(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public CharSequence getStrA(Record rec) {
+        return initSink();
+    }
+
+    @Override
+    public CharSequence getStrA(Record rec, int arrayIndex) {
         return items.getQuick(arrayIndex);
     }
 
     @Override
-    public void getStr(Record rec, CharSink sink, int arrayIndex) {
-        sink.put(getStr(rec, arrayIndex));
+    public CharSequence getStrB(Record rec) {
+        return initSink();
     }
 
     @Override
     public CharSequence getStrB(Record rec, int arrayIndex) {
-        return getStr(rec, arrayIndex);
+        return getStrA(rec, arrayIndex);
+    }
+
+    @Override
+    public int getStrLen(Record rec) {
+        return initSink().length();
     }
 
     @Override
     public int getStrLen(Record rec, int arrayIndex) {
-        return getStr(rec, arrayIndex).length();
+        return getStrA(rec, arrayIndex).length();
     }
 
     @Override
@@ -176,8 +197,13 @@ class StringToStringArrayFunction extends StrArrayFunction {
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return true;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.val(items).val("::string[]");
     }
 
     private void commit(@NotNull CharSequence type, int stringStartIndex, int stringEndIndex, StringSink sink) {
@@ -198,5 +224,20 @@ class StringToStringArrayFunction extends StrArrayFunction {
             }
         }
         throw SqlException.$(position, "array must start with '{'");
+    }
+
+    StringSink initSink() {
+        if (sink.length() > 0) {
+            return sink;
+        }
+        sink.put('{');
+        for (int i = 0, n = items.size(); i < n; i++) {
+            sink.put(items.getQuick(i));
+            if (i != n - 1) {
+                sink.put(',');
+            }
+        }
+        sink.put('}');
+        return sink;
     }
 }

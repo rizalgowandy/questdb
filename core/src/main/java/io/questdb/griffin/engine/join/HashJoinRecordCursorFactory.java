@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,26 +24,37 @@
 
 package io.questdb.griffin.engine.join;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.RecordChain;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.TableToken;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapValue;
-import io.questdb.cairo.sql.*;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.table.SymbolTranslatingRecord;
+import io.questdb.griffin.model.JoinContext;
 import io.questdb.std.Misc;
 import io.questdb.std.Transient;
+import org.jetbrains.annotations.Nullable;
 
-public class HashJoinRecordCursorFactory extends AbstractRecordCursorFactory {
-    private final Map joinKeyMap;
-    private final RecordChain slaveChain;
-    private final RecordCursorFactory masterFactory;
-    private final RecordCursorFactory slaveFactory;
-    private final RecordSink masterSink;
+import static io.questdb.griffin.engine.join.AbstractHashOuterJoinRecordCursor.populateRecordHashMap;
+
+public class HashJoinRecordCursorFactory extends AbstractJoinRecordCursorFactory {
+    private final RecordSink masterKeySink;
     private final RecordSink slaveKeySink;
-    private final HashJoinRecordCursor cursor;
+    private HashJoinRecordCursor cursor;
+    private SymbolTranslatingRecord symbolTranslatingRecord;
 
     public HashJoinRecordCursorFactory(
             CairoConfiguration configuration,
@@ -51,30 +62,45 @@ public class HashJoinRecordCursorFactory extends AbstractRecordCursorFactory {
             RecordCursorFactory masterFactory,
             RecordCursorFactory slaveFactory,
             @Transient ColumnTypes joinColumnTypes,
-            @Transient ColumnTypes valueTypes, // this expected to be just LONG, we store chain references in map
-            RecordSink masterSink,
+            @Transient ColumnTypes valueTypes, // this expected to be just 3 LONGs, we store chain references in map
+            RecordSink masterKeySink,
             RecordSink slaveKeySink,
             RecordSink slaveChainSink,
-            int columnSplit
-
+            int columnSplit,
+            JoinContext joinContext,
+            int @Nullable [] masterSymbolKeyColumnIndices,
+            int @Nullable [] slaveSymbolKeyColumnIndices
     ) {
-        super(metadata);
-        this.masterFactory = masterFactory;
-        this.slaveFactory = slaveFactory;
-        joinKeyMap = MapFactory.createMap(configuration, joinColumnTypes, valueTypes);
-        slaveChain = new RecordChain(slaveFactory.getMetadata(), slaveChainSink, configuration.getSqlHashJoinValuePageSize(), configuration.getSqlHashJoinValueMaxPages());
-        this.masterSink = masterSink;
-        this.slaveKeySink = slaveKeySink;
-        this.cursor = new HashJoinRecordCursor(columnSplit, joinKeyMap, slaveChain);
+        super(metadata, joinContext, masterFactory, slaveFactory);
+        Map joinKeyMap = null;
+        RecordChain slaveChain = null;
+        try {
+            // Lazy variant: the map skeleton is constructed but the native backing is not
+            // allocated until the first cursor's of() binds a MemoryTracker and reopens it.
+            joinKeyMap = MapFactory.createUnorderedMap(configuration, joinColumnTypes, valueTypes, false, false);
+            slaveChain = new RecordChain(
+                    slaveFactory.getMetadata(),
+                    slaveChainSink,
+                    configuration.getSqlHashJoinValuePageSize(),
+                    configuration.getSqlHashJoinValueMaxPages()
+            );
+            this.masterKeySink = masterKeySink;
+            this.slaveKeySink = slaveKeySink;
+            this.symbolTranslatingRecord = masterSymbolKeyColumnIndices != null
+                    ? new SymbolTranslatingRecord(configuration, slaveFactory.getMetadata().getColumnCount(), slaveSymbolKeyColumnIndices, masterSymbolKeyColumnIndices)
+                    : null;
+            cursor = new HashJoinRecordCursor(columnSplit, joinKeyMap, slaveChain);
+        } catch (Throwable th) {
+            Misc.free(joinKeyMap, th);
+            Misc.free(slaveChain, th);
+            Misc.free(this, th);
+            throw th;
+        }
     }
 
     @Override
-    public void close() {
-        joinKeyMap.close();
-        slaveChain.close();
-        ((JoinRecordMetadata) getMetadata()).close();
-        masterFactory.close();
-        slaveFactory.close();
+    public boolean followedOrderByAdvice() {
+        return masterFactory.followedOrderByAdvice();
     }
 
     @Override
@@ -82,15 +108,22 @@ public class HashJoinRecordCursorFactory extends AbstractRecordCursorFactory {
         RecordCursor slaveCursor = slaveFactory.getCursor(executionContext);
         RecordCursor masterCursor = null;
         try {
-            buildMapOfSlaveRecords(slaveCursor, executionContext.getCircuitBreaker());
             masterCursor = masterFactory.getCursor(executionContext);
-            this.cursor.of(masterCursor, slaveCursor);
-            return this.cursor;
+            cursor.of(masterCursor, slaveCursor, executionContext);
+            return cursor;
         } catch (Throwable e) {
             Misc.free(slaveCursor);
             Misc.free(masterCursor);
+            // of() binds the per-query tracker and reopens the join map and caches before it adopts the cursors;
+            // close() frees them under that tracker and resets isOpen so the factory is reusable.
+            Misc.free(cursor);
             throw e;
         }
+    }
+
+    @Override
+    public int getScanDirection() {
+        return masterFactory.getScanDirection();
     }
 
     @Override
@@ -99,24 +132,61 @@ public class HashJoinRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
-    public boolean hasDescendingOrder() {
-        return masterFactory.hasDescendingOrder();
+    public boolean supportsUpdateRowId(TableToken tableToken) {
+        return masterFactory.supportsUpdateRowId(tableToken);
     }
 
     @Override
-    public boolean supportsUpdateRowId(CharSequence tableName) {
-        return masterFactory.supportsUpdateRowId(tableName);
+    public void toPlan(PlanSink sink) {
+        sink.type("Hash Join");
+        sink.attr("condition").val(joinContext);
+        if (symbolTranslatingRecord != null) {
+            sink.attr("symbolKeyJoin").val(true);
+        }
+        sink.child(masterFactory);
+        sink.child("Hash", slaveFactory);
     }
 
-    private void buildMapOfSlaveRecords(RecordCursor slaveCursor, SqlExecutionCircuitBreaker circuitBreaker) {
-        HashOuterJoinRecordCursorFactory.buildMap(slaveCursor, slaveCursor.getRecord(), joinKeyMap, slaveKeySink, slaveChain, circuitBreaker);
+    private static long computeCursorSizeFromMap(RecordCursor masterCursor, Map map, RecordSink keySink) {
+        final Record masterRecord = masterCursor.getRecord();
+        long size = 0;
+        try {
+            masterCursor.toTop();
+            while (masterCursor.hasNext()) {
+                MapKey key = map.withKey();
+                key.put(masterRecord, keySink);
+                MapValue value = key.findValue();
+                if (value != null) {
+                    size += value.getLong(2);
+                }
+            }
+            return size;
+        } finally {
+            masterCursor.toTop();
+        }
+    }
+
+    @Override
+    protected void _close() {
+        final HashJoinRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final SymbolTranslatingRecord symbolTranslatingRecord = this.symbolTranslatingRecord;
+        this.symbolTranslatingRecord = null;
+        Throwable cleanupFailure = closeJoinOwnersBestEffort();
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, cursor);
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, symbolTranslatingRecord);
+        CairoException.rethrowCleanupFailure(cleanupFailure);
     }
 
     private class HashJoinRecordCursor extends AbstractJoinCursor {
+        private final Map joinKeyMap;
         private final JoinRecord recordA;
         private final RecordChain slaveChain;
-        private final Map joinKeyMap;
+        private SqlExecutionCircuitBreaker circuitBreaker;
+        private boolean isMapBuilt;
+        private boolean isOpen;
         private Record masterRecord;
+        private long size = -1;
         private boolean useSlaveCursor;
 
         public HashJoinRecordCursor(int columnSplit, Map joinKeyMap, RecordChain slaveChain) {
@@ -124,6 +194,19 @@ public class HashJoinRecordCursorFactory extends AbstractRecordCursorFactory {
             this.recordA = new JoinRecord(columnSplit);
             this.joinKeyMap = joinKeyMap;
             this.slaveChain = slaveChain;
+            // joinKeyMap was created with openOnInit=false; first cursor's of() reopens it.
+            this.isOpen = false;
+        }
+
+        @Override
+        public void close() {
+            if (isOpen) {
+                isOpen = false;
+                joinKeyMap.close();
+                slaveChain.close();
+                Misc.free(symbolTranslatingRecord);
+                super.close();
+            }
         }
 
         @Override
@@ -132,19 +215,17 @@ public class HashJoinRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public long size() {
-            return -1;
-        }
-
-        @Override
         public boolean hasNext() {
+            buildMapOfSlaveRecords();
+
             if (useSlaveCursor && slaveChain.hasNext()) {
                 return true;
             }
 
             while (masterCursor.hasNext()) {
+                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
                 MapKey key = joinKeyMap.withKey();
-                key.put(masterRecord, masterSink);
+                key.put(masterRecord, masterKeySink);
                 MapValue value = key.findValue();
                 if (value != null) {
                     slaveChain.of(value.getLong(0));
@@ -159,19 +240,65 @@ public class HashJoinRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
+        public long preComputedStateSize() {
+            return isMapBuilt ? 1 : 0;
+        }
+
+        @Override
+        public long size() {
+            if (size != -1) {
+                return size;
+            }
+            buildMapOfSlaveRecords();
+            return size = computeCursorSizeFromMap(masterCursor, joinKeyMap, masterKeySink);
+        }
+
+        @Override
         public void toTop() {
             masterCursor.toTop();
             useSlaveCursor = false;
+            if (!isMapBuilt) {
+                slaveCursor.toTop();
+                joinKeyMap.clear();
+                slaveChain.clear();
+            }
         }
 
-        void of(RecordCursor masterCursor, RecordCursor slaveCursor) {
+        private void buildMapOfSlaveRecords() {
+            if (!isMapBuilt) {
+                final Record keyRecord = symbolTranslatingRecord != null ? symbolTranslatingRecord : slaveCursor.getRecord();
+                populateRecordHashMap(circuitBreaker, slaveCursor, joinKeyMap, slaveKeySink, slaveChain, keyRecord);
+                isMapBuilt = true;
+            }
+        }
+
+        private void of(RecordCursor masterCursor, RecordCursor slaveCursor, SqlExecutionContext executionContext) {
+            if (!isOpen) {
+                isOpen = true;
+                joinKeyMap.setMemoryTracker(executionContext.getMemoryTracker());
+                joinKeyMap.reopen();
+            }
+            // Bind the tracker on every of(); the chain's inner MemoryCARW is
+            // lazy, so the first chain.put() inside buildMapOfSlaveRecords()
+            // triggers a malloc under the bound tracker. After the cursor's
+            // close(), the chain's backing is freed against the same tracker.
+            slaveChain.setMemoryTracker(executionContext.getMemoryTracker());
+            this.circuitBreaker = executionContext.getCircuitBreaker();
+            masterRecord = masterCursor.getRecord();
+            Record slaveRecord = slaveChain.getRecord();
+            recordA.of(masterRecord, slaveRecord);
+            slaveChain.setSymbolTableResolver(slaveCursor);
+            if (symbolTranslatingRecord != null) {
+                symbolTranslatingRecord.of(slaveCursor.getRecord());
+                symbolTranslatingRecord.setMemoryTracker(executionContext.getMemoryTracker());
+                symbolTranslatingRecord.initSources(slaveCursor, masterCursor);
+            }
+            useSlaveCursor = false;
+            size = -1;
+            isMapBuilt = false;
+            // Adopt the cursors last so an initSources() breach above leaves them unset for the getCursor() catch.
             this.masterCursor = masterCursor;
             this.slaveCursor = slaveCursor;
-            this.masterRecord = masterCursor.getRecord();
-            Record slaveRecord = slaveChain.getRecord();
-            this.slaveChain.setSymbolTableResolver(slaveCursor);
-            recordA.of(masterRecord, slaveRecord);
-            useSlaveCursor = false;
         }
     }
 }

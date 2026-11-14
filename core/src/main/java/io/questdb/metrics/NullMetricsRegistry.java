@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,23 @@
 
 package io.questdb.metrics;
 
-import io.questdb.std.str.CharSink;
+import io.questdb.std.str.BorrowableUtf8Sink;
+import org.jetbrains.annotations.NotNull;
 
 public class NullMetricsRegistry implements MetricsRegistry {
+
+    @Override
+    public void addTarget(Target target) {
+    }
+
+    @Override
+    public void removeTarget(Target target) {
+    }
+
+    @Override
+    public AtomicLongGauge newAtomicLongGauge(CharSequence name) {
+        return NullLongGauge.INSTANCE;
+    }
 
     @Override
     public Counter newCounter(CharSequence name) {
@@ -39,28 +53,37 @@ public class NullMetricsRegistry implements MetricsRegistry {
     }
 
     @Override
-    public CounterWithTwoLabels newCounter(CharSequence name,
-                                           CharSequence labelName0, CharSequence[] labelValues0,
-                                           CharSequence labelName1, CharSequence[] labelValues1) {
+    public CounterWithTwoLabels newCounter(
+            CharSequence name,
+            CharSequence labelName0,
+            CharSequence[] labelValues0,
+            CharSequence labelName1,
+            CharSequence[] labelValues1
+    ) {
         return NullCounter.INSTANCE;
     }
 
     @Override
-    public Gauge newGauge(CharSequence name) {
-        return NullGauge.INSTANCE;
+    public DoubleGauge newDoubleGauge(CharSequence name) {
+        return DoubleGauge.INSTANCE;
     }
 
     @Override
-    public Gauge newGauge(int memoryTag) {
-        return NullGauge.INSTANCE;
+    public LongGauge newLongGauge(CharSequence name) {
+        return NullLongGauge.INSTANCE;
     }
 
     @Override
-    public Gauge newVirtualGauge(CharSequence name, VirtualGauge.StatProvider provider) {
-        return NullGauge.INSTANCE;
+    public LongGauge newLongGauge(int memoryTag) {
+        return NullLongGauge.INSTANCE;
     }
 
     @Override
-    public void scrapeIntoPrometheus(CharSink sink) {
+    public LongGauge newVirtualGauge(CharSequence name, VirtualLongGauge.StatProvider provider) {
+        return NullLongGauge.INSTANCE;
+    }
+
+    @Override
+    public void scrapeIntoPrometheus(@NotNull BorrowableUtf8Sink sink) {
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,16 +24,21 @@
 
 package io.questdb.griffin.engine.groupby;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.RecordSinkFactory;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.EmptyTableNoSizeRecordCursor;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.Misc;
@@ -42,10 +47,10 @@ import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 
 public class SampleByFillNoneRecordCursorFactory extends AbstractSampleByRecordCursorFactory {
-    protected final Map map;
-    private final SampleByFillNoneRecordCursor cursor;
+    private SampleByFillNoneRecordCursor cursor;
 
     public SampleByFillNoneRecordCursorFactory(
+            @Transient @NotNull BytecodeAssembler asm,
             CairoConfiguration configuration,
             RecordCursorFactory base,
             RecordMetadata groupByMetadata,
@@ -53,43 +58,67 @@ public class SampleByFillNoneRecordCursorFactory extends AbstractSampleByRecordC
             @NotNull ObjList<Function> recordFunctions,
             @NotNull TimestampSampler timestampSampler,
             @Transient @NotNull ListColumnFilter listColumnFilter,
-            @Transient @NotNull BytecodeAssembler asm,
             @Transient @NotNull ArrayColumnTypes keyTypes,
             @Transient @NotNull ArrayColumnTypes valueTypes,
             int timestampIndex,
+            int timestampType,
             Function timezoneNameFunc,
             int timezoneNameFuncPos,
             Function offsetFunc,
-            int offsetFuncPos
+            int offsetFuncPos,
+            Function sampleFromFunc,
+            int sampleFromFuncPos,
+            Function sampleToFunc,
+            int sampleToFuncPos
     ) {
-        super(base, groupByMetadata, recordFunctions);
-        // sink will be storing record columns to map key
-        final RecordSink mapSink = RecordSinkFactory.getInstance(asm, base.getMetadata(), listColumnFilter, false);
-        // this is the map itself, which we must not forget to free when factory closes
-        this.map = MapFactory.createMap(configuration, keyTypes, valueTypes);
-        this.cursor = new SampleByFillNoneRecordCursor(
-                this.map,
-                mapSink,
-                groupByFunctions,
-                this.recordFunctions,
-                timestampIndex,
-                timestampSampler,
-                timezoneNameFunc,
-                timezoneNameFuncPos,
-                offsetFunc,
-                offsetFuncPos
-        );
+        super(base, groupByMetadata, recordFunctions, timezoneNameFunc, offsetFunc, sampleFromFunc, sampleToFunc);
+        Map map = null;
+        try {
+            // sink will be storing record columns to map key
+            final RecordSink mapSink = RecordSinkFactory.getInstance(configuration, asm, base.getMetadata(), listColumnFilter);
+            // this is the map itself, which we must not forget to free when factory closes.
+            // Lazy variant (openOnInit=false): the native backing is allocated by the first
+            // reopen() in the cursor's of(), after the per-query MemoryTracker is bound, so the
+            // map's malloc and the matching free at cursor close balance on the per-query counter.
+            map = MapFactory.createOrderedMap(configuration, keyTypes, valueTypes, false);
+            final GroupByFunctionsUpdater groupByFunctionsUpdater = GroupByFunctionsUpdaterFactory.getInstance(asm, groupByFunctions);
+            cursor = new SampleByFillNoneRecordCursor(
+                    configuration,
+                    map,
+                    mapSink,
+                    groupByFunctions,
+                    groupByFunctionsUpdater,
+                    this.recordFunctions,
+                    timestampIndex,
+                    timestampType,
+                    timestampSampler,
+                    timezoneNameFunc,
+                    timezoneNameFuncPos,
+                    offsetFunc,
+                    offsetFuncPos,
+                    sampleFromFunc,
+                    sampleFromFuncPos,
+                    sampleToFunc,
+                    sampleToFuncPos
+            );
+        } catch (Throwable th) {
+            Misc.free(map, th);
+            Misc.free(this, th);
+            throw th;
+        }
     }
 
     @Override
-    public void close() {
-        super.close();
-        Misc.free(map);
+    public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
+        final RecordCursor baseCursor = base.getCursor(executionContext);
+        return initFunctionsAndCursor(executionContext, baseCursor);
     }
 
     @Override
-    public RecordMetadata getMetadata() {
-        return metadata;
+    protected AbstractNoRecordSampleByCursor detachRawCursor() {
+        final SampleByFillNoneRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        return cursor;
     }
 
     @Override
@@ -98,18 +127,39 @@ public class SampleByFillNoneRecordCursorFactory extends AbstractSampleByRecordC
     }
 
     @Override
-    public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        final RecordCursor baseCursor = base.getCursor(executionContext);
-        try {
-            if (baseCursor.hasNext()) {
-                map.clear();
-                return initFunctionsAndCursor(executionContext, baseCursor);
-            }
-            Misc.free(baseCursor);
-            return EmptyTableNoSizeRecordCursor.INSTANCE;
-        } catch (Throwable ex) {
-            Misc.free(baseCursor);
-            throw ex;
-        }
+    public void toPlan(PlanSink sink) {
+        sink.type("Sample By");
+        sink.optAttr("keys", GroupByRecordCursorFactory.getKeys(recordFunctions, getMetadata()));
+        sink.optAttr("values", cursor.groupByFunctions, true);
+        sink.child(base);
+    }
+
+    @Override
+    protected void _close() {
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final AbstractNoRecordSampleByCursor cursor = detachRawCursor();
+        final Function offsetFunc = this.offsetFunc;
+        this.offsetFunc = null;
+        final ObjList<Function> recordFunctions = this.recordFunctions;
+        this.recordFunctions = null;
+        final Function sampleFromFunc = this.sampleFromFunc;
+        this.sampleFromFunc = null;
+        final Function sampleToFunc = this.sampleToFunc;
+        this.sampleToFunc = null;
+        final Function timezoneNameFunc = this.timezoneNameFunc;
+        this.timezoneNameFunc = null;
+
+        Throwable failure = Misc.freeBestEffort(null, cursor);
+        failure = closeDetachedSampleByOwnersBestEffort(
+                failure,
+                base,
+                offsetFunc,
+                recordFunctions,
+                sampleFromFunc,
+                sampleToFunc,
+                timezoneNameFunc
+        );
+        CairoException.rethrowCleanupFailure(failure);
     }
 }

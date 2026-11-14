@@ -1,0 +1,592 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cairo.wal.seq;
+
+import io.questdb.cairo.AbstractRecordMetadata;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableReaderMetadata;
+import io.questdb.cairo.TableStructure;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.file.BlockFileWriter;
+import io.questdb.cairo.lv.LiveViewDefinition;
+import io.questdb.cairo.mv.MatViewDefinition;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.cairo.view.ViewDefinition;
+import io.questdb.cairo.vm.Vm;
+import io.questdb.cairo.vm.api.MemoryMARW;
+import io.questdb.cairo.vm.api.MemoryMR;
+import io.questdb.cairo.wal.WalUtils;
+import io.questdb.std.Chars;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.IntList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.ObjList;
+import io.questdb.std.Misc;
+import io.questdb.std.str.Path;
+import io.questdb.std.str.Utf8Sequence;
+
+import java.io.Closeable;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static io.questdb.cairo.TableUtils.*;
+import static io.questdb.cairo.wal.WalUtils.*;
+
+public class SequencerMetadata extends AbstractRecordMetadata implements TableRecordMetadata, Closeable {
+    private final int commitMode;
+    private final CairoConfiguration configuration;
+    private final FilesFacade ff;
+    private final MemoryMARW metaMem;
+    private final IntList readColumnOrder = new IntList();
+    private final boolean readonly;
+    private final MemoryMR roMetaMem;
+    private final AtomicLong structureVersion = new AtomicLong(-1);
+    private int tableId;
+    private TableToken tableToken;
+
+    public SequencerMetadata(CairoConfiguration configuration) {
+        this(configuration, false);
+    }
+
+    public SequencerMetadata(CairoConfiguration configuration, boolean readonly) {
+        this.configuration = configuration;
+        this.ff = configuration.getFilesFacade();
+        this.commitMode = configuration.getCommitMode();
+        this.readonly = readonly;
+        if (!readonly) {
+            roMetaMem = metaMem = Vm.getCMARWInstance();
+        } else {
+            metaMem = null;
+            roMetaMem = Vm.getCMRInstance(configuration.getBypassWalFdCache());
+        }
+    }
+
+    public void addColumn(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            byte indexType,
+            int indexValueBlockCapacity,
+            boolean isDedupKey
+    ) {
+        addColumn0(columnName, columnType, symbolCapacity, symbolCacheFlag, indexType, indexValueBlockCapacity, isDedupKey);
+        readColumnOrder.add(columnMetadata.size() - 1);
+        structureVersion.incrementAndGet();
+    }
+
+    public void addIndex(CharSequence columnName, int indexValueBlockSize, byte indexType, ObjList<CharSequence> coveringColumnNames) {
+        int colIdx = columnNameIndexMap.get(columnName);
+        if (colIdx < 0) {
+            throw CairoException.critical(0).put("column not found for addIndex [name=").put(columnName).put(']');
+        }
+        TableColumnMetadata colMeta = columnMetadata.getQuick(colIdx);
+        colMeta.setIndexType(indexType);
+        colMeta.setIndexValueBlockCapacity(indexValueBlockSize);
+
+        if (coveringColumnNames != null && coveringColumnNames.size() > 0) {
+            IntList coveringIndices = new IntList(coveringColumnNames.size());
+            for (int i = 0, n = coveringColumnNames.size(); i < n; i++) {
+                CharSequence covName = coveringColumnNames.get(i);
+                int covIdx = columnNameIndexMap.get(covName);
+                if (covIdx < 0) {
+                    throw CairoException.nonCritical().put("INCLUDE column does not exist [column=").put(covName).put(']');
+                }
+                if (covIdx == colIdx) {
+                    throw CairoException.nonCritical().put("INCLUDE must not contain the indexed column [column=").put(covName).put(']');
+                }
+                for (int j = 0; j < i; j++) {
+                    if (coveringIndices.getQuick(j) == covIdx) {
+                        throw CairoException.nonCritical().put("duplicate column in INCLUDE [column=").put(covName).put(']');
+                    }
+                }
+                coveringIndices.add(covIdx);
+            }
+            colMeta.setCoveringColumnIndices(coveringIndices);
+        }
+        structureVersion.incrementAndGet();
+    }
+
+    public void changeColumnType(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            byte indexType,
+            int indexValueBlockCapacity
+    ) {
+        int existingColumnIndex = TableUtils.changeColumnTypeInMetadata(
+                columnName,
+                columnType,
+                symbolCapacity,
+                symbolCacheFlag,
+                indexType,
+                indexValueBlockCapacity,
+                columnNameIndexMap, columnMetadata
+        );
+        int readIndex = readColumnOrder.get(existingColumnIndex);
+        readColumnOrder.add(readIndex);
+        columnCount++;
+        structureVersion.incrementAndGet();
+    }
+
+    @Override
+    public void close() {
+        reset();
+        if (metaMem != null) {
+            metaMem.close(false);
+        }
+        Misc.free(roMetaMem);
+    }
+
+    public void create(TableStructure tableStruct, TableToken tableToken, Path path, int pathLen, int tableId) {
+        create(tableStruct, tableToken, path, pathLen, tableId, true);
+    }
+
+    public void create(TableStructure tableStruct, TableToken tableToken, Path path, int pathLen, int tableId, boolean writeInitialMetadata) {
+        copyFrom(tableStruct, tableToken, tableId);
+        openSmallFile(ff, path, pathLen, metaMem, WalUtils.INITIAL_META_FILE_NAME, MemoryTag.MMAP_SEQUENCER_METADATA);
+        if (writeInitialMetadata) {
+            TableUtils.writeMetadata(tableStruct, ColumnType.VERSION, tableId, metaMem);
+        }
+        metaMem.sync(false);
+        metaMem.close(true, Vm.TRUNCATE_TO_POINTER);
+
+        // G5: these two structural writes (the view / mat-view DEFINITION block files) use the raw
+        // configured commitMode DELIBERATELY — they are intentionally NOT routed through
+        // LocalDurabilityPolicy.resolveCommitMode() the way the adaptive apply-side sites are. A view
+        // definition is structural DDL, not the lazily-applied column data the durable epoch protects, so it
+        // must stay durable under commitMode != NOSYNC regardless of role (matching CommitMode's
+        // structural-sync principle and DatabaseCheckpointAgent). This is reachable on a replica via
+        // `ALTER TABLE ... REBASE WAL INTO` on a mat view — a rare operator-invoked recovery op whose
+        // definition is LOCAL truth (not re-downloaded from the object store), so forcing it durable is
+        // correct: an fsync of over-durability here, never under-durability.
+        if (writeInitialMetadata && tableStruct.isView()) {
+            assert tableStruct.getViewDefinition() != null;
+            try (BlockFileWriter writer = new BlockFileWriter(ff, commitMode)) {
+                writer.of(path.trimTo(pathLen).concat(ViewDefinition.VIEW_DEFINITION_FILE_NAME).$());
+                ViewDefinition.append(tableStruct.getViewDefinition(), writer);
+            }
+            path.trimTo(pathLen);
+        }
+
+        if (writeInitialMetadata && tableStruct.isMatView()) {
+            assert tableStruct.getMatViewDefinition() != null;
+            try (BlockFileWriter writer = new BlockFileWriter(ff, commitMode)) {
+                writer.of(path.trimTo(pathLen).concat(MatViewDefinition.MAT_VIEW_DEFINITION_FILE_NAME).$());
+                MatViewDefinition.append(tableStruct.getMatViewDefinition(), writer);
+            }
+            path.trimTo(pathLen);
+        }
+
+        // Persist the live view definition into the sequencer directory so it
+        // replicates with the sequencer metadata (the LV table dir is rebuilt
+        // from WAL on a replica and never ships its own _lv). reconstructLiveViewFiles
+        // copies it back into the LV table dir on the replica. Mirrors _mv above.
+        if (writeInitialMetadata && tableStruct.isLiveView()) {
+            assert tableStruct.getLiveViewDefinition() != null;
+            try (BlockFileWriter writer = new BlockFileWriter(ff, commitMode)) {
+                writer.of(path.trimTo(pathLen).concat(LiveViewDefinition.LIVE_VIEW_DEFINITION_FILE_NAME).$());
+                LiveViewDefinition.append(tableStruct.getLiveViewDefinition(), writer);
+            }
+            path.trimTo(pathLen);
+        }
+
+        switchTo(path, pathLen);
+    }
+
+    /**
+     * Creates sequencer metadata files from Table Structure object, needed for enterprise incremental backup/restore.
+     */
+    @SuppressWarnings("unused")
+    public void createMetaFile(TableStructure tableStruct, Path path, int pathLen, int tableId, int structureVersion) {
+        copyFrom(tableStruct, tableId);
+        this.structureVersion.set(structureVersion);
+        switchTo(path, pathLen);
+    }
+
+    public void disableDeduplication() {
+        structureVersion.incrementAndGet();
+    }
+
+    public void dropTable() {
+        this.structureVersion.set(DROP_TABLE_STRUCTURE_VERSION);
+        syncToMetaFile();
+    }
+
+    public boolean enableDeduplication() {
+        structureVersion.incrementAndGet();
+        return false;
+    }
+
+    @Override
+    public long getMetadataVersion() {
+        return structureVersion.get();
+    }
+
+    public IntList getReadColumnOrder() {
+        return readColumnOrder;
+    }
+
+    public int getRealColumnCount() {
+        return columnNameIndexMap.size();
+    }
+
+    @Override
+    public int getTableId() {
+        return tableId;
+    }
+
+    @Override
+    public TableToken getTableToken() {
+        return tableToken;
+    }
+
+    public boolean isDropped() {
+        return structureVersion.get() == DROP_TABLE_STRUCTURE_VERSION;
+    }
+
+    @Override
+    public boolean isWalEnabled() {
+        return true;
+    }
+
+    public void notifyRenameTable(TableToken tableToken) {
+        this.tableToken = tableToken;
+    }
+
+    public void open(Path path, int pathLen, TableToken tableToken) {
+        reset();
+        open0(path, pathLen, tableToken);
+    }
+
+    public void openTableSequencerMetadata(Path path, int pathLen, TableToken tableToken) {
+        try {
+            open(path, pathLen, tableToken);
+        } catch (CairoException ex) {
+            if (ex.isMetadataVersionMismatch()
+                    || ex.isSequencerMetadataOpenFailed()
+                    || (!ex.isFileCannotRead() && !ex.isFileTooSmall() && !ex.isMetadataValidation())) {
+                throw ex;
+            }
+            final int errno = ex.getErrno();
+            final String message = ex.getFlyweightMessage().toString();
+            throw CairoException.sequencerMetadataOpenFailed(tableToken, errno, message);
+        }
+    }
+
+    public void removeColumn(CharSequence columnName) {
+        removeColumnFromMetadata(columnName, columnNameIndexMap, columnMetadata);
+        structureVersion.incrementAndGet();
+    }
+
+    public void renameColumn(CharSequence columnName, CharSequence newName) {
+        TableUtils.renameColumnInMetadata(columnName, newName, columnNameIndexMap, columnMetadata);
+        structureVersion.incrementAndGet();
+    }
+
+    public void renameTable(CharSequence toTableName) {
+        if (!Chars.equalsIgnoreCaseNc(toTableName, tableToken.getTableName())) {
+            tableToken = tableToken.renamed(Chars.toString(toTableName));
+        }
+        structureVersion.incrementAndGet();
+    }
+
+    public void sync() {
+        metaMem.sync(false);
+    }
+
+    public void updateTableToken(TableToken newTableToken) {
+        assert newTableToken != null;
+        this.tableToken = newTableToken;
+    }
+
+    private void addColumn0(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            byte indexType,
+            int indexValueBlockCapacity,
+            boolean isDedupKey
+    ) {
+        final String name = columnName.toString();
+        if (columnType > 0) {
+            columnNameIndexMap.put(name, columnMetadata.size());
+        }
+        columnMetadata.add(
+                new TableColumnMetadata(
+                        name,
+                        columnType,
+                        indexType,
+                        indexValueBlockCapacity,
+                        false,
+                        null,
+                        columnMetadata.size(),
+                        isDedupKey,
+                        0,
+                        symbolCacheFlag,
+                        symbolCapacity
+                )
+        );
+        columnCount++;
+    }
+
+    private void copyFrom(TableStructure tableStruct, TableToken tableToken, int tableId) {
+        copyFrom(tableStruct, tableId);
+        this.tableToken = tableToken;
+    }
+
+    private void copyFrom(TableStructure tableStruct, int tableId) {
+        reset();
+        this.timestampIndex = tableStruct.getTimestampIndex();
+        this.tableId = tableId;
+
+        for (int i = 0, n = tableStruct.getColumnCount(); i < n; i++) {
+            addColumn0(
+                    tableStruct.getColumnName(i),
+                    tableStruct.getColumnType(i),
+                    tableStruct.getSymbolCapacity(i),
+                    tableStruct.getSymbolCacheFlag(i),
+                    tableStruct.getIndexType(i),
+                    tableStruct.getIndexBlockCapacity(i),
+                    tableStruct.isDedupKey(i)
+            );
+            // Propagate covering column indices (INCLUDE list) from the table structure
+            IntList coveringIndices = tableStruct.getCoveringColumnIndices(i);
+            if (coveringIndices != null && coveringIndices.size() > 0) {
+                columnMetadata.getQuick(columnMetadata.size() - 1).setCoveringColumnIndices(new IntList(coveringIndices));
+            }
+            readColumnOrder.add(i);
+        }
+
+        this.structureVersion.set(0);
+        columnCount = columnMetadata.size();
+    }
+
+    private void open0(Path path, int pathLen, TableToken tableToken) {
+        openSmallFile(ff, path, pathLen, roMetaMem, META_FILE_NAME, MemoryTag.MMAP_SEQUENCER_METADATA);
+
+        // get written data size
+        if (!readonly) {
+            metaMem.jumpTo(SEQ_META_OFFSET_WAL_VERSION);
+            int size = metaMem.getInt(0);
+            metaMem.jumpTo(size);
+        }
+
+        loadSequencerMetadata(path, roMetaMem);
+        structureVersion.set(roMetaMem.getLong(SEQ_META_OFFSET_STRUCTURE_VERSION));
+        columnCount = columnMetadata.size();
+        timestampIndex = roMetaMem.getInt(SEQ_META_OFFSET_TIMESTAMP_INDEX);
+        tableId = roMetaMem.getInt(SEQ_META_TABLE_ID);
+        this.tableToken = tableToken;
+
+        if (readonly) {
+            // close early
+            roMetaMem.close();
+        }
+    }
+
+    private void loadSequencerMetadata(Utf8Sequence metaPath, MemoryMR metaMem) {
+        columnMetadata.clear();
+        columnNameIndexMap.clear();
+        readColumnOrder.clear();
+
+        try {
+            final long memSize = Math.min(checkMemSize(metaMem, SEQ_META_OFFSET_COLUMNS), metaMem.getInt(SEQ_META_OFFSET_WAL_LENGTH));
+            validateMetaVersion(metaPath, metaMem, SEQ_META_OFFSET_WAL_VERSION, WAL_FORMAT_VERSION);
+            final int columnCount = TableUtils.getColumnCount(metaPath, metaMem, SEQ_META_OFFSET_COLUMN_COUNT);
+            final int timestampIndex = TableUtils.getTimestampIndex(metaPath, metaMem, SEQ_META_OFFSET_TIMESTAMP_INDEX, columnCount);
+
+            // load column types and names
+            long checkSum = columnCount;
+            long offset = SEQ_META_OFFSET_COLUMNS;
+            for (int i = 0; i < columnCount; i++) {
+                final int type = TableUtils.getColumnType(metaPath, metaMem, memSize, offset, i);
+                offset += Integer.BYTES;
+
+                final String name = TableUtils.getColumnName(metaPath, metaMem, memSize, offset, i).toString();
+                offset += Vm.getStorageLength(name);
+
+                if (type > 0) {
+                    columnNameIndexMap.put(name, i);
+                }
+
+                if (ColumnType.isSymbol(Math.abs(type))) {
+                    // Default to BITMAP; overridden by optional index-type section if present
+                    columnMetadata.add(new TableColumnMetadata(name, type, IndexType.BITMAP, 1024, true, null));
+                } else {
+                    columnMetadata.add(new TableColumnMetadata(name, type));
+                }
+                readColumnOrder.add(i);
+                checkSum = checkSum * 31 + type;
+                checkSum = checkSum * 31 + name.hashCode();
+            }
+
+            // validate designated timestamp column
+            if (timestampIndex != -1) {
+                final int timestampType = columnMetadata.getQuick(timestampIndex).getColumnType();
+                if (!ColumnType.isTimestamp(timestampType)) {
+                    throw validationException().put("Timestamp column must be TIMESTAMP, but found ").put(ColumnType.nameOf(timestampType));
+                }
+            }
+
+            if (memSize > offset + 8 + 4) {
+                long optionalSectionCheckSum = metaMem.getLong(offset);
+                offset += Long.BYTES;
+                if (optionalSectionCheckSum == checkSum) {
+                    long records = metaMem.getInt(offset);
+                    offset += Integer.BYTES;
+
+                    // Optional section about column order
+                    if (memSize - offset >= records * Integer.BYTES) {
+                        readColumnOrder.clear();
+                        for (int i = 0; i < records; i++) {
+                            readColumnOrder.add(metaMem.getInt(offset));
+                            offset += Integer.BYTES;
+                        }
+                    }
+                }
+            }
+
+            // Optional section: index types (backward compatible)
+            if (memSize > offset + 8 + 4) {
+                long indexTypeCheckSum = checkSum * 31 + SEQ_META_INDEX_TYPE_CHECKSUM_SALT;
+                long storedCheckSum = metaMem.getLong(offset);
+                offset += Long.BYTES;
+                if (storedCheckSum == indexTypeCheckSum) {
+                    int indexTypeCount = metaMem.getInt(offset);
+                    offset += Integer.BYTES;
+                    if (indexTypeCount == columnCount && memSize - offset >= columnCount) {
+                        for (int i = 0; i < columnCount; i++) {
+                            byte indexType = metaMem.getByte(offset);
+                            offset += Byte.BYTES;
+                            columnMetadata.getQuick(i).setIndexType(indexType);
+                        }
+                    } else if (memSize - offset >= indexTypeCount) {
+                        offset += indexTypeCount;
+                    }
+                }
+            }
+
+            // Optional section: covering column indices (backward compatible)
+            if (memSize > offset + 8 + 4) {
+                long coverCheckSum = checkSum * 31 + SEQ_META_COVERING_COLUMN_CHECKSUM_SALT;
+                long storedCoverSum = metaMem.getLong(offset);
+                offset += Long.BYTES;
+                if (storedCoverSum == coverCheckSum) {
+                    int coveringColumnCount = metaMem.getInt(offset);
+                    offset += Integer.BYTES;
+                    for (int c = 0; c < coveringColumnCount; c++) {
+                        if (memSize - offset < 2 * Integer.BYTES) break;
+                        int colIdx = metaMem.getInt(offset);
+                        offset += Integer.BYTES;
+                        int includeCount = metaMem.getInt(offset);
+                        offset += Integer.BYTES;
+                        if (includeCount > 0 && memSize - offset >= (long) includeCount * Integer.BYTES
+                                && colIdx >= 0 && colIdx < columnCount) {
+                            IntList indices = new IntList(includeCount);
+                            for (int j = 0; j < includeCount; j++) {
+                                indices.add(metaMem.getInt(offset));
+                                offset += Integer.BYTES;
+                            }
+                            columnMetadata.getQuick(colIdx).setCoveringColumnIndices(indices);
+                        }
+                    }
+                }
+            }
+        } catch (Throwable e) {
+            columnNameIndexMap.clear();
+            columnMetadata.clear();
+            throw e;
+        }
+    }
+
+    private void reset() {
+        columnMetadata.clear();
+        columnNameIndexMap.clear();
+        readColumnOrder.clear();
+        columnCount = 0;
+        timestampIndex = -1;
+        tableToken = null;
+        tableId = -1;
+    }
+
+    private void switchTo(Path path, int pathLen) {
+        openSmallFile(ff, path, pathLen, metaMem, META_FILE_NAME, MemoryTag.MMAP_SEQUENCER_METADATA);
+        syncToMetaFile();
+    }
+
+    void openFromInitialMetadata(Path path, int pathLen, TableToken tableToken) {
+        assert !readonly;
+        try (TableReaderMetadata initialMetadata = new TableReaderMetadata(configuration)) {
+            try {
+                // _meta.0 is the immutable create-time metadata; recovery replays committed changes over it.
+                initialMetadata.loadMetadata(path.trimTo(pathLen).concat(WalUtils.INITIAL_META_FILE_NAME).$());
+            } finally {
+                path.trimTo(pathLen);
+            }
+            copyFrom(initialMetadata, tableToken, initialMetadata.getTableId());
+        }
+        openSmallFile(ff, path, pathLen, metaMem, META_FILE_NAME, MemoryTag.MMAP_SEQUENCER_METADATA);
+    }
+
+    void skipTableRename() {
+        // Replaying historical renames can move metadata away from the registry token after rename chains or abandoned renames.
+        structureVersion.incrementAndGet();
+    }
+
+    void syncToMetaFile() {
+        metaMem.jumpTo(0);
+        // Size of metadata
+        metaMem.putInt(0);
+        metaMem.putInt(WAL_FORMAT_VERSION);
+        metaMem.putLong(structureVersion.get());
+        metaMem.putInt(columnCount);
+        metaMem.putInt(timestampIndex);
+        metaMem.putInt(tableId);
+        // we do not persist suspended flag anymore, suspended flag is in SeqTxnTracker
+        // field is kept for backwards compatibility only, the value is irrelevant
+        metaMem.putBool(false);
+        long checkSum = columnCount;
+        for (int i = 0; i < columnCount; i++) {
+            final int columnType = getColumnType(i);
+            metaMem.putInt(columnType);
+            metaMem.putStr(getColumnName(i));
+            checkSum = checkSum * 31 + columnType;
+            checkSum = checkSum * 31 + getColumnName(i).hashCode();
+        }
+
+        writeSequencerMetadataOptionalSections(metaMem, columnCount, checkSum, this, readColumnOrder);
+
+        // update metadata size
+        metaMem.putInt(0, (int) metaMem.getAppendOffset());
+        metaMem.sync(false);
+    }
+}

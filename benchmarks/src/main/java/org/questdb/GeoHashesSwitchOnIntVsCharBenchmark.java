@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,19 +38,10 @@ import java.util.concurrent.TimeUnit;
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 public class GeoHashesSwitchOnIntVsCharBenchmark {
 
-    public static void main(String[] args) throws Exception {
-        new Runner(new OptionsBuilder()
-                .include(GeoHashesSwitchOnIntVsCharBenchmark.class.getSimpleName())
-                .warmupIterations(2)
-                .measurementIterations(3)
-                .forks(1)
-                .build()).run();
-    }
-
     @Benchmark
     public static void isValidBits0() {
         Rnd rnd = new Rnd();
-        StringSink sink = Misc.getThreadLocalBuilder();
+        StringSink sink = Misc.getThreadLocalSink();
         for (int j = 0, m = 10_000_000; j < m; j++) {
             if (!isValidBits0(rnd_geobits(rnd, sink), 0)) {
                 throw new AssertionError();
@@ -61,12 +52,21 @@ public class GeoHashesSwitchOnIntVsCharBenchmark {
     @Benchmark
     public static void isValidBits1() {
         Rnd rnd = new Rnd();
-        StringSink sink = Misc.getThreadLocalBuilder();
+        StringSink sink = Misc.getThreadLocalSink();
         for (int j = 0, m = 10_000_000; j < m; j++) {
             if (!isValidBits1(rnd_geobits(rnd, sink), 0)) {
                 throw new AssertionError();
             }
         }
+    }
+
+    public static void main(String[] args) throws Exception {
+        new Runner(new OptionsBuilder()
+                .include(GeoHashesSwitchOnIntVsCharBenchmark.class.getSimpleName())
+                .warmupIterations(2)
+                .measurementIterations(3)
+                .forks(1)
+                .build()).run();
     }
 
     private static boolean isValidBits0(CharSequence tok, int start) {

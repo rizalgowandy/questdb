@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,17 +24,17 @@
 
 package io.questdb.cutlass.http;
 
+import io.questdb.FactoryProvider;
+import io.questdb.Metrics;
 import io.questdb.network.NetworkFacade;
+import io.questdb.std.datetime.NanosecondClock;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 
 public interface HttpContextConfiguration {
 
-    Runnable NONE= () -> {
-    };
-
     boolean allowDeflateBeforeSend();
 
-    MillisecondClock getClock();
+    boolean areCookiesEnabled();
 
     int getConnectionPoolInitialCapacity();
 
@@ -42,25 +42,37 @@ public interface HttpContextConfiguration {
 
     boolean getDumpNetworkTraffic();
 
+    int getExportConnectionLimit();
+
+    FactoryProvider getFactoryProvider();
+
+    int getForceRecvFragmentationChunkSize();
+
+    int getForceSendFragmentationChunkSize();
+
     String getHttpVersion();
+
+    int getIlpConnectionLimit();
+
+    int getJsonQueryConnectionLimit();
+
+    Metrics getMetrics();
+
+    MillisecondClock getMillisecondClock();
 
     int getMultipartHeaderBufferSize();
 
     long getMultipartIdleSpinCount();
 
-    NetworkFacade getNetworkFacade();
+    NanosecondClock getNanosecondClock();
 
-    int getRecvBufferSize();
+    NetworkFacade getNetworkFacade();
 
     int getRequestHeaderBufferSize();
 
-    int getSendBufferSize();
-
     boolean getServerKeepAlive();
 
-    boolean readOnlySecurityContext();
+    long getSessionTimeout();
 
-    default Runnable onPeerDisconnect(){
-        return NONE;
-    }
+    boolean readOnlySecurityContext();
 }

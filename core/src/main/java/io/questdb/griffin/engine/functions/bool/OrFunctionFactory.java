@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.BooleanFunction;
@@ -37,6 +38,7 @@ import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 
 public class OrFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "or(TT)";
@@ -66,7 +68,7 @@ public class OrFunctionFactory implements FunctionFactory {
                 }
                 return leftFunc;
             } finally {
-                rightFunc.close();
+                Misc.free(rightFunc);
             }
         }
         return new MyBooleanFunction(leftFunc, rightFunc);
@@ -94,6 +96,11 @@ public class OrFunctionFactory implements FunctionFactory {
         @Override
         public Function getRight() {
             return right;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val('(').val(left).val(" or ").val(right).val(')');
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,32 +25,46 @@
 package io.questdb.cutlass.http;
 
 import io.questdb.std.ObjList;
-import io.questdb.std.str.DirectByteCharSequence;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.Nullable;
 
 public interface HttpRequestHeader {
-    DirectByteCharSequence getBoundary();
+    DirectUtf8Sequence getBoundary();
 
-    DirectByteCharSequence getCharset();
+    DirectUtf8Sequence getCharset();
 
-    CharSequence getContentDisposition();
+    DirectUtf8Sequence getContentDisposition();
 
-    CharSequence getContentDispositionFilename();
+    DirectUtf8Sequence getContentDispositionFilename();
 
-    CharSequence getContentDispositionName();
+    DirectUtf8Sequence getContentDispositionName();
 
-    CharSequence getContentType();
+    long getContentLength();
 
-    DirectByteCharSequence getHeader(CharSequence name);
+    DirectUtf8Sequence getContentType();
 
-    ObjList<CharSequence> getHeaderNames();
+    DirectUtf8Sequence getHeader(Utf8Sequence name);
 
-    CharSequence getMethod();
+    ObjList<? extends Utf8Sequence> getHeaderNames();
 
-    CharSequence getMethodLine();
+    DirectUtf8Sequence getMethod();
 
-    CharSequence getUrl();
+    DirectUtf8Sequence getMethodLine();
 
-    DirectByteCharSequence getUrlParam(CharSequence name);
+    @Nullable
+    DirectUtf8String getQuery();
 
     long getStatementTimeout();
+
+    DirectUtf8String getUrl();
+
+    DirectUtf8Sequence getUrlParam(Utf8Sequence name);
+
+    boolean isGetRequest();
+
+    boolean isPostRequest();
+
+    boolean isPutRequest();
 }

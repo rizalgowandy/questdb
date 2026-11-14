@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,11 +24,16 @@
 
 package io.questdb.std;
 
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
+import org.jetbrains.annotations.NotNull;
+
 import java.util.Arrays;
 
 
-public class LongHashSet extends AbstractLongHashSet {
+public class LongHashSet extends AbstractLongHashSet implements Sinkable {
 
+    public static final double DEFAULT_LOAD_FACTOR = 0.4;
     private static final int MIN_INITIAL_CAPACITY = 16;
     private final LongList list;
 
@@ -36,40 +41,30 @@ public class LongHashSet extends AbstractLongHashSet {
         this(MIN_INITIAL_CAPACITY);
     }
 
-    @SuppressWarnings("CopyConstructorMissesField")
-    public LongHashSet(LongHashSet that) {
-        this(that.capacity, that.loadFactor, noEntryKey);
-        addAll(that);
-    }
-
     public LongHashSet(int initialCapacity) {
-        this(initialCapacity, 0.4, noEntryKey);
+        this(initialCapacity, DEFAULT_LOAD_FACTOR, noEntryKey);
     }
 
     public LongHashSet(int initialCapacity, double loadFactor, long noKeyValue) {
         super(initialCapacity, loadFactor, noKeyValue);
-        this.list = new LongList(free);
+        list = new LongList(free);
         clear();
     }
 
     /**
      * Adds key to hash set preserving key uniqueness.
      *
-     * @param key immutable sequence of characters.
+     * @param key key to be added.
+     * @return false if key is already in the set and true otherwise.
      */
-    public void add(long key) {
+    public boolean add(long key) {
         int index = keyIndex(key);
         if (index < 0) {
-            return;
+            return false;
         }
 
         addAt(index, key);
-    }
-
-    public final void addAll(LongHashSet that) {
-        for (int i = 0, k = that.size(); i < k; i++) {
-            add(that.get(i));
-        }
+        return true;
     }
 
     public void addAt(int index, long key) {
@@ -82,32 +77,8 @@ public class LongHashSet extends AbstractLongHashSet {
 
     public final void clear() {
         free = capacity;
-        Arrays.fill(keys, noEntryKeyValue
-        );
+        Arrays.fill(keys, noEntryKeyValue);
         list.clear();
-    }
-
-    public boolean excludes(long key) {
-        return keyIndex(key) > -1;
-    }
-
-    public void removeAt(int index) {
-        if (index < 0) {
-            long key = keys[-index - 1];
-            super.removeAt(index);
-            list.remove(key);
-        }
-    }
-
-    @Override
-    protected void erase(int index) {
-        keys[index] = noEntryKeyValue;
-    }
-
-    @Override
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        erase(from);
     }
 
     public boolean contains(long key) {
@@ -120,6 +91,19 @@ public class LongHashSet extends AbstractLongHashSet {
 
     public long getLast() {
         return list.getLast();
+    }
+
+    public void removeAt(int index) {
+        if (index < 0) {
+            long key = keys[-index - 1];
+            super.removeAt(index);
+            list.remove(key);
+        }
+    }
+
+    @Override
+    public void toSink(@NotNull CharSink<?> sink) {
+        list.toSinkSorted(sink);
     }
 
     @Override
@@ -142,4 +126,16 @@ public class LongHashSet extends AbstractLongHashSet {
             keys[keyIndex] = key;
         }
     }
+
+    @Override
+    protected void erase(int index) {
+        keys[index] = noEntryKeyValue;
+    }
+
+    @Override
+    protected void move(int from, int to) {
+        keys[to] = keys[from];
+        erase(from);
+    }
+
 }

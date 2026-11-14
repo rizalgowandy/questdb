@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,44 +25,78 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.CairoConfiguration;
-import io.questdb.cairo.sql.DataFrameCursorFactory;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.PlanSink;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.IntList;
 import io.questdb.std.LongList;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
 import org.jetbrains.annotations.NotNull;
 
 public class LatestByAllIndexedRecordCursorFactory extends AbstractTreeSetRecordCursorFactory {
-    protected final DirectLongList prefixes;
+    protected DirectLongList prefixes;
 
     public LatestByAllIndexedRecordCursorFactory(
-            @NotNull RecordMetadata metadata,
+            CairoEngine engine,
             @NotNull CairoConfiguration configuration,
-            @NotNull DataFrameCursorFactory dataFrameCursorFactory,
+            @NotNull RecordMetadata metadata,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
             int columnIndex,
             @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts,
             @NotNull LongList prefixes
     ) {
-        super(metadata, dataFrameCursorFactory, configuration);
-        this.prefixes = new DirectLongList(Math.max(2, prefixes.size()), MemoryTag.NATIVE_LATEST_BY_LONG_LIST);
+        super(configuration, metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
 
-        // copy into owned direct memory
-        for (int i = 0; i < prefixes.size(); i++) {
-            this.prefixes.add(prefixes.get(i));
+        try {
+            this.prefixes = new DirectLongList(Math.max(2, prefixes.size()), MemoryTag.NATIVE_LATEST_BY_LONG_LIST);
+            // copy into owned direct memory
+            for (int i = 0; i < prefixes.size(); i++) {
+                this.prefixes.add(prefixes.get(i));
+            }
+
+            this.cursor = new LatestByAllIndexedRecordCursor(engine, configuration, metadata, columnIndex, rows, this.prefixes);
+        } catch (Throwable th) {
+            close();
+            throw th;
         }
-
-        this.cursor = new LatestByAllIndexedRecordCursor(columnIndex, rows, columnIndexes, this.prefixes);
-    }
-
-    @Override
-    public void close() {
-        super.close();
-        prefixes.close();
     }
 
     @Override
     public boolean recordCursorSupportsRandomAccess() {
         return true;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("LatestByAllIndexed");
+        sink.child(cursor);
+        sink.child(partitionFrameCursorFactory);
+    }
+
+    @Override
+    public boolean usesIndex() {
+        return true;
+    }
+
+    @Override
+    protected void _close() {
+        final PageFrameRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final DirectLongList prefixes = this.prefixes;
+        this.prefixes = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
+        }
+        failure = Misc.freeBestEffort(failure, prefixes);
+        failure = Misc.freeBestEffort(failure, cursor);
+        CairoException.rethrowCleanupFailure(failure);
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,10 +27,16 @@ package io.questdb.cutlass.http;
 import java.io.Closeable;
 
 public interface HttpRequestProcessorSelector extends Closeable {
-    HttpRequestProcessor select(CharSequence url);
-
-    HttpRequestProcessor getDefaultProcessor();
+    int REJECT_PROCESSOR_ID = -1;
 
     @Override
     void close();
+
+    default int getLastSelectedHandlerId() {
+        return REJECT_PROCESSOR_ID;
+    }
+
+    HttpRequestProcessor resolveProcessorById(int handlerId, HttpRequestHeader header);
+
+    HttpRequestProcessor select(HttpRequestHeader requestHeader);
 }

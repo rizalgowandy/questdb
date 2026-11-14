@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,117 +24,196 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
 
 class SampleByFillNoneRecordCursor extends AbstractVirtualRecordSampleByCursor {
-    private final Map map;
     private final RecordSink keyMapSink;
+    private final Map map;
     private final RecordCursor mapCursor;
+    private boolean isMapBuildPending;
+    private boolean isOpen;
+    private long rowId;
 
     public SampleByFillNoneRecordCursor(
+            CairoConfiguration configuration,
             Map map,
             RecordSink keyMapSink,
             ObjList<GroupByFunction> groupByFunctions,
+            GroupByFunctionsUpdater groupByFunctionsUpdater,
             ObjList<Function> recordFunctions,
             int timestampIndex, // index of timestamp column in base cursor
+            int timestampType,
             TimestampSampler timestampSampler,
             Function timezoneNameFunc,
             int timezoneNameFuncPos,
             Function offsetFunc,
-            int offsetFuncPos
+            int offsetFuncPos,
+            Function sampleFromFunc,
+            int sampleFromFuncPos,
+            Function sampleToFunc,
+            int sampleToFuncPos
     ) {
         super(
+                configuration,
                 recordFunctions,
                 timestampIndex,
+                timestampType,
                 timestampSampler,
                 groupByFunctions,
+                groupByFunctionsUpdater,
                 timezoneNameFunc,
                 timezoneNameFuncPos,
                 offsetFunc,
-                offsetFuncPos
+                offsetFuncPos,
+                sampleFromFunc,
+                sampleFromFuncPos,
+                sampleToFunc,
+                sampleToFuncPos,
+                false
         );
         this.map = map;
         this.keyMapSink = keyMapSink;
-        this.record.of(map.getRecord());
-        this.mapCursor = map.getCursor();
+        record.of(map.getRecord());
+        mapCursor = map.getCursor();
+        // Lazy map (openOnInit=false): start closed so of() allocates the backing
+        // under the bound MemoryTracker on the first cursor.
+        isOpen = false;
+    }
+
+    @Override
+    public void close() {
+        if (isOpen) {
+            map.close();
+            super.close();
+            isOpen = false;
+        }
     }
 
     @Override
     public boolean hasNext() {
+        // on the first call, initTimestamps() may leave the NULL bucket in the map, see aggregateNullTimestampRows()
+        initTimestamps();
+
         if (mapCursor.hasNext()) {
             return true;
         }
 
         if (baseRecord == null) {
             return false;
-
         }
-        this.map.clear();
 
-        this.sampleLocalEpoch = this.localEpoch;
-        long next = timestampSampler.nextTimestamp(this.localEpoch);
+        buildMap();
 
-        // looks like we need to populate key map
-        // at the start of this loop 'lastTimestamp' will be set to timestamp
-        // of first record in base cursor
-        int n = groupByFunctions.size();
-        do {
-            long timestamp = getBaseRecordTimestamp();
-            if (timestamp < next) {
-                adjustDSTInFlight(timestamp - tzOffset);
-                final MapKey key = map.withKey();
-                keyMapSink.copy(baseRecord, key);
-                GroupByUtils.updateFunctions(groupByFunctions, n, key.createValue(), baseRecord);
-                circuitBreaker.statefulThrowExceptionIfTripped();
-            } else {
-                // map value is conditional and only required when clock goes back
-                // we override base method for when this happens
-                // see: updateValueWhenClockMovesBack()
-                timestamp = adjustDST(timestamp, n, null, next);
-                if (timestamp != Long.MIN_VALUE) {
-                    nextSamplePeriod(timestamp);
-                    return createMapCursor();
-                }
-            }
-        } while (base.hasNext());
+        return mapCursor.hasNext();
+    }
 
-        // we ran out of data, make sure hasNext() returns false at the next
-        // opportunity, after we stream map that is.
-        baseRecord = null;
-        return createMapCursor();
+    @Override
+    public void of(RecordCursor base, SqlExecutionContext executionContext) throws SqlException {
+        // isOpen before super.of() so an of() breach frees the base cursor via close().
+        isOpen = true;
+        super.of(base, executionContext);
+        // Bind+reopen the map as super.of() does the allocator; reopen() is idempotent.
+        map.setMemoryTracker(executionContext.getMemoryTracker());
+        map.reopen();
+        // hasNext() consults the map cursor before it builds the first bucket, so drop
+        // the rows that the previous execution left unread in it.
+        map.clear();
+        map.getCursor();
+        rowId = 0;
+        isMapBuildPending = true;
     }
 
     @Override
     public void toTop() {
         super.toTop();
-        if (base.hasNext()) {
-            baseRecord = base.getRecord();
-            map.clear();
+        // drop the rows left unread in the map cursor, as of() does
+        map.clear();
+        map.getCursor();
+        rowId = 0;
+        isMapBuildPending = true;
+    }
+
+    private void aggregateBaseRecord() {
+        final MapKey key = map.withKey();
+        keyMapSink.copy(baseRecord, key);
+        final MapValue value = key.createValue();
+        if (value.isNew()) {
+            groupByFunctionsUpdater.updateNew(value, baseRecord, rowId++);
+        } else {
+            groupByFunctionsUpdater.updateExisting(value, baseRecord, rowId++);
         }
     }
 
-    @Override
-    protected void updateValueWhenClockMovesBack(MapValue value, int n) {
-        final MapKey key = map.withKey();
-        keyMapSink.copy(baseRecord, key);
-        super.updateValueWhenClockMovesBack(key.createValue(), n);
-    }
+    private void buildMap() {
+        if (isMapBuildPending) {
+            map.clear();
+            sampleLocalEpoch = localEpoch;
+            isMapBuildPending = false;
+        }
 
-    private boolean createMapCursor() {
+        final long next = timestampSampler.nextTimestamp(getGridLocalEpoch());
+        // the row that starts the bucket falls inside it, so the first iteration consumes it
+        assert getBaseRecordTimestamp() < next;
+        do {
+            long timestamp = getBaseRecordTimestamp();
+            if (timestamp < next) {
+                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+
+                adjustDstInFlight(timestamp - tzOffset);
+                aggregateBaseRecord();
+            } else {
+                // map value is conditional and only required when clock goes back
+                // we override base method for when this happens
+                // see: updateValueWhenClockMovesBack()
+                timestamp = adjustDst(timestamp, null, next);
+                if (timestamp != Long.MIN_VALUE) {
+                    nextSamplePeriod(timestamp);
+                    // reset map iterator
+                    map.getCursor();
+                    isMapBuildPending = true;
+                    return;
+                }
+            }
+        } while (baseCursor.hasNext());
+
+        // we ran out of data, make sure hasNext() returns false at the next
+        // opportunity, after we stream map that is.
+        baseRecord = null;
         // reset map iterator
         map.getCursor();
-        // we do not have any more data, let map take over
-        return mapHasNext();
+        isMapBuildPending = true;
     }
 
-    private boolean mapHasNext() {
-        return mapCursor.hasNext();
+    @Override
+    protected boolean aggregateNullTimestampRows() {
+        // of() and toTop() left the map empty, so it holds the NULL bucket alone, one entry per key. hasNext() streams
+        // the entries before it builds the first bucket of the grid, and isMapBuildPending makes buildMap() clear them.
+        boolean hasNext;
+        do {
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            aggregateBaseRecord();
+            hasNext = baseCursor.hasNext();
+        } while (hasNext && baseRecord.getTimestamp(timestampIndex) == Numbers.LONG_NULL);
+        // reset map iterator
+        map.getCursor();
+        return hasNext;
+    }
+
+    @Override
+    protected void updateValueWhenClockMovesBack(MapValue value) {
+        // The row joins the bucket in progress. The map starts every bucket empty, so the key may have
+        // no entry yet, and an entry it creates must go through updateNew().
+        aggregateBaseRecord();
     }
 }

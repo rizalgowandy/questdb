@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,18 +24,47 @@
 
 package io.questdb.griffin.engine.join;
 
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.sql.Record;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
 
 public class JoinRecord implements Record {
-    private final int split;
-    private Record master;
+    protected final int split;
+    protected Record master;
     protected Record slave;
 
     public JoinRecord(int split) {
         this.split = split;
+    }
+
+    @Override
+    public ArrayView getArray(int col, int columnType) {
+        if (col < split) {
+            return master.getArray(col, columnType);
+        }
+        return slave.getArray(col - split, columnType);
+    }
+
+    @Override
+    public int getArrayDimLen(int col, int columnType, int dim) {
+        if (col < split) {
+            return master.getArrayDimLen(col, columnType, dim);
+        }
+        return slave.getArrayDimLen(col - split, columnType, dim);
+    }
+
+    @Override
+    public double getArrayDouble1d2d(int col, int columnType, int idx0, int idx1) {
+        if (col < split) {
+            return master.getArrayDouble1d2d(col, columnType, idx0, idx1);
+        }
+        return slave.getArrayDouble1d2d(col - split, columnType, idx0, idx1);
     }
 
     @Override
@@ -87,6 +116,56 @@ public class JoinRecord implements Record {
     }
 
     @Override
+    public void getDecimal128(int col, Decimal128 sink) {
+        if (col < split) {
+            master.getDecimal128(col, sink);
+        } else {
+            slave.getDecimal128(col - split, sink);
+        }
+    }
+
+    @Override
+    public short getDecimal16(int col) {
+        if (col < split) {
+            return master.getDecimal16(col);
+        }
+        return slave.getDecimal16(col - split);
+    }
+
+    @Override
+    public void getDecimal256(int col, Decimal256 sink) {
+        if (col < split) {
+            master.getDecimal256(col, sink);
+        } else {
+            slave.getDecimal256(col - split, sink);
+        }
+    }
+
+    @Override
+    public int getDecimal32(int col) {
+        if (col < split) {
+            return master.getDecimal32(col);
+        }
+        return slave.getDecimal32(col - split);
+    }
+
+    @Override
+    public long getDecimal64(int col) {
+        if (col < split) {
+            return master.getDecimal64(col);
+        }
+        return slave.getDecimal64(col - split);
+    }
+
+    @Override
+    public byte getDecimal8(int col) {
+        if (col < split) {
+            return master.getDecimal8(col);
+        }
+        return slave.getDecimal8(col - split);
+    }
+
+    @Override
     public double getDouble(int col) {
         if (col < split) {
             return master.getDouble(col);
@@ -103,11 +182,59 @@ public class JoinRecord implements Record {
     }
 
     @Override
+    public byte getGeoByte(int col) {
+        if (col < split) {
+            return master.getGeoByte(col);
+        }
+        return slave.getGeoByte(col - split);
+    }
+
+    @Override
+    public int getGeoInt(int col) {
+        if (col < split) {
+            return master.getGeoInt(col);
+        }
+        return slave.getGeoInt(col - split);
+    }
+
+    @Override
+    public long getGeoLong(int col) {
+        if (col < split) {
+            return master.getGeoLong(col);
+        }
+        return slave.getGeoLong(col - split);
+    }
+
+    @Override
+    public short getGeoShort(int col) {
+        if (col < split) {
+            return master.getGeoShort(col);
+        }
+        return slave.getGeoShort(col - split);
+    }
+
+    @Override
+    public int getIPv4(int col) {
+        if (col < split) {
+            return master.getIPv4(col);
+        }
+        return slave.getIPv4(col - split);
+    }
+
+    @Override
     public int getInt(int col) {
         if (col < split) {
             return master.getInt(col);
         }
         return slave.getInt(col - split);
+    }
+
+    @Override
+    public Interval getInterval(int col) {
+        if (col < split) {
+            return master.getInterval(col);
+        }
+        return slave.getInterval(col - split);
     }
 
     @Override
@@ -119,7 +246,23 @@ public class JoinRecord implements Record {
     }
 
     @Override
-    public void getLong256(int col, CharSink sink) {
+    public long getLong128Hi(int col) {
+        if (col < split) {
+            return master.getLong128Hi(col);
+        }
+        return slave.getLong128Hi(col - split);
+    }
+
+    @Override
+    public long getLong128Lo(int col) {
+        if (col < split) {
+            return master.getLong128Lo(col);
+        }
+        return slave.getLong128Lo(col - split);
+    }
+
+    @Override
+    public void getLong256(int col, CharSink<?> sink) {
         if (col < split) {
             master.getLong256(col, sink);
         } else {
@@ -157,11 +300,6 @@ public class JoinRecord implements Record {
     }
 
     @Override
-    public long getUpdateRowId() {
-        return master.getUpdateRowId();
-    }
-
-    @Override
     public short getShort(int col) {
         if (col < split) {
             return master.getShort(col);
@@ -170,20 +308,11 @@ public class JoinRecord implements Record {
     }
 
     @Override
-    public CharSequence getStr(int col) {
+    public CharSequence getStrA(int col) {
         if (col < split) {
-            return master.getStr(col);
+            return master.getStrA(col);
         }
-        return slave.getStr(col - split);
-    }
-
-    @Override
-    public void getStr(int col, CharSink sink) {
-        if (col < split) {
-            master.getStr(col, sink);
-        } else {
-            slave.getStr(col - split, sink);
-        }
+        return slave.getStrA(col - split);
     }
 
     @Override
@@ -203,11 +332,11 @@ public class JoinRecord implements Record {
     }
 
     @Override
-    public CharSequence getSym(int col) {
+    public CharSequence getSymA(int col) {
         if (col < split) {
-            return master.getSym(col);
+            return master.getSymA(col);
         }
-        return slave.getSym(col - split);
+        return slave.getSymA(col - split);
     }
 
     @Override
@@ -227,38 +356,35 @@ public class JoinRecord implements Record {
     }
 
     @Override
-    public byte getGeoByte(int col) {
-        if (col < split) {
-            return master.getGeoByte(col);
-        }
-        return slave.getGeoByte(col - split);
+    public long getUpdateRowId() {
+        return master.getUpdateRowId();
     }
 
     @Override
-    public short getGeoShort(int col) {
+    public Utf8Sequence getVarcharA(int col) {
         if (col < split) {
-            return master.getGeoShort(col);
+            return master.getVarcharA(col);
         }
-        return slave.getGeoShort(col - split);
+        return slave.getVarcharA(col - split);
     }
 
     @Override
-    public int getGeoInt(int col) {
+    public Utf8Sequence getVarcharB(int col) {
         if (col < split) {
-            return master.getGeoInt(col);
+            return master.getVarcharB(col);
         }
-        return slave.getGeoInt(col - split);
+        return slave.getVarcharB(col - split);
     }
 
     @Override
-    public long getGeoLong(int col) {
+    public int getVarcharSize(int col) {
         if (col < split) {
-            return master.getGeoLong(col);
+            return master.getVarcharSize(col);
         }
-        return slave.getGeoLong(col - split);
+        return slave.getVarcharSize(col - split);
     }
 
-    void of(Record master, Record slave) {
+    public void of(Record master, Record slave) {
         this.master = master;
         this.slave = slave;
     }

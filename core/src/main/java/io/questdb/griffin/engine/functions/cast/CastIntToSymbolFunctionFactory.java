@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -47,14 +47,14 @@ public class CastIntToSymbolFunctionFactory implements FunctionFactory {
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
         final Function arg = args.getQuick(0);
         if (arg.isConstant()) {
-            final StringSink sink = Misc.getThreadLocalBuilder();
+            final StringSink sink = Misc.getThreadLocalSink();
             sink.put(arg.getInt(null));
             return SymbolConstant.newInstance(sink);
         }
         return new Func(arg);
     }
 
-    private static class Func extends AbstractToSymbolCastFunction {
+    private static class Func extends AbstractCastToSymbolFunction {
         public Func(Function arg) {
             super(arg);
         }
@@ -62,7 +62,7 @@ public class CastIntToSymbolFunctionFactory implements FunctionFactory {
         @Override
         public int getInt(Record rec) {
             final int value = arg.getInt(rec);
-            if (value == Numbers.INT_NaN) {
+            if (value == Numbers.INT_NULL) {
                 return SymbolTable.VALUE_IS_NULL;
             }
             return getInt0(value);
@@ -71,15 +71,10 @@ public class CastIntToSymbolFunctionFactory implements FunctionFactory {
         @Override
         public CharSequence getSymbol(Record rec) {
             final int value = arg.getInt(rec);
-            if (value == Numbers.INT_NaN) {
+            if (value == Numbers.INT_NULL) {
                 return null;
             }
             return getSymbol0(value);
-        }
-
-        @Override
-        protected AbstractToSymbolCastFunction newFunc() {
-            return new Func(arg);
         }
     }
 }

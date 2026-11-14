@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,25 +24,47 @@
 
 package io.questdb.cutlass.line.tcp;
 
-import io.questdb.WorkerPoolAwareConfiguration;
-import io.questdb.cairo.CairoSecurityContext;
-import io.questdb.cutlass.line.LineProtoTimestampAdapter;
+import io.questdb.FactoryProvider;
+import io.questdb.Metrics;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.mp.WorkerPoolConfiguration;
 import io.questdb.network.IODispatcherConfiguration;
 import io.questdb.network.NetworkFacade;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.datetime.MicrosecondClock;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 
-public interface LineTcpReceiverConfiguration {
+public interface LineTcpReceiverConfiguration extends IODispatcherConfiguration {
 
-    String getAuthDbPath();
+    String getAuthDB();
 
-    CairoSecurityContext getCairoSecurityContext();
+    boolean getAutoCreateNewColumns();
+
+    boolean getAutoCreateNewTables();
+
+    CairoConfiguration getCairoConfiguration();
+
+    long getCommitInterval();
+
+    long getCommitIntervalDefault();
+
+    double getCommitIntervalFraction();
 
     int getConnectionPoolInitialCapacity();
 
+    short getDefaultColumnTypeForFloat();
+
+    short getDefaultColumnTypeForInteger();
+
+    int getDefaultCreateTimestampColumnType();
+
     int getDefaultPartitionBy();
 
-    WorkerPoolAwareConfiguration getIOWorkerPoolConfiguration();
+    boolean getDisconnectOnError();
+
+    FactoryProvider getFactoryProvider();
+
+    FilesFacade getFilesFacade();
 
     /**
      * Interval in milliseconds to perform writer maintenance. Such maintenance can
@@ -52,43 +74,37 @@ public interface LineTcpReceiverConfiguration {
      */
     long getMaintenanceInterval();
 
-    double getCommitIntervalFraction();
-
-    long getCommitIntervalDefault();
+    int getMaxFileNameLength();
 
     int getMaxMeasurementSize();
+
+    long getMaxRecvBufferSize();
+
+    Metrics getMetrics();
 
     MicrosecondClock getMicrosecondClock();
 
     MillisecondClock getMillisecondClock();
 
-    long getWriterIdleTimeout();
-
-    IODispatcherConfiguration getDispatcherConfiguration();
-
-    int getNetMsgBufferSize();
-
     NetworkFacade getNetworkFacade();
 
-    LineProtoTimestampAdapter getTimestampAdapter();
+    WorkerPoolConfiguration getNetworkWorkerPoolConfiguration();
+
+    long getSymbolCacheWaitBeforeReload();
+
+    byte getTimestampUnit();
+
+    long getWriterIdleTimeout();
 
     int getWriterQueueCapacity();
 
-    WorkerPoolAwareConfiguration getWriterWorkerPoolConfiguration();
+    WorkerPoolConfiguration getWriterWorkerPoolConfiguration();
 
     boolean isEnabled();
 
-    boolean getDisconnectOnError();
-
-    long getSymbolCacheWaitUsBeforeReload();
-
     boolean isStringToCharCastAllowed();
 
-    boolean isSymbolAsFieldSupported();
+    boolean isUseLegacyStringDefault();
 
-    boolean isStringAsTagSupported();
-
-    short getDefaultColumnTypeForFloat();
-
-    short getDefaultColumnTypeForInteger();
+    boolean logMessageOnError();
 }

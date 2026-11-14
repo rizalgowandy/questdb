@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 package io.questdb.network;
 
 import io.questdb.log.Log;
+import io.questdb.std.str.LPSZ;
 
 public interface NetworkFacade {
 
@@ -36,47 +37,68 @@ public interface NetworkFacade {
 
     boolean bindTcp(long fd, CharSequence ipv4Address, int port);
 
+    boolean bindUdp(long fd, int ipv4Address, int port);
+
+    long bumpFdCount(int fd);
+
     int close(long fd);
 
     void close(long fd, Log logger);
 
-    void configureNoLinger(long fd);
+    void configureKeepAlive(long fd);
 
     int configureLinger(long fd, int seconds);
 
+    void configureNoLinger(long fd);
+
     int configureNonBlocking(long fd);
 
-    long connect(long fd, long sockaddr);
+    int connect(long fd, long pSockaddr);
 
-    void freeSockAddr(long socketAddress);
-
-    long getPeerIP(long fd);
-
-    void listen(long serverFd, int backlog);
-
-    int recv(long fd, long buffer, int bufferLen);
-
-    int peek(long fd, long buffer, int bufferLen);
-
-    int send(long fd, long buffer, int bufferLen);
+    int connectAddrInfo(long fd, long pAddrInfo);
 
     int errno();
 
-    long sockaddr(int address, int port);
+    void freeAddrInfo(long pAddrInfo);
 
-    int sendTo(long fd, long lo, int len, long socketAddress);
+    void freeMsgHeaders(long msgVec);
 
-    long socketTcp(boolean blocking);
+    void freeSockAddr(long pSockaddr);
 
-    long socketUdp();
+    long getAddrInfo(LPSZ host, int port);
 
-    boolean bindUdp(long fd, int ipv4Address, int port);
+    long getAddrInfo(CharSequence host, int port);
+
+    long getMMsgBuf(long msg);
+
+    long getMMsgBufLen(long msg);
+
+    long getPeerIP(long fd);
+
+    int getSndBuf(long fd);
 
     boolean join(long fd, CharSequence bindIPv4Address, CharSequence groupIPv4Address);
 
     boolean join(long fd, int bindIPv4, int groupIPv4);
 
-    long sockaddr(CharSequence address, int port);
+    void listen(long serverFd, int backlog);
+
+    long msgHeaders(int msgBufferSize, int msgCount);
+
+    int parseIPv4(CharSequence ipv4Address);
+
+    int peekRaw(long fd, long buffer, int bufferLen);
+
+    int recvRaw(long fd, long buffer, int bufferLen);
+
+    @SuppressWarnings("SpellCheckingInspection")
+    int recvmmsgRaw(long fd, long msgVec, int msgCount);
+
+    int resolvePort(long fd);
+
+    int sendRaw(long fd, long buffer, int bufferLen);
+
+    int sendToRaw(long fd, long lo, int len, long socketAddress);
 
     int setMulticastInterface(long fd, CharSequence address);
 
@@ -84,30 +106,35 @@ public interface NetworkFacade {
 
     int setMulticastLoop(long fd, boolean loop);
 
-    int shutdown(long fd, int how);
-
-    int parseIPv4(CharSequence ipv4Address);
-
-    int setReusePort(long fd);
-
-    int setTcpNoDelay(long fd, boolean noDelay);
+    int setMulticastTtl(long fd, int ttl);
 
     int setRcvBuf(long fd, int size);
 
-    void freeMsgHeaders(long msgVec);
-
-    long getMMsgBuf(long msg);
-
-    long getMMsgBufLen(long msg);
-
-    long msgHeaders(int msgBufferSize, int msgCount);
-
-    @SuppressWarnings("SpellCheckingInspection")
-    int recvmmsg(long fd, long msgVec, int msgCount);
+    int setReusePort(long fd);
 
     boolean setSndBuf(long fd, int size);
 
-    int getSndBuf(long fd);
+    int setTcpNoDelay(long fd, boolean noDelay);
 
-    int setMulticastTtl(long fd, int ttl);
+    int shutdown(long fd, int how);
+
+    long sockaddr(int address, int port);
+
+    long sockaddr(CharSequence address, int port);
+
+    long socketTcp(boolean blocking);
+
+    long socketUdp();
+
+    /**
+     * Returns true if the peer has disconnected, false otherwise. The implementation probes the
+     * socket directly (see {@link Net#isPeerDisconnected(long)}); the {@code buffer}/{@code bufferSize}
+     * arguments are retained only for backward compatibility and are no longer read.
+     *
+     * @param fd         file descriptor
+     * @param buffer     unused; retained for signature compatibility
+     * @param bufferSize unused; retained for signature compatibility
+     * @return true if the peer has disconnected, false otherwise
+     */
+    boolean testConnection(long fd, long buffer, int bufferSize);
 }

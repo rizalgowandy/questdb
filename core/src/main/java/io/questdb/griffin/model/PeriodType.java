@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,11 @@
 package io.questdb.griffin.model;
 
 public final class PeriodType {
-    public static final char NONE = (char) 0;
-
-    public static final char YEAR = 'y';
-    public static final char MONTH = 'M';
+    public static final char DAY = 'd';
     public static final char HOUR = 'h';
     public static final char MINUTE = 'm';
+    public static final char MONTH = 'M';
+    public static final char NONE = (char) 0;
     public static final char SECOND = 's';
-    public static final char DAY = 'd';
+    public static final char YEAR = 'y';
 }

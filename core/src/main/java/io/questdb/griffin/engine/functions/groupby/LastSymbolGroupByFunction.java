@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,7 +35,24 @@ public class LastSymbolGroupByFunction extends FirstSymbolGroupByFunction {
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
-        computeFirst(mapValue, record);
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
+        if (rowId > mapValue.getLong(valueIndex)) {
+            computeFirst(mapValue, record, rowId);
+        }
+    }
+
+    @Override
+    public String getName() {
+        return "last";
+    }
+
+    @Override
+    public void merge(MapValue destValue, MapValue srcValue) {
+        long srcRowId = srcValue.getLong(valueIndex);
+        long destRowId = destValue.getLong(valueIndex);
+        if (srcRowId > destRowId) {
+            destValue.putLong(valueIndex, srcRowId);
+            destValue.putInt(valueIndex + 1, srcValue.getInt(valueIndex + 1));
+        }
     }
 }

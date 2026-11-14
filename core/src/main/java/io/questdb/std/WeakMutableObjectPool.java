@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,19 +34,24 @@ public class WeakMutableObjectPool<T extends Mutable> extends WeakObjectPoolBase
     public WeakMutableObjectPool(@NotNull ObjectFactory<T> factory, int initSize) {
         super(initSize);
         this.factory = factory;
-        fill();
+        try {
+            fill();
+        } catch (Throwable e) {
+            close();
+            throw e;
+        }
+    }
+
+    @Override
+    public void close() {
+        while (!cache.isEmpty()) {
+            Misc.freeIfCloseable(cache.pop());
+        }
     }
 
     @Override
     public boolean push(T obj) {
         return super.push(obj);
-    }
-
-    @Override
-    public void close() {
-        while (cache.size() > 0) {
-            Misc.free(cache.pop());
-        }
     }
 
     @Override
@@ -56,7 +61,7 @@ public class WeakMutableObjectPool<T extends Mutable> extends WeakObjectPoolBase
 
     @Override
     void close(T obj) {
-        Misc.free(obj);
+        Misc.freeIfCloseable(obj);
     }
 
     @Override

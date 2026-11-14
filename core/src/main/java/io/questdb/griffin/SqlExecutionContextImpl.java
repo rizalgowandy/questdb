@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,63 +24,275 @@
 
 package io.questdb.griffin;
 
-import io.questdb.cairo.*;
-import io.questdb.cairo.security.AllowAllCairoSecurityContext;
+import io.questdb.Telemetry;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.pool.ResourcePoolSupervisor;
+import io.questdb.cairo.security.DenyAllSecurityContext;
+import io.questdb.cairo.sql.AtomicBooleanCircuitBreaker;
 import io.questdb.cairo.sql.BindVariableService;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.VirtualRecord;
-import io.questdb.griffin.engine.analytic.AnalyticContext;
-import io.questdb.griffin.engine.analytic.AnalyticContextImpl;
-import io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl;
+import io.questdb.cairo.sql.async.PageFrameSequence;
 import io.questdb.griffin.engine.functions.rnd.SharedRandom;
-import io.questdb.mp.RingQueue;
-import io.questdb.mp.Sequence;
+import io.questdb.griffin.engine.window.WindowContext;
+import io.questdb.griffin.engine.window.WindowContextImpl;
+import io.questdb.griffin.model.IntervalUtils;
+import io.questdb.griffin.model.RuntimeIntrinsicIntervalModel;
+import io.questdb.mp.continuation.CancellationBinding;
+import io.questdb.mp.continuation.Fiber;
+import io.questdb.mp.continuation.SuspensionScope;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Decimal64;
+import io.questdb.std.IntHashSet;
 import io.questdb.std.IntStack;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.ObjStack;
 import io.questdb.std.Rnd;
 import io.questdb.std.Transient;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.datetime.MicrosecondClock;
+import io.questdb.std.datetime.NanosecondClock;
+import io.questdb.std.str.CharSink;
 import io.questdb.tasks.TelemetryTask;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+
 public class SqlExecutionContextImpl implements SqlExecutionContext {
-    private final IntStack timestampRequiredStack = new IntStack();
-    private final int workerCount;
+    private static final IntHashSet SKIP_TELEMETRY_EVENTS = new IntHashSet();
     private final CairoConfiguration cairoConfiguration;
     private final CairoEngine cairoEngine;
-    private final MicrosecondClock clock;
-    private final AnalyticContextImpl analyticContext = new AnalyticContextImpl();
-    private final RingQueue<TelemetryTask> telemetryQueue;
-    private Sequence telemetryPubSeq;
-    private TelemetryTask.TelemetryMethod telemetryMethod = this::storeTelemetryNoop;
-    private BindVariableService bindVariableService;
-    private CairoSecurityContext cairoSecurityContext;
-    private Rnd random;
-    private long requestFd = -1;
+    private final Decimal128 decimal128 = new Decimal128();
+    private final Decimal256 decimal256 = new Decimal256();
+    private final Decimal64 decimal64 = new Decimal64();
+    private final int defaultPageFrameMaxRows;
+    private final int defaultPageFrameMinRows;
+    private final ExecutionState executionState;
+    private final IntStack hasIntervalStack = new IntStack();
+    private final ObjStack<RuntimeIntrinsicIntervalModel> intervalModelObjStack = new ObjStack<>();
+    private final MicrosecondClock microClock;
+    private final NanosecondClock nanoClock;
+    private final ObjList<PageFrameSequence<?>> pageFrameSequences = new ObjList<>();
+    private final int sharedQueryWorkerCount;
+    private final AtomicBooleanCircuitBreaker simpleCircuitBreaker;
+    private final Telemetry<TelemetryTask> telemetry;
+    private final TelemetryFacade telemetryFacade;
+    private final IntStack timestampRequiredStack = new IntStack();
+    private final ObjList<WindowContextImpl> windowContexts = new ObjList<>();
+    protected BindVariableService bindVariableService;
+    protected SecurityContext securityContext;
+    private boolean allowBareNoArgFunctionCalls = true;
+    private boolean allowNonDeterministicFunction = true;
+    private boolean cacheHit;
     private SqlExecutionCircuitBreaker circuitBreaker = SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
-    private long now;
+    private boolean clockUseNow = false;
+    private boolean cloneSymbolTables;
+    private boolean containsSecret;
+    private CharSequence expiryMaterializingViewName;
+    private TableToken expiryRawReadTable;
+    private ExpiryReadPolicy expiryReadPolicy = ExpiryReadPolicy.FILTER;
+    private int intervalFunctionType;
+    private long intervalPlanGeneration;
+    private long intervalPlanGenerationCounter;
+    private boolean isMetadataProbe;
+    private boolean isViewCompile;
+    private boolean isViewMetadataSubquery;
     private int jitMode;
-    private boolean cloneSymbolTables = false;
+    private boolean liveViewCompile;
+    private MemoryTracker memoryTracker;
+    private long nowMicros;
+    private long nowNanos;
+    // Timestamp type only for now() function, used by NowFunctionFactory
+    private int nowTimestampType;
+    private int pageFrameMaxRows;
+    private int pageFrameMinRows;
+    private boolean parallelFilterEnabled;
+    private boolean parallelGroupByEnabled;
+    private boolean parallelHashJoinGroupByEnabled;
+    private boolean parallelReadParquetEnabled;
+    private boolean parquetRowGroupPruningEnabled;
+    private boolean parallelTopKEnabled;
+    private boolean parallelHorizonJoinEnabled;
+    private boolean parallelWindowJoinEnabled;
+    private long queryRegistryOwnerId = -1;
+    private QueryFutureUpdateListener queryFutureUpdateListener = QueryFutureUpdateListener.EMPTY;
+    private Rnd random;
+    private ResourcePoolSupervisor<TableReader> readerPoolSupervisor;
+    private long requestFd = -1;
+    private TableFunctionView tableFunctionView;
+    private boolean useSimpleCircuitBreaker;
+    private boolean validationOnly = false;
+    private SecurityContext validationSecurityContext;
+    private WindowContextImpl windowContext = new WindowContextImpl();
+    private int windowContextDepth;
 
-    public SqlExecutionContextImpl(CairoEngine cairoEngine, int workerCount) {
-        this.cairoConfiguration = cairoEngine.getConfiguration();
-        this.workerCount = workerCount;
-        assert workerCount > 0;
+    public SqlExecutionContextImpl(CairoEngine cairoEngine, int sharedQueryWorkerCount) {
+        assert sharedQueryWorkerCount >= 0;
+        this.sharedQueryWorkerCount = sharedQueryWorkerCount;
         this.cairoEngine = cairoEngine;
-        this.clock = cairoConfiguration.getMicrosecondClock();
-        this.cairoSecurityContext = AllowAllCairoSecurityContext.INSTANCE;
-        this.jitMode = cairoConfiguration.getSqlJitMode();
 
-        this.telemetryQueue = cairoEngine.getTelemetryQueue();
-        if (telemetryQueue != null) {
-            this.telemetryPubSeq = cairoEngine.getTelemetryPubSequence();
-            this.telemetryMethod = this::doStoreTelemetry;
+        cairoConfiguration = cairoEngine.getConfiguration();
+        microClock = cairoConfiguration.getMicrosecondClock();
+        nanoClock = cairoConfiguration.getNanosecondClock();
+        executionState = cairoEngine.createExecutionState();
+        securityContext = DenyAllSecurityContext.INSTANCE;
+        jitMode = cairoConfiguration.getSqlJitMode();
+        parallelFilterEnabled = cairoConfiguration.isSqlParallelFilterEnabled() && sharedQueryWorkerCount > 0;
+        parallelGroupByEnabled = cairoConfiguration.isSqlParallelGroupByEnabled() && sharedQueryWorkerCount > 0;
+        parallelHashJoinGroupByEnabled = cairoConfiguration.isSqlParallelHashJoinGroupByEnabled();
+        parallelTopKEnabled = cairoConfiguration.isSqlParallelTopKEnabled() && sharedQueryWorkerCount > 0;
+        parallelHorizonJoinEnabled = cairoConfiguration.isSqlParallelHorizonJoinEnabled() && sharedQueryWorkerCount > 0;
+        parallelWindowJoinEnabled = cairoConfiguration.isSqlParallelWindowJoinEnabled() && sharedQueryWorkerCount > 0;
+        parallelReadParquetEnabled = cairoConfiguration.isSqlParallelReadParquetEnabled() && sharedQueryWorkerCount > 0;
+        parquetRowGroupPruningEnabled = cairoConfiguration.isSqlParquetRowGroupPruningEnabled();
+        telemetry = cairoEngine.getTelemetry();
+        telemetryFacade = telemetry.isEnabled() ? this::doStoreTelemetry : this::storeTelemetryNoOp;
+        // default set to micro
+        nowTimestampType = ColumnType.TIMESTAMP_MICRO;
+        intervalFunctionType = IntervalUtils.getIntervalType(nowTimestampType);
+        this.containsSecret = false;
+        this.useSimpleCircuitBreaker = false;
+        this.simpleCircuitBreaker = new AtomicBooleanCircuitBreaker(cairoEngine, cairoConfiguration.getCircuitBreakerConfiguration().getCircuitBreakerThrottle());
+        this.defaultPageFrameMaxRows = cairoConfiguration.getSqlPageFrameMaxRows();
+        this.defaultPageFrameMinRows = cairoConfiguration.getSqlPageFrameMinRows();
+        this.pageFrameMaxRows = defaultPageFrameMaxRows;
+        this.pageFrameMinRows = defaultPageFrameMinRows;
+        windowContexts.add(windowContext);
+    }
+
+    @Override
+    public boolean allowBareNoArgFunctionCalls() {
+        return allowBareNoArgFunctionCalls;
+    }
+
+    @Override
+    public boolean allowNonDeterministicFunctions() {
+        return allowNonDeterministicFunction;
+    }
+
+    @Override
+    public void awaitPageFrameSequences() {
+        for (int i = 0, n = pageFrameSequences.size(); i < n; i++) {
+            pageFrameSequences.getQuick(i).awaitReduced();
         }
     }
 
     @Override
-    public QueryFutureUpdateListener getQueryFutureUpdateListener() {
-        return QueryFutureUpdateListener.EMPTY;
+    public void changePageFrameSizes(int minRows, int maxRows) {
+        this.pageFrameMinRows = minRows;
+        this.pageFrameMaxRows = maxRows;
+    }
+
+    @Override
+    public synchronized void clearCancelledFlag(AtomicBoolean expected) {
+        circuitBreaker.clearCancelledFlag(expected);
+        simpleCircuitBreaker.clearCancelledFlag(expected);
+    }
+
+    @Override
+    public synchronized void clearCancelledFlag(AtomicBoolean expected, long expectedGeneration) {
+        circuitBreaker.clearCancelledFlag(expected, expectedGeneration);
+        simpleCircuitBreaker.clearCancelledFlag(expected, expectedGeneration);
+    }
+
+    @Override
+    public void clearWindowContext() {
+        windowContext.clear();
+    }
+
+    @Override
+    public void configureWindowContext(
+            @Nullable VirtualRecord partitionByRecord,
+            @Nullable RecordSink partitionBySink,
+            @Transient @Nullable ColumnTypes partitionByKeyTypes,
+            boolean ordered,
+            int orderByDirection,
+            int orderByPos,
+            boolean baseSupportsRandomAccess,
+            int framingMode,
+            long rowsLo,
+            char rowsLoUnit,
+            int rowsLoExprPos,
+            int rowsLoKindPos,
+            long rowsHi,
+            char rowsHiUnit,
+            int rowsHiExprPos,
+            int rowsHiKindPos,
+            int exclusionKind,
+            int exclusionKindPos,
+            int timestampIndex,
+            int timestampType,
+            boolean ignoreNulls,
+            int nullsDescPos
+    ) throws SqlException {
+        windowContext.of(
+                partitionByRecord,
+                partitionBySink,
+                partitionByKeyTypes,
+                ordered,
+                orderByDirection,
+                orderByPos,
+                framingMode,
+                rowsLo,
+                rowsLoUnit,
+                rowsLoExprPos,
+                rowsLoKindPos,
+                rowsHi,
+                rowsHiUnit,
+                rowsHiExprPos,
+                rowsHiKindPos,
+                exclusionKind,
+                exclusionKindPos,
+                timestampIndex,
+                timestampType,
+                ignoreNulls,
+                nullsDescPos
+        );
+        // Re-stamp the live-view flag on every configuration: the code generator
+        // clears the window context after each window function it compiles (and
+        // clear() resets the flag), while setLiveViewCompile scopes the flag to
+        // the whole statement - so a multi-window-function live view must have
+        // the flag re-applied per function, not rely on the first stamp surviving.
+        windowContext.setLiveView(liveViewCompile);
+    }
+
+    @Override
+    public boolean containsSecret() {
+        return containsSecret;
+    }
+
+    @Override
+    public void containsSecret(boolean containsSecret) {
+        this.containsSecret = containsSecret;
+    }
+
+    @Override
+    public synchronized void copyCancelledFlagsTo(CancellationBinding circuitBreakerTarget, CancellationBinding simpleCircuitBreakerTarget) {
+        circuitBreaker.copyCancelledFlagTo(circuitBreakerTarget);
+        simpleCircuitBreaker.copyCancelledFlagTo(simpleCircuitBreakerTarget);
+    }
+
+    @Override
+    public Rnd getAsyncRandom() {
+        if (SuspensionScope.getMode() == SuspensionScope.Mode.FIBER) {
+            final Fiber fiber = Fiber.current();
+            if (fiber == null || !Fiber.isMounted()) {
+                throw new IllegalStateException("fiber async random requires a mounted fiber");
+            }
+            return fiber.getAsyncRandom(nanoClock, microClock);
+        }
+        return SharedRandom.getAsyncRandom(cairoConfiguration);
     }
 
     @Override
@@ -89,91 +301,49 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     }
 
     @Override
-    public CairoSecurityContext getCairoSecurityContext() {
-        return cairoSecurityContext;
-    }
-
-    @Override
-    public boolean isTimestampRequired() {
-        return timestampRequiredStack.notEmpty() && timestampRequiredStack.peek() == 1;
-    }
-
-    @Override
-    public void popTimestampRequiredFlag() {
-        timestampRequiredStack.pop();
-    }
-
-    @Override
-    public void pushTimestampRequiredFlag(boolean flag) {
-        timestampRequiredStack.push(flag ? 1 : 0);
-    }
-
-    @Override
-    public int getWorkerCount() {
-        return workerCount;
-    }
-
-    @Override
-    public Rnd getRandom() {
-        return random != null ? random : SharedRandom.getRandom(cairoConfiguration);
-    }
-
-    @Override
-    public void setRandom(Rnd rnd) {
-        this.random = rnd;
-    }
-
-    @Override
-    public CairoEngine getCairoEngine() {
+    public @NotNull CairoEngine getCairoEngine() {
         return cairoEngine;
     }
 
     @Override
-    public long getRequestFd() {
-        return requestFd;
+    public @NotNull SqlExecutionCircuitBreaker getCircuitBreaker() {
+        if (useSimpleCircuitBreaker) {
+            return simpleCircuitBreaker;
+        } else {
+            return circuitBreaker;
+        }
     }
 
     @Override
-    public SqlExecutionCircuitBreaker getCircuitBreaker() {
-        circuitBreaker.resetTimer();
-        return circuitBreaker;
+    public boolean getCloneSymbolTables() {
+        return cloneSymbolTables;
+    }
+
+    public Decimal128 getDecimal128() {
+        return decimal128;
+    }
+
+    public Decimal256 getDecimal256() {
+        return decimal256;
+    }
+
+    public Decimal64 getDecimal64() {
+        return decimal64;
     }
 
     @Override
-    public void storeTelemetry(short event, short origin) {
-        telemetryMethod.store(event, origin);
+    public @Nullable ExecutionState getExecutionState() {
+        return executionState;
     }
 
     @Override
-    public AnalyticContext getAnalyticContext() {
-        return analyticContext;
+    public int getIntervalFunctionType() {
+        return intervalFunctionType;
     }
 
     @Override
-    public void configureAnalyticContext(
-            @Nullable VirtualRecord partitionByRecord,
-            @Nullable RecordSink partitionBySink,
-            @Transient @Nullable ColumnTypes partitionByKeyTypes,
-            boolean ordered,
-            boolean baseSupportsRandomAccess
-    ) {
-        analyticContext.of(
-                partitionByRecord,
-                partitionBySink,
-                partitionByKeyTypes,
-                ordered,
-                baseSupportsRandomAccess
-        );
-    }
-
-    @Override
-    public void initNow() {
-        now = cairoConfiguration.getMicrosecondClock().getTicks();
-    }
-
-    @Override
-    public long getNow() {
-        return now;
+    public long getIntervalPlanGeneration() {
+        return intervalPlanGeneration;
     }
 
     @Override
@@ -182,19 +352,354 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
     }
 
     @Override
-    public void setJitMode(int jitMode) {
-        this.jitMode = jitMode;
+    public @Nullable MemoryTracker getMemoryTracker() {
+        return memoryTracker;
     }
 
-    public SqlExecutionContextImpl with(
-            @NotNull CairoSecurityContext cairoSecurityContext,
-            @Nullable BindVariableService bindVariableService,
-            @Nullable Rnd rnd
+    @Override
+    public long getMicrosecondTimestamp() {
+        return clockUseNow ? nowMicros : microClock.getTicks();
+    }
+
+    @Override
+    public long getNanosecondTimestamp() {
+        return clockUseNow ? nowNanos : nanoClock.getTicks();
+    }
+
+    @Override
+    public long getNow(int timestampType) {
+        assert ColumnType.isTimestamp(timestampType);
+        return switch (timestampType) {
+            case ColumnType.TIMESTAMP_MICRO -> nowMicros;
+            case ColumnType.TIMESTAMP_NANO -> nowNanos;
+            default -> 0L;
+        };
+    }
+
+    @Override
+    public long getQueryRegistryOwnerId() {
+        return queryRegistryOwnerId;
+    }
+
+    @Override
+    public int getNowTimestampType() {
+        return nowTimestampType;
+    }
+
+    @Override
+    public int getPageFrameMaxRows() {
+        return pageFrameMaxRows;
+    }
+
+    @Override
+    public int getPageFrameMinRows() {
+        return pageFrameMinRows;
+    }
+
+    @Override
+    public QueryFutureUpdateListener getQueryFutureUpdateListener() {
+        return queryFutureUpdateListener;
+    }
+
+    @Override
+    public Rnd getRandom() {
+        if (random != null) {
+            return random;
+        }
+        if (SuspensionScope.getMode() == SuspensionScope.Mode.FIBER) {
+            final Fiber fiber = Fiber.current();
+            if (fiber == null || !Fiber.isMounted()) {
+                throw new IllegalStateException("fiber random requires a mounted fiber");
+            }
+            return fiber.getRandom(nanoClock, microClock);
+        }
+        return SharedRandom.getRandom(cairoConfiguration);
+    }
+
+    @Override
+    public ResourcePoolSupervisor<TableReader> getReaderPoolSupervisor() {
+        return readerPoolSupervisor;
+    }
+
+    @Override
+    public long getRequestFd() {
+        return requestFd;
+    }
+
+    @Override
+    public @NotNull SecurityContext getSecurityContext() {
+        return validationOnly ? validationSecurityContext : securityContext;
+    }
+
+    @Override
+    public int getSharedQueryWorkerCount() {
+        return sharedQueryWorkerCount;
+    }
+
+    @Override
+    public @NotNull SqlExecutionCircuitBreaker getSimpleCircuitBreaker() {
+        return simpleCircuitBreaker;
+    }
+
+    @Override
+    public TableFunctionView getTableFunctionView() {
+        return tableFunctionView;
+    }
+
+    @Override
+    public WindowContext getWindowContext() {
+        return windowContext;
+    }
+
+    @Override
+    public int hasInterval() {
+        return hasIntervalStack.peek();
+    }
+
+    @Override
+    public void initNow() {
+        this.nowNanos = nanoClock.getTicks();
+        this.nowMicros = microClock.getTicks();
+        if (executionState != null) {
+            executionState.onExecutionStart(this);
+        }
+    }
+
+    public boolean isCacheHit() {
+        return cacheHit;
+    }
+
+    @Override
+    public boolean isExpiryReadFilterEnabled() {
+        return expiryReadPolicy == ExpiryReadPolicy.FILTER;
+    }
+
+    @Override
+    public CharSequence getExpiryMaterializingViewName() {
+        return expiryMaterializingViewName;
+    }
+
+    @Override
+    public @Nullable TableToken getExpiryRawReadTable() {
+        return expiryRawReadTable;
+    }
+
+    @Override
+    public ExpiryReadPolicy getExpiryReadPolicy() {
+        return expiryReadPolicy;
+    }
+
+    @Override
+    public ExpiryReadPolicy getExpiryReadPolicy(TableToken tableToken) {
+        // The raw table overrides only a filtered read: a materializing compile in REJECT mode keeps
+        // rejecting every policied table.
+        return expiryReadPolicy == ExpiryReadPolicy.FILTER && tableToken.equals(expiryRawReadTable)
+                ? ExpiryReadPolicy.RAW
+                : expiryReadPolicy;
+    }
+
+    @Override
+    public boolean isLiveViewCompile() {
+        return liveViewCompile;
+    }
+
+    @Override
+    public boolean isMetadataProbe() {
+        return isMetadataProbe;
+    }
+
+    @Override
+    public boolean isParallelFilterEnabled() {
+        return parallelFilterEnabled;
+    }
+
+    @Override
+    public boolean isParallelGroupByEnabled() {
+        return parallelGroupByEnabled;
+    }
+
+    @Override
+    public boolean isParallelHashJoinGroupByEnabled() {
+        return parallelHashJoinGroupByEnabled && isParallelGroupByEnabled() && sharedQueryWorkerCount > 0;
+    }
+
+    @Override
+    public boolean isParallelReadParquetEnabled() {
+        return parallelReadParquetEnabled;
+    }
+
+    @Override
+    public boolean isParquetRowGroupPruningEnabled() {
+        return parquetRowGroupPruningEnabled;
+    }
+
+    @Override
+    public boolean isParallelTopKEnabled() {
+        return parallelTopKEnabled;
+    }
+
+    @Override
+    public boolean isParallelHorizonJoinEnabled() {
+        return parallelHorizonJoinEnabled;
+    }
+
+    @Override
+    public boolean isParallelWindowJoinEnabled() {
+        return parallelWindowJoinEnabled;
+    }
+
+    @Override
+    public boolean isTimestampRequired() {
+        return timestampRequiredStack.notEmpty() && timestampRequiredStack.peek() == 1;
+    }
+
+    @Override
+    public boolean isValidationOnly() {
+        return validationOnly;
+    }
+
+    @Override
+    public boolean isViewCompile() {
+        return isViewCompile;
+    }
+
+    @Override
+    public boolean isViewMetadataSubquery() {
+        return isViewMetadataSubquery;
+    }
+
+    @Override
+    public boolean isWalApplication() {
+        return false;
+    }
+
+    @Override
+    public long nextIntervalPlanGeneration() {
+        if (intervalPlanGenerationCounter == Long.MAX_VALUE) {
+            intervalPlanGenerationCounter = 0;
+        }
+        return intervalPlanGeneration = -(++intervalPlanGenerationCounter);
+    }
+
+    @Override
+    public RuntimeIntrinsicIntervalModel peekIntervalModel() {
+        return intervalModelObjStack.peek();
+    }
+
+    @Override
+    public void popHasInterval() {
+        hasIntervalStack.pop();
+    }
+
+    @Override
+    public void popIntervalModel() {
+        intervalModelObjStack.pop();
+    }
+
+    @Override
+    public void popTimestampRequiredFlag() {
+        timestampRequiredStack.pop();
+    }
+
+    @Override
+    public void popWindowContext() {
+        assert windowContextDepth > 0;
+        // Contexts only borrow the compiled functions and sinks. Drop those references, but
+        // leave resource cleanup to the factories and the code generator that own them.
+        windowContext.clear();
+        windowContext = windowContexts.getQuick(--windowContextDepth);
+    }
+
+    @Override
+    public void pushHasInterval(int hasInterval) {
+        hasIntervalStack.push(hasInterval);
+    }
+
+    @Override
+    public void pushIntervalModel(RuntimeIntrinsicIntervalModel intervalModel) {
+        intervalModelObjStack.push(intervalModel);
+    }
+
+    @Override
+    public void pushTimestampRequiredFlag(boolean flag) {
+        timestampRequiredStack.push(flag ? 1 : 0);
+    }
+
+    @Override
+    public void pushWindowContext() {
+        final int depth = windowContextDepth + 1;
+        WindowContextImpl next = windowContexts.getQuiet(depth);
+        if (next == null) {
+            next = new WindowContextImpl();
+            windowContexts.extendAndSet(depth, next);
+        }
+        assert next.isEmpty();
+        windowContext = next;
+        windowContextDepth = depth;
+    }
+
+    @Override
+    public void registerPageFrameSequence(PageFrameSequence<?> frameSequence) {
+        pageFrameSequences.add(frameSequence);
+    }
+
+    @Override
+    public void reset() {
+        checkNoMountedQueryOwner();
+        resetState();
+    }
+
+    @Override
+    public synchronized void restoreCancelledFlag(
+            AtomicBoolean expected,
+            CancellationBinding circuitBreakerPrevious,
+            CancellationBinding simpleCircuitBreakerPrevious
     ) {
-        this.cairoSecurityContext = cairoSecurityContext;
-        this.bindVariableService = bindVariableService;
-        this.random = rnd;
-        return this;
+        if (circuitBreaker.getCancelledFlag() == expected) {
+            circuitBreaker.setCancelledFlag(circuitBreakerPrevious);
+        }
+        if (simpleCircuitBreaker.getCancelledFlag() == expected) {
+            simpleCircuitBreaker.setCancelledFlag(simpleCircuitBreakerPrevious);
+        }
+    }
+
+    @Override
+    public void restoreToDefaultPageFrameSizes() {
+        this.pageFrameMinRows = defaultPageFrameMinRows;
+        this.pageFrameMaxRows = defaultPageFrameMaxRows;
+    }
+
+    @Override
+    public void setAllowBareNoArgFunctionCalls(boolean value) {
+        this.allowBareNoArgFunctionCalls = value;
+    }
+
+    @Override
+    public void setAllowNonDeterministicFunction(boolean value) {
+        this.allowNonDeterministicFunction = value;
+    }
+
+    @Override
+    public void setCacheHit(boolean value) {
+        cacheHit = value;
+    }
+
+    @Override
+    public synchronized void setCancelledFlag(AtomicBoolean cancelled) {
+        circuitBreaker.setCancelledFlag(cancelled);
+        simpleCircuitBreaker.setCancelledFlag(cancelled);
+    }
+
+    @Override
+    public synchronized void setCancelledFlag(CancellationBinding source) {
+        circuitBreaker.setCancelledFlag(source);
+        simpleCircuitBreaker.setCancelledFlag(source);
+    }
+
+    @Override
+    public synchronized void setCancelledFlag(AtomicBoolean cancelled, long generation) {
+        circuitBreaker.setCancelledFlag(cancelled, generation);
+        simpleCircuitBreaker.setCancelledFlag(cancelled, generation);
     }
 
     @Override
@@ -202,37 +707,303 @@ public class SqlExecutionContextImpl implements SqlExecutionContext {
         this.cloneSymbolTables = cloneSymbolTables;
     }
 
-    public SqlExecutionContextImpl with(
-            long requestFd
-    ) {
-        this.requestFd = requestFd;
+    @Override
+    public void setExpiryRawReadTable(@Nullable TableToken tableToken) {
+        this.expiryRawReadTable = tableToken;
+    }
+
+    @Override
+    public void setExpiryReadFilterEnabled(boolean enabled) {
+        this.expiryReadPolicy = enabled ? ExpiryReadPolicy.FILTER : ExpiryReadPolicy.RAW;
+        this.expiryMaterializingViewName = null;
+    }
+
+    @Override
+    public void setExpiryReadPolicy(ExpiryReadPolicy policy, @Nullable CharSequence materializingViewName) {
+        this.expiryReadPolicy = policy;
+        this.expiryMaterializingViewName = materializingViewName;
+    }
+
+    @Override
+    public void setIntervalFunctionType(int intervalType) {
+        this.intervalFunctionType = intervalType;
+    }
+
+    @Override
+    public void setIntervalPlanGeneration(long generation) {
+        this.intervalPlanGeneration = generation;
+    }
+
+    @Override
+    public void setJitMode(int jitMode) {
+        this.jitMode = jitMode;
+    }
+
+    @Override
+    public void setLiveViewCompile(boolean value) {
+        this.liveViewCompile = value;
+        this.windowContext.setLiveView(value);
+    }
+
+    @Override
+    public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+        this.memoryTracker = tracker;
+    }
+
+    @Override
+    public void setMetadataProbe(boolean value) {
+        this.isMetadataProbe = value;
+    }
+
+    @Override
+    public void setQueryRegistryOwnerId(long queryRegistryOwnerId) {
+        this.queryRegistryOwnerId = queryRegistryOwnerId;
+    }
+
+    @Override
+    public void setNowAndFixClock(long now, int nowTimestampType) {
+        TimestampDriver driver = ColumnType.getTimestampDriver(nowTimestampType);
+        this.nowMicros = driver.toMicros(now);
+        this.nowNanos = driver.toNanos(now);
+        this.nowTimestampType = nowTimestampType;
+        this.clockUseNow = true;
+    }
+
+    public void setQueryFutureUpdateListener(QueryFutureUpdateListener listener) {
+        this.queryFutureUpdateListener = listener != null ? listener : QueryFutureUpdateListener.EMPTY;
+    }
+
+    @Override
+    public void setParallelFilterEnabled(boolean parallelFilterEnabled) {
+        this.parallelFilterEnabled = parallelFilterEnabled;
+    }
+
+    @Override
+    public void setParallelGroupByEnabled(boolean parallelGroupByEnabled) {
+        this.parallelGroupByEnabled = parallelGroupByEnabled;
+    }
+
+    @Override
+    public void setParallelHashJoinGroupByEnabled(boolean isEnabled) {
+        this.parallelHashJoinGroupByEnabled = isEnabled;
+    }
+
+    @Override
+    public void setParallelReadParquetEnabled(boolean parallelReadParquetEnabled) {
+        this.parallelReadParquetEnabled = parallelReadParquetEnabled;
+    }
+
+    @Override
+    public void setParquetRowGroupPruningEnabled(boolean parquetRowGroupPruningEnabled) {
+        this.parquetRowGroupPruningEnabled = parquetRowGroupPruningEnabled;
+    }
+
+    @Override
+    public void setParallelTopKEnabled(boolean parallelTopKEnabled) {
+        this.parallelTopKEnabled = parallelTopKEnabled;
+    }
+
+    @Override
+    public void setParallelHorizonJoinEnabled(boolean parallelHorizonJoinEnabled) {
+        this.parallelHorizonJoinEnabled = parallelHorizonJoinEnabled;
+    }
+
+    @Override
+    public void setParallelWindowJoinEnabled(boolean parallelWindowJoinEnabled) {
+        this.parallelWindowJoinEnabled = parallelWindowJoinEnabled;
+    }
+
+    @Override
+    public void setRandom(Rnd rnd) {
+        this.random = rnd;
+    }
+
+    @Override
+    public void setReaderPoolSupervisor(@Nullable ResourcePoolSupervisor<TableReader> supervisor) {
+        this.readerPoolSupervisor = supervisor;
+    }
+
+    @Override
+    public void setTableFunctionView(TableFunctionView view) {
+        this.tableFunctionView = view;
+    }
+
+    @Override
+    public void setUseSimpleCircuitBreaker(boolean value) {
+        this.useSimpleCircuitBreaker = value;
+    }
+
+    public void setValidationOnly(boolean validationOnly) {
+        this.validationOnly = validationOnly;
+        if (validationOnly) {
+            // During validation the compiler must check syntax only, not authorization.
+            // Route all authorization through a no-op view of the security context.
+            validationSecurityContext = securityContext.asValidationContext();
+        }
+    }
+
+    @Override
+    public void setViewCompile(boolean value) {
+        isViewCompile = value;
+    }
+
+    @Override
+    public void setViewMetadataSubquery(boolean value) {
+        isViewMetadataSubquery = value;
+    }
+
+    @Override
+    public boolean shouldLogSql() {
+        // Validation only compiles the SQL to check it; suppress query progress logging
+        // so the validation endpoint does not pollute the log with every validated statement.
+        return !validationOnly;
+    }
+
+    @Override
+    public void storeTelemetry(short event, short origin) {
+        telemetryFacade.store(event, origin);
+    }
+
+    /**
+     * Temporarily replaces only the authorization view for a trusted nested operation. Unlike
+     * {@link #with(SecurityContext)}, this deliberately preserves the mounted query owner and all
+     * execution-scoped accounting. The caller must restore the returned context in a finally block.
+     */
+    public SecurityContext swapSecurityContext(@NotNull SecurityContext securityContext) {
+        final SecurityContext previous = this.securityContext;
+        this.securityContext = securityContext;
+        return previous;
+    }
+
+    @Override
+    public void toSink(@NotNull CharSink<?> sink) {
+        sink.putAscii("principal=").put(securityContext.getPrincipal()).putAscii(", cache=").put(isCacheHit());
+    }
+
+    @Override
+    public void unregisterPageFrameSequence(PageFrameSequence<?> frameSequence) {
+        pageFrameSequences.remove(frameSequence);
+    }
+
+    public SqlExecutionContextImpl with(@NotNull SecurityContext securityContext, @Nullable BindVariableService bindVariableService, @Nullable Rnd rnd) {
+        checkNoMountedQueryOwner();
+        this.securityContext = securityContext;
+        this.bindVariableService = bindVariableService;
+        this.random = rnd;
+        resetState();
         return this;
     }
 
+    public void with(long requestFd) {
+        checkNoMountedQueryOwner();
+        this.requestFd = requestFd;
+        resetState();
+    }
+
+    public void with(BindVariableService bindVariableService) {
+        checkNoMountedQueryOwner();
+        this.bindVariableService = bindVariableService;
+    }
+
+    public SqlExecutionContext with(SqlExecutionCircuitBreaker circuitBreaker) {
+        checkNoMountedQueryOwner();
+        this.circuitBreaker = circuitBreaker;
+        return this;
+    }
+
+    public SqlExecutionContextImpl with(@NotNull SecurityContext securityContext) {
+        return with(securityContext, null, null, -1, null);
+    }
+
+    public SqlExecutionContextImpl with(@NotNull SecurityContext securityContext, @Nullable BindVariableService bindVariableService) {
+        return with(securityContext, bindVariableService, null, -1, null);
+    }
+
     public SqlExecutionContextImpl with(
-            @NotNull CairoSecurityContext cairoSecurityContext,
+            @NotNull SecurityContext securityContext,
             @Nullable BindVariableService bindVariableService,
             @Nullable Rnd rnd,
             long requestFd,
             @Nullable SqlExecutionCircuitBreaker circuitBreaker
     ) {
-        this.cairoSecurityContext = cairoSecurityContext;
+        checkNoMountedQueryOwner();
+        this.securityContext = securityContext;
         this.bindVariableService = bindVariableService;
         this.random = rnd;
         this.requestFd = requestFd;
-        this.circuitBreaker = null == circuitBreaker ? SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER : circuitBreaker;
+        this.circuitBreaker = circuitBreaker == null ? SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER : circuitBreaker;
+        this.pageFrameMaxRows = defaultPageFrameMaxRows;
+        this.pageFrameMinRows = defaultPageFrameMinRows;
+        resetState();
         return this;
     }
 
+    private void checkNoMountedQueryOwner() {
+        if (queryRegistryOwnerId > -1) {
+            throw new IllegalStateException(
+                    "cannot rebind SQL execution context while a query owner is mounted [ownerId="
+                            + queryRegistryOwnerId
+                            + ']'
+            );
+        }
+    }
+
     private void doStoreTelemetry(short event, short origin) {
-        TelemetryTask.store(telemetryQueue, telemetryPubSeq, event, origin, clock);
+        if (SKIP_TELEMETRY_EVENTS.contains(event)) {
+            return;
+        }
+        TelemetryTask.store(telemetry, origin, event);
     }
 
-    private void storeTelemetryNoop(short event, short origin) {
+    private void resetState() {
+        this.containsSecret = false;
+        this.useSimpleCircuitBreaker = false;
+        this.cacheHit = false;
+        this.allowBareNoArgFunctionCalls = true;
+        this.allowNonDeterministicFunction = true;
+        this.intervalPlanGeneration = 0;
+        this.validationOnly = false;
+        this.validationSecurityContext = null;
+        // Defensive: production callers arm live-view compile mode inside a try/finally
+        // that disarms it, so this is currently a backstop rather than a reachable leak,
+        // but a reused per-connection context must never inherit a stale live-view flag.
+        // setLiveViewCompile also clears the mirrored windowContext flag.
+        setLiveViewCompile(false);
+        this.tableFunctionView = null;
+        isMetadataProbe = false;
+        isViewCompile = false;
+        isViewMetadataSubquery = false;
+        // QueryRegistry owns the tracker lifecycle; null it defensively so an error
+        // unwinding between register() and unregister() cannot leak it into reuse.
+        this.memoryTracker = null;
+        this.queryRegistryOwnerId = -1;
+        // Defensive: a query reusing this per-connection context must never inherit a
+        // stale supervisor from a prior query. QueryProgress restores it in the finally of
+        // cursor open; reset() is a backstop for reused per-connection contexts if that
+        // restore is ever bypassed.
+        this.readerPoolSupervisor = null;
+        this.clockUseNow = false;
+        this.nowTimestampType = ColumnType.TIMESTAMP_MICRO;
+        this.intervalFunctionType = IntervalUtils.getIntervalType(nowTimestampType);
+        this.timestampRequiredStack.clear();
+        this.hasIntervalStack.clear();
+        this.intervalModelObjStack.clear();
+        Misc.clear(securityContext);
     }
 
-    @Override
-    public boolean getCloneSymbolTables() {
-        return cloneSymbolTables;
+    private void storeTelemetryNoOp(short event, short origin) {
+    }
+
+    @FunctionalInterface
+    private interface TelemetryFacade {
+        void store(short event, short origin);
+    }
+
+    static {
+        SKIP_TELEMETRY_EVENTS.add(CompiledQuery.SET);
+        SKIP_TELEMETRY_EVENTS.add(CompiledQuery.BEGIN);
+        SKIP_TELEMETRY_EVENTS.add(CompiledQuery.COMMIT);
+        SKIP_TELEMETRY_EVENTS.add(CompiledQuery.ROLLBACK);
+        SKIP_TELEMETRY_EVENTS.add(CompiledQuery.DEALLOCATE);
     }
 }

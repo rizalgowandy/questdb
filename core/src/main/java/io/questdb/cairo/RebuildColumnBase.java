@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,26 +24,47 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
 import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
 import io.questdb.std.Mutable;
-import io.questdb.std.datetime.DateFormat;
+import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
 
+import static io.questdb.cairo.TableUtils.TXN_FILE_NAME;
 import static io.questdb.cairo.TableUtils.lockName;
 
 public abstract class RebuildColumnBase implements Closeable, Mutable {
-    static final int ALL = -1;
-    final Path path = new Path();
+    private static final Log LOG = LogFactory.getLog(RebuildColumnBase.class);
+    static final int REBUILD_ALL_COLUMNS = -1;
+    protected final CairoConfiguration configuration;
+    protected final String unsupportedTableMessage = "Table does not have any indexes";
+    private final MillisecondClock clock;
     private final StringSink tempStringSink = new StringSink();
-    CairoConfiguration configuration;
-    int rootLen;
-    String columnTypeErrorMsg = "Wrong column type";
+    // The committed table _txn the rebuild is operating against. Set by
+    // reindex callers that have a TxReader handy (reindexAfterUpdate gets it
+    // from tableWriter; reindex0 reads it from the .txn file). Concrete
+    // doReindex implementations use this to tag PostingIndexWriter chain
+    // entries with txnAtSeal=currentTableTxn so a future recovery walk does
+    // not mis-classify the rebuilt index as abandoned.
+    protected long currentTableTxn = -1L;
+    protected Path path = new Path(255, MemoryTag.NATIVE_SQL_COMPILER);
+    protected int rootLen;
+    protected String unsupportedColumnMessage = "Wrong column type";
     private long lockFd;
-    private TableReaderMetadata metadata;
+
+    public RebuildColumnBase(CairoConfiguration configuration) {
+        this.configuration = configuration;
+        this.clock = configuration.getMillisecondClock();
+    }
 
     @Override
     public void clear() {
@@ -53,220 +74,345 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
 
     @Override
     public void close() {
-        this.path.close();
-        Misc.free(metadata);
+        this.path = Misc.free(path);
     }
 
-    public RebuildColumnBase of(CharSequence tablePath, CairoConfiguration configuration) {
+    public RebuildColumnBase of(Utf8Sequence tablePath) {
         this.path.of(tablePath);
-        this.rootLen = tablePath.length();
-        this.configuration = configuration;
+        this.rootLen = tablePath.size();
         return this;
     }
 
     public void rebuildAll() {
-        rebuildPartitionColumn(null, null);
+        reindex(configuration.getFilesFacade(), null, null);
     }
 
-    public void rebuildColumn(CharSequence columnName) {
-        rebuildPartitionColumn(null, columnName);
+    public void reindex(
+            @Nullable CharSequence partitionName,
+            @Nullable CharSequence columnName
+    ) {
+        reindex(configuration.getFilesFacade(), partitionName, columnName);
     }
 
-    public void rebuildPartition(CharSequence partitionName) {
-        rebuildPartitionColumn(partitionName, null);
-    }
-
-    public void rebuildPartitionColumn(CharSequence partitionName, CharSequence columnName) {
-        FilesFacade ff = configuration.getFilesFacade();
+    public void reindex(FilesFacade ff, @Nullable CharSequence partitionName, @Nullable CharSequence columnName) {
         try {
             lock(ff);
-            path.concat(TableUtils.COLUMN_VERSION_FILE_NAME).$();
-            try (ColumnVersionReader columnVersionReader = new ColumnVersionReader().ofRO(ff, path)) {
-                final long deadline = configuration.getMicrosecondClock().getTicks() + configuration.getSpinLockTimeoutUs();
-                columnVersionReader.readSafe(configuration.getMicrosecondClock(), deadline);
+            path.concat(TableUtils.COLUMN_VERSION_FILE_NAME);
+            try (ColumnVersionReader columnVersionReader = new ColumnVersionReader().ofRO(ff, path.$())) {
+                columnVersionReader.readSafe(clock, configuration.getSpinLockTimeout());
                 path.trimTo(rootLen);
-
-                rebuildPartitionColumn(ALL, partitionName, columnName, columnVersionReader, ff);
+                reindex0(ff, columnVersionReader, partitionName, columnName);
             }
         } finally {
-                lockName(path);
+            lockName(path);
             releaseLock(ff);
         }
     }
 
-    public void rebuildColumn(CharSequence columnName, TableWriter tableWriter) {
-        rebuildPartitionColumn(null, columnName, tableWriter);
+    public void reindexAfterUpdate(
+            FilesFacade ff,
+            long partitionTimestamp,
+            CharSequence columnName,
+            TableWriter tableWriter
+    ) {
+        TxReader txReader = tableWriter.getTxReader();
+        int partitionIndex = txReader.getPartitionIndex(partitionTimestamp);
+        assert partitionIndex > -1L;
+
+        final RecordMetadata metadata = tableWriter.getMetadata();
+        final int columnIndex = tableWriter.getColumnIndex(columnName);
+        final int indexValueBlockCapacity = metadata.getIndexValueBlockCapacity(columnIndex);
+        assert indexValueBlockCapacity > 0;
+
+        // The DIRECTORY's whole shared frame, not one piece's rows: a rebuild recreates the single index
+        // its pieces all read, so a rebuild over one piece drops every sibling's rows out of it.
+        final long partitionSize = tableWriter.getPartitionPhysicalRowCount(partitionIndex);
+
+        long partitionNameTxn = txReader.getPartitionNameTxn(partitionIndex);
+        currentTableTxn = txReader.getTxn();
+
+        doReindex(
+                ff,
+                tableWriter.columnVersionReader(),
+                // this may not be needed, because table writer's column index is the same
+                // as metadata writers' index.
+                columnIndex,
+                columnName,
+                partitionNameTxn,
+                partitionSize,
+                partitionTimestamp,
+                tableWriter.getMetadata().getTimestampType(),
+                tableWriter.getPartitionBy(),
+                indexValueBlockCapacity,
+                metadata.getColumnIndexType(columnIndex),
+                metadata,
+                columnIndex
+        );
     }
 
-    // if TableWriter is passed in the lock has to be held already
-    public void rebuildPartitionColumn(CharSequence partitionName, CharSequence columnName, TableWriter tableWriter) {
-        rebuildPartitionColumn(ALL, partitionName, columnName, tableWriter.getColumnVersionWriter(), configuration.getFilesFacade());
+    public void reindexAllInPartition(CharSequence partitionName) {
+        reindex(partitionName, null);
     }
 
-    public void rebuildPartitionColumn(long partitionTs, CharSequence columnName, TableWriter tableWriter) {
-        rebuildPartitionColumn(partitionTs, null, columnName, tableWriter.getColumnVersionWriter(), configuration.getFilesFacade());
+    public void reindexColumn(CharSequence columnName) {
+        reindex(null, columnName);
     }
 
-    private void rebuildPartitionColumn(long partitionTs, CharSequence rebuildPartitionName, CharSequence rebuildColumn, ColumnVersionReader columnVersionReader, FilesFacade ff) {
-        path.trimTo(rootLen).concat(TableUtils.META_FILE_NAME);
-        if (metadata == null) {
-            metadata = new TableReaderMetadata(ff);
-        }
-        metadata.of(path.$(), ColumnType.VERSION);
-
-        try {
-            // Resolve column id if the column name specified
-            int rebuildColumnIndex = ALL;
-            if (rebuildColumn != null) {
-                rebuildColumnIndex = metadata.getColumnIndexQuiet(rebuildColumn, 0, rebuildColumn.length());
-                if (rebuildColumnIndex < 0) {
-                    throw CairoException.instance(0).put("Column does not exist");
-                }
-            }
-
-            path.trimTo(rootLen);
-            int partitionBy = metadata.getPartitionBy();
-            DateFormat partitionDirFormatMethod = PartitionBy.getPartitionDirFormatMethod(partitionBy);
-
-            try (TxReader txReader = new TxReader(ff).ofRO(path, partitionBy)) {
-                txReader.unsafeLoadAll();
-                path.trimTo(rootLen);
-
-                if (PartitionBy.isPartitioned(partitionBy)) {
-                    // Resolve partition timestamp if partition name specified
-                    long rebuildPartitionTs = partitionTs;
-                    if (rebuildPartitionName != null) {
-                        rebuildPartitionTs = PartitionBy.parsePartitionDirName(rebuildPartitionName, partitionBy);
-                    }
-
-                    for (int partitionIndex = txReader.getPartitionCount() - 1; partitionIndex > -1; partitionIndex--) {
-                        long partitionTimestamp = txReader.getPartitionTimestamp(partitionIndex);
-                        if (rebuildPartitionTs == ALL || partitionTimestamp == rebuildPartitionTs) {
-                            long partitionSize = txReader.getPartitionSize(partitionIndex);
-                            if (partitionIndex == txReader.getPartitionCount() - 1) {
-                                partitionSize = txReader.getTransientRowCount();
-                            }
-                            long partitionNameTxn = txReader.getPartitionNameTxn(partitionIndex);
-                            rebuildColumn(
-                                    rebuildColumnIndex,
-                                    ff,
-                                    metadata,
-                                    partitionDirFormatMethod,
-                                    tempStringSink,
-                                    partitionTimestamp,
-                                    partitionSize,
-                                    partitionNameTxn,
-                                    columnVersionReader);
-                        }
-                    }
-                } else {
-                    long partitionSize = txReader.getTransientRowCount();
-                    rebuildColumn(
-                            rebuildColumnIndex,
-                            ff,
-                            metadata,
-                            partitionDirFormatMethod,
-                            tempStringSink,
-                            0L,
-                            partitionSize,
-                            -1L,
-                            columnVersionReader
-                    );
-                }
-            }
-        } finally {
-            metadata.close();
-            path.trimTo(rootLen);
-        }
+    public void reindexColumn(FilesFacade ff, CharSequence columnName) {
+        reindex(ff, null, columnName);
     }
 
-    protected boolean checkColumnType(TableReaderMetadata metadata, int rebuildColumnIndex) {
-        return true;
+    public void reindexColumn(
+            FilesFacade ff,
+            ColumnVersionReader columnVersionReader,
+            RecordMetadata metadata,
+            int columnIndex,
+            long partitionNameTxn,
+            long partitionTimestamp,
+            int partitionBy,
+            long partitionSize
+    ) {
+        doReindex(
+                ff,
+                columnVersionReader,
+                metadata.getWriterIndex(columnIndex),
+                metadata.getColumnName(columnIndex),
+                partitionNameTxn,
+                partitionSize,
+                partitionTimestamp,
+                metadata.getTimestampType(),
+                partitionBy,
+                metadata.getIndexValueBlockCapacity(columnIndex),
+                metadata.getColumnIndexType(columnIndex),
+                metadata,
+                columnIndex
+        );
     }
 
     private void lock(FilesFacade ff) {
         try {
             path.trimTo(rootLen);
-            lockName(path);
-            this.lockFd = TableUtils.lock(ff, path);
+            this.lockFd = TableUtils.lock(ff, lockName(path));
         } finally {
             path.trimTo(rootLen);
         }
 
-        if (this.lockFd == -1L) {
-            throw CairoException.instance(ff.errno()).put("Cannot lock table: ").put(path.$());
+        if (this.lockFd == -1) {
+            throw CairoException.nonCritical().put("cannot lock table: ").put(path.$());
         }
     }
 
-    private void rebuildColumn(
-            int rebuildColumnIndex,
+    // this method is not used by UPDATE SQL
+    private void reindex0(
             FilesFacade ff,
-            TableReaderMetadata metadata,
-            DateFormat partitionDirFormatMethod,
-            StringSink sink,
-            long partitionTimestamp,
-            long partitionSize,
-            long partitionNameTxn,
-            ColumnVersionReader columnVersionReader
+            ColumnVersionReader columnVersionReader,
+            @Nullable CharSequence partitionName, // will reindex all partitions if partition name is not provided
+            @Nullable CharSequence columnName // will reindex all columns if name is not provided
     ) {
-        sink.clear();
-        partitionDirFormatMethod.format(partitionTimestamp, null, null, sink);
+        path.trimTo(rootLen).concat(TableUtils.META_FILE_NAME);
+        try (TableReaderMetadata metadata = new TableReaderMetadata(configuration)) {
+            metadata.loadMetadata(path.$());
+            // Resolve column id if the column name specified
+            final int columnIndex;
+            if (columnName != null) {
+                columnIndex = metadata.getColumnIndex(columnName);
+            } else {
+                columnIndex = REBUILD_ALL_COLUMNS;
+            }
 
-        if (rebuildColumnIndex == ALL) {
-            for (int columnIndex = metadata.getColumnCount() - 1; columnIndex > -1; columnIndex--) {
-                if (checkColumnType(metadata, columnIndex)) {
-                    rebuildColumn(metadata, columnIndex, sink, partitionSize, ff, columnVersionReader, partitionTimestamp, partitionNameTxn);
+            path.trimTo(rootLen);
+            final int partitionBy = metadata.getPartitionBy();
+
+            try (TxReader txReader = new TxReader(ff).ofRO(path.concat(TXN_FILE_NAME).$(), metadata.getTimestampType(), partitionBy)) {
+                txReader.unsafeLoadAll();
+                currentTableTxn = txReader.getTxn();
+                path.trimTo(rootLen);
+
+                if (PartitionBy.isPartitioned(partitionBy)) {
+                    // REINDEX runs standalone under an exclusive lock, with no TableWriter to borrow a
+                    // resolver from, so it opens its own. A rebuild's unit is the DIRECTORY, and only the
+                    // geometry knows how far a COMPOSITE one's files reach.
+                    try (PartitionGeometry geometry = new PartitionGeometry().of(
+                            ff, txReader, path.trimTo(rootLen).toString(), metadata.getTimestampType(), partitionBy, MemoryTag.NATIVE_TABLE_READER)
+                    ) {
+                        // Resolve partition timestamp if partition name specified
+                        if (partitionName != null) {
+                            final long partitionTimestamp = PartitionBy.parsePartitionDirName(partitionName, metadata.getTimestampType(), partitionBy);
+                            int partitionIndex = txReader.findAttachedPartitionIndexByLoTimestamp(partitionTimestamp);
+                            if (partitionIndex > -1L) {
+                                if (txReader.isPartitionParquet(partitionIndex)) {
+                                    // No local .d to rebuild from (folded into the parquet); reject
+                                    // rather than wipe an index we cannot recreate.
+                                    throw CairoException.nonCritical()
+                                            .put("cannot reindex parquet partition [partition=").put(partitionName).put(']');
+                                }
+                                reindexPartition(
+                                        ff,
+                                        metadata,
+                                        columnVersionReader,
+                                        txReader,
+                                        geometry,
+                                        columnIndex,
+                                        partitionIndex,
+                                        partitionBy,
+                                        partitionTimestamp
+                                );
+                            }
+                        } else {
+                            for (int partitionIndex = txReader.getPartitionCount() - 1; partitionIndex > -1; partitionIndex--) {
+                                if (txReader.isPartitionParquet(partitionIndex)) {
+                                    // No local .d to rebuild from; skip so the existing index survives and
+                                    // the native partitions still get reindexed.
+                                    LOG.info().$("skipping parquet partition during reindex, index left intact [path=").$(path)
+                                            .$(", ts=").$ts(ColumnType.getTimestampDriver(metadata.getTimestampType()), txReader.getPartitionTimestampByIndex(partitionIndex))
+                                            .I$();
+                                    continue;
+                                }
+                                reindexPartition(
+                                        ff,
+                                        metadata,
+                                        columnVersionReader,
+                                        txReader,
+                                        geometry,
+                                        columnIndex,
+                                        partitionIndex,
+                                        partitionBy,
+                                        txReader.getPartitionTimestampByIndex(partitionIndex)
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    // reindexing columns in non-partitioned table
+                    reindexOneOrAllColumns(
+                            ff,
+                            metadata,
+                            columnVersionReader,
+                            columnIndex,
+                            partitionBy,
+                            -1L,
+                            0L,
+                            txReader.getTransientRowCount()
+                    );
                 }
             }
+        } finally {
+            path.trimTo(rootLen);
+        }
+    }
+
+    private void reindexOneOrAllColumns(
+            FilesFacade ff,
+            RecordMetadata metadata,
+            ColumnVersionReader columnVersionReader,
+            int columnIndex,
+            int partitionBy,
+            long partitionNameTxn,
+            long partitionTimestamp,
+            long partitionSize
+    ) {
+        boolean isIndexed = false;
+
+        if (columnIndex == REBUILD_ALL_COLUMNS) {
+            for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+                if (isSupportedColumn(metadata, i)) {
+                    isIndexed = true;
+                    reindexColumn(
+                            ff,
+                            columnVersionReader,
+                            metadata,
+                            i,
+                            partitionNameTxn,
+                            partitionTimestamp,
+                            partitionBy,
+                            partitionSize
+                    );
+                }
+            }
+            if (!isIndexed) {
+                throw CairoException.nonCritical().put(unsupportedTableMessage);
+            }
         } else {
-            if (checkColumnType(metadata, rebuildColumnIndex)) {
-                rebuildColumn(metadata, rebuildColumnIndex, sink, partitionSize, ff, columnVersionReader, partitionTimestamp, partitionNameTxn);
+            if (isSupportedColumn(metadata, columnIndex)) {
+                reindexColumn(
+                        ff,
+                        columnVersionReader,
+                        metadata,
+                        columnIndex,
+                        partitionNameTxn,
+                        partitionTimestamp,
+                        partitionBy,
+                        partitionSize
+                );
             } else {
-                throw CairoException.instance(0).put(columnTypeErrorMsg);
+                throw CairoException.nonCritical().put(unsupportedColumnMessage);
             }
         }
     }
 
-    private void rebuildColumn(
-            TableReaderMetadata metadata,
-            int columnIndex,
-            StringSink sink,
-            long partitionSize,
+    private void reindexPartition(
             FilesFacade ff,
+            RecordMetadata metadata,
             ColumnVersionReader columnVersionReader,
-            long partitionTimestamp,
-            long partitionNameTxn
+            TxReader txReader,
+            PartitionGeometry geometry,
+            int columnIndex,
+            int partitionIndex,
+            int partitionBy,
+            long partitionTimestamp
     ) {
-        CharSequence columnName = metadata.getColumnName(columnIndex);
-        int indexValueBlockCapacity = metadata.getIndexValueBlockCapacity(columnIndex);
-        int writerIndex = metadata.getWriterIndex(columnIndex);
-        rebuildColumn(columnName, sink, indexValueBlockCapacity, partitionSize, ff, columnVersionReader, writerIndex, partitionTimestamp, partitionNameTxn);
-    }
+        // The DIRECTORY's whole shared frame - same unit and same reason as reindexAfterUpdate above.
+        final long liveRows = partitionIndex == txReader.getPartitionCount() - 1
+                ? txReader.getTransientRowCount()
+                : txReader.getPartitionSize(partitionIndex);
+        final long partitionSize = txReader.isPartitionComposite(partitionIndex)
+                ? Math.max(liveRows, geometry.getE(partitionIndex))
+                : liveRows;
 
-    abstract protected void rebuildColumn(
-            CharSequence columnName,
-            CharSequence partitionName,
-            int indexValueBlockCapacity,
-            long partitionSize,
-            FilesFacade ff,
-            ColumnVersionReader columnVersionReader,
-            int columnIndex,
-            long partitionTimestamp,
-            long partitionNameTxn
-    );
+        reindexOneOrAllColumns(
+                ff,
+                metadata,
+                columnVersionReader,
+                columnIndex,
+                partitionBy,
+                txReader.getPartitionNameTxn(partitionIndex),
+                partitionTimestamp,
+                partitionSize
+        );
+    }
 
     private void releaseLock(FilesFacade ff) {
         if (lockFd != -1L) {
             ff.close(lockFd);
+            lockFd = -1;
             try {
                 path.trimTo(rootLen);
-                lockName(path);
-                if (ff.exists(path) && !ff.remove(path)) {
-                    throw CairoException.instance(ff.errno()).put("Cannot remove ").put(path);
-                }
+                ff.remove(lockName(path));
             } finally {
                 path.trimTo(rootLen);
             }
         }
     }
+
+    abstract protected void doReindex(
+            FilesFacade ff,
+            ColumnVersionReader columnVersionReader,
+            int columnWriterIndex,
+            CharSequence columnName,
+            long partitionNameTxn,
+            long partitionSize,
+            long partitionTimestamp,
+            int timestampType,
+            int partitionBy,
+            int indexValueBlockCapacity,
+            byte indexType,
+            // The metadata reference and the column's dense index are
+            // required for POSTING covering rebuilds: the seal needs to
+            // look up covering column names/types from metadata. They are
+            // ignored by indexers that don't support covering.
+            RecordMetadata metadata,
+            int columnIndex
+    );
+
+    protected abstract boolean isSupportedColumn(RecordMetadata metadata, int columnIndex);
 }

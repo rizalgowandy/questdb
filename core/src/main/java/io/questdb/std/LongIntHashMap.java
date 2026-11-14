@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -39,8 +39,14 @@ public class LongIntHashMap extends AbstractLongHashSet implements Mutable {
         this(initialCapacity, 0.5f);
     }
 
-    private LongIntHashMap(int initialCapacity, double loadFactor) {
+    public LongIntHashMap(int initialCapacity, double loadFactor) {
         super(initialCapacity, loadFactor);
+        values = new int[keys.length];
+        clear();
+    }
+
+    public LongIntHashMap(int initialCapacity, double loadFactor, long noKeyValue) {
+        super(initialCapacity, loadFactor, noKeyValue);
         values = new int[keys.length];
         clear();
     }
@@ -51,6 +57,16 @@ public class LongIntHashMap extends AbstractLongHashSet implements Mutable {
 
     public void put(long key, int value) {
         putAt(keyIndex(key), key, value);
+    }
+
+    public void putAll(LongIntHashMap other) {
+        long[] otherKeys = other.keys;
+        int[] otherValues = other.values;
+        for (int i = 0, n = otherKeys.length; i < n; i++) {
+            if (otherKeys[i] != other.noEntryKeyValue) {
+                put(otherKeys[i], otherValues[i]);
+            }
+        }
     }
 
     public void putAt(int index, long key, int value) {
@@ -65,30 +81,8 @@ public class LongIntHashMap extends AbstractLongHashSet implements Mutable {
         }
     }
 
-    public void putAll(LongIntHashMap other) {
-        long[] otherKeys = other.keys;
-        int[] otherValues = other.values;
-        for (int i = 0, n = otherKeys.length; i < n; i++) {
-            if (otherKeys[i] != other.noEntryKeyValue) {
-                put(otherKeys[i], otherValues[i]);
-            }
-        }
-    }
-
     public int valueAt(int index) {
         return index < 0 ? values[-index - 1] : NO_ENTRY_VALUE;
-    }
-
-    @Override
-    protected void erase(int index) {
-        keys[index] = this.noEntryKeyValue;
-    }
-
-    @Override
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        values[to] = values[from];
-        erase(from);
     }
 
     private void rehash() {
@@ -113,5 +107,17 @@ public class LongIntHashMap extends AbstractLongHashSet implements Mutable {
                 values[index] = oldValues[i];
             }
         }
+    }
+
+    @Override
+    protected void erase(int index) {
+        keys[index] = this.noEntryKeyValue;
+    }
+
+    @Override
+    protected void move(int from, int to) {
+        keys[to] = keys[from];
+        values[to] = values[from];
+        erase(from);
     }
 }

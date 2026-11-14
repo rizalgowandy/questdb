@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,36 +24,38 @@
 
 package io.questdb.griffin.engine.functions.bind;
 
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.ScalarFunction;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlUtil;
 import io.questdb.griffin.engine.functions.StrFunction;
 import io.questdb.std.Mutable;
 import io.questdb.std.Numbers;
-import io.questdb.std.str.CharSink;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8StringSink;
 
-class StrBindVariable extends StrFunction implements ScalarFunction, Mutable {
-    private final StringSink sink = new StringSink();
+public class StrBindVariable extends StrFunction implements Mutable {
+    private final StringSink utf16Sink = new StringSink();
+    private final Utf8StringSink utf8Sink = new Utf8StringSink();
     private boolean isNull = true;
-    private final int floatScale;
-
-    public StrBindVariable(int floatScale) {
-        this.floatScale = floatScale;
-    }
 
     @Override
     public void clear() {
         isNull = true;
-        sink.clear();
+        utf16Sink.clear();
+        utf8Sink.clear();
     }
 
     @Override
-    public void getStr(Record rec, CharSink sink) {
-        if (isNull) {
-            sink.put((CharSequence) null);
-        } else {
-            sink.put(this.sink);
-        }
+    public CharSequence getStrA(Record rec) {
+        return isNull ? null : utf16Sink;
+    }
+
+    @Override
+    public CharSequence getStrB(Record rec) {
+        return isNull ? null : utf16Sink;
     }
 
     @Override
@@ -61,71 +63,145 @@ class StrBindVariable extends StrFunction implements ScalarFunction, Mutable {
         if (isNull) {
             return -1;
         }
-        return sink.length();
+        return utf16Sink.length();
     }
 
     @Override
-    public CharSequence getStr(Record rec) {
-        return isNull ? null : sink;
+    public Utf8Sequence getVarcharA(Record rec) {
+        return isNull ? null : utf8Sink;
     }
 
     @Override
-    public CharSequence getStrB(Record rec) {
-        return isNull ? null : sink;
+    public Utf8Sequence getVarcharB(Record rec) {
+        return isNull ? null : utf8Sink;
+    }
+
+    @Override
+    public int getVarcharSize(Record rec) {
+        if (isNull) {
+            return -1;
+        }
+        return utf8Sink.size();
+    }
+
+    @Override
+    public boolean isNonDeterministic() {
+        return true;
+    }
+
+    @Override
+    public boolean isRuntimeConstant() {
+        return true;
+    }
+
+    @Override
+    public boolean isStableWithinExecution() {
+        // the bound value is set before execution starts and is immutable while it runs
+        return true;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return true;
+    }
+
+    public void setTimestamp(long value, int timestampType) {
+        isNull = value == Numbers.LONG_NULL;
+        if (!isNull) {
+            utf16Sink.clear();
+            TimestampDriver timestampDriver = ColumnType.getTimestampDriver(timestampType);
+            timestampDriver.append(utf16Sink, value);
+            utf8Sink.clear();
+            timestampDriver.append(utf8Sink, value);
+        }
+    }
+
+    public void setUuidValue(long lo, long hi) {
+        utf16Sink.clear();
+        if (SqlUtil.implicitCastUuidAsStr(lo, hi, utf16Sink)) {
+            utf8Sink.clear();
+            Numbers.appendUuid(lo, hi, utf8Sink);
+            isNull = false;
+        }
+    }
+
+    public void setValue(boolean value) {
+        isNull = false;
+        utf16Sink.clear();
+        utf16Sink.put(value);
+        utf8Sink.clear();
+        utf8Sink.put(value);
     }
 
     public void setValue(char value) {
-        sink.clear();
         isNull = false;
-        sink.put(value);
+        utf16Sink.clear();
+        utf16Sink.put(value);
+        utf8Sink.clear();
+        utf8Sink.put(value);
     }
 
     public void setValue(long l0, long l1, long l2, long l3) {
-        sink.clear();
         isNull = false;
-        Numbers.appendLong256(l0, l1, l2, l3, sink);
+        utf16Sink.clear();
+        Numbers.appendLong256(l0, l1, l2, l3, utf16Sink);
+        utf8Sink.clear();
+        Numbers.appendLong256(l0, l1, l2, l3, utf8Sink);
     }
 
     public void setValue(short value) {
-        sink.clear();
         isNull = false;
-        sink.put(value);
+        utf16Sink.clear();
+        utf16Sink.put(value);
+        utf8Sink.clear();
+        utf8Sink.put(value);
     }
 
     public void setValue(byte value) {
-        sink.clear();
         isNull = false;
-        sink.put(value);
+        utf16Sink.clear();
+        utf16Sink.put(value);
+        utf8Sink.clear();
+        utf8Sink.put((int) value);
     }
 
     public void setValue(long value) {
-        isNull = value == Numbers.LONG_NaN;
+        isNull = value == Numbers.LONG_NULL;
         if (!isNull) {
-            sink.clear();
-            sink.put(value);
+            utf16Sink.clear();
+            utf16Sink.put(value);
+            utf8Sink.clear();
+            utf8Sink.put(value);
         }
     }
 
     public void setValue(int value) {
-        isNull = value == Numbers.INT_NaN;
+        isNull = value == Numbers.INT_NULL;
         if (!isNull) {
-            sink.clear();
-            sink.put(value);
+            utf16Sink.clear();
+            utf16Sink.put(value);
+            utf8Sink.clear();
+            utf8Sink.put(value);
         }
     }
 
     public void setValue(double value) {
-        isNull = value == Numbers.LONG_NaN;
+        isNull = Numbers.isNull(value);
         if (!isNull) {
-            sink.clear();
-            sink.put(value);
+            utf16Sink.clear();
+            utf16Sink.put(value);
+            utf8Sink.clear();
+            utf8Sink.put(value);
         }
     }
+
     public void setValue(float value) {
-        isNull = value == Numbers.LONG_NaN;
+        isNull = Numbers.isNull(value);
         if (!isNull) {
-            sink.clear();
-            sink.put(value, floatScale);
+            utf16Sink.clear();
+            utf16Sink.put(value);
+            utf8Sink.clear();
+            utf8Sink.put(value);
         }
     }
 
@@ -134,13 +210,27 @@ class StrBindVariable extends StrFunction implements ScalarFunction, Mutable {
             isNull = true;
         } else {
             isNull = false;
-            sink.clear();
-            sink.put(value);
+            utf16Sink.clear();
+            utf16Sink.put(value);
+            utf8Sink.clear();
+            utf8Sink.put(value);
+        }
+    }
+
+    public void setValue(Utf8Sequence value) {
+        if (value == null) {
+            isNull = true;
+        } else {
+            isNull = false;
+            utf16Sink.clear();
+            utf16Sink.put(value);
+            utf8Sink.clear();
+            utf8Sink.put(value);
         }
     }
 
     @Override
-    public boolean isRuntimeConstant() {
-        return true;
+    public void toPlan(PlanSink sink) {
+        sink.val("?::string");
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,18 +26,52 @@ package io.questdb.cairo.vm;
 
 import io.questdb.cairo.MapWriter;
 import io.questdb.cairo.SymbolValueCountCollector;
+import io.questdb.cairo.vm.api.MemoryR;
 
 public class NullMapWriter implements MapWriter {
     public static final MapWriter INSTANCE = new NullMapWriter();
 
     @Override
-    public boolean isCached() {
-        return true;
+    public int getColumnIndex() {
+        return -1;
+    }
+
+    @Override
+    public boolean getNullFlag() {
+        return false;
+    }
+
+    @Override
+    public int getSymbolCapacity() {
+        return -1;
     }
 
     @Override
     public int getSymbolCount() {
         throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public MemoryR getSymbolOffsetsMemory() {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public MemoryR getSymbolValuesMemory() {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public boolean isCacheAllocated() {
+        // Agrees with isCached(), so a caller that reads the two disagreeing as a column
+        // missing a cache it asked for finds nothing to recover on a writer that stands in
+        // for a column with no symbol map at all - and never reaches updateCacheFlag() here.
+        return true;
+    }
+
+    @Override
+    public boolean isCached() {
+        return true;
     }
 
     @Override
@@ -62,6 +96,11 @@ public class NullMapWriter implements MapWriter {
 
     @Override
     public void setSymbolIndexInTxWriter(int symbolIndexInTxWriter) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void sync(boolean async) {
         throw new UnsupportedOperationException();
     }
 

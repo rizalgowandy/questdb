@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,47 +24,48 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.sql.DataFrame;
-import io.questdb.cairo.sql.DataFrameCursor;
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.std.IntList;
+import io.questdb.std.DirectLongList;
 import org.jetbrains.annotations.NotNull;
 
-class LatestByValueFilteredRecordCursor extends AbstractDataFrameRecordCursor {
-
-    private final int columnIndex;
-    private final int symbolKey;
+class LatestByValueFilteredRecordCursor extends AbstractLatestByValueRecordCursor {
     private final Function filter;
-    private boolean empty;
-    private boolean hasNext;
+    private final LatestByFrameScanner scanner;
 
     public LatestByValueFilteredRecordCursor(
+            @NotNull CairoConfiguration configuration,
+            @NotNull RecordMetadata metadata,
             int columnIndex,
             int symbolKey,
-            @NotNull Function filter,
-            @NotNull IntList columnIndexes
+            @NotNull Function filter
     ) {
-        super(columnIndexes);
-        this.columnIndex = columnIndex;
-        this.symbolKey = symbolKey;
+        super(configuration, metadata, columnIndex, symbolKey);
         this.filter = filter;
+        this.scanner = new LatestByFrameScanner(filter, frameMemoryPool, frameAddressCache);
     }
 
     @Override
     public void close() {
-        dataFrameCursor.close();
-    }
-
-    @Override
-    public void toTop() {
-        hasNext = !empty;
-        filter.toTop();
+        filter.cursorClosed();
+        super.close();
     }
 
     @Override
     public boolean hasNext() {
+        circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+        if (!isFindPending) {
+            findRecord();
+            hasNext = isRecordFound;
+            isFindPending = true;
+        }
         if (hasNext) {
             hasNext = false;
             return true;
@@ -73,36 +74,73 @@ class LatestByValueFilteredRecordCursor extends AbstractDataFrameRecordCursor {
     }
 
     @Override
+    public void of(PageFrameCursor pageFrameCursor, SqlExecutionContext executionContext) throws SqlException {
+        this.frameCursor = pageFrameCursor;
+        recordA.of(pageFrameCursor);
+        recordB.of(pageFrameCursor);
+        circuitBreaker = executionContext.getCircuitBreaker();
+        filter.init(pageFrameCursor, executionContext);
+        isRecordFound = false;
+        isFindPending = false;
+        // prepare for page frame iteration
+        super.init(executionContext.getMemoryTracker());
+    }
+
+    @Override
     public long size() {
         return -1;
     }
 
     @Override
-    void of(DataFrameCursor dataFrameCursor, SqlExecutionContext executionContext) throws SqlException {
-        this.dataFrameCursor = dataFrameCursor;
-        this.recordA.of(dataFrameCursor.getTableReader());
-        this.recordB.of(dataFrameCursor.getTableReader());
-        findRecord();
-        hasNext = !empty;
-        filter.init(this, executionContext);
+    public long preComputedStateSize() {
+        return isFindPending ? 1 : 0;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Row backward scan");
+        sink.attr("symbolFilter").putColumnName(columnIndex).val('=').val(symbolKey);
+        sink.attr("filter").val(filter);
+    }
+
+    @Override
+    public void toTop() {
+        hasNext = isRecordFound;
+        filter.toTop();
     }
 
     private void findRecord() {
-        empty = true;
-        DataFrame frame;
+        // The reserved NULL key does not imply that this snapshot contains a NULL.
+        if (symbolKey == SymbolTable.VALUE_IS_NULL && !frameCursor.getSymbolTable(columnIndex).containsNullValue()) {
+            return;
+        }
+        final Function javaFilter = scanner.getJavaFilter();
+        PageFrame frame;
         OUT:
-        while ((frame = this.dataFrameCursor.next()) != null) {
-            final long rowLo = frame.getRowLo();
-            final long rowHi = frame.getRowHi() - 1;
-
-            recordA.jumpTo(frame.getPartitionIndex(), rowHi);
-            for (long row = rowHi; row >= rowLo; row--) {
-                recordA.setRecordIndex(row);
-                if (filter.getBool(recordA)) {
-                    int key = recordA.getInt(columnIndex);
-                    if (key == symbolKey) {
-                        empty = false;
-                        break OUT;
+        while ((frame = frameCursor.next()) != null) {
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            final int frameIndex = frameCount;
+            frameAddressCache.add(frameCount, frame);
+            frameMemoryPool.navigateTo(frameCount++, recordA);
+            scanner.of(frameIndex, frame.getPartitionHi() - frame.getPartitionLo());
+            while (scanner.nextBatch(circuitBreaker)) {
+                final DirectLongList matches = scanner.getMatches();
+                if (matches == null) {
+                    for (long row = scanner.getRowCount() - 1; row >= 0; row--) {
+                        recordA.setRowIndex(row);
+                        if (javaFilter.getBool(recordA) && recordA.getInt(columnIndex) == symbolKey) {
+                            isRecordFound = true;
+                            break OUT;
+                        }
+                    }
+                } else {
+                    final long batchLo = scanner.getBatchLo();
+                    for (long i = matches.size() - 1; i >= 0; i--) {
+                        recordA.setRowIndex(matches.get(i) + batchLo);
+                        if (recordA.getInt(columnIndex) == symbolKey) {
+                            isRecordFound = true;
+                            break OUT;
+                        }
                     }
                 }
             }

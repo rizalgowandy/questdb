@@ -1,0 +1,2423 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test;
+
+import io.questdb.Bootstrap;
+import io.questdb.BootstrapConfiguration;
+import io.questdb.ConfigPropertyKey;
+import io.questdb.ConfigReloader;
+import io.questdb.DefaultBootstrapConfiguration;
+import io.questdb.DefaultHttpClientConfiguration;
+import io.questdb.DynamicPropServerConfiguration;
+import io.questdb.FactoryProviderFactoryImpl;
+import io.questdb.HttpClientConfiguration;
+import io.questdb.Metrics;
+import io.questdb.PropertyKey;
+import io.questdb.ServerConfiguration;
+import io.questdb.ServerMain;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.security.AllowAllSecurityContext;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cutlass.Services;
+import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
+import io.questdb.cutlass.http.HttpRequestHandler;
+import io.questdb.cutlass.http.HttpRequestHandlerFactory;
+import io.questdb.cutlass.http.HttpServer;
+import io.questdb.cutlass.http.client.HttpClient;
+import io.questdb.cutlass.http.client.HttpClientException;
+import io.questdb.cutlass.http.client.HttpClientFactory;
+import io.questdb.cutlass.qwp.server.QwpIngressHttpProcessor;
+import io.questdb.cutlass.qwp.server.egress.QwpEgressHttpProcessor;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.engine.window.WindowMapState;
+import io.questdb.griffin.engine.window.WindowRecordCursorFactory;
+import io.questdb.metrics.QueryTracingJob;
+import io.questdb.mp.WorkerPool;
+import io.questdb.mp.WorkerPoolConfiguration;
+import io.questdb.mp.continuation.Fiber;
+import io.questdb.mp.continuation.FiberRuntime;
+import io.questdb.mp.continuation.FiberTask;
+import io.questdb.mp.continuation.FiberWaitCoordinator;
+import io.questdb.mp.continuation.LaunchResult;
+import io.questdb.std.Chars;
+import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.MemoryTrackerWorkload;
+import io.questdb.std.ObjHashSet;
+import io.questdb.std.ObjList;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
+import io.questdb.std.str.StringSink;
+import io.questdb.test.cutlass.http.HttpUtils;
+import io.questdb.test.cutlass.http.TestHttpClient;
+import io.questdb.test.cutlass.qwp.QwpWireTestFixtures;
+import io.questdb.test.tools.LogCapture;
+import io.questdb.test.tools.TestUtils;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.junit.AfterClass;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+import org.postgresql.util.PSQLException;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
+
+import static io.questdb.cutlass.http.HttpConstants.SESSION_COOKIE_NAME;
+import static io.questdb.test.cutlass.qwp.QwpWireTestFixtures.QWP_ORIGINS_TEST_BOOT_CONFIG;
+import static io.questdb.test.cutlass.qwp.QwpWireTestFixtures.assertCredentialUpgradeSwitched;
+import static io.questdb.test.cutlass.qwp.QwpWireTestFixtures.assertQwpBrowserUpgrade;
+import static io.questdb.test.cutlass.qwp.QwpWireTestFixtures.browserCredentialOffer;
+import static io.questdb.test.cutlass.qwp.QwpWireTestFixtures.browserCredentialProtocol;
+import static io.questdb.test.cutlass.qwp.QwpWireTestFixtures.browserCredentialUpgrade;
+import static io.questdb.test.tools.TestUtils.assertMemoryLeak;
+import static org.junit.Assert.assertFalse;
+
+public class DynamicPropServerConfigurationTest extends AbstractTest {
+    private static final TestHttpClient testHttpClient = new TestHttpClient();
+    private File serverConf;
+
+    @AfterClass
+    public static void tearDownStatic() {
+        testHttpClient.close();
+        AbstractTest.tearDownStatic();
+        assert Unsafe.getMemUsedByTag(MemoryTag.NATIVE_HTTP_CONN) == 0;
+    }
+
+    @Before
+    public void setUp() {
+        Path serverConfPath = Paths.get(temp.getRoot().getAbsolutePath(), "dbRoot", "conf", "server.conf");
+        try {
+            Files.createDirectories(serverConfPath.getParent());
+            serverConf = serverConfPath.toFile();
+            Assert.assertTrue(serverConf.createNewFile());
+        } catch (Exception e) {
+            Assert.fail(e.getMessage());
+        }
+        Assert.assertTrue(serverConf.exists());
+    }
+
+    @Test
+    public void testAsOfJoinEvacuationThreshold() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.asof.join.evacuation.threshold=1000\n");
+                }
+
+                assertReloadConfigEventually();
+
+                int threshold = serverMain.getConfiguration().getCairoConfiguration().getSqlAsOfJoinMapEvacuationThreshold();
+                Assert.assertEquals(1000, threshold);
+            }
+        });
+    }
+
+    @Test
+    public void testAsOfJoinShortCircuitCacheCapacity() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.asof.join.short.circuit.cache.capacity=1000\n");
+                }
+
+                assertReloadConfigEventually();
+
+                int capacity = serverMain.getConfiguration().getCairoConfiguration().getSqlAsOfJoinShortCircuitCacheCapacity();
+                Assert.assertEquals(1000, capacity);
+            }
+        });
+    }
+
+    @Test
+    public void testCairoMemoryLimitsReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                CairoConfiguration cairoConfig = serverMain.getConfiguration().getCairoConfiguration();
+                // All three workloads default to unlimited.
+                Assert.assertEquals(0, cairoConfig.getQueryMemoryLimitBytes());
+                Assert.assertEquals(0, cairoConfig.getMatViewRefreshMemoryLimitBytes());
+                Assert.assertEquals(0, cairoConfig.getWalApplyMemoryLimitBytes());
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.query.memory.limit.bytes=1000000\n");
+                    w.write("cairo.mat.view.refresh.memory.limit.bytes=2000000\n");
+                    w.write("cairo.wal.apply.memory.limit.bytes=3000000\n");
+                }
+
+                assertReloadConfigEventually();
+
+                // The reloaded limits are visible through the config getters...
+                Assert.assertEquals(1_000_000, cairoConfig.getQueryMemoryLimitBytes());
+                Assert.assertEquals(2_000_000, cairoConfig.getMatViewRefreshMemoryLimitBytes());
+                Assert.assertEquals(3_000_000, cairoConfig.getWalApplyMemoryLimitBytes());
+
+                // ...and through a tracker freshly acquired after the reload, since the provider
+                // reads the configured limit on each acquisition.
+                assertTrackerLimit(serverMain, MemoryTrackerWorkload.QUERY, 1_000_000);
+                assertTrackerLimit(serverMain, MemoryTrackerWorkload.MAT_VIEW_REFRESH, 2_000_000);
+                assertTrackerLimit(serverMain, MemoryTrackerWorkload.WAL_APPLY, 3_000_000);
+            }
+        });
+    }
+
+    @Test
+    public void testQueryMemoryLimitReloadUnblocksQuery() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Seed two tables whose hash join build needs far more tracked memory
+                // than the low limit configured below. Seeding runs under the default
+                // unlimited limit, so it is never constrained. A hash join drives the breach
+                // because it holds its whole build side in tracked memory before it returns
+                // a row. That holds whether the planner fuses the join into the count (Async
+                // Hash Join Group By) or counts over an ordinary hash join, and either build
+                // fails with the per-query OOM message intact, keeping the client-visible
+                // error stable.
+                try (Connection conn = getConnection("admin", "quest")) {
+                    try (PreparedStatement stmt = conn.prepareStatement(
+                            "CREATE TABLE master AS (SELECT cast(x AS varchar) k FROM long_sequence(100_000))")) {
+                        stmt.execute();
+                    }
+                    try (PreparedStatement stmt = conn.prepareStatement(
+                            "CREATE TABLE slave AS (SELECT cast(x AS varchar) k, x AS v FROM long_sequence(100_000))")) {
+                        stmt.execute();
+                    }
+                }
+
+                final String query = "SELECT count(*) AS c FROM (SELECT master.k, slave.v FROM master JOIN slave ON k)";
+
+                // Configure a too-low per-query memory limit and reload it in.
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.query.memory.limit.bytes=65536\n");
+                }
+                assertReloadConfigEventually();
+                Assert.assertEquals(65_536, serverMain.getConfiguration().getCairoConfiguration().getQueryMemoryLimitBytes());
+
+                // The aggregation's hash map blows past 64 KiB, so the query fails with an
+                // out-of-memory error tagged with the QUERY workload.
+                try (
+                        Connection conn = getConnection("admin", "quest");
+                        PreparedStatement stmt = conn.prepareStatement(query)
+                ) {
+                    stmt.executeQuery();
+                    Assert.fail("expected out-of-memory error under the low query memory limit");
+                } catch (PSQLException e) {
+                    TestUtils.assertContains(e.getMessage(), "query memory limit exceeded");
+                    TestUtils.assertContains(e.getMessage(), "workload=QUERY");
+                }
+
+                // Bump the limit to unlimited and reload it in.
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.query.memory.limit.bytes=0\n");
+                }
+                assertReloadConfigEventually();
+                Assert.assertEquals(0, serverMain.getConfiguration().getCairoConfiguration().getQueryMemoryLimitBytes());
+
+                // The very same query now runs to completion: a freshly acquired tracker reads
+                // the reloaded (unlimited) limit.
+                try (
+                        Connection conn = getConnection("admin", "quest");
+                        PreparedStatement stmt = conn.prepareStatement(query);
+                        ResultSet rs = stmt.executeQuery()
+                ) {
+                    Assert.assertTrue(rs.next());
+                    Assert.assertEquals(100_000, rs.getLong(1));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testConfigChangeListener() throws Exception {
+        assertMemoryLeak(() -> {
+            final AtomicLong configChangedCalledCounter = new AtomicLong(0);
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                final var listener = new ConfigReloader.Listener() {
+                    private final ConfigPropertyKey[] WATCHED_PROPERTIES = new ConfigPropertyKey[]{
+                            PropertyKey.CAIRO_SQL_ASOF_JOIN_EVACUATION_THRESHOLD
+                    };
+
+                    @Override
+                    public void configChanged() {
+                        configChangedCalledCounter.incrementAndGet();
+                    }
+
+                    @Override
+                    public @NotNull ConfigPropertyKey[] getWatchedConfigKeys() {
+                        return WATCHED_PROPERTIES;
+                    }
+                };
+                final long watchId = serverMain.getEngine().getConfigReloader().watch(listener);
+
+                Assert.assertTrue("watchId should be non-negative", watchId >= 0);
+                Assert.assertEquals(0, configChangedCalledCounter.get());
+
+                // [1] First, reload config after changing a watched setting.
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.asof.join.evacuation.threshold=1000\n");
+                }
+
+                assertReloadConfigEventually();
+
+                Assert.assertEquals(1, configChangedCalledCounter.get());
+
+                final int threshold = serverMain.getConfiguration().getCairoConfiguration().getSqlAsOfJoinMapEvacuationThreshold();
+                Assert.assertEquals(1000, threshold);
+
+                // [2] Now again, reload config after changing a setting which is reloadable but not watched.
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.asof.join.evacuation.threshold=1000\n");
+                    w.write("cairo.sql.asof.join.short.circuit.cache.capacity=4000\n");
+                }
+
+                assertReloadConfigEventually();
+
+                final int capacity = serverMain.getConfiguration().getCairoConfiguration().getSqlAsOfJoinShortCircuitCacheCapacity();
+                Assert.assertEquals(4000, capacity);
+
+                // Note! The listener was _not_ notified. The `cairo.sql.asof.join.short.circuit.cache.capacity` is of no interest.
+                Assert.assertEquals(1, configChangedCalledCounter.get());
+
+                // [3] Now we test _removing_ keys. Should get notified.
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    // Not going to `w.write("cairo.sql.asof.join.evacuation.threshold=1000\n");`, i.e. removed.
+                    w.write("cairo.sql.asof.join.short.circuit.cache.capacity=4000\n");
+                }
+                assertReloadConfigEventually();
+                Assert.assertEquals(2, configChangedCalledCounter.get());
+
+                // [4] Finally, we test unregistering from config changes.
+                // We should not get notified, despite adding back the key of interest.
+                serverMain.getEngine().getConfigReloader().unwatch(watchId);
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.asof.join.evacuation.threshold=2000\n");
+                }
+                assertReloadConfigEventually();
+                Assert.assertEquals(2, configChangedCalledCounter.get());
+
+                // [5] Should we re-register, we'll get a different ID.
+                final long watchId2 = serverMain.getEngine().getConfigReloader().watch(listener);
+                Assert.assertNotEquals("re-register should return a new watchId", watchId, watchId2);
+            }
+        });
+    }
+
+    @Test
+    public void testFiberLimitsReloadIntoExistingRuntime() throws Exception {
+        assertFiberLimitsReloadIntoExistingRuntime(
+                "shared.network.worker",
+                DynamicPropServerConfiguration::getSharedWorkerPoolNetworkConfiguration
+        );
+    }
+
+    @Test
+    public void testFiberLimitsReloadIntoExistingRuntimeForHttp() throws Exception {
+        assertFiberLimitsReloadIntoExistingRuntime(
+                "http.worker",
+                DynamicPropServerConfiguration::getHttpServerConfiguration
+        );
+    }
+
+    @Test
+    public void testFiberLimitsReloadIntoExistingRuntimeForMatViewRefresh() throws Exception {
+        assertFiberLimitsReloadIntoExistingRuntime(
+                "mat.view.refresh.worker",
+                DynamicPropServerConfiguration::getMatViewRefreshPoolConfiguration
+        );
+    }
+
+    @Test
+    public void testFiberLimitsReloadIntoExistingRuntimeForPg() throws Exception {
+        assertFiberLimitsReloadIntoExistingRuntime(
+                "pg.worker",
+                DynamicPropServerConfiguration::getPGWireConfiguration
+        );
+    }
+
+    @Test
+    public void testFiberLimitsReloadIntoExistingRuntimeForSharedQuery() throws Exception {
+        assertFiberLimitsReloadIntoExistingRuntime(
+                "shared.query.worker",
+                DynamicPropServerConfiguration::getSharedWorkerPoolQueryConfiguration
+        );
+    }
+
+    private void assertFiberLimitsReloadIntoExistingRuntime(
+            String keyPrefix,
+            Function<DynamicPropServerConfiguration, WorkerPoolConfiguration> poolConfiguration
+    ) throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter writer = new FileWriter(serverConf)) {
+                writer.write(keyPrefix + ".fiber.enabled=true\n");
+                writer.write(keyPrefix + ".fiber.max.live=2\n");
+                writer.write(keyPrefix + ".fiber.max.retained=1\n");
+                writer.write(keyPrefix + ".fiber.mount.budget=3\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                final DynamicPropServerConfiguration configuration =
+                        (DynamicPropServerConfiguration) serverMain.getConfiguration();
+                try (WorkerPool pool = new WorkerPool(poolConfiguration.apply(configuration))) {
+                    final FiberRuntime runtime = pool.getFiberRuntime();
+
+                    try (FileWriter writer = new FileWriter(serverConf)) {
+                        writer.write(keyPrefix + ".fiber.enabled=true\n");
+                        writer.write(keyPrefix + ".fiber.max.live=5\n");
+                        writer.write(keyPrefix + ".fiber.max.retained=4\n");
+                        writer.write(keyPrefix + ".fiber.mount.budget=7\n");
+                    }
+
+                    Assert.assertTrue(configuration.reload());
+                    Assert.assertSame(runtime, pool.getFiberRuntime());
+                    Assert.assertEquals(5, runtime.getMaxLiveFiberCount());
+                    Assert.assertEquals(4, runtime.getMaxRetainedFiberCount());
+                    Assert.assertEquals(7, runtime.getMountBudget());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFiberMaxLiveIncreaseWakesCapacityWaiter() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter writer = new FileWriter(serverConf)) {
+                writer.write("shared.network.worker.fiber.max.live=2\n");
+                writer.write("shared.network.worker.fiber.max.retained=2\n");
+                writer.write("shared.network.worker.fiber.mount.budget=1\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                final DynamicPropServerConfiguration configuration =
+                        (DynamicPropServerConfiguration) serverMain.getConfiguration();
+                try (WorkerPool pool = new WorkerPool(configuration.getSharedWorkerPoolNetworkConfiguration())) {
+                    final FiberRuntime runtime = pool.getFiberRuntime();
+                    final Fiber reservedFiber = runtime.tryReserveFiber();
+                    Assert.assertNotNull(reservedFiber);
+                    final AtomicLong wakeReason = new AtomicLong(FiberWaitCoordinator.REASON_NONE);
+                    final FiberTask waiter = new FiberTask() {
+                        @Override
+                        protected boolean runStep() {
+                            wakeReason.set(runtime.awaitCapacity());
+                            return true;
+                        }
+                    };
+                    try {
+                        Assert.assertEquals(LaunchResult.LAUNCHED, runtime.launch(waiter));
+                        Assert.assertEquals(1, runtime.drain(1));
+                        Assert.assertFalse(waiter.isDone());
+                        Assert.assertEquals(1, runtime.getParkedFiberCount());
+
+                        try (FileWriter writer = new FileWriter(serverConf)) {
+                            writer.write("shared.network.worker.fiber.max.live=3\n");
+                            writer.write("shared.network.worker.fiber.max.retained=2\n");
+                            writer.write("shared.network.worker.fiber.mount.budget=1\n");
+                        }
+
+                        Assert.assertTrue(configuration.reload());
+                        Assert.assertEquals(1, runtime.drain(1));
+                        Assert.assertTrue(waiter.isDone());
+                        Assert.assertEquals(FiberWaitCoordinator.REASON_CAPACITY, wakeReason.get());
+                    } finally {
+                        runtime.releaseReservedFiber(reservedFiber, reservedFiber.getReservationEpoch());
+                        runtime.beginQuiesce();
+                        runtime.drain(64);
+                        runtime.awaitClosed();
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testHttpConnectionLimitReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("http.net.bind.to=0.0.0.0:9001\n");
+                w.write("http.net.connection.limit=1\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                final Metrics metrics = serverMain.getEngine().getMetrics();
+                final HttpClientConfiguration config = new DefaultHttpClientConfiguration() {
+                    @Override
+                    public int getTimeout() {
+                        return 1000;
+                    }
+                };
+                try (
+                        HttpClient httpClient1 = HttpClientFactory.newPlainTextInstance(config);
+                        TestHttpClient testHttpClient1 = new TestHttpClient(httpClient1)
+                ) {
+                    testHttpClient1.setKeepConnection(true);
+                    testHttpClient1.assertGet(
+                            "/exec",
+                            "{\"query\":\"select 1;\",\"columns\":[{\"name\":\"1\",\"type\":\"INT\"}],\"timestamp\":-1,\"dataset\":[[1]],\"count\":1}",
+                            "select 1;"
+                    );
+
+                    try (
+                            HttpClient httpClient2 = HttpClientFactory.newPlainTextInstance(config);
+                            TestHttpClient testHttpClient2 = new TestHttpClient(httpClient2)
+                    ) {
+                        testHttpClient2.assertGet(
+                                "/exec",
+                                "{\"query\":\"select 1;\",\"columns\":[{\"name\":\"1\",\"type\":\"INT\"}],\"timestamp\":-1,\"dataset\":[[1]],\"count\":1}",
+                                "select 1;"
+                        );
+                        Assert.fail();
+                    } catch (Exception ignore) {
+                    }
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("http.net.bind.to=0.0.0.0:9001\n");
+                    w.write("http.net.connection.limit=10\n");
+                }
+
+                TestUtils.assertEventually(() -> Assert.assertEquals(0, metrics.httpMetrics().connectionCountGauge().getValue()));
+                TestUtils.assertEventually(() -> Assert.assertTrue(3 < metrics.httpMetrics().listenerStateChangeCounter().getValue()));
+
+                assertReloadConfigEventually();
+
+                // we should be able to open two connections eventually
+                TestUtils.assertEventually(() -> {
+                    try (
+                            HttpClient httpClient1 = HttpClientFactory.newPlainTextInstance(config);
+                            TestHttpClient testHttpClient1 = new TestHttpClient(httpClient1)
+                    ) {
+                        testHttpClient1.setKeepConnection(true);
+                        testHttpClient1.assertGet(
+                                "/exec",
+                                "{\"query\":\"select 1;\",\"columns\":[{\"name\":\"1\",\"type\":\"INT\"}],\"timestamp\":-1,\"dataset\":[[1]],\"count\":1}",
+                                "select 1;"
+                        );
+
+                        try (
+                                HttpClient httpClient2 = HttpClientFactory.newPlainTextInstance(config);
+                                TestHttpClient testHttpClient2 = new TestHttpClient(httpClient2)
+                        ) {
+                            testHttpClient2.assertGet(
+                                    "/exec",
+                                    "{\"query\":\"select 1;\",\"columns\":[{\"name\":\"1\",\"type\":\"INT\"}],\"timestamp\":-1,\"dataset\":[[1]],\"count\":1}",
+                                    "select 1;"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    @Test
+    public void testHttpPasswordFromFile() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a secret file for HTTP password
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "http_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "http_secret_password");
+
+            // Configure http.password.file and http.user
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("http.user=httpuser\n");
+                w.write("http.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Verify HTTP password was read from file
+                Assert.assertEquals(
+                        "http_secret_password",
+                        serverMain.getConfiguration().getHttpServerConfiguration().getPassword()
+                );
+
+                // Verify HTTP username is set
+                Assert.assertEquals(
+                        "httpuser",
+                        serverMain.getConfiguration().getHttpServerConfiguration().getUsername()
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testHttpRecvBufferSizeReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("http.net.bind.to=0.0.0.0:9001\n");
+                w.write("http.request.header.buffer.size=100\n");
+                w.write("http.recv.buffer.size=100\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                final StringSink querySink = new StringSink();
+                querySink.put("select length('");
+                querySink.put(Chars.repeat("q", 150));
+                querySink.put("');");
+                final String query = querySink.toString();
+                try {
+                    testHttpClient.assertGet(
+                            "/exec",
+                            "",
+                            query
+                    );
+                    Assert.fail();
+                } catch (HttpClientException ignore) {
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("http.net.bind.to=0.0.0.0:9001\n");
+                    w.write("http.request.header.buffer.size=300\n");
+                    w.write("http.recv.buffer.size=300\n");
+                }
+
+                assertReloadConfigEventually();
+
+                // second reload should not reload (no changes)
+                assertReloadConfig(false);
+
+                try {
+                    testHttpClient.assertGet(
+                            "/exec",
+                            "{\"query\":\"select length('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq');\",\"columns\":[{\"name\":\"length('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\",\"type\":\"INT\"}],\"timestamp\":-1,\"dataset\":[[150]],\"count\":1}",
+                            query
+                    );
+                    Assert.fail();
+                } catch (HttpClientException ignore) {
+
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("http.net.bind.to=0.0.0.0:9001\n");
+                    // add size for the second copy of the URL query
+                    w.write("http.request.header.buffer.size=500\n");
+                    w.write("http.recv.buffer.size=300\n");
+                }
+
+                assertReloadConfigEventually();
+
+                // second reload should not reload (no changes)
+                assertReloadConfig(false);
+
+                testHttpClient.assertGet(
+                        "/exec",
+                        "{\"query\":\"select length('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq');\",\"columns\":[{\"name\":\"length('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\",\"type\":\"INT\"}],\"timestamp\":-1,\"dataset\":[[150]],\"count\":1}",
+                        query
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testHttpSendBufferSizeReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("http.net.bind.to=0.0.0.0:9001\n");
+                w.write("http.send.buffer.size=100\n");
+                w.write("query.tracing.enabled=true\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                final String query = "select rpad('QuestDB', 150, '0');";
+                try {
+                    testHttpClient.assertGet(
+                            "/exec",
+                            "",
+                            query
+                    );
+                    Assert.fail();
+                } catch (HttpClientException ignore) {
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("http.net.bind.to=0.0.0.0:9001\n");
+                    w.write("http.send.buffer.size=200\n");
+                }
+
+                assertReloadConfigEventually();
+
+                testHttpClient.assertGet(
+                        "/exec",
+                        "{\"query\":\"select rpad('QuestDB', 150, '0');\",\"columns\":[{\"name\":\"rpad('QuestDB', 150, '0')\",\"type\":\"STRING\"}],\"timestamp\":-1,\"dataset\":[[\"QuestDB00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"]],\"count\":1}",
+                        query
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testJoinSymbolTranslationCacheCapacity() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.join.symbol.translation.cache.capacity=1000\n");
+                }
+
+                assertReloadConfigEventually();
+
+                int capacity = serverMain.getConfiguration().getCairoConfiguration().getSqlJoinSymbolTranslationCacheCapacity();
+                Assert.assertEquals(1000, capacity);
+            }
+        });
+    }
+
+    @Test
+    public void testMultiplePasswordsFromFilesSimultaneously() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create secret files for multiple passwords
+            Path pgPasswordFile = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "pg_password.txt");
+            Path pgRoPasswordFile = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "pg_ro_password.txt");
+            Path httpPasswordFile = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "http_password.txt");
+            Files.createDirectories(pgPasswordFile.getParent());
+
+            Files.writeString(pgPasswordFile, "pg_secret");
+            Files.writeString(pgRoPasswordFile, "pg_ro_secret");
+            Files.writeString(httpPasswordFile, "http_secret");
+
+            // Configure all passwords from files
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + pgPasswordFile.toString().replace("\\", "\\\\") + "\n");
+                w.write("pg.readonly.user.enabled=true\n");
+                w.write("pg.readonly.user=rouser\n");
+                w.write("pg.readonly.password.file=" + pgRoPasswordFile.toString().replace("\\", "\\\\") + "\n");
+                w.write("http.user=httpuser\n");
+                w.write("http.password.file=" + httpPasswordFile.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Verify all passwords were read from files
+                Assert.assertEquals("pg_secret",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword());
+                Assert.assertEquals("pg_ro_secret",
+                        serverMain.getConfiguration().getPGWireConfiguration().getReadOnlyPassword());
+                Assert.assertEquals("http_secret",
+                        serverMain.getConfiguration().getHttpServerConfiguration().getPassword());
+
+                // Verify PG connections work
+                try (Connection conn = getConnection("admin", "pg_secret")) {
+                    assertFalse(conn.isClosed());
+                }
+                try (Connection conn = getConnection("rouser", "pg_ro_secret")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Update all password files
+                Files.writeString(pgPasswordFile, "pg_secret_updated");
+                Files.writeString(pgRoPasswordFile, "pg_ro_secret_updated");
+                Files.writeString(httpPasswordFile, "http_secret_updated");
+
+                // Reload
+                serverMain.getEngine().getConfigReloader().reload();
+
+                // Verify all passwords were updated
+                Assert.assertEquals("pg_secret_updated",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword());
+                Assert.assertEquals("pg_ro_secret_updated",
+                        serverMain.getConfiguration().getPGWireConfiguration().getReadOnlyPassword());
+                Assert.assertEquals("http_secret_updated",
+                        serverMain.getConfiguration().getHttpServerConfiguration().getPassword());
+            }
+        });
+    }
+
+    @Test
+    public void testPgNamedStatementLimitReloadWithChangedProp() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                int namedStatementLimit = serverMain.getConfiguration().getPGWireConfiguration().getNamedStatementLimit();
+                Assert.assertEquals(10_000, namedStatementLimit);
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.named.statement.limit=10\n");
+                }
+
+                assertReloadConfigEventually();
+
+                namedStatementLimit = serverMain.getConfiguration().getPGWireConfiguration().getNamedStatementLimit();
+                Assert.assertEquals(10, namedStatementLimit);
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireConnectionLimitReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.net.connection.limit=1\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                final Metrics metrics = serverMain.getEngine().getMetrics();
+
+                try (Connection conn1 = getConnection("admin", "quest")) {
+                    assertFalse(conn1.isClosed());
+
+                    try {
+                        try (Connection ignore = getConnection("admin", "quest")) {
+                            Assert.fail();
+                        }
+                    } catch (Throwable ignore) {
+                    }
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.net.connection.limit=10\n");
+                }
+
+                TestUtils.assertEventually(() -> Assert.assertEquals(0, metrics.pgWireMetrics().connectionCountGauge().getValue()));
+                TestUtils.assertEventually(() -> Assert.assertTrue(3 < metrics.pgWireMetrics().listenerStateChangeCounter().getValue()));
+
+                // call the reload method directly instead of using the reload_config() SQL function
+                // to avoid opening a PGWire connection;
+                // there is no reliable way to wait until the server listener is re-registered
+                serverMain.getEngine().getConfigReloader().reload();
+
+                // while the configuration was reloaded, metrics must not be reset
+                TestUtils.assertEventually(() -> Assert.assertTrue(3 < metrics.pgWireMetrics().listenerStateChangeCounter().getValue()));
+
+                // we should be able to open two connections eventually
+                TestUtils.assertEventually(() -> {
+                    try (Connection conn1 = getConnection("admin", "quest")) {
+                        assertFalse(conn1.isClosed());
+
+                        try (Connection conn2 = getConnection("admin", "quest")) {
+                            assertFalse(conn2.isClosed());
+                        }
+                    } catch (SQLException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireCredentialsReloadByDeletingProp() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.user=steven\n");
+                w.write("pg.password=sklar\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (Connection conn = getConnection("steven", "sklar")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Overwrite file to remove props
+                try (FileWriter w = new FileWriter(serverConf, false)) {
+                    w.write("\n");
+                }
+
+                assertReloadConfig(true, "steven", "sklar");
+
+                try (Connection conn = getConnection("admin", "quest")) {
+                    assertFalse(conn.isClosed());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireCredentialsReloadWithChangedProp() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.user=steven\n");
+                w.write("pg.password=sklar\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (Connection conn = getConnection("steven", "sklar")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.user=nevets\n");
+                    w.write("pg.password=ralks\n");
+                }
+
+                assertReloadConfig(true, "steven", "sklar");
+
+                try (Connection conn = getConnection("nevets", "ralks")) {
+                    assertFalse(conn.isClosed());
+                }
+                Assert.assertThrows(PSQLException.class, () -> getConnection("admin", "quest"));
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireCredentialsReloadWithChangedPropAfterRecreatedFile() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (Connection conn = getConnection("admin", "quest")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                Assert.assertTrue(serverConf.delete());
+                Assert.assertTrue(serverConf.createNewFile());
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.user=steven\n");
+                    w.write("pg.password=sklar\n");
+                }
+
+                assertReloadConfigEventually();
+
+                try (Connection conn = getConnection("steven", "sklar")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                Assert.assertThrows(PSQLException.class, () -> getConnection("admin", "quest"));
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireCredentialsReloadWithNewProp() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (Connection conn = getConnection("admin", "quest")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.user=steven\n");
+                    w.write("pg.password=sklar\n");
+                }
+
+                assertReloadConfigEventually();
+
+                try (Connection conn = getConnection("steven", "sklar")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                Assert.assertThrows(PSQLException.class, () -> getConnection("admin", "quest"));
+            }
+        });
+    }
+
+    @Test
+    public void testPgWirePasswordFromFileReload() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a secret file with initial password
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "pg_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "initial_secret_password");
+
+            // Configure pg.password.file to point to the secret file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Verify initial password was read from file
+                Assert.assertEquals(
+                        "initial_secret_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Verify we can connect with the initial password
+                try (Connection conn = getConnection("admin", "initial_secret_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Update the secret file with a new password
+                Files.writeString(secretFilePath, "updated_secret_password");
+
+                // Call the reload method directly instead of using the reload_config() SQL function
+                // to avoid needing to know the current password
+                serverMain.getEngine().getConfigReloader().reload();
+
+                // Verify password was updated from the file
+                Assert.assertEquals(
+                        "updated_secret_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Verify we can connect with the new password
+                try (Connection conn = getConnection("admin", "updated_secret_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Old password should no longer work
+                Assert.assertThrows(PSQLException.class, () -> getConnection("admin", "initial_secret_password"));
+            }
+        });
+    }
+
+    @Test
+    public void testPgWirePasswordSwitchFromConfToFile() throws Exception {
+        assertMemoryLeak(() -> {
+            // Start with password in server.conf (not from file)
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password=direct_password\n");
+            }
+
+            // Create a secret file (but don't use it yet)
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "pg_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "file_based_password");
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Verify initial password from conf
+                Assert.assertEquals(
+                        "direct_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Verify we can connect with the direct password
+                try (Connection conn = getConnection("admin", "direct_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Switch to file-based password by adding pg.password.file
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+                }
+
+                // Reload config
+                serverMain.getEngine().getConfigReloader().reload();
+
+                // Verify password was switched to file-based
+                Assert.assertEquals(
+                        "file_based_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Verify we can connect with the new file-based password
+                try (Connection conn = getConnection("admin", "file_based_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Old direct password should no longer work
+                Assert.assertThrows(PSQLException.class, () -> getConnection("admin", "direct_password"));
+            }
+        });
+    }
+
+    @Test
+    public void testPgWirePasswordSwitchFromFileToConf() throws Exception {
+        assertMemoryLeak(() -> {
+            // Start with password from file
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "pg_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "file_based_password");
+
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Verify initial password from file
+                Assert.assertEquals(
+                        "file_based_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Verify we can connect with the file-based password
+                try (Connection conn = getConnection("admin", "file_based_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Switch to direct password by removing pg.password.file and adding pg.password
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.password=direct_password\n");
+                }
+
+                // Reload config
+                serverMain.getEngine().getConfigReloader().reload();
+
+                // Verify password was switched to direct
+                Assert.assertEquals(
+                        "direct_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Verify we can connect with the new direct password
+                try (Connection conn = getConnection("admin", "direct_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Old file-based password should no longer work
+                Assert.assertThrows(PSQLException.class, () -> getConnection("admin", "file_based_password"));
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireReadOnlyPasswordFromFile() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a secret file for readonly password
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "pg_ro_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "readonly_secret_password");
+
+            // Configure pg.readonly.password.file and enable readonly user
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.readonly.user.enabled=true\n");
+                w.write("pg.readonly.user=rouser\n");
+                w.write("pg.readonly.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Verify readonly password was read from file
+                Assert.assertEquals(
+                        "readonly_secret_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getReadOnlyPassword()
+                );
+
+                // Verify we can connect with the readonly user
+                try (Connection conn = getConnection("rouser", "readonly_secret_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Update the secret file with a new password
+                Files.writeString(secretFilePath, "updated_ro_password");
+
+                // Reload config
+                serverMain.getEngine().getConfigReloader().reload();
+
+                // Verify password was updated
+                Assert.assertEquals(
+                        "updated_ro_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getReadOnlyPassword()
+                );
+
+                // Verify we can connect with the new password
+                try (Connection conn = getConnection("rouser", "updated_ro_password")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // Old password should no longer work
+                Assert.assertThrows(PSQLException.class, () -> getConnection("rouser", "readonly_secret_password"));
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireRecvBufferSizeReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.recv.buffer.size=256\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                final StringSink sink = new StringSink();
+                sink.put(Chars.repeat("q", 300));
+
+                try (Connection conn = getConnection("admin", "quest")) {
+                    try (PreparedStatement stmt = conn.prepareStatement("create table x (s varchar)")) {
+                        stmt.execute();
+                    }
+
+                    try (PreparedStatement stmt = conn.prepareStatement("insert into x values (?)")) {
+                        stmt.setString(1, sink.toString());
+                        stmt.execute();
+                        Assert.fail();
+                    } catch (PSQLException ignore) {
+                    }
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.recv.buffer.size=512\n");
+                }
+
+                assertReloadConfigEventually();
+
+                // now we should be able to insert
+                try (
+                        Connection conn = getConnection("admin", "quest");
+                        PreparedStatement stmt = conn.prepareStatement("insert into x values (?)")
+                ) {
+                    stmt.setString(1, sink.toString());
+                    stmt.execute();
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPgWireSendBufferSizeReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.send.buffer.size=256\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                final int len = 300;
+                final String query = "select rpad('QuestDB', " + len + ", '0');";
+                try (
+                        Connection conn = getConnection("admin", "quest");
+                        PreparedStatement stmt = conn.prepareStatement(query)
+                ) {
+                    try (ResultSet ignore = stmt.executeQuery()) {
+                        Assert.fail();
+                    } catch (PSQLException e) {
+                        TestUtils.assertContains(e.getMessage(), "not enough space in send buffer");
+                    }
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("pg.send.buffer.size=512\n");
+                }
+
+                assertReloadConfigEventually();
+
+                try (
+                        Connection conn = getConnection("admin", "quest");
+                        PreparedStatement stmt = conn.prepareStatement(query);
+                        ResultSet rs = stmt.executeQuery()
+                ) {
+                    Assert.assertTrue(rs.next());
+                    Assert.assertEquals(len, rs.getString(1).length());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testQueryTracingReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                String tableName = QueryTracingJob.TABLE_NAME;
+                try (
+                        Connection conn = getConnection("admin", "quest");
+                        PreparedStatement queryTraceStmt = conn.prepareStatement(tableName)
+                ) {
+                    Runnable assertTableEmpty = () -> {
+                        try (ResultSet rs = queryTraceStmt.executeQuery()) {
+                            assertFalse("Query Trace table not empty, but query tracing is disabled", rs.next());
+                        } catch (SQLException e) {
+                            throw new RuntimeException(e);
+                        }
+                    };
+
+                    // this executes a query, and would trigger query tracing (if it was enabled) as a side effect
+                    assertTableEmpty.run();
+                    Os.sleep(1_000);
+                    // by this time the query_trace table would most likely exist if tracing was enabled
+                    assertTableEmpty.run();
+
+                    try (FileWriter w = new FileWriter(serverConf)) {
+                        w.write("query.tracing.enabled=true\n");
+                    }
+                    // This is also a query. With tracing now on, it triggers creating the query_trace table:
+                    assertReloadConfigEventually();
+
+                    int sleepMillis = 100;
+                    while (true) {
+                        Os.sleep(sleepMillis);
+                        try (ResultSet rs = queryTraceStmt.executeQuery()) {
+                            Assert.assertTrue(rs.next());
+                            break;
+                        } catch (AssertionError | SQLException e) {
+                            if (sleepMillis >= 6400) {
+                                throw e;
+                            }
+                            sleepMillis *= 2;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserAllowedOriginsReloadOnBothEndpoints() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                int port = serverMain.getHttpServerPort();
+                for (String path : new String[]{"/write/v4", "/read/v1"}) {
+                    assertQwpBrowserUpgrade(port, path, "http://localhost:" + port, true);
+                    assertQwpBrowserUpgrade(port, path, "https://app.example.com", false);
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                    w.write("qwp.browser.allowed.origins=https://app.example.com, http://other.example.com:3000\n");
+                }
+                Assert.assertTrue(serverMain.getEngine().getConfigReloader().reload());
+                String basicAuthorization = "Authorization: Basic "
+                        + Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII)) + "\r\n";
+                for (String path : new String[]{"/write/v4", "/read/v1"}) {
+                    assertQwpBrowserUpgrade(port, path, "http://localhost:" + port, true);
+                    assertQwpBrowserUpgrade(port, path, "https://app.example.com", true);
+                    assertQwpBrowserUpgrade(port, path, "http://other.example.com:3000", true);
+                    assertQwpBrowserUpgrade(port, path, "https://app.example.com:8443", false);
+                    assertQwpBrowserUpgrade(port, path, "https://app.example.com.evil.com", false);
+                    // Even with authentication disabled, a cross-origin upgrade that
+                    // carries an Authorization header is refused, listed origin or not.
+                    String listedHeader = browserCredentialUpgrade(port, path, "https://app.example.com",
+                            "questdb.qwp.v1", basicAuthorization);
+                    Assert.assertTrue(listedHeader, listedHeader.startsWith("HTTP/1.1 401"));
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                    w.write("qwp.browser.allowed.origins=https://new.example.com\n");
+                }
+                Assert.assertTrue(serverMain.getEngine().getConfigReloader().reload());
+                for (String path : new String[]{"/write/v4", "/read/v1"}) {
+                    assertQwpBrowserUpgrade(port, path, "https://app.example.com", false);
+                    assertQwpBrowserUpgrade(port, path, "https://new.example.com", true);
+                }
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    // Removing the property restores same-origin-only behavior.
+                    w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                }
+                Assert.assertTrue(serverMain.getEngine().getConfigReloader().reload());
+                for (String path : new String[]{"/write/v4", "/read/v1"}) {
+                    assertQwpBrowserUpgrade(port, path, "https://new.example.com", false);
+                    assertQwpBrowserUpgrade(port, path, "http://localhost:" + port, true);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserCredentialRefusesAuthorizationHeaderAndNonWebSocketUpgrade() throws Exception {
+        // A valid credential from a listed origin authenticates only a WebSocket
+        // upgrade that carries no Authorization header. Accepting the header case
+        // would switch protocols (101); accepting a non-WebSocket upgrade would
+        // reach the handshake check (400).
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                w.write("http.user=admin\nhttp.password=quest\n");
+                w.write("qwp.browser.allowed.origins=https://app.example.com\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                int port = serverMain.getHttpServerPort();
+                String basic = Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII));
+                String goodOffer = browserCredentialOffer("Basic " + basic);
+                for (String path : new String[]{"/write/v4", "/read/v1"}) {
+                    String control = browserCredentialUpgrade(port, path, "https://app.example.com", goodOffer, "");
+                    Assert.assertTrue(control, control.startsWith("HTTP/1.1 101"));
+
+                    String withHeader = browserCredentialUpgrade(port, path, "https://app.example.com", goodOffer,
+                            "Authorization: Basic " + basic + "\r\n");
+                    Assert.assertTrue(withHeader, withHeader.startsWith("HTTP/1.1 401"));
+
+                    try (Socket socket = new Socket("localhost", port)) {
+                        socket.setSoTimeout(5_000);
+                        String request = QwpWireTestFixtures.browserUpgradeRequestWithOrigin(
+                                path, "localhost:" + port, "https://app.example.com",
+                                "Sec-WebSocket-Protocol: " + goodOffer + "\r\n"
+                        ).replace("Upgrade: websocket\r\n", "Upgrade: h2c\r\n");
+                        socket.getOutputStream().write(request.getBytes(StandardCharsets.US_ASCII));
+                        String notWebSocket = QwpWireTestFixtures.readHttpHeaders(socket.getInputStream());
+                        Assert.assertTrue(notWebSocket, notWebSocket.startsWith("HTTP/1.1 401"));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserCredentialSubprotocolOnBothEndpoints() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                w.write("http.user=admin\nhttp.password=quest\n");
+                w.write("qwp.browser.allowed.origins=https://app.example.com\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                int port = serverMain.getHttpServerPort();
+                String credential = browserCredentialProtocol(
+                        "Basic " + Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII)));
+                String goodOffer = "questdb.qwp.v1, " + credential;
+                final HttpFullFatServerConfiguration httpConfiguration = serverMain.getConfiguration().getHttpServerConfiguration();
+                final ObjList<String> qwpPaths = new ObjList<>();
+                for (ObjHashSet<String> contextPaths : List.of(httpConfiguration.getContextPathQWP(), httpConfiguration.getContextPathQWPRead())) {
+                    Assert.assertTrue(contextPaths.size() > 0);
+                    for (int i = 0, n = contextPaths.size(); i < n; i++) {
+                        qwpPaths.add(contextPaths.get(i));
+                    }
+                }
+                for (int i = 0, n = qwpPaths.size(); i < n; i++) {
+                    final String path = qwpPaths.getQuick(i);
+                    assertCredentialUpgradeSwitched(
+                            browserCredentialUpgrade(port, path + "?session=true", "https://app.example.com", goodOffer, ""));
+
+                    String bad = browserCredentialUpgrade(port, path, "https://other.example.com", goodOffer, "");
+                    Assert.assertTrue(bad, bad.startsWith("HTTP/1.1 401"));
+                    Assert.assertFalse(bad, bad.contains("Set-Cookie:"));
+                }
+                String bothProtocols = "questdb.qwp.v1, questdb.qwp.durable-ack.v1, " + credential;
+                String ingress = browserCredentialUpgrade(port, "/write/v4", "https://app.example.com", bothProtocols, "");
+                Assert.assertTrue(ingress, ingress.contains("\r\nSec-WebSocket-Protocol: questdb.qwp.durable-ack.v1\r\n"));
+                Assert.assertFalse(ingress, ingress.contains("\r\nSec-WebSocket-Protocol: questdb.qwp.v1\r\n"));
+                String egress = browserCredentialUpgrade(port, "/read/v1", "https://app.example.com", bothProtocols, "");
+                Assert.assertTrue(egress, egress.contains("\r\nSec-WebSocket-Protocol: questdb.qwp.v1\r\n"));
+                Assert.assertFalse(egress, egress.contains("\r\nSec-WebSocket-Protocol: questdb.qwp.durable-ack.v1\r\n"));
+                String durableOnly = "questdb.qwp.durable-ack.v1, " + credential;
+                String durableIngress = browserCredentialUpgrade(port, "/write/v4", "https://app.example.com", durableOnly, "");
+                Assert.assertTrue(durableIngress, durableIngress.contains("\r\nSec-WebSocket-Protocol: questdb.qwp.durable-ack.v1\r\n"));
+                String durableEgress = browserCredentialUpgrade(port, "/read/v1", "https://app.example.com", durableOnly, "");
+                Assert.assertTrue(durableEgress, durableEgress.startsWith("HTTP/1.1 401"));
+                String sessionCookie = createHttpSessionCookie(port);
+                String normalSession = browserCredentialUpgrade(port, "/write/v4", "http://localhost:" + port,
+                        "questdb.qwp.v1", "Cookie: " + sessionCookie + "\r\n");
+                Assert.assertTrue(normalSession, normalSession.startsWith("HTTP/1.1 101"));
+                String badCredential = "questdb.qwp.v1, questdb.qwp.authorization.!";
+                String invalid = browserCredentialUpgrade(port, "/read/v1?session=true", "https://app.example.com", badCredential,
+                        "Cookie: " + sessionCookie + "\r\n");
+                Assert.assertTrue(invalid, invalid.startsWith("HTTP/1.1 401"));
+                Assert.assertFalse(invalid, invalid.contains("Set-Cookie:"));
+                String forbidden = browserCredentialUpgrade(port, "/write/v4", "http://localhost:" + port, goodOffer,
+                        "Cookie: " + sessionCookie + "\r\n");
+                Assert.assertTrue(forbidden, forbidden.startsWith("HTTP/1.1 401"));
+                String missingDialect = browserCredentialUpgrade(port, "/write/v4", "https://app.example.com", credential, "");
+                Assert.assertTrue(missingDialect, missingDialect.startsWith("HTTP/1.1 401"));
+                String outsideQwp = browserCredentialUpgrade(port, "/exec?query=select%201", "https://app.example.com", goodOffer, "");
+                Assert.assertTrue(outsideQwp, outsideQwp.startsWith("HTTP/1.1 401"));
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserCredentialSubprotocolOnCustomBoundEndpoints() throws Exception {
+        // The credential gate must follow request routing: a QWP handler bound on
+        // a URL outside the default context paths accepts the browser credential
+        // exactly like the default paths, and keeps the ingress/egress split.
+        final String customWritePath = "/custom/qwp/write";
+        final String customReadPath = "/custom/qwp/read";
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                w.write("http.user=admin\nhttp.password=quest\n");
+                w.write("qwp.browser.allowed.origins=https://app.example.com\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap()) {
+                @Override
+                protected Services services() {
+                    return new Services() {
+                        @Override
+                        public @Nullable HttpServer createHttpServer(
+                                ServerConfiguration configuration,
+                                CairoEngine cairoEngine,
+                                WorkerPool networkSharedPool,
+                                int sharedQueryWorkerCount,
+                                AtomicBoolean acceptOpen
+                        ) {
+                            final HttpServer server = super.createHttpServer(
+                                    configuration, cairoEngine, networkSharedPool, sharedQueryWorkerCount, acceptOpen);
+                            if (server != null) {
+                                final HttpFullFatServerConfiguration httpConfiguration = configuration.getHttpServerConfiguration();
+                                server.bind(new HttpRequestHandlerFactory() {
+                                    @Override
+                                    public ObjHashSet<String> getUrls() {
+                                        return new ObjHashSet<>() {{
+                                            add(customWritePath);
+                                        }};
+                                    }
+
+                                    @Override
+                                    public HttpRequestHandler newInstance() {
+                                        return new QwpIngressHttpProcessor(cairoEngine, httpConfiguration);
+                                    }
+                                });
+                                server.bind(new HttpRequestHandlerFactory() {
+                                    @Override
+                                    public ObjHashSet<String> getUrls() {
+                                        return new ObjHashSet<>() {{
+                                            add(customReadPath);
+                                        }};
+                                    }
+
+                                    @Override
+                                    public HttpRequestHandler newInstance() {
+                                        return new QwpEgressHttpProcessor(cairoEngine, httpConfiguration, sharedQueryWorkerCount);
+                                    }
+                                });
+                            }
+                            return server;
+                        }
+                    };
+                }
+            }) {
+                serverMain.start();
+                int port = serverMain.getHttpServerPort();
+                String credential = browserCredentialProtocol(
+                        "Basic " + Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII)));
+                String goodOffer = "questdb.qwp.v1, " + credential;
+                String basicAuthorization = "Authorization: Basic " + Base64.getEncoder().encodeToString(
+                        "admin:quest".getBytes(StandardCharsets.US_ASCII)) + "\r\n";
+                for (String path : new String[]{customWritePath, customReadPath}) {
+                    // The header-authenticated upgrade proves the QWP handler serves this path.
+                    String headerAuth = browserCredentialUpgrade(port, path, "http://localhost:" + port, "questdb.qwp.v1", basicAuthorization);
+                    Assert.assertTrue(headerAuth, headerAuth.startsWith("HTTP/1.1 101"));
+
+                    assertCredentialUpgradeSwitched(browserCredentialUpgrade(port, path, "https://app.example.com", goodOffer, ""));
+
+                    String bad = browserCredentialUpgrade(port, path, "https://other.example.com", goodOffer, "");
+                    Assert.assertTrue(bad, bad.startsWith("HTTP/1.1 401"));
+                }
+                String durableOnly = "questdb.qwp.durable-ack.v1, " + credential;
+                String durableIngress = browserCredentialUpgrade(port, customWritePath, "https://app.example.com", durableOnly, "");
+                Assert.assertTrue(durableIngress, durableIngress.startsWith("HTTP/1.1 101"));
+                Assert.assertTrue(durableIngress, durableIngress.contains("\r\nSec-WebSocket-Protocol: questdb.qwp.durable-ack.v1\r\n"));
+                String durableEgress = browserCredentialUpgrade(port, customReadPath, "https://app.example.com", durableOnly, "");
+                Assert.assertTrue(durableEgress, durableEgress.startsWith("HTTP/1.1 401"));
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserCrossOriginGateSkipsNonQwpEndpoints() throws Exception {
+        // Only the QWP upgrade endpoints refuse ambient credentials from another
+        // origin. A REST request carrying a foreign Origin still authenticates
+        // with the session cookie or the Authorization header.
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                w.write("http.user=admin\nhttp.password=quest\n");
+                w.write("qwp.browser.allowed.origins=https://app.example.com\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                int port = serverMain.getHttpServerPort();
+                String basicAuthorization = "Authorization: Basic "
+                        + Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII)) + "\r\n";
+                String cookie = "Cookie: " + createHttpSessionCookie(port) + "\r\n";
+                for (String origin : new String[]{"https://app.example.com", "https://other.example.com"}) {
+                    for (String credentials : new String[]{cookie, basicAuthorization}) {
+                        try (Socket socket = new Socket("localhost", port)) {
+                            socket.setSoTimeout(5_000);
+                            String request = "GET /exec?query=select%201 HTTP/1.1\r\n"
+                                    + "Host: localhost:" + port + "\r\n"
+                                    + "Origin: " + origin + "\r\n"
+                                    + credentials
+                                    + "Connection: close\r\n\r\n";
+                            socket.getOutputStream().write(request.getBytes(StandardCharsets.US_ASCII));
+                            String response = QwpWireTestFixtures.readHttpHeaders(socket.getInputStream());
+                            Assert.assertTrue(response, response.startsWith("HTTP/1.1 200"));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserListedOriginIgnoresAmbientCredentials() throws Exception {
+        // A browser attaches the session cookie, and any cached Basic credentials,
+        // to a WebSocket opened by a same-site page on another origin. Neither may
+        // authenticate a cross-origin upgrade, even from a listed origin: only the
+        // credential subprotocol can. Same-origin upgrades keep using them.
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                w.write("http.user=admin\nhttp.password=quest\n");
+                w.write("qwp.browser.allowed.origins=https://app.example.com\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                int port = serverMain.getHttpServerPort();
+                String basic = Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII));
+                String credentialOffer = browserCredentialOffer("Basic " + basic);
+                String basicAuthorization = "Authorization: Basic " + basic + "\r\n";
+                String cookie = "Cookie: " + createHttpSessionCookie(port) + "\r\n";
+                String sameOrigin = "http://localhost:" + port;
+                for (String path : new String[]{"/write/v4", "/read/v1"}) {
+                    // Positive controls: the cookie and the header authenticate a
+                    // same-origin upgrade, and the credential a listed-origin one.
+                    String sameOriginCookie = browserCredentialUpgrade(port, path, sameOrigin, "questdb.qwp.v1", cookie);
+                    Assert.assertTrue(sameOriginCookie, sameOriginCookie.startsWith("HTTP/1.1 101"));
+                    String sameOriginHeader = browserCredentialUpgrade(port, path, sameOrigin, "questdb.qwp.v1", basicAuthorization);
+                    Assert.assertTrue(sameOriginHeader, sameOriginHeader.startsWith("HTTP/1.1 101"));
+                    String listedCredential = browserCredentialUpgrade(port, path, "https://app.example.com", credentialOffer, "");
+                    Assert.assertTrue(listedCredential, listedCredential.startsWith("HTTP/1.1 101"));
+
+                    String listedCookie = browserCredentialUpgrade(port, path + "?session=true", "https://app.example.com",
+                            "questdb.qwp.v1", cookie);
+                    Assert.assertTrue(listedCookie, listedCookie.startsWith("HTTP/1.1 401"));
+                    Assert.assertFalse(listedCookie, listedCookie.contains("Set-Cookie:"));
+                    String listedHeader = browserCredentialUpgrade(port, path + "?session=true", "https://app.example.com",
+                            "questdb.qwp.v1", basicAuthorization);
+                    Assert.assertTrue(listedHeader, listedHeader.startsWith("HTTP/1.1 401"));
+                    Assert.assertFalse(listedHeader, listedHeader.contains("Set-Cookie:"));
+                    String unlistedCookie = browserCredentialUpgrade(port, path, "https://other.example.com",
+                            "questdb.qwp.v1", cookie);
+                    Assert.assertTrue(unlistedCookie, unlistedCookie.startsWith("HTTP/1.1 401"));
+                    Assert.assertFalse(unlistedCookie, unlistedCookie.contains("Set-Cookie:"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserTlsTerminationEnabled() throws Exception {
+        // The QWP upgrade processors read this flag off the object
+        // ServerConfiguration.getHttpServerConfiguration() returns, which is
+        // HttpServerConfigurationWrapper and not the PropServerConfiguration
+        // behind it. Asserting through PropServerConfiguration alone passes
+        // even when the wrapper drops the property on the floor.
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(PropertyKey.QWP_BROWSER_TLS_TERMINATION_ENABLED.getPropertyPath() + "=true\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                Assert.assertTrue(
+                        serverMain.getConfiguration().getHttpServerConfiguration().isQwpBrowserTlsTerminationEnabled()
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserTlsTerminationSameOriginUsesAmbientCredentials() throws Exception {
+        // Behind a TLS-terminating proxy the socket is plaintext, yet the Web
+        // Console's Origin is https://. HttpConnectionContext must treat that
+        // Origin as same-origin, like the QWP processors do, so the session cookie
+        // and the Authorization header still authenticate the upgrade; an http://
+        // Origin becomes cross-origin and gets no cookie authentication.
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                w.write("http.user=admin\nhttp.password=quest\n");
+                w.write(PropertyKey.QWP_BROWSER_TLS_TERMINATION_ENABLED.getPropertyPath() + "=true\n");
+            }
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                int port = serverMain.getHttpServerPort();
+                String basicAuthorization = "Authorization: Basic "
+                        + Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII)) + "\r\n";
+                String cookie = "Cookie: " + createHttpSessionCookie(port) + "\r\n";
+                for (String path : new String[]{"/write/v4", "/read/v1"}) {
+                    String httpsCookie = browserCredentialUpgrade(port, path, "https://localhost:" + port,
+                            "questdb.qwp.v1", cookie);
+                    Assert.assertTrue(httpsCookie, httpsCookie.startsWith("HTTP/1.1 101"));
+                    String httpsHeader = browserCredentialUpgrade(port, path, "https://localhost:" + port,
+                            "questdb.qwp.v1", basicAuthorization);
+                    Assert.assertTrue(httpsHeader, httpsHeader.startsWith("HTTP/1.1 101"));
+                    String httpCookie = browserCredentialUpgrade(port, path, "http://localhost:" + port,
+                            "questdb.qwp.v1", cookie);
+                    Assert.assertTrue(httpCookie, httpCookie.startsWith("HTTP/1.1 401"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testQwpBrowserUpgradeRefusalReasonIsLogged() throws Exception {
+        // Every refused browser upgrade gets the same generic 401 body, so only the
+        // server log can tell a proxy that broke same-origin or an unlisted origin
+        // apart from a bad credential. The credential itself must never be logged.
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write(QWP_ORIGINS_TEST_BOOT_CONFIG);
+                w.write("http.user=admin\nhttp.password=quest\n");
+                w.write("qwp.browser.allowed.origins=https://app.example.com\n");
+            }
+            final LogCapture capture = new LogCapture();
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+                capture.start();
+                int port = serverMain.getHttpServerPort();
+                String basic = "Basic " + Base64.getEncoder().encodeToString("admin:quest".getBytes(StandardCharsets.US_ASCII));
+                String wrongBasic = "Basic " + Base64.getEncoder().encodeToString("admin:wrong".getBytes(StandardCharsets.US_ASCII));
+                String credential = browserCredentialProtocol(basic);
+                String offer = "questdb.qwp.v1, " + credential;
+
+                // A TLS terminator without qwp.browser.tls.termination.enabled turns the
+                // page's own https Origin cross-origin, so its session cookie no longer counts.
+                String proxiedCookie = browserCredentialUpgrade(port, "/read/v1", "https://localhost:" + port,
+                        "questdb.qwp.v1", "Cookie: " + createHttpSessionCookie(port) + "\r\n");
+                assertQwpUpgradeRefused(capture, proxiedCookie,
+                        "Origin is not same-origin with Host on QWP WebSocket; a cross-origin browser upgrade cannot authenticate with cookies");
+                String unlisted = browserCredentialUpgrade(port, "/write/v4", "https://www.app.example.com", offer, "");
+                assertQwpUpgradeRefused(capture, unlisted,
+                        "QWP browser credential rejected: it is accepted only on a QWP WebSocket upgrade from an origin listed in qwp.browser.allowed.origins");
+                String withHeader = browserCredentialUpgrade(port, "/read/v1", "https://app.example.com", offer,
+                        "Authorization: " + basic + "\r\n");
+                assertQwpUpgradeRefused(capture, withHeader, "QWP browser credential rejected: the upgrade also carries an Authorization header");
+                String malformed = browserCredentialUpgrade(port, "/write/v4", "https://app.example.com",
+                        "questdb.qwp.v1, questdb.qwp.authorization.!", "");
+                assertQwpUpgradeRefused(capture, malformed,
+                        "QWP browser credential rejected: the questdb.qwp.authorization subprotocol must carry exactly one unpadded base64url");
+                String wrongPassword = browserCredentialUpgrade(port, "/read/v1", "https://app.example.com",
+                        browserCredentialOffer(wrongBasic), "");
+                assertQwpUpgradeRefused(capture, wrongPassword, "QWP browser credential rejected: authentication failed");
+                capture.drain();
+                capture.assertNotLogged(credential);
+                capture.assertNotLogged(basic);
+                // wrongBasic is the only credential here that is decoded and handed to the authenticator
+                capture.assertNotLogged(browserCredentialProtocol(wrongBasic));
+                capture.assertNotLogged(wrongBasic);
+            } finally {
+                capture.stop();
+            }
+        });
+    }
+
+    @Test
+    public void testReloadDisabled() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.user=steven\n");
+                w.write("pg.password=sklar\n");
+                w.write("config.reload.enabled=false\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (Connection conn = getConnection("steven", "sklar")) {
+                    assertFalse(conn.isClosed());
+                }
+
+                // overwrite file to remove props
+                try (FileWriter w = new FileWriter(serverConf, false)) {
+                    w.write("\n");
+                }
+
+                assertReloadConfig(false, "steven", "sklar");
+
+                try (Connection conn = getConnection("steven", "sklar")) {
+                    assertFalse(conn.isClosed());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRemovalOfUnsupportedPropertyWontTriggerReload() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.user=steven\n");
+                w.write("pg.password=sklar\n");
+                w.write("cairo.legacy.string.column.type.default=true\n"); // non-default value
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                Assert.assertTrue(serverMain.getConfiguration().getLineTcpReceiverConfiguration().isUseLegacyStringDefault());
+
+                // remove unsupported property
+                try (FileWriter w = new FileWriter(serverConf, false)) {
+                    w.write("pg.user=steven\n");
+                    w.write("pg.password=sklar\n");
+                }
+
+                assertReloadConfig(false, "steven", "sklar");
+            }
+        });
+    }
+
+    @Test
+    public void testRemovedUnsupportedPropertyWontReturnToDefault() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.user=steven\n");
+                w.write("pg.password=sklar\n");
+                w.write("cairo.legacy.string.column.type.default=true\n"); // non-default value
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                Assert.assertTrue(serverMain.getConfiguration().getLineTcpReceiverConfiguration().isUseLegacyStringDefault());
+
+                // remove unsupported property and change some supported property
+                try (FileWriter w = new FileWriter(serverConf, false)) {
+                    w.write("pg.user=steven\n");
+                    w.write("pg.password=foo\n");
+                }
+
+                assertReloadConfig(true, "steven", "sklar");
+
+                // unsupported property should stay as it was before reload
+                Assert.assertTrue(serverMain.getConfiguration().getLineTcpReceiverConfiguration().isUseLegacyStringDefault());
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileDeletedDuringReload() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a secret file with initial password
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "deletable_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "initial_password");
+
+            // Configure pg.password.file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Verify initial password
+                Assert.assertEquals(
+                        "initial_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Delete the secret file
+                Files.delete(secretFilePath);
+
+                // Reload should fail because file is missing
+                boolean reloadResult = serverMain.getEngine().getConfigReloader().reload();
+                Assert.assertFalse("Reload should fail when secret file is missing", reloadResult);
+
+                // Password should remain unchanged (old value kept)
+                Assert.assertEquals(
+                        "initial_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Should still be able to connect with old password
+                try (Connection conn = getConnection("admin", "initial_password")) {
+                    assertFalse(conn.isClosed());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileEmpty() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create an empty secret file
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "empty_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "");
+
+            // Configure pg.password.file to point to the empty file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Empty file should result in empty password
+                Assert.assertEquals(
+                        "",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileInvalidUtf8() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a file with invalid UTF-8 bytes
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "invalid_utf8.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            // Write invalid UTF-8: 0xFF 0xFE are not valid UTF-8 start bytes
+            Files.write(secretFilePath, new byte[]{(byte) 0xFF, (byte) 0xFE, 'a', 'b', 'c'});
+
+            // Configure pg.password.file to point to the invalid UTF-8 file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            // Server should fail to start with invalid UTF-8 in secret file
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for invalid UTF-8 in secret file");
+            } catch (Exception e) {
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "cannot convert invalid UTF-8");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileIsDirectory() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a directory instead of a file
+            Path secretDirPath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "password_dir");
+            Files.createDirectories(secretDirPath);
+
+            // Configure pg.password.file to point to the directory
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretDirPath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for directory as secret file");
+            } catch (Exception e) {
+                // The CairoException is wrapped in BootstrapException
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "secret file path is a directory");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFilePathTraversalRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // Configure pg.password.file with path traversal
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=/etc/../etc/passwd\n");
+            }
+
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for path traversal in secret file");
+            } catch (Exception e) {
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "secret file path not allowed");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileDevPathRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // Configure pg.password.file to /dev/ path
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=/dev/null\n");
+            }
+
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for /dev/ path in secret file");
+            } catch (Exception e) {
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "secret file path not allowed");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileProcPathRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // Configure pg.password.file to /proc/ path
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=/proc/self/environ\n");
+            }
+
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for /proc/ path in secret file");
+            } catch (Exception e) {
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "secret file path not allowed");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileSysPathRejected() throws Exception {
+        assertMemoryLeak(() -> {
+            // Configure pg.password.file to /sys/ path
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=/sys/kernel/hostname\n");
+            }
+
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for /sys/ path in secret file");
+            } catch (Exception e) {
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "secret file path not allowed");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileNotFound() throws Exception {
+        assertMemoryLeak(() -> {
+            // Configure pg.password.file to point to a non-existent file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=/nonexistent/path/to/secret.txt\n");
+            }
+
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for missing secret file");
+            } catch (Exception e) {
+                // The CairoException is wrapped in BootstrapException
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "cannot open secret file");
+                TestUtils.assertContains(message, "/nonexistent/path/to/secret.txt");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileTooLarge() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a file larger than 64KB
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "large_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+
+            // Write more than 64KB (65537 bytes)
+            Files.writeString(secretFilePath, "x".repeat(65537));
+
+            // Configure pg.password.file to point to the large file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try {
+                new ServerMain(getBootstrap()).close();
+                Assert.fail("Expected exception for too large secret file");
+            } catch (Exception e) {
+                // The CairoException is wrapped in BootstrapException
+                String message = e.getMessage();
+                TestUtils.assertContains(message, "secret file is too large");
+                TestUtils.assertContains(message, "maxSize=65536");
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileWhitespaceOnly() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a file with only whitespace
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "whitespace_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "   \n\t  \n  ");
+
+            // Configure pg.password.file to point to the whitespace file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Whitespace-only file should result in empty password after trimming
+                Assert.assertEquals(
+                        "",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileWithTrailingNewline() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a file with password followed by newlines (common with Kubernetes secrets)
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "newline_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "my_secret_password\n\n");
+
+            // Configure pg.password.file
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Trailing newlines should be trimmed
+                Assert.assertEquals(
+                        "my_secret_password",
+                        serverMain.getConfiguration().getPGWireConfiguration().getDefaultPassword()
+                );
+
+                // Should be able to connect with the trimmed password
+                try (Connection conn = getConnection("admin", "my_secret_password")) {
+                    assertFalse(conn.isClosed());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSqlJitMaxInListSizeThreshold() throws Exception {
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                int oldCapacity = serverMain.getConfiguration().getCairoConfiguration().getSqlJitMaxInListSizeThreshold();
+                Assert.assertEquals(10, oldCapacity);
+
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.jit.max.in.list.size.threshold=1000\n");
+                }
+
+                assertReloadConfigEventually();
+
+                int capacity = serverMain.getConfiguration().getCairoConfiguration().getSqlJitMaxInListSizeThreshold();
+                Assert.assertEquals(1000, capacity);
+            }
+        });
+    }
+
+    @Test
+    public void testUnknownPropertyAdditionIsIgnored() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("query.tracing.enabled=false\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (FileWriter w = new FileWriter(serverConf, false)) {
+                    w.write("query.tracing.enabled=true\n");
+                    w.write("foo.bar=baz\n");
+                }
+
+                assertReloadConfig(true, "admin", "quest");
+
+                Assert.assertTrue(serverMain.getConfiguration().getCairoConfiguration().isQueryTracingEnabled());
+            }
+        });
+    }
+
+    @Test
+    public void testSecretFileRotationDoesNotNotifyStaleWatchers() throws Exception {
+        assertMemoryLeak(() -> {
+            // Create a secret file for pg.password
+            Path secretFilePath = Paths.get(temp.getRoot().getAbsolutePath(), "secrets", "pg_password.txt");
+            Files.createDirectories(secretFilePath.getParent());
+            Files.writeString(secretFilePath, "initial_password");
+
+            // Initial config: a dynamic property + a secret file reference
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("cairo.sql.asof.join.evacuation.threshold=100\n");
+                w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                // Register a listener that watches ONLY the evacuation threshold
+                final AtomicLong listenerCounter = new AtomicLong(0);
+                final var listener = new ConfigReloader.Listener() {
+                    private final ConfigPropertyKey[] WATCHED_PROPERTIES = new ConfigPropertyKey[]{
+                            PropertyKey.CAIRO_SQL_ASOF_JOIN_EVACUATION_THRESHOLD
+                    };
+
+                    @Override
+                    public void configChanged() {
+                        listenerCounter.incrementAndGet();
+                    }
+
+                    @Override
+                    public @NotNull ConfigPropertyKey[] getWatchedConfigKeys() {
+                        return WATCHED_PROPERTIES;
+                    }
+                };
+                serverMain.getEngine().getConfigReloader().watch(listener);
+
+                // [1] Change the evacuation threshold in server.conf → listener should fire
+                try (FileWriter w = new FileWriter(serverConf)) {
+                    w.write("cairo.sql.asof.join.evacuation.threshold=200\n");
+                    w.write("pg.password.file=" + secretFilePath.toString().replace("\\", "\\\\") + "\n");
+                }
+                serverMain.getEngine().getConfigReloader().reload();
+                Assert.assertEquals(1, listenerCounter.get());
+
+                // [2] Now rotate ONLY the secret file. Do NOT touch server.conf.
+                // The listener watches evacuation.threshold which hasn't changed,
+                // so it should NOT fire again.
+                Files.writeString(secretFilePath, "rotated_password");
+                serverMain.getEngine().getConfigReloader().reload();
+
+                Assert.assertEquals(
+                        "listener for evacuation.threshold should not fire on secret file rotation",
+                        1,
+                        listenerCounter.get()
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testUnknownPropertyRemovalIsIgnored() throws Exception {
+        assertMemoryLeak(() -> {
+            try (FileWriter w = new FileWriter(serverConf)) {
+                w.write("query.tracing.enabled=false\n");
+                w.write("foo.bar=baz\n");
+            }
+
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                try (FileWriter w = new FileWriter(serverConf, false)) {
+                    w.write("query.tracing.enabled=true\n");
+                }
+
+                assertReloadConfig(true, "admin", "quest");
+
+                Assert.assertTrue(serverMain.getConfiguration().getCairoConfiguration().isQueryTracingEnabled());
+            }
+        });
+    }
+
+    @Test
+    public void testWindowMapFusionReload() throws Exception {
+        // The switch is read once per compile rather than held anywhere, so what the reload has
+        // to reach is the next compile - not the value alone. The assertion is therefore the
+        // binding a fresh compile produces, which is the only thing the two settings differ in:
+        // the results and the EXPLAIN plan are identical either way.
+        assertMemoryLeak(() -> {
+            try (ServerMain serverMain = new ServerMain(getBootstrap())) {
+                serverMain.start();
+
+                final CairoEngine engine = serverMain.getEngine();
+                try (SqlExecutionContext executionContext = new SqlExecutionContextImpl(engine, 1)
+                        .with(AllowAllSecurityContext.INSTANCE)) {
+                    engine.execute(
+                            "CREATE TABLE t (ts TIMESTAMP, k SYMBOL, x DOUBLE, y DOUBLE) TIMESTAMP(ts) PARTITION BY DAY",
+                            executionContext
+                    );
+                    Assert.assertTrue(serverMain.getConfiguration().getCairoConfiguration().isSqlWindowMapFusionEnabled());
+                    assertWindowMapFusion(engine, executionContext, true);
+
+                    try (FileWriter w = new FileWriter(serverConf)) {
+                        w.write("cairo.sql.window.map.fusion.enabled=false\n");
+                    }
+
+                    assertReloadConfigEventually();
+
+                    assertFalse(serverMain.getConfiguration().getCairoConfiguration().isSqlWindowMapFusionEnabled());
+                    assertWindowMapFusion(engine, executionContext, false);
+
+                    // And back, because an escape hatch a reload cannot undo is half of one.
+                    try (FileWriter w = new FileWriter(serverConf)) {
+                        w.write("cairo.sql.window.map.fusion.enabled=true\n");
+                    }
+
+                    assertReloadConfigEventually();
+
+                    Assert.assertTrue(serverMain.getConfiguration().getCairoConfiguration().isSqlWindowMapFusionEnabled());
+                    assertWindowMapFusion(engine, executionContext, true);
+                }
+            }
+        });
+    }
+
+    private static void assertQwpUpgradeRefused(LogCapture capture, String response, String reason) {
+        Assert.assertTrue(response, response.startsWith("HTTP/1.1 401"));
+        capture.waitFor(reason);
+    }
+
+    private static void assertWindowMapFusion(
+            CairoEngine engine,
+            SqlExecutionContext executionContext,
+            boolean expectedFused
+    ) throws SqlException {
+        final String sql = "SELECT ts, sum(x) OVER w, count(y) OVER w FROM t "
+                + "WINDOW w AS (PARTITION BY k ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)";
+        try (RecordCursorFactory factory = engine.select(sql, executionContext)) {
+            // A projection wrapper can sit above the window factory, so the search walks the
+            // whole chain rather than unwrapping one known level.
+            RecordCursorFactory root = factory;
+            while (root != null && !(root instanceof WindowRecordCursorFactory)) {
+                root = root.getBaseFactory();
+            }
+            Assert.assertNotNull("no window factory in the tree", root);
+            final ObjList<WindowMapState> states = ((WindowRecordCursorFactory) root).getWindowMapStates();
+            if (expectedFused) {
+                Assert.assertNotNull("the compile bound no window map group", states);
+                Assert.assertEquals(1, states.size());
+            } else {
+                Assert.assertNull("the compile bound a window map group with fusion off", states);
+            }
+        }
+    }
+
+    private static String createHttpSessionCookie(int port) {
+        try (HttpClient httpClient = HttpClientFactory.newPlainTextInstance()) {
+            HttpClient.ResponseHeaders response = HttpUtils.newHttpRequest(httpClient, port, "select 1", "admin", "quest", "true");
+            HttpUtils.awaitStatusCode(response, "200");
+            return SESSION_COOKIE_NAME + '=' + HttpUtils.assertSessionCookie(response, false);
+        }
+    }
+
+    private static Connection getConnection(String user, String pass) throws SQLException {
+        Properties properties = new Properties();
+        properties.setProperty("user", user);
+        properties.setProperty("password", pass);
+        properties.setProperty("connectTimeout", "5");
+        properties.setProperty("socketTimeout", "3");
+        final String url = String.format("jdbc:postgresql://127.0.0.1:%d/qdb", 8812);
+        return DriverManager.getConnection(url, properties);
+    }
+
+    private void assertReloadConfig(boolean expectedResult) throws SQLException {
+        assertReloadConfig(expectedResult, "admin", "quest");
+    }
+
+    private void assertReloadConfig(boolean expectedResult, String user, String password) throws SQLException {
+        try (
+                Connection conn = getConnection(user, password);
+                PreparedStatement stmt = conn.prepareStatement("select reload_config();");
+                ResultSet rs = stmt.executeQuery()
+        ) {
+            Assert.assertTrue(rs.next());
+            Assert.assertEquals(expectedResult, rs.getBoolean(1));
+        }
+    }
+
+    private void assertReloadConfigEventually() throws SQLException {
+        final long timeoutSeconds = 10;
+        long maxSleepingTimeMillis = 1000;
+        long nextSleepingTimeMillis = 10;
+        long startTime = System.nanoTime();
+        long deadline = startTime + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        for (; ; ) {
+            try {
+                assertReloadConfig(true);
+                return;
+            } catch (AssertionError error) {
+                if (System.nanoTime() >= deadline) {
+                    throw error;
+                }
+            }
+            Os.sleep(nextSleepingTimeMillis);
+            nextSleepingTimeMillis = Math.min(maxSleepingTimeMillis, nextSleepingTimeMillis << 1);
+        }
+    }
+
+    private void assertTrackerLimit(ServerMain serverMain, MemoryTrackerWorkload workload, long expectedLimit) {
+        MemoryTracker tracker = serverMain.getEngine().getMemoryTrackerProvider().acquire(
+                AllowAllSecurityContext.INSTANCE,
+                1,
+                workload
+        );
+        try {
+            Assert.assertEquals(expectedLimit, tracker.getLimit());
+        } finally {
+            tracker.close();
+        }
+    }
+
+    private Bootstrap getBootstrap() {
+        return new Bootstrap(
+                getBootstrapConfig(),
+                Bootstrap.getServerMainArgs(root)
+        );
+    }
+
+    private BootstrapConfiguration getBootstrapConfig() {
+        Map<String, String> envMap = new HashMap<>();
+        envMap.put(PropertyKey.METRICS_ENABLED.getEnvVarName(), "true");
+        envMap.put(PropertyKey.SHARED_WORKER_COUNT.getEnvVarName(), "1");
+        envMap.put(PropertyKey.WAL_APPLY_WORKER_COUNT.getEnvVarName(), "1");
+        return new DefaultBootstrapConfiguration() {
+            @Override
+            public ServerConfiguration getServerConfiguration(Bootstrap bootstrap) {
+                try {
+                    return new DynamicPropServerConfiguration(
+                            bootstrap.getRootDirectory(),
+                            bootstrap.loadProperties(),
+                            envMap,
+                            bootstrap.getLog(),
+                            bootstrap.getBuildInformation(),
+                            FilesFacadeImpl.INSTANCE,
+                            bootstrap.getMicrosecondClock(),
+                            FactoryProviderFactoryImpl.INSTANCE,
+                            true
+                    );
+                } catch (Exception ex) {
+                    Assert.fail(ex.getMessage());
+                    return null;
+                }
+            }
+        };
+    }
+}

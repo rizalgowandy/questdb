@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,15 @@
 
 package io.questdb.network;
 
+import io.questdb.std.FiberLocal;
 import io.questdb.std.FlyweightMessageContainer;
-import io.questdb.std.Sinkable;
-import io.questdb.std.ThreadLocal;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.NotNull;
 
 public class NetworkError extends Error implements Sinkable, FlyweightMessageContainer {
-    private static final ThreadLocal<NetworkError> tlException = new ThreadLocal<>(NetworkError::new);
+    private static final FiberLocal<NetworkError> tlException = new FiberLocal<>(NetworkError::new);
     private final StringSink message = new StringSink();
     private int errno;
 
@@ -50,13 +51,24 @@ public class NetworkError extends Error implements Sinkable, FlyweightMessageCon
         return ex;
     }
 
+    public NetworkError couldNotBindSocket(CharSequence who, int ipv4, int port) {
+        return this.put("could not bind socket [who=").put(who).put(", bindTo=").ip(ipv4).put(':').put(port).put(']');
+    }
+
+    public NetworkError detachedCopy() {
+        final NetworkError copy = new NetworkError();
+        copy.errno = errno;
+        copy.message.put(message);
+        return copy;
+    }
+
+    public int getErrno() {
+        return errno;
+    }
+
     @Override
     public CharSequence getFlyweightMessage() {
         return message;
-    }
-
-    public NetworkError couldNotBindSocket(CharSequence who, int ipv4, int port) {
-        return this.put("could not bind socket [who=").put(who).put(", bindTo=").ip(ipv4).put(':').put(port).put(']');
     }
 
     @Override
@@ -90,7 +102,7 @@ public class NetworkError extends Error implements Sinkable, FlyweightMessageCon
     }
 
     @Override
-    public void toSink(CharSink sink) {
-        sink.put("[errno=").put(errno).put("] ").put(message);
+    public void toSink(@NotNull CharSink<?> sink) {
+        sink.putAscii("[errno=").put(errno).putAscii("] ").put(message);
     }
 }

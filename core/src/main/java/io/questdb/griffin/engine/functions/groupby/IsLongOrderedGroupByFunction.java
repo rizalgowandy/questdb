@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,51 +37,74 @@ import org.jetbrains.annotations.NotNull;
 public class IsLongOrderedGroupByFunction extends BooleanFunction implements GroupByFunction, UnaryFunction {
     private final Function arg;
     private int valueIndex;
-    private int flagIndex;
 
     public IsLongOrderedGroupByFunction(@NotNull Function arg) {
         this.arg = arg;
     }
 
     @Override
-    public void computeFirst(MapValue mapValue, Record record) {
-        mapValue.putBool(flagIndex, true);
-        mapValue.putLong(valueIndex, arg.getLong(record));
+    public void computeFirst(MapValue mapValue, Record record, long rowId) {
+        mapValue.putBool(valueIndex, true);
+        mapValue.putLong(valueIndex + 1, arg.getLong(record));
     }
 
     @Override
-    public void computeNext(MapValue mapValue, Record record) {
-        if (mapValue.getBool(flagIndex)) {
-            long prev = mapValue.getLong(valueIndex);
+    public void computeNext(MapValue mapValue, Record record, long rowId) {
+        if (mapValue.getBool(valueIndex)) {
+            long prev = mapValue.getLong(valueIndex + 1);
             long curr = arg.getLong(record);
             if (curr < prev) {
-                mapValue.putBool(flagIndex, false);
+                mapValue.putBool(valueIndex, false);
             } else {
-                mapValue.putLong(valueIndex, curr);
+                mapValue.putLong(valueIndex + 1, curr);
             }
         }
     }
 
     @Override
-    public void pushValueTypes(ArrayColumnTypes columnTypes) {
-        this.flagIndex = columnTypes.getColumnCount();
-        this.valueIndex = flagIndex + 1;
+    public Function getArg() {
+        return arg;
+    }
+
+    @Override
+    public boolean getBool(Record rec) {
+        return rec.getBool(valueIndex);
+    }
+
+    @Override
+    public String getName() {
+        return "isOrdered";
+    }
+
+    @Override
+    public int getValueIndex() {
+        return valueIndex;
+    }
+
+    @Override
+    public void initValueIndex(int valueIndex) {
+        this.valueIndex = valueIndex;
+    }
+
+    @Override
+    public void initValueTypes(ArrayColumnTypes columnTypes) {
+        this.valueIndex = columnTypes.getColumnCount();
         columnTypes.add(ColumnType.BOOLEAN);
         columnTypes.add(ColumnType.LONG);
     }
 
     @Override
+    public boolean isConstant() {
+        return false;
+    }
+
+    @Override
     public void setNull(MapValue mapValue) {
-        mapValue.putBool(flagIndex, true);
+        mapValue.putBool(valueIndex, true);
     }
 
     @Override
-    public boolean getBool(Record rec) {
-        return rec.getBool(flagIndex);
-    }
-
-    @Override
-    public Function getArg() {
-        return arg;
+    public boolean supportsParallelism() {
+        return false;
     }
 }

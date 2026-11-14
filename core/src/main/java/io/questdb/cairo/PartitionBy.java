@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,16 +24,17 @@
 
 package io.questdb.cairo;
 
+import io.questdb.griffin.SqlException;
 import io.questdb.std.LowerCaseCharSequenceIntHashMap;
-import io.questdb.std.NumericException;
+import io.questdb.std.LowerCaseUtf8SequenceIntHashMap;
 import io.questdb.std.datetime.DateFormat;
-import io.questdb.std.datetime.DateLocale;
-import io.questdb.std.datetime.microtime.TimestampFormatCompiler;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
-import io.questdb.std.datetime.microtime.Timestamps;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8String;
+import org.jetbrains.annotations.NotNull;
 
 import static io.questdb.cairo.TableUtils.DEFAULT_PARTITION_NAME;
+import static io.questdb.std.datetime.DateLocaleFactory.EN_LOCALE;
 
 /**
  * Collection of static assets to provide time partitioning API. It should be
@@ -43,32 +44,18 @@ import static io.questdb.cairo.TableUtils.DEFAULT_PARTITION_NAME;
 public final class PartitionBy {
 
     public static final int DAY = 0;
-    public static final int MONTH = 1;
-    public static final int YEAR = 2;
     public static final int HOUR = 4;
+    public static final int MONTH = 1;
     /**
-     * Data is not partitioned at all,
-     * all data is stored in a single directory
+     * Data is not partitioned at all, all data is stored in a single directory
      */
     public static final int NONE = 3;
-    private static final PartitionCeilMethod CEIL_DD = Timestamps::ceilDD;
-    private static final PartitionCeilMethod CEIL_YYYY = Timestamps::ceilYYYY;
-    private static final PartitionCeilMethod CEIL_HH = Timestamps::ceilHH;
-    private static final PartitionFloorMethod FLOOR_MM = Timestamps::floorMM;
-    private static final PartitionCeilMethod CEIL_MM = Timestamps::ceilMM;
-    private static final PartitionAddMethod ADD_MM = Timestamps::addMonths;
-    private static final PartitionAddMethod ADD_YYYY = Timestamps::addYear;
-    private static final PartitionAddMethod ADD_HH = Timestamps::addHours;
-    private static final PartitionFloorMethod FLOOR_DD = Timestamps::floorDD;
-    private static final PartitionAddMethod ADD_DD = Timestamps::addDays;
-    private static final PartitionFloorMethod FLOOR_YYYY = Timestamps::floorYYYY;
-    private static final PartitionFloorMethod FLOOR_HH = Timestamps::floorHH;
-    private final static LowerCaseCharSequenceIntHashMap nameToIndexMap = new LowerCaseCharSequenceIntHashMap();
-    private static final DateFormat fmtDay;
-    private static final DateFormat fmtMonth;
-    private static final DateFormat fmtYear;
-    private final static DateFormat fmtDefault;
-    private final static DateFormat fmtHour;
+    public static final int NOT_APPLICABLE = 6;
+    public static final int WEEK = 5;
+    public static final int YEAR = 2;
+    private static final LowerCaseCharSequenceIntHashMap nameToIndexMap = new LowerCaseCharSequenceIntHashMap();
+    private static final LowerCaseUtf8SequenceIntHashMap nameToIndexMapUtf8 = new LowerCaseUtf8SequenceIntHashMap();
+    private static final LowerCaseCharSequenceIntHashMap ttlUnitToIndexMap = new LowerCaseCharSequenceIntHashMap();
 
     private PartitionBy() {
     }
@@ -77,242 +64,129 @@ public final class PartitionBy {
         return nameToIndexMap.get(name);
     }
 
-    public static PartitionAddMethod getPartitionAddMethod(int partitionBy) {
-        switch (partitionBy) {
-            case DAY:
-                return ADD_DD;
-            case MONTH:
-                return ADD_MM;
-            case YEAR:
-                return ADD_YYYY;
-            case HOUR:
-                return ADD_HH;
-            default:
-                return null;
-        }
+    public static int fromUtf8String(Utf8Sequence name) {
+        return nameToIndexMapUtf8.get(name);
     }
 
-    public static DateFormat getPartitionDirFormatMethod(int partitionBy) {
-        switch (partitionBy) {
-            case DAY:
-                return fmtDay;
-            case MONTH:
-                return fmtMonth;
-            case YEAR:
-                return fmtYear;
-            case HOUR:
-                return fmtHour;
-            case NONE:
-                return fmtDefault;
-            default:
-                throw new UnsupportedOperationException("partition by " + partitionBy + " does not have date format");
-        }
+    public static TimestampDriver.PartitionAddMethod getPartitionAddMethod(int timestampType, int partitionBy) {
+        return ColumnType.getTimestampDriver(timestampType).getPartitionAddMethod(partitionBy);
     }
 
-    public static PartitionFloorMethod getPartitionFloorMethod(int partitionBy) {
-        switch (partitionBy) {
-            case DAY:
-                return FLOOR_DD;
-            case MONTH:
-                return FLOOR_MM;
-            case YEAR:
-                return FLOOR_YYYY;
-            case HOUR:
-                return FLOOR_HH;
-            default:
-                return null;
-        }
+    public static TimestampDriver.TimestampCeilMethod getPartitionCeilMethod(int timestampType, int partitionBy) {
+        return ColumnType.getTimestampDriver(timestampType).getPartitionCeilMethod(partitionBy);
     }
 
-    public static long getPartitionTimeIntervalFloor(int partitionBy) {
-        switch (partitionBy) {
-            case DAY:
-                return Timestamps.DAY_MICROS;
-            case MONTH:
-                return Timestamps.DAY_MICROS * 28;
-            case YEAR:
-                return Timestamps.DAY_MICROS * 365;
-            case HOUR:
-                return Timestamps.HOUR_MICROS;
-            default:
-                throw new UnsupportedOperationException();
-        }
+    public static DateFormat getPartitionDirFormatMethod(int timestampType, int partitionBy) {
+        return ColumnType.getTimestampDriver(timestampType).getPartitionDirFormatMethod(partitionBy);
+    }
+
+    public static TimestampDriver.TimestampFloorMethod getPartitionFloorMethod(int timestampType, int partitionBy) {
+        return ColumnType.getTimestampDriver(timestampType).getPartitionFloorMethod(partitionBy);
     }
 
     public static boolean isPartitioned(int partitionBy) {
         return partitionBy != NONE;
     }
 
-    public static long parsePartitionDirName(CharSequence partitionName, int partitionBy) {
-        try {
-            return getPartitionDirFormatMethod(partitionBy).parse(partitionName, null);
-        } catch (NumericException e) {
-            final CairoException ee = CairoException.instance(0);
-            switch (partitionBy) {
-                case DAY:
-                    ee.put("'YYYY-MM-DD'");
-                    break;
-                case MONTH:
-                    ee.put("'YYYY-MM'");
-                    break;
-                case YEAR:
-                    ee.put("'YYYY'");
-                    break;
-                case HOUR:
-                    ee.put("'YYYY-MM-DDTHH'");
-                    break;
-            }
-            ee.put(" expected");
-            throw ee;
-        }
+    public static long parsePartitionDirName(@NotNull CharSequence partitionName, int timestampType, int partitionBy) {
+        return parsePartitionDirName(partitionName, timestampType, partitionBy, 0, partitionName.length());
     }
 
-    public static long setSinkForPartition(CharSink path, int partitionBy, long timestamp, boolean calculatePartitionMax) {
-        int y, m, d;
-        boolean leap;
-        switch (partitionBy) {
-            case DAY:
-                y = Timestamps.getYear(timestamp);
-                leap = Timestamps.isLeapYear(y);
-                m = Timestamps.getMonthOfYear(timestamp, y, leap);
-                d = Timestamps.getDayOfMonth(timestamp, y, m, leap);
-                TimestampFormatUtils.append000(path, y);
-                path.put('-');
-                TimestampFormatUtils.append0(path, m);
-                path.put('-');
-                TimestampFormatUtils.append0(path, d);
+    public static long parsePartitionDirName(@NotNull CharSequence partitionName, int timestampType, int partitionBy, int lo, int hi) {
+        return ColumnType.getTimestampDriver(timestampType).parsePartitionDirName(partitionName, partitionBy, lo, hi);
+    }
 
-                if (calculatePartitionMax) {
-                    return Timestamps.yearMicros(y, leap)
-                            + Timestamps.monthOfYearMicros(m, leap)
-                            + (d - 1) * Timestamps.DAY_MICROS + 24 * Timestamps.HOUR_MICROS - 1;
-                }
-                return 0;
-            case MONTH:
-                y = Timestamps.getYear(timestamp);
-                leap = Timestamps.isLeapYear(y);
-                m = Timestamps.getMonthOfYear(timestamp, y, leap);
-                TimestampFormatUtils.append000(path, y);
-                path.put('-');
-                TimestampFormatUtils.append0(path, m);
-
-                if (calculatePartitionMax) {
-                    return Timestamps.yearMicros(y, leap)
-                            + Timestamps.monthOfYearMicros(m, leap)
-                            + Timestamps.getDaysPerMonth(m, leap) * 24L * Timestamps.HOUR_MICROS - 1;
-                }
-                return 0;
-            case YEAR:
-                y = Timestamps.getYear(timestamp);
-                leap = Timestamps.isLeapYear(y);
-                TimestampFormatUtils.append000(path, y);
-                if (calculatePartitionMax) {
-                    return Timestamps.addYear(Timestamps.yearMicros(y, leap), 1) - 1;
-                }
-                return 0;
-            case HOUR:
-                y = Timestamps.getYear(timestamp);
-                leap = Timestamps.isLeapYear(y);
-                m = Timestamps.getMonthOfYear(timestamp, y, leap);
-                d = Timestamps.getDayOfMonth(timestamp, y, m, leap);
-                int h = Timestamps.getHourOfDay(timestamp);
-                TimestampFormatUtils.append000(path, y);
-                path.put('-');
-                TimestampFormatUtils.append0(path, m);
-                path.put('-');
-                TimestampFormatUtils.append0(path, d);
-                path.put('T');
-                TimestampFormatUtils.append0(path, h);
-
-                if (calculatePartitionMax) {
-                    return Timestamps.yearMicros(y, leap)
-                            + Timestamps.monthOfYearMicros(m, leap)
-                            + (d - 1) * Timestamps.DAY_MICROS + (h + 1) * Timestamps.HOUR_MICROS - 1;
-                }
-                return 0;
-            default:
-                path.put(DEFAULT_PARTITION_NAME);
-                return Long.MAX_VALUE;
+    public static void setSinkForPartition(CharSink<?> path, int timestampType, int partitionBy, long timestamp) {
+        if (isPartitioned(partitionBy)) {
+            getPartitionDirFormatMethod(timestampType, partitionBy).format(timestamp, EN_LOCALE, null, path);
+            return;
         }
+        path.putAscii(DEFAULT_PARTITION_NAME);
     }
 
     public static String toString(int partitionBy) {
+        return switch (partitionBy) {
+            case DAY -> "DAY";
+            case MONTH -> "MONTH";
+            case YEAR -> "YEAR";
+            case HOUR -> "HOUR";
+            case WEEK -> "WEEK";
+            case NONE -> "NONE";
+            case NOT_APPLICABLE -> "N/A";
+            default -> "UNKNOWN";
+        };
+    }
+
+    public static int ttlUnitFromString(CharSequence name, int start, int limit) {
+        return ttlUnitToIndexMap.valueAt(ttlUnitToIndexMap.keyIndex(name, start, limit));
+    }
+
+    public static void validateTtlGranularity(int partitionBy, int ttlHoursOrMonths, int ttlValuePos) throws SqlException {
         switch (partitionBy) {
-            case DAY:
-                return "DAY";
-            case MONTH:
-                return "MONTH";
-            case YEAR:
-                return "YEAR";
-            case HOUR:
-                return "HOUR";
             case NONE:
-                return "NONE";
-            default:
-                return "UNKNOWN";
-        }
-    }
-
-    static PartitionCeilMethod getPartitionCeilMethod(int partitionBy) {
-        switch (partitionBy) {
+            case NOT_APPLICABLE:
+                throw SqlException.position(ttlValuePos).put("cannot set TTL on a non-partitioned table");
             case DAY:
-                return CEIL_DD;
+                if (ttlHoursOrMonths < 0 || ttlHoursOrMonths % 24 == 0) {
+                    return;
+                }
+                break;
+            case WEEK:
+                if (ttlHoursOrMonths < 0 || ttlHoursOrMonths % (24 * 7) == 0) {
+                    return;
+                }
+                break;
             case MONTH:
-                return CEIL_MM;
+                // ttl == 0 means "unset" (no TTL), negative values are months-based TTL
+                if (ttlHoursOrMonths < 1) {
+                    return;
+                }
+                break;
             case YEAR:
-                return CEIL_YYYY;
-            case HOUR:
-                return CEIL_HH;
+                // ttl == 0 means "unset" (no TTL), negative values are months-based TTL
+                if (ttlHoursOrMonths < 1 && ttlHoursOrMonths % 12 == 0) {
+                    return;
+                }
+                break;
             default:
-                return null;
+                return;
         }
+        throw SqlException.position(ttlValuePos)
+                .put("TTL value must be an integer multiple of the partition size (its time interval)");
     }
 
-    @FunctionalInterface
-    public interface PartitionFloorMethod {
-        long floor(long timestamp);
-    }
-
-    @FunctionalInterface
-    public interface PartitionCeilMethod {
-        // returns exclusive ceiling for the give timestamp
-        long ceil(long timestamp);
-    }
-
-    @FunctionalInterface
-    public interface PartitionAddMethod {
-        long calculate(long timestamp, int increment);
-    }
 
     static {
         nameToIndexMap.put("day", DAY);
         nameToIndexMap.put("month", MONTH);
         nameToIndexMap.put("year", YEAR);
         nameToIndexMap.put("hour", HOUR);
+        nameToIndexMap.put("week", WEEK);
         nameToIndexMap.put("none", NONE);
-    }
+        nameToIndexMap.put("n/a", NOT_APPLICABLE);
 
-    static {
-        TimestampFormatCompiler compiler = new TimestampFormatCompiler();
-        fmtDay = compiler.compile("yyyy-MM-dd");
-        fmtMonth = compiler.compile("yyyy-MM");
-        fmtYear = compiler.compile("yyyy");
-        fmtHour = compiler.compile("yyyy-MM-ddTHH");
-        fmtDefault = new DateFormat() {
-            @Override
-            public void format(long datetime, DateLocale locale, CharSequence timeZoneName, CharSink sink) {
-                sink.put(DEFAULT_PARTITION_NAME);
-            }
+        nameToIndexMapUtf8.put(new Utf8String("day"), DAY);
+        nameToIndexMapUtf8.put(new Utf8String("month"), MONTH);
+        nameToIndexMapUtf8.put(new Utf8String("year"), YEAR);
+        nameToIndexMapUtf8.put(new Utf8String("hour"), HOUR);
+        nameToIndexMapUtf8.put(new Utf8String("week"), WEEK);
+        nameToIndexMapUtf8.put(new Utf8String("none"), NONE);
+        nameToIndexMapUtf8.put(new Utf8String("n/a"), NOT_APPLICABLE);
 
-            @Override
-            public long parse(CharSequence in, DateLocale locale) {
-                return parse(in, 0, in.length(), locale);
-            }
-
-            @Override
-            public long parse(CharSequence in, int lo, int hi, DateLocale locale) {
-                return 0;
-            }
-        };
+        ttlUnitToIndexMap.put("h", HOUR);
+        ttlUnitToIndexMap.put("hour", HOUR);
+        ttlUnitToIndexMap.put("hours", HOUR);
+        ttlUnitToIndexMap.put("d", DAY);
+        ttlUnitToIndexMap.put("day", DAY);
+        ttlUnitToIndexMap.put("days", DAY);
+        ttlUnitToIndexMap.put("w", WEEK);
+        ttlUnitToIndexMap.put("week", WEEK);
+        ttlUnitToIndexMap.put("weeks", WEEK);
+        ttlUnitToIndexMap.put("m", MONTH);
+        ttlUnitToIndexMap.put("month", MONTH);
+        ttlUnitToIndexMap.put("months", MONTH);
+        ttlUnitToIndexMap.put("y", YEAR);
+        ttlUnitToIndexMap.put("year", YEAR);
+        ttlUnitToIndexMap.put("years", YEAR);
     }
 }

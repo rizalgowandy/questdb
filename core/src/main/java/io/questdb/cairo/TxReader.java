@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,57 +27,140 @@ package io.questdb.cairo;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMR;
 import io.questdb.cairo.vm.api.MemoryW;
-import io.questdb.std.*;
-import io.questdb.std.str.Path;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.IntList;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.Numbers;
+import io.questdb.std.Transient;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
 
 import static io.questdb.cairo.TableUtils.*;
 
 public class TxReader implements Closeable, Mutable {
-    protected static final int PARTITION_TS_OFFSET = 0;
-    protected static final int PARTITION_SIZE_OFFSET = 1;
+    // Counts stable-version loads that fell back from a torn selected area to the other A/B area.
+    @TestOnly
+    static volatile long bodyChecksumFallbackCount = 0;
+    public static final long DEFAULT_PARTITION_TIMESTAMP = 0L;
+    public static final long PARTITION_FLAGS_MASK = 0x7FFFF00000000000L;
+    // Flag in the high byte of the offset-3 partition-version word: a remote copy of the
+    // partition's parquet data exists. Set on parquet partitions and on native partitions
+    // uploaded while native (upload-while-native keeps the format bit 0).
+    public static final long PARTITION_REMOTE_BIT = 1L << 63;
+    // Flag in the high byte of the offset-3 word: the value was written as a native seqTxn
+    // stamp by a stamp-aware binary. Released binaries stored a parquet file size in this slot
+    // for parquet_generated native partitions; without this bit such a legacy word is
+    // indistinguishable from a seqTxn, so the native read quarantines it (returns -1) instead
+    // of trusting it. Meaningful for native-format words only; a parquet word holds the file
+    // size and is valid without it.
+    public static final long PARTITION_SEQ_TXN_VALID_BIT = 1L << 62;
+    public static final long PARTITION_SIZE_MASK = 0x80000FFFFFFFFFFFL;
+    public static final int PARTITION_SQUASH_COUNTER_MAX = 0xFFFF;
+    public static final long PARTITION_VERSION_FLAGS_MASK = 0xFFL << 56;
+    public static final long PARTITION_VERSION_VALUE_MASK = ~PARTITION_VERSION_FLAGS_MASK;
+    protected static final int NONE_COL_STRUCTURE_VERSION = Integer.MIN_VALUE;
+    // COMPOSITE re-reads the offset-3 word's VALUE field (the 56 bits under PARTITION_VERSION_VALUE_MASK) as a pointer
+    // into the partition's own _geometry.<generation> file.
+    protected static final long PARTITION_COMPOSITE_FLAG = 1L << 61;
+    protected static final int PARTITION_GEOMETRY_GENERATION_BIT_OFFSET = 24;
+    protected static final long PARTITION_GEOMETRY_GENERATION_MASK = 0x0F000000L; // bits 24-27 (4 bits)
+    protected static final int PARTITION_GEOMETRY_MAX_GENERATION = 15;
+    protected static final long PARTITION_GEOMETRY_OFFSET_MASK = 0x00FFFFFFL; // bits 0-23 (24 bits, 8-byte units)
+    // Every packed offset is this many bits narrower than the byte offset it represents.
+    protected static final int PARTITION_GEOMETRY_OFFSET_UNIT_SHIFT = 3;
+    protected static final int PARTITION_MASKED_SIZE_OFFSET = 1;
+    protected static final int PARTITION_MASK_PARQUET_FORMAT_BIT_OFFSET = 61;
+    protected static final int PARTITION_MASK_PARQUET_GENERATED_BIT_OFFSET = 60;
+    protected static final int PARTITION_MASK_READ_ONLY_BIT_OFFSET = 62;
     protected static final int PARTITION_NAME_TX_OFFSET = 2;
-    protected static final int PARTITION_COLUMN_VERSION_OFFSET = 3;
-    private static final long DEFAULT_PARTITION_TIMESTAMP = 0L;
+    protected static final int PARTITION_SQUASH_COUNTER_BIT_OFFSET = 44;
+    protected static final long PARTITION_SQUASH_COUNTER_MASK = 0xFFFFL << PARTITION_SQUASH_COUNTER_BIT_OFFSET;
+    // partition size's highest possible value is 0xFFFFFFFFFFFL (15 Tera Rows):
+    //
+    // | reserved | read-only | parquet format | parquet generated | squash counter | partition size |
+    // +----------+-----------+----------------+-------------------+----------------+----------------+
+    // |  1 bit   |  1 bit    |  1 bit         |  1 bit            |   16 bit       |      44 bits   |
+    //
+    // when read-only bit is set, the partition is read only.
+    // we reserve the highest bit to allow negative values to
+    // have meaning (in future). For instance the table reader uses
+    // a negative size value to mean that the partition is not open.
+    // the parquet format bit indicates that the partition has been converted to parquet format
+    // the parquet generated bit indicates that a parquet file has been generated for the partition
+    // the last long (PARTITION_VERSION_OFFSET) holds, for a parquet partition the parquet file
+    // size, for a native one its last-modifying seqTxn:
+    //
+    // |  remote  |  valid   | reserved | value (parquet file size / native seqTxn) |
+    // +----------+----------+----------+-------------------------------------------+
+    // |  1 bit   |  1 bit   |  6 bits  |                 56 bits                   |
+    //
+    // remote is cleared by the value writes that supersede the bytes (setPartitionParquetFileSize, setPartitionSeqTxn),
+    // so it can't outlive them; setPartitionFormat preserves it, leaving REMOTE to caller discipline on a format flip.
+    // valid (PARTITION_SEQ_TXN_VALID_BIT) accompanies every positive native seqTxn stamp; a native word without it is
+    // untrusted and reads as -1 (quarantines the released-binary file-size poison). A 0 stamp writes the cleared word,
+    // so "valid with value 0" is unrepresentable. setPartitionFormat sets it flipping to native, clears it flipping to
+    // parquet (a parquet word is valid without it).
+    // legacy: a cleared slot reads as 0L (written today) or -1L (older binaries), both folded by isPartitionOffset3Cleared().
+    protected static final int PARTITION_TS_OFFSET = 0;
+    protected static final int PARTITION_VERSION_OFFSET = 3;
     protected final LongList attachedPartitions = new LongList();
+    protected final FilesFacade ff;
     private final IntList symbolCountSnapshot = new IntList();
-    private final FilesFacade ff;
-    protected long minTimestamp;
-    protected long maxTimestamp;
-    protected long txn;
-    protected int symbolColumnCount;
-    protected long truncateVersion;
+    protected int attachedPartitionsSize = 0;
+    protected long columnVersion;
     protected long dataVersion;
-    protected long structureVersion;
     protected long fixedRowCount;
-    protected long transientRowCount;
+    protected int geometryVersion;
+    protected long lagMaxTimestamp;
+    protected long lagMinTimestamp;
+    protected boolean lagOrdered;
+    protected int lagRowCount;
+    protected int lagTxnCount;
+    protected long maxTimestamp;
+    protected long minTimestamp;
     protected int partitionBy;
     protected long partitionTableVersion;
-    protected int attachedPartitionsSize = 0;
-    private PartitionBy.PartitionFloorMethod partitionFloorMethod;
-    private MemoryMR roTxMemBase;
+    protected long seqTxn;
+    protected long structureVersion;
+    protected int symbolColumnCount;
+    protected int timestampType;
+    protected long transientRowCount;
+    protected long truncateVersion;
+    protected long txn;
     private int baseOffset;
-    private long size;
-    private long version;
-    private int symbolsSize;
+    // Verify once per open mapping. Ordinary reloads rely on the transaction publication protocol.
+    // A failed initial load (including A/B fallback) must not consume this check.
+    private boolean isInitialChecksumVerificationRequired = true;
+    private TimestampDriver.TimestampCeilMethod partitionCeilMethod;
+    private TimestampDriver.TimestampFloorMethod partitionFloorMethod;
     private int partitionSegmentSize;
-    protected long columnVersion;
+    private MemoryMR roTxMemBase;
+    private long size;
+    private int symbolsSize;
+    private long version;
 
     public TxReader(FilesFacade ff) {
         this.ff = ff;
     }
 
     public boolean attachedPartitionsContains(long ts) {
-        return findAttachedPartitionIndex(ts) > -1;
+        return findAttachedPartitionRawIndexByLoTimestamp(ts) > -1L;
     }
 
     @Override
     public void clear() {
+        requireInitialChecksumVerification();
         clearData();
-        if (roTxMemBase != null) {
-            roTxMemBase.close();
-        }
+        Misc.free(roTxMemBase);
     }
 
     @Override
@@ -86,92 +169,364 @@ public class TxReader implements Closeable, Mutable {
         clear();
     }
 
+    public void dumpRawTxPartitionInfo(LongList container) {
+        container.add(attachedPartitions);
+    }
+
+    public void dumpTo(MemoryW mem) {
+        mem.putLong(TX_BASE_OFFSET_VERSION_64, version);
+        boolean isA = (version & 1L) == 0L;
+        final int baseOffset = TX_BASE_HEADER_SIZE;
+        mem.putInt(isA ? TX_BASE_OFFSET_A_32 : TX_BASE_OFFSET_B_32, baseOffset);
+        mem.putInt(isA ? TX_BASE_OFFSET_SYMBOLS_SIZE_A_32 : TX_BASE_OFFSET_SYMBOLS_SIZE_B_32, symbolsSize);
+        mem.putInt(isA ? TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 : TX_BASE_OFFSET_PARTITIONS_SIZE_B_32, partitionSegmentSize);
+
+        mem.putLong(baseOffset + TX_OFFSET_TXN_64, txn);
+        mem.putLong(baseOffset + TX_OFFSET_TRANSIENT_ROW_COUNT_64, transientRowCount);
+        mem.putLong(baseOffset + TX_OFFSET_FIXED_ROW_COUNT_64, fixedRowCount);
+        mem.putLong(baseOffset + TX_OFFSET_MIN_TIMESTAMP_64, minTimestamp);
+        mem.putLong(baseOffset + TX_OFFSET_MAX_TIMESTAMP_64, maxTimestamp);
+        mem.putLong(baseOffset + TX_OFFSET_STRUCT_VERSION_64, structureVersion);
+        mem.putLong(baseOffset + TX_OFFSET_DATA_VERSION_64, dataVersion);
+        mem.putLong(baseOffset + TX_OFFSET_PARTITION_TABLE_VERSION_64, partitionTableVersion);
+        mem.putLong(baseOffset + TX_OFFSET_COLUMN_VERSION_64, columnVersion);
+        mem.putLong(baseOffset + TX_OFFSET_TRUNCATE_VERSION_64, truncateVersion);
+        mem.putLong(baseOffset + TX_OFFSET_SEQ_TXN_64, seqTxn);
+        mem.putInt(baseOffset + TX_OFFSET_GEOMETRY_VERSION_32, geometryVersion);
+        mem.putInt(baseOffset + TX_OFFSET_LAG_ROW_COUNT_32, lagRowCount);
+        mem.putLong(baseOffset + TX_OFFSET_LAG_MIN_TIMESTAMP_64, lagMinTimestamp);
+        mem.putLong(baseOffset + TX_OFFSET_LAG_MAX_TIMESTAMP_64, lagMaxTimestamp);
+        mem.putInt(baseOffset + TX_OFFSET_LAG_TXN_COUNT_32, lagOrdered ? lagTxnCount : -lagTxnCount);
+        // A dump has no base header for the merged geometry slot, so it keeps geometryVersion in the legacy
+        // body field and clears the overlapping checksum stamp. The first commit migrates both pieces.
+        mem.putInt(baseOffset + TX_OFFSET_BODY_CHECKSUM_STAMP_32, 0);
+        mem.putInt(baseOffset + TX_OFFSET_MAP_WRITER_COUNT_32, symbolColumnCount);
+
+        int symbolMapCount = symbolCountSnapshot.size();
+        for (int i = 0; i < symbolMapCount; i++) {
+            long offset = TableUtils.getSymbolWriterIndexOffset(i);
+            int symCount = symbolCountSnapshot.getQuick(i);
+            mem.putInt(baseOffset + offset, symCount);
+            offset += Integer.BYTES;
+            mem.putInt(baseOffset + offset, symCount);
+        }
+
+        final int size = attachedPartitions.size();
+        final long partitionTableOffset = TableUtils.getPartitionTableSizeOffset(symbolMapCount);
+        mem.putInt(baseOffset + partitionTableOffset, size * Long.BYTES);
+        for (int i = 0; i < size; i++) {
+            long value = attachedPartitions.getQuick(i);
+            // A native partition's generated data.parquet only duplicates its native columns and is not
+            // part of a snapshot, so a checkpoint must not record the partition as parquet_generated --
+            // else the restored _txn claims a data.parquet that was never backed up. The masked-size
+            // word carries both the format and generated bits.
+            if (i % LONGS_PER_TX_ATTACHED_PARTITION == PARTITION_MASKED_SIZE_OFFSET) {
+                final int partitionIndex = i / LONGS_PER_TX_ATTACHED_PARTITION;
+                if (!isPartitionParquet(partitionIndex) && isPartitionParquetGenerated(partitionIndex)) {
+                    value &= ~(1L << PARTITION_MASK_PARQUET_GENERATED_BIT_OFFSET);
+                }
+            } else if (i % LONGS_PER_TX_ATTACHED_PARTITION == PARTITION_VERSION_OFFSET) {
+                // A native offset-3 word without the VALID bit is untrusted (a released binary
+                // stored a parquet file size there): scrub it to the cleared sentinel so a backup
+                // never carries the ambiguous word. The whole word goes, including bit 63 -- a
+                // native slot cannot legitimately be REMOTE without a valid stamp. Parquet words
+                // hold the file size and are valid without the bit; leave them. The cleared 0L/-1L
+                // sentinels scrub to the canonical 0L, a no-op in meaning.
+                final int partitionIndex = i / LONGS_PER_TX_ATTACHED_PARTITION;
+                // A COMPOSITE word legitimately lacks the VALID bit - it spends the value field on
+                // its geometry pointer, not on a stamp - and scrubbing it would strand the partition's
+                // _geometry record, losing its piece layout for good. Its seqTxn lives in that record.
+                if (!isPartitionParquet(partitionIndex)
+                        && !isPartitionCompositeByRawIndex(i - PARTITION_VERSION_OFFSET)
+                        && (isPartitionOffset3Cleared(value) || (value & PARTITION_SEQ_TXN_VALID_BIT) == 0)) {
+                    value = 0L;
+                }
+            }
+            long offset = TableUtils.getPartitionTableIndexOffset(partitionTableOffset, i);
+            mem.putLong(baseOffset + offset, value);
+        }
+    }
+
+    public int findAttachedPartitionIndexByLoTimestamp(long ts) {
+        // Start from the end, usually it will be last partition searched / appended
+        int index = attachedPartitions.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, ts, Vect.BIN_SEARCH_SCAN_UP);
+        if (index < 0) {
+            return -((-index - 1) / LONGS_PER_TX_ATTACHED_PARTITION) - 1;
+        }
+        return index / LONGS_PER_TX_ATTACHED_PARTITION;
+    }
+
     public int getBaseOffset() {
         return baseOffset;
     }
 
-    public long getDataVersion() {
-        return dataVersion;
-    }
-
-    public long getRecordSize() {
-        return size;
-    }
-
-    public long getFixedRowCount() {
-        return fixedRowCount;
-    }
-
-    public long getMaxTimestamp() {
-        return maxTimestamp;
-    }
-
-    public long getMinTimestamp() {
-        return minTimestamp;
-    }
-
-    public int getPartitionCount() {
-        return attachedPartitions.size() / LONGS_PER_TX_ATTACHED_PARTITION;
-    }
-
-    public long getPartitionColumnVersion(int i) {
-        return getPartitionColumnVersionByIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
-    }
-
-    public long getPartitionColumnVersionByIndex(int index) {
-        return attachedPartitions.getQuick(index + PARTITION_COLUMN_VERSION_OFFSET);
-    }
-
-    public long getPartitionNameTxn(int i) {
-        return getPartitionNameTxnByIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
-    }
-
-    public long getPartitionNameTxnByIndex(int index) {
-        return attachedPartitions.getQuick(index + PARTITION_NAME_TX_OFFSET);
-    }
-
-    public long getPartitionNameTxnByPartitionTimestamp(long ts) {
-        final int index = findAttachedPartitionIndex(ts);
-        if (index > -1) {
-            return attachedPartitions.getQuick(index + PARTITION_NAME_TX_OFFSET);
-        }
-        return -1;
-    }
-
-    public long getPartitionSize(int i) {
-        return getPartitionSizeByIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
-    }
-
-    public long getPartitionSizeByIndex(int index) {
-        return attachedPartitions.getQuick(index + PARTITION_SIZE_OFFSET);
-    }
-
-    public long getPartitionSizeByPartitionTimestamp(long ts) {
-        final int index = findAttachedPartitionIndex(ts);
-        if (index > -1) {
-            return attachedPartitions.getQuick(index + PARTITION_SIZE_OFFSET);
-        }
-        return -1;
-    }
-
-    public long getPartitionTableVersion() {
-        return partitionTableVersion;
-    }
-
-    public long getPartitionTimestamp(int i) {
-        return attachedPartitions.getQuick(i * LONGS_PER_TX_ATTACHED_PARTITION + PARTITION_TS_OFFSET);
+    public int getColumnStructureVersion() {
+        int columnStructureVersion = Numbers.decodeHighInt(structureVersion);
+        // if columnStructureVersion == 0 then the version is the same as metadata version
+        // if columnStructureVersion == NONE_COL_STRUCTURE_VERSION then column structure version is 0.
+        return columnStructureVersion == 0 ? getMetadataVersion() :
+                columnStructureVersion == NONE_COL_STRUCTURE_VERSION ? 0 : columnStructureVersion;
     }
 
     public long getColumnVersion() {
         return columnVersion;
     }
 
+    public long getCurrentPartitionMaxTimestamp(long timestamp) {
+        return getNextPartitionTimestamp(timestamp) - 1;
+    }
+
+    public long getDataVersion() {
+        return dataVersion;
+    }
+
+    public int getFirstNativePartitionIndex() {
+        for (int i = 0, n = getPartitionCount(); i < n; i++) {
+            if (!isPartitionParquet(i)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public int getFirstNativePartitionWithoutParquetGenerated() {
+        for (int i = 0, n = getPartitionCount(); i < n; i++) {
+            if (!isPartitionParquetGenerated(i) && !isPartitionParquet(i)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public long getFixedRowCount() {
+        return fixedRowCount;
+    }
+
+    public long getLagMaxTimestamp() {
+        return lagMaxTimestamp;
+    }
+
+    public long getLagMinTimestamp() {
+        return lagMinTimestamp;
+    }
+
+    public int getLagRowCount() {
+        return lagRowCount;
+    }
+
+    public int getLagTxnCount() {
+        return lagTxnCount;
+    }
+
+    public long getLastPartitionTimestamp() {
+        if (PartitionBy.isPartitioned(partitionBy)) {
+            return getPartitionTimestampByTimestamp(maxTimestamp);
+        }
+        return DEFAULT_PARTITION_TIMESTAMP;
+    }
+
+    public long getLogicalPartitionTimestamp(long timestamp) {
+        return getPartitionFloor(timestamp);
+    }
+
+    public long getMaxTimestamp() {
+        return maxTimestamp;
+    }
+
+    public int getMetadataVersion() {
+        return Numbers.decodeLowInt(structureVersion);
+    }
+
+    public long getMinTimestamp() {
+        return minTimestamp;
+    }
+
+    /**
+     * Returns a native partition's last-modifying seqTxn from the offset-3 word
+     * (flag bits masked off), or -1 when the version is unknown or untrusted. Native-only:
+     * for a parquet partition offset 3 holds the file size, read it via the parquet accessor.
+     * <p>
+     * A word without {@link #PARTITION_SEQ_TXN_VALID_BIT} is quarantined to -1: released
+     * binaries stored a parquet file size in this slot for {@code parquet_generated} native
+     * partitions, and after an upgrade such a word is indistinguishable from a seqTxn by value
+     * alone. Quarantined slots heal with a real stamp on the next write or at parquet
+     * generation; callers needing a version sooner must stamp one themselves.
+     * <p>
+     * Contract: this is a monotonic-safe version hint, NOT a deterministic identity. It is
+     * always {@code >=} the highest seqTxn that actually wrote the partition, and it strictly
+     * increases whenever the partition's bytes change. It is NOT identical across instances
+     * applying the same WAL: block grouping, WAL-lag carry, and partition squashing all
+     * over-approximate it upward (never below). Only compare it where an over-estimate is
+     * harmless.
+     */
+    public long getNativePartitionSeqTxn(int partitionIndex) {
+        assert !isPartitionParquet(partitionIndex);
+        final int rawIndex = partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION;
+        if (isPartitionCompositeByRawIndex(rawIndex)) {
+            // The value field is this partition's geometry pointer, not a stamp.
+            return -1L;
+        }
+        // getPartitionOffset3 folds the cleared 0L/-1L sentinels to 0 before the bit test;
+        // the legacy all-ones word has bit 62 set and must not read as a valid stamp.
+        if ((getPartitionOffset3(rawIndex) & PARTITION_SEQ_TXN_VALID_BIT) == 0) {
+            return -1L;
+        }
+        final long seqTxn = getPartitionVersionByRawIndex(rawIndex);
+        // a positive stamp is guaranteed by the writer; fold a corrupt non-positive word
+        return seqTxn > 0 ? seqTxn : -1L;
+    }
+
+    public long getNextExistingPartitionTimestamp(long timestamp) {
+        if (partitionBy == PartitionBy.NONE) {
+            return Long.MAX_VALUE;
+        }
+
+        int index = attachedPartitions.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, timestamp, Vect.BIN_SEARCH_SCAN_UP);
+        if (index < 0) {
+            index = -index - 1;
+        } else {
+            index += LONGS_PER_TX_ATTACHED_PARTITION;
+        }
+        int nextIndex = index + PARTITION_TS_OFFSET;
+        if (nextIndex < attachedPartitions.size()) {
+            return attachedPartitions.get(nextIndex);
+        }
+        return Long.MAX_VALUE;
+    }
+
+    public long getNextLogicalPartitionTimestamp(long timestamp) {
+        if (partitionCeilMethod != null) {
+            return partitionCeilMethod.ceil(timestamp);
+        }
+        assert partitionBy == PartitionBy.NONE;
+        return Long.MAX_VALUE;
+    }
+
+    public long getNextPartitionTimestamp(long timestamp) {
+        if (partitionBy == PartitionBy.NONE) {
+            return Long.MAX_VALUE;
+        }
+
+        int index = attachedPartitions.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, timestamp, Vect.BIN_SEARCH_SCAN_UP);
+        if (index < 0) {
+            index = -index - 1;
+        } else {
+            index += LONGS_PER_TX_ATTACHED_PARTITION;
+        }
+        int nextIndex = index + PARTITION_TS_OFFSET;
+        if (nextIndex < attachedPartitions.size()) {
+            long nextPartitionTs = attachedPartitions.getQuick(nextIndex);
+            if (partitionFloorMethod.floor(timestamp) == partitionFloorMethod.floor(nextPartitionTs)) {
+                return nextPartitionTs;
+            }
+        }
+        return partitionCeilMethod.ceil(timestamp);
+    }
+
+    public int getPartitionCount() {
+        return attachedPartitions.size() / LONGS_PER_TX_ATTACHED_PARTITION;
+    }
+
+    public long getPartitionFloor(long timestamp) {
+        return partitionFloorMethod != null
+                ? (timestamp != Long.MIN_VALUE ? partitionFloorMethod.floor(timestamp) : Long.MIN_VALUE)
+                : DEFAULT_PARTITION_TIMESTAMP;
+    }
+
+    public int getPartitionIndex(long ts) {
+        int index = findAttachedPartitionRawIndexByLoTimestamp(getPartitionTimestampByTimestamp(ts));
+        if (index > -1) {
+            return index / LONGS_PER_TX_ATTACHED_PARTITION;
+        }
+        return -1;
+    }
+
+    public long getPartitionNameTxn(int i) {
+        return getPartitionNameTxnByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public long getPartitionNameTxnByPartitionTimestamp(long ts) {
+        return getPartitionNameTxnByPartitionTimestamp(ts, -1);
+    }
+
+    public long getPartitionNameTxnByPartitionTimestamp(long ts, long defaultValue) {
+        final int index = findAttachedPartitionRawIndexByLoTimestamp(ts);
+        if (index > -1) {
+            return attachedPartitions.getQuick(index + PARTITION_NAME_TX_OFFSET);
+        }
+        return defaultValue;
+    }
+
+    public long getPartitionNameTxnByRawIndex(int index) {
+        return getPartitionNameTxnByRawIndex(attachedPartitions, index);
+    }
+
+    public long getPartitionParquetFileSize(int partitionIndex) {
+        assert isPartitionParquet(partitionIndex) : "parquet file size read on a native partition";
+        final long fileSize = getPartitionVersionByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
+        assert fileSize > 0;
+        return fileSize;
+    }
+
+    public long getPartitionRowCountByTimestamp(long ts) {
+        final int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
+        if (indexRaw > -1) {
+            return attachedPartitions.getQuick(indexRaw + PARTITION_MASKED_SIZE_OFFSET) & PARTITION_SIZE_MASK;
+        }
+        return -1;
+    }
+
+    public long getPartitionSize(int i) {
+        return getPartitionSizeByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public long getPartitionSizeByRawIndex(int index) {
+        return getPartitionSizeByRawIndex(attachedPartitions, index);
+    }
+
+    public int getPartitionSquashCount(int i) {
+        return getPartitionSquashCountByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public int getGeometryVersion() {
+        return geometryVersion;
+    }
+
+    public long getPartitionTableVersion() {
+        return partitionTableVersion;
+    }
+
+    public long getPartitionTimestampByIndex(int i) {
+        return attachedPartitions.getQuick(i * LONGS_PER_TX_ATTACHED_PARTITION + PARTITION_TS_OFFSET);
+    }
+
+    public long getPartitionTimestampByTimestamp(long timestamp) {
+        int indexRaw = findAttachedPartitionRawIndex(timestamp);
+        if (indexRaw > -1) {
+            return attachedPartitions.getQuick(indexRaw + PARTITION_TS_OFFSET);
+        }
+        return getPartitionFloor(timestamp);
+    }
+
+    /**
+     * Returns the partition-version value from the offset-3 word (flag bits masked off): the
+     * parquet file size for a parquet-format partition, or the last-modifying seqTxn for a native
+     * one. Distinct from {@link #getPartitionTableVersion()}, which versions the partition list.
+     */
+    public long getPartitionVersion(int partitionIndex) {
+        return getPartitionVersionByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public long getRecordSize() {
+        return size;
+    }
+
     public long getRowCount() {
         return transientRowCount + fixedRowCount;
     }
 
-    public long getStructureVersion() {
-        return structureVersion;
+    public long getSeqTxn() {
+        return seqTxn;
     }
 
     public int getSymbolColumnCount() {
@@ -180,6 +535,10 @@ public class TxReader implements Closeable, Mutable {
 
     public int getSymbolValueCount(int i) {
         return symbolCountSnapshot.get(i);
+    }
+
+    public int getTimestampType() {
+        return timestampType;
     }
 
     public long getTransientRowCount() {
@@ -198,32 +557,362 @@ public class TxReader implements Closeable, Mutable {
         return version;
     }
 
-    public boolean unsafeLoadAll() {
-        if (unsafeLoadBaseOffset()) {
-            this.txn = version;
-            if (txn != getLong(TX_OFFSET_TXN_64)) {
-                return false;
+    public boolean hasCompositePartitions() {
+        for (int i = 0, n = attachedPartitions.size(); i < n; i += LONGS_PER_TX_ATTACHED_PARTITION) {
+            if (isPartitionCompositeByRawIndex(i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @TestOnly
+    public static long getBodyChecksumFallbackCount() {
+        return bodyChecksumFallbackCount;
+    }
+
+    @TestOnly
+    public static void resetBodyChecksumFallbackCount() {
+        bodyChecksumFallbackCount = 0;
+    }
+
+    public boolean hasParquetPartitions() {
+        for (int i = 0, n = attachedPartitions.size(); i < n; i += LONGS_PER_TX_ATTACHED_PARTITION) {
+            if (isPartitionParquetByRawIndex(i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public void initPartitionBy(int timestampType, int partitionBy) {
+        this.timestampType = timestampType;
+        this.partitionBy = partitionBy;
+        this.partitionFloorMethod = PartitionBy.getPartitionFloorMethod(timestampType, partitionBy);
+        this.partitionCeilMethod = PartitionBy.getPartitionCeilMethod(timestampType, partitionBy);
+
+        if (!PartitionBy.isPartitioned(partitionBy)) {
+            // Add transient row count as the only partition in attached partitions list
+            attachedPartitions.setPos(LONGS_PER_TX_ATTACHED_PARTITION);
+            initPartitionAt(0, DEFAULT_PARTITION_TIMESTAMP, transientRowCount, -1L);
+        }
+    }
+
+    public void initRO(MemoryMR txnFile) {
+        requireInitialChecksumVerification();
+        this.roTxMemBase = txnFile;
+    }
+
+    public boolean isLagOrdered() {
+        return lagOrdered;
+    }
+
+    /**
+     * The {@code _geometry.<generation>} file a slot-3 geometry pointer names.
+     */
+    public static int geometryGeneration(long geometryRef) {
+        return (int) ((geometryRef & PARTITION_GEOMETRY_GENERATION_MASK) >>> PARTITION_GEOMETRY_GENERATION_BIT_OFFSET);
+    }
+
+    public static long geometryOffset(long geometryRef) {
+        return (geometryRef & PARTITION_GEOMETRY_OFFSET_MASK) << PARTITION_GEOMETRY_OFFSET_UNIT_SHIFT;
+    }
+
+    /**
+     * Whether the {@code _txn} image of {@code size} bytes at {@code addr} lists the partition version, in the area
+     * its version word selects. The partition table is sorted by timestamp, as {@link TxWriter} keeps it. An image
+     * too short for that area, or whose partition table is not a whole number of entries, counts as listing it.
+     */
+    public static boolean imageListsPartition(long addr, long size, long partitionTimestamp, long partitionNameTxn) {
+        if (size < TX_BASE_HEADER_SIZE) {
+            return true;
+        }
+        final boolean isA = (Unsafe.getUnsafe().getLong(addr + TX_BASE_OFFSET_VERSION_64) & 1) == 0;
+        final long baseOffset = Unsafe.getUnsafe().getInt(addr + (isA ? TX_BASE_OFFSET_A_32 : TX_BASE_OFFSET_B_32));
+        final int symbolsSize = Unsafe.getUnsafe().getInt(addr + (isA ? TX_BASE_OFFSET_SYMBOLS_SIZE_A_32 : TX_BASE_OFFSET_SYMBOLS_SIZE_B_32));
+        final int partitionsSize = Unsafe.getUnsafe().getInt(addr + (isA ? TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 : TX_BASE_OFFSET_PARTITIONS_SIZE_B_32));
+        final long lo = baseOffset + getPartitionTableSizeOffset(symbolsSize / Long.BYTES) + Integer.BYTES;
+        final int entryBytes = LONGS_PER_TX_ATTACHED_PARTITION * Long.BYTES;
+        if (baseOffset < 0 || symbolsSize < 0 || partitionsSize < 0 || partitionsSize % entryBytes != 0 || lo + partitionsSize > size) {
+            return true;
+        }
+        // Lower bound: the first entry whose timestamp is not below the one sought.
+        final long tableAddr = addr + lo;
+        int low = 0;
+        int high = partitionsSize / entryBytes;
+        while (low < high) {
+            final int mid = (low + high) >>> 1;
+            if (Unsafe.getUnsafe().getLong(tableAddr + (long) mid * entryBytes + PARTITION_TS_OFFSET * Long.BYTES) < partitionTimestamp) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        for (long p = tableAddr + (long) low * entryBytes, hi = tableAddr + partitionsSize;
+             p < hi && Unsafe.getUnsafe().getLong(p + PARTITION_TS_OFFSET * Long.BYTES) == partitionTimestamp;
+             p += entryBytes) {
+            if (Unsafe.getUnsafe().getLong(p + PARTITION_NAME_TX_OFFSET * Long.BYTES) == partitionNameTxn) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Packs a slot-3 geometry pointer from its components.
+     *
+     * @param byteOffset must be 8-byte aligned, as every real geometry record start is
+     */
+    @TestOnly
+    public static long packGeometryRef(int generation, long byteOffset) {
+        assert generation >= 0 && generation <= PARTITION_GEOMETRY_MAX_GENERATION : "generation out of range";
+        assert (byteOffset & ((1L << PARTITION_GEOMETRY_OFFSET_UNIT_SHIFT) - 1)) == 0 : "byteOffset must be 8-byte aligned";
+        final long packedOffset = byteOffset >>> PARTITION_GEOMETRY_OFFSET_UNIT_SHIFT;
+        assert (packedOffset & ~PARTITION_GEOMETRY_OFFSET_MASK) == 0 : "byteOffset out of range";
+        return PARTITION_COMPOSITE_FLAG
+                | ((long) generation << PARTITION_GEOMETRY_GENERATION_BIT_OFFSET)
+                | packedOffset;
+    }
+
+    public long getGeometryRef(int partitionIndex) {
+        final int rawIndex = partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION;
+        if (!isPartitionCompositeByRawIndex(rawIndex)) {
+            // -1 is the "no committed geometry record yet" sentinel that starts a chain at offset 0 of the first
+            // generation with no file in the directory - see PartitionGeometry#publish.
+            return -1L;
+        }
+        // Strip the flags that are not ours - REMOTE and SEQ_TXN_VALID share this word - so a ref only
+        // ever carries COMPOSITE, its generation and its offset.
+        return getPartitionOffset3(rawIndex)
+                & (PARTITION_COMPOSITE_FLAG | PARTITION_GEOMETRY_GENERATION_MASK | PARTITION_GEOMETRY_OFFSET_MASK);
+    }
+
+    /**
+     * Whether the partition is composite - has a {@code _geometry} record to resolve.
+     */
+    public boolean isPartitionComposite(int partitionIndex) {
+        return isPartitionCompositeByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public boolean isPartitionCompositeByRawIndex(int indexRaw) {
+        if (isPartitionParquetByRawIndex(indexRaw) || isPartitionParquetGeneratedByRawIndex(indexRaw)) {
+            return false;
+        }
+        // getPartitionOffset3 folds the cleared 0L/-1L sentinels to 0, so a legacy all-ones word
+        // (which has bit 61 set) never reads as composite.
+        return (getPartitionOffset3(indexRaw) & PARTITION_COMPOSITE_FLAG) != 0;
+    }
+
+    public boolean isPartitionParquet(int i) {
+        return isPartitionParquetByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public boolean isPartitionParquetByPartitionTimestamp(long ts) {
+        int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
+        if (indexRaw > -1) {
+            return isPartitionParquetByRawIndex(indexRaw);
+        }
+        return false;
+    }
+
+    public boolean isPartitionParquetByRawIndex(int indexRaw) {
+        return checkPartitionOptionBit(indexRaw, PARTITION_MASK_PARQUET_FORMAT_BIT_OFFSET);
+    }
+
+    public boolean isPartitionParquetGenerated(int i) {
+        return isPartitionParquetGeneratedByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public boolean isPartitionReadOnly(int i) {
+        return isPartitionReadOnlyByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public boolean isPartitionReadOnlyByPartitionTimestamp(long ts) {
+        int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
+        if (indexRaw > -1) {
+            return isPartitionReadOnlyByRawIndex(indexRaw);
+        }
+        return false;
+    }
+
+    public boolean isPartitionReadOnlyByRawIndex(int indexRaw) {
+        return checkPartitionOptionBit(indexRaw, PARTITION_MASK_READ_ONLY_BIT_OFFSET);
+    }
+
+    public boolean isPartitionRemote(int i) {
+        return isPartitionRemoteByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public boolean isPartitionRemoteByPartitionTimestamp(long ts) {
+        int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
+        if (indexRaw > -1) {
+            return isPartitionRemoteByRawIndex(indexRaw);
+        }
+        return false;
+    }
+
+    public boolean isPartitionRemoteByRawIndex(int indexRaw) {
+        return (getPartitionOffset3(indexRaw) & PARTITION_REMOTE_BIT) != 0;
+    }
+
+    public boolean isPartitionRemotelyServed(int i) {
+        return isPartitionParquet(i) && !isPartitionParquetGenerated(i) && isPartitionRemote(i);
+    }
+
+    /**
+     * Copies all _txn values from the given reader.
+     */
+    public void loadAllFrom(TxReader srcReader) {
+        // The following three fields are temporary fields used when reading mmapped _txn file,
+        // so they're not mandatory to copy. Yet, we include them for the sake of copy completeness.
+        this.baseOffset = srcReader.baseOffset;
+        this.size = srcReader.size;
+        this.attachedPartitionsSize = srcReader.attachedPartitionsSize;
+
+        this.partitionBy = srcReader.partitionBy;
+        this.partitionFloorMethod = srcReader.partitionFloorMethod;
+        this.partitionCeilMethod = srcReader.partitionCeilMethod;
+
+        this.version = srcReader.version;
+        this.symbolsSize = srcReader.symbolsSize;
+        this.partitionSegmentSize = srcReader.partitionSegmentSize;
+
+        this.txn = srcReader.txn;
+        this.transientRowCount = srcReader.transientRowCount;
+        this.fixedRowCount = srcReader.fixedRowCount;
+        this.minTimestamp = srcReader.minTimestamp;
+        this.maxTimestamp = srcReader.maxTimestamp;
+        this.structureVersion = srcReader.structureVersion;
+        this.dataVersion = srcReader.dataVersion;
+        this.partitionTableVersion = srcReader.partitionTableVersion;
+        this.geometryVersion = srcReader.geometryVersion;
+        this.columnVersion = srcReader.columnVersion;
+        this.truncateVersion = srcReader.truncateVersion;
+        this.seqTxn = srcReader.seqTxn;
+        this.lagRowCount = srcReader.lagRowCount;
+        this.lagMinTimestamp = srcReader.lagMinTimestamp;
+        this.lagMaxTimestamp = srcReader.lagMaxTimestamp;
+        this.lagOrdered = srcReader.lagOrdered;
+        this.lagTxnCount = srcReader.lagTxnCount;
+        this.symbolColumnCount = srcReader.symbolColumnCount;
+
+        symbolCountSnapshot.clear();
+        symbolCountSnapshot.addAll(srcReader.symbolCountSnapshot);
+
+        attachedPartitions.clear();
+        attachedPartitions.addAll(srcReader.attachedPartitions);
+    }
+
+    public TxReader ofRO(@Transient LPSZ path, int timestampType, int partitionBy) {
+        clear();
+        try {
+            openTxnFile(ff, path);
+            initPartitionBy(timestampType, partitionBy);
+        } catch (Throwable e) {
+            close();
+            throw e;
+        }
+        return this;
+    }
+
+    @Override
+    public String toString() {
+        // Used for debugging, don't use Misc.getThreadLocalSink() to not mess with other debugging values
+        TimestampDriver timestampDriver = ColumnType.getTimestampDriver(timestampType);
+        StringSink sink = new StringSink();
+        sink.put("{");
+        sink.put("txn: ").put(txn);
+        sink.put(", attachedPartitions: [");
+        for (int i = 0; i < attachedPartitions.size(); i += LONGS_PER_TX_ATTACHED_PARTITION) {
+            long timestamp = getPartitionTimestampByIndex(i / LONGS_PER_TX_ATTACHED_PARTITION);
+            long rowCount = attachedPartitions.getQuick(i + PARTITION_MASKED_SIZE_OFFSET) & PARTITION_SIZE_MASK;
+
+            if (i / LONGS_PER_TX_ATTACHED_PARTITION == getPartitionCount()) {
+                rowCount = transientRowCount;
             }
 
-            this.transientRowCount = getLong(TX_OFFSET_TRANSIENT_ROW_COUNT_64);
-            this.fixedRowCount = getLong(TX_OFFSET_FIXED_ROW_COUNT_64);
-            this.minTimestamp = getLong(TX_OFFSET_MIN_TIMESTAMP_64);
-            this.maxTimestamp = getLong(TX_OFFSET_MAX_TIMESTAMP_64);
-            this.dataVersion = getLong(TX_OFFSET_DATA_VERSION_64);
-            this.structureVersion = getLong(TX_OFFSET_STRUCT_VERSION_64);
-            final long prevPartitionTableVersion = this.partitionTableVersion;
-            this.partitionTableVersion = getLong(TableUtils.TX_OFFSET_PARTITION_TABLE_VERSION_64);
-            final long prevColumnVersion = this.columnVersion;
-            this.columnVersion = unsafeReadColumnVersion();
-            this.truncateVersion = getLong(TableUtils.TX_OFFSET_TRUNCATE_VERSION_64);
-            this.symbolColumnCount = this.symbolsSize / 8;
+            long nameTxn = getPartitionNameTxnByRawIndex(i);
+            long parquetSize = getPartitionVersionByRawIndex(i);
 
-            unsafeLoadSymbolCounts(symbolColumnCount);
-            unsafeLoadPartitions(prevPartitionTableVersion, prevColumnVersion, partitionSegmentSize);
+            if (i > 0) {
+                sink.put(",");
+            }
+            sink.put("\n{ts: '");
 
-            Unsafe.getUnsafe().loadFence();
-            if (version == unsafeReadVersion()) {
-                return true;
+            timestampDriver.append(sink, timestamp);
+            sink.put("', rowCount: ").put(rowCount);
+            sink.put(", nameTxn: ").put(nameTxn);
+            if (isPartitionParquet(i / LONGS_PER_TX_ATTACHED_PARTITION)) {
+                sink.put(", parquetSize: ").put(parquetSize);
+            }
+            if (isPartitionReadOnlyByRawIndex(i)) {
+                sink.put(", readOnly=true");
+            }
+            sink.put("}");
+        }
+        sink.put("\n], transientRowCount: ").put(transientRowCount);
+        sink.put(", fixedRowCount: ").put(fixedRowCount);
+        sink.put(", minTimestamp: '");
+        timestampDriver.append(sink, minTimestamp);
+        sink.put("', maxTimestamp: '");
+        timestampDriver.append(sink, maxTimestamp);
+        sink.put("', dataVersion: ").put(dataVersion);
+        sink.put(", structureVersion: ").put(structureVersion);
+        sink.put(", partitionTableVersion: ").put(partitionTableVersion);
+        sink.put(", geometryVersion: ").put(geometryVersion);
+        sink.put(", columnVersion: ").put(columnVersion);
+        sink.put(", truncateVersion: ").put(truncateVersion);
+        sink.put(", seqTxn: ").put(seqTxn);
+        sink.put(", symbolColumnCount: ").put(symbolColumnCount);
+        sink.put(", lagRowCount: ").put(lagRowCount);
+        sink.put(", lagMinTimestamp: '");
+        timestampDriver.append(sink, lagMinTimestamp);
+        sink.put("', lagMaxTimestamp: '");
+        timestampDriver.append(sink, lagMaxTimestamp);
+        sink.put("', lagTxnCount: ").put(lagTxnCount);
+        sink.put(", lagOrdered: ").put(lagOrdered);
+        sink.put("}");
+        return sink.toString();
+    }
+
+    public boolean unsafeLoadAll() {
+        if (unsafeReadLiveAreaGeometry()) {
+            final long selectedVersion = version;
+            final int liveBaseOffset = baseOffset;
+            final long liveSize = size;
+            if (isInitialChecksumVerificationRequired) {
+                // A prior row-count-only read or copied snapshot is not initial integrity validation.
+                partitionTableVersion = -1;
+                attachedPartitionsSize = -1;
+            }
+            if (unsafeMapArea(baseOffset, size)
+                    && unsafeLoadAreaFields()
+                    && (!isInitialChecksumVerificationRequired || unsafeVerifyBodyChecksum())) {
+                Unsafe.loadFence();
+                if (selectedVersion == unsafeReadVersion()) {
+                    isInitialChecksumVerificationRequired = false;
+                    return true;
+                }
+            } else {
+                Unsafe.loadFence();
+                if (selectedVersion == unsafeReadVersion()) {
+                    // Stable version with a torn selected area: try the settled previous A/B record.
+                    //noinspection NonAtomicOperationOnVolatileField
+                    bodyChecksumFallbackCount++;
+                    final boolean otherOk = unsafeLoadAndVerifyOtherArea(selectedVersion);
+                    Unsafe.loadFence();
+                    if (selectedVersion == unsafeReadVersion()) {
+                        if (otherOk) {
+                            return true;
+                        }
+                        clearData();
+                        throw CairoException.critical(0)
+                                .put("_txn body checksum mismatch in both A and B areas [baseOffset=").put(liveBaseOffset)
+                                .put(", size=").put(liveSize)
+                                .put(", version=").put(selectedVersion)
+                                .put(']');
+                    }
+                }
             }
         }
 
@@ -231,58 +920,245 @@ public class TxReader implements Closeable, Mutable {
         return false;
     }
 
+    /**
+     * Loads all fields, symbol counts and partitions for the area currently described by
+     * {@link #baseOffset}/{@link #symbolsSize}/{@link #partitionSegmentSize}/{@link #size}/{@link #version}
+     * into {@code this}. Returns {@code false} if the area fails its internal txn guard
+     * (stored txn != version), which indicates a torn/garbage area.
+     */
+    private boolean unsafeLoadAreaFields() {
+        txn = version;
+        if (txn != getLong(TX_OFFSET_TXN_64)) {
+            return false;
+        }
+
+        transientRowCount = getLong(TX_OFFSET_TRANSIENT_ROW_COUNT_64);
+        fixedRowCount = getLong(TX_OFFSET_FIXED_ROW_COUNT_64);
+        minTimestamp = getLong(TX_OFFSET_MIN_TIMESTAMP_64);
+        maxTimestamp = getLong(TX_OFFSET_MAX_TIMESTAMP_64);
+        dataVersion = getLong(TX_OFFSET_DATA_VERSION_64);
+        structureVersion = getLong(TX_OFFSET_STRUCT_VERSION_64);
+        final long prevPartitionTableVersion = partitionTableVersion;
+        partitionTableVersion = getLong(TableUtils.TX_OFFSET_PARTITION_TABLE_VERSION_64);
+        final long prevColumnVersion = this.columnVersion;
+        columnVersion = unsafeReadColumnVersion();
+        truncateVersion = getLong(TableUtils.TX_OFFSET_TRUNCATE_VERSION_64);
+        seqTxn = getLong(TX_OFFSET_SEQ_TXN_64);
+        geometryVersion = unsafeReadGeometryVersion();
+        if (geometryVersion < 0) {
+            return false;
+        }
+        symbolColumnCount = symbolsSize / Long.BYTES;
+        lagRowCount = getInt(TX_OFFSET_LAG_ROW_COUNT_32);
+        lagMinTimestamp = getLong(TX_OFFSET_LAG_MIN_TIMESTAMP_64);
+        lagMaxTimestamp = getLong(TX_OFFSET_LAG_MAX_TIMESTAMP_64);
+        int lagTxnCountRaw = getInt(TX_OFFSET_LAG_TXN_COUNT_32);
+        lagTxnCount = Math.abs(lagTxnCountRaw);
+        lagOrdered = lagTxnCountRaw > -1;
+        unsafeLoadSymbolCounts(symbolColumnCount);
+        unsafeLoadPartitions(prevPartitionTableVersion, prevColumnVersion, partitionSegmentSize);
+        return true;
+    }
+
+    /**
+     * Points the geometry at the other A/B area (the previous commit) and loads and verifies it: the fallback
+     * when the selected area is torn under a stable version. Forces a full partition reload, since the failed
+     * load may have left the partition list partial. Returns true only if the other area loads and its body
+     * checksum matches, or its stamp is absent or stale. Call it only after confirming the version is stable,
+     * so the other area is the settled previous commit, not one the writer is writing.
+     */
+    private boolean unsafeLoadAndVerifyOtherArea(long selectedVersion) {
+        // Recovering the previous area does not validate the live one. Keep checking until a stable,
+        // valid live record loads, even if the fallback itself succeeds.
+        requireInitialChecksumVerification();
+        // The selected area used slot (selectedVersion & 1); the prior commit lives in the opposite slot
+        // and carries selectedVersion - 1. Re-point geometry at it.
+        boolean otherIsA = (selectedVersion & 1) != 0;
+        long otherBaseOffset = otherIsA ? roTxMemBase.getInt(TX_BASE_OFFSET_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_B_32);
+        int otherSymbolsSize = otherIsA ? roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_B_32);
+        int otherPartitionSegmentSize = otherIsA ? roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_B_32);
+        long otherSize = calculateTxRecordSize(otherSymbolsSize, otherPartitionSegmentSize);
+        // The load mapped the file only up to the end of the live area. Once a table has enough partitions,
+        // the previous area lies past it, so map it too: skipping it would call an intact record torn.
+        if (!unsafeMapArea(otherBaseOffset, otherSize)) {
+            return false;
+        }
+
+        baseOffset = (int) otherBaseOffset;
+        symbolsSize = otherSymbolsSize;
+        partitionSegmentSize = otherPartitionSegmentSize;
+        size = otherSize;
+        // The prior commit's txn equals its version (selectedVersion - 1); unsafeLoadAreaFields uses `version`
+        // for its stored-txn guard.
+        version = selectedVersion - 1;
+        // Force a full partition reload: the failed primary load may have left attachedPartitions partial.
+        partitionTableVersion = -1;
+        attachedPartitionsSize = -1;
+
+        return unsafeLoadAreaFields() && unsafeVerifyBodyChecksum();
+    }
+
+    /**
+     * Verifies the complete commit-immutable body on first open and A/B fallback. Live reader reloads
+     * use the transaction publication protocol without continuous corruption detection.
+     * {@link #unsafeIsLiveAreaTorn()} also performs full verification for explicit diagnosis.
+     * <p>
+     * A missing or stale stamp leaves the record unverified. A matching stamp names both this record and
+     * its checksum coverage; a zero or mismatched checksum then means tearing, not legacy data.
+     * <p>
+     * Race-free with concurrent writers: every covered byte and the stamp changes only ahead of a version
+     * bump, and the caller re-checks the version after this returns.
+     */
+    private boolean unsafeVerifyBodyChecksum() {
+        // The stamp decides. If it does not name this record, no checksum was written for it (a released
+        // record), so the slot says nothing about it. If it does, a checksum was written, and a zero or wrong
+        // slot is a torn write.
+        if (!unsafeChecksumStampNamesThisRecord(baseOffset, roTxMemBase.getLong(baseOffset + TX_OFFSET_TXN_64))) {
+            return true;
+        }
+        return roTxMemBase.getLong(baseOffset + TX_OFFSET_BODY_CHECKSUM_64) == calculateTxnBodyChecksum(
+                roTxMemBase.addressOf(baseOffset),
+                size,
+                getPartitionTableSizeOffset(symbolColumnCount)
+        );
+    }
+
+    /**
+     * True when the checksum slot at {@code areaBaseOffset} was written for the record now occupying that
+     * area. A released record never wrote the slot, see {@link TableUtils#TX_BODY_CHECKSUM_STAMP_XOR}.
+     * <p>
+     * 0 remains the "no stamp" sentinel for legacy and freshly reset records. One txn in 2^32 therefore
+     * goes unverified, when its encoded stamp is zero.
+     */
+    private boolean unsafeChecksumStampNamesThisRecord(long areaBaseOffset, long areaTxn) {
+        final int stamp = roTxMemBase.getInt(areaBaseOffset + TX_OFFSET_BODY_CHECKSUM_STAMP_32);
+        return stamp != 0 && (stamp == ((int) areaTxn ^ TX_BODY_CHECKSUM_STAMP_XOR)
+                || stamp == ((int) areaTxn ^ TX_BODY_CHECKSUM_LEGACY_STAMP_XOR));
+    }
+
+    /**
+     * Diagnosis for a reader that has already given up: is the version-selected (live) A/B area of {@code _txn}
+     * torn? True when that area fails its internal txn guard or its body checksum <i>under a version that does
+     * not move across the check</i>, the standard {@link #unsafeLoadAll()} uses to tell genuine tearing
+     * from a concurrent commit. A moving version means contention, and this returns false.
+     * <p>
+     * A torn live area is not a dead end for {@code unsafeLoadAll()}: it falls back to the intact previous area
+     * and returns that. But the previous area carries the previous txn, which a live scoreboard refuses, so the
+     * caller's retry loop cannot make progress and times out looking like contention. Callers use this on their
+     * deadline path to name the corruption instead.
+     * <p>
+     * Touches none of the load state, so a caller may use it on an in-use reader. Like a load, it may grow the
+     * mapping to reach the live area. The healthy path never calls it.
+     */
+    public boolean unsafeIsLiveAreaTorn() {
+        final long selectedVersion = unsafeReadVersion();
+        Unsafe.loadFence();
+
+        final boolean isA = (selectedVersion & 1) == 0;
+        final long areaBaseOffset = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_B_32);
+        final int areaSymbolsSize = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_B_32);
+        final int areaPartitionSegmentSize = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_B_32);
+        final long areaSize = calculateTxRecordSize(areaSymbolsSize, areaPartitionSegmentSize);
+
+        final boolean intact;
+        if (!unsafeMapArea(areaBaseOffset, areaSize)) {
+            // The header's own geometry does not fit the file: torn, and not something to read further. The
+            // file length decides, not this reader's mapping: a commit since the last load can move the live
+            // area past the mapping, and that area is not torn.
+            intact = false;
+        } else if (roTxMemBase.getLong(areaBaseOffset + TX_OFFSET_TXN_64) != selectedVersion) {
+            intact = false;
+        } else if (unsafeReadGeometryVersion(areaBaseOffset, selectedVersion) < 0) {
+            // The load path rejects a checksummed record whose geometry stamp names another txn; agree with it.
+            intact = false;
+        } else {
+            // Explicit diagnosis checks the full body even after initial verification has completed.
+            intact = !unsafeChecksumStampNamesThisRecord(areaBaseOffset, selectedVersion)
+                    || roTxMemBase.getLong(areaBaseOffset + TX_OFFSET_BODY_CHECKSUM_64) == calculateTxnBodyChecksum(
+                    roTxMemBase.addressOf(areaBaseOffset),
+                    areaSize,
+                    getPartitionTableSizeOffset(areaSymbolsSize / Long.BYTES)
+            );
+        }
+
+        Unsafe.loadFence();
+        // Only a mismatch under a stable version is tearing; if the version moved, a writer was mid-commit.
+        return !intact && selectedVersion == unsafeReadVersion();
+    }
+
+    /**
+     * Selects the version-selected area and maps it. Returns false when the version moves while its geometry
+     * is read, and also when that geometry points past the end of the file, which only a crash leaves behind.
+     */
+    public boolean unsafeLoadBaseOffset() {
+        return unsafeReadLiveAreaGeometry() && unsafeMapArea(baseOffset, size);
+    }
+
+    public long unsafeLoadRowCount() {
+        if (unsafeLoadBaseOffset()) {
+            txn = version;
+            if (txn != getLong(TX_OFFSET_TXN_64)) {
+                return -1;
+            }
+
+            final long prevPartitionTableVersion = partitionTableVersion;
+            final long prevColumnVersion = this.columnVersion;
+            unsafeLoadPartitions(prevPartitionTableVersion, prevColumnVersion, partitionSegmentSize);
+            transientRowCount = getLong(TX_OFFSET_TRANSIENT_ROW_COUNT_64);
+            fixedRowCount = getLong(TX_OFFSET_FIXED_ROW_COUNT_64);
+
+            Unsafe.loadFence();
+            if (version == unsafeReadVersion()) {
+                return getRowCount();
+            }
+        }
+
+        clearData();
+        return -1;
+    }
+
     public long unsafeReadColumnVersion() {
         return getLong(TX_OFFSET_COLUMN_VERSION_64);
     }
 
-    public long getLastPartitionTimestamp() {
-        if (PartitionBy.isPartitioned(partitionBy)) {
-            return getPartitionTimestampLo(maxTimestamp);
-        }
-        return DEFAULT_PARTITION_TIMESTAMP;
+    private int unsafeReadGeometryVersion() {
+        return unsafeReadGeometryVersion(baseOffset, txn);
     }
 
-    public void initRO(MemoryMR txnFile, int partitionBy) {
-        roTxMemBase = txnFile;
-        this.partitionFloorMethod = PartitionBy.getPartitionFloorMethod(partitionBy);
-        this.partitionBy = partitionBy;
-    }
-
-    public TxReader ofRO(@Transient Path path, int partitionBy) {
-        clear();
-        int tableRootLen = path.length();
-        try {
-            openTxnFile(ff, path);
-            this.partitionFloorMethod = PartitionBy.getPartitionFloorMethod(partitionBy);
-            this.partitionBy = partitionBy;
-        } catch (Throwable e) {
-            close();
-            path.trimTo(tableRootLen);
-            throw e;
+    /**
+     * The geometry version of the record at {@code areaBaseOffset}, whose txn (equal to the version that
+     * selects it, so also its A/B slot parity) is {@code areaTxn}. Returns -1 for a record that carries a
+     * body-checksum stamp but whose base-header geometry slot does not name it: every publication of an
+     * area stamps both, so that is tearing. Every other record yields a value in [0, Integer.MAX_VALUE], so a
+     * negative result means tearing and nothing else. Touches no load state.
+     */
+    private int unsafeReadGeometryVersion(long areaBaseOffset, long areaTxn) {
+        final boolean isA = (areaTxn & 1) == 0;
+        final long geometryOffset = isA
+                ? TX_BASE_OFFSET_GEOMETRY_VERSION_A_32
+                : TX_BASE_OFFSET_GEOMETRY_VERSION_B_32;
+        final long stampOffset = isA
+                ? TX_BASE_OFFSET_GEOMETRY_VERSION_STAMP_A_32
+                : TX_BASE_OFFSET_GEOMETRY_VERSION_STAMP_B_32;
+        final int stamp = roTxMemBase.getInt(stampOffset);
+        if (stamp != 0 && stamp == ((int) areaTxn ^ TX_GEOMETRY_VERSION_STAMP_XOR)) {
+            return roTxMemBase.getInt(geometryOffset);
         }
-        return this;
-    }
-
-    public boolean unsafeLoadBaseOffset() {
-        this.version = unsafeReadVersion();
-        Unsafe.getUnsafe().loadFence();
-
-        boolean isA = (version & 1L) == 0L;
-        this.baseOffset = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_B_32);
-        this.symbolsSize = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_B_32);
-        this.partitionSegmentSize = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_B_32);
-
-        // Before extending file, check that values read are not dirty
-        Unsafe.getUnsafe().loadFence();
-        if (unsafeReadVersion() != version) {
-            return false;
+        final int bodyStamp = roTxMemBase.getInt(areaBaseOffset + TX_OFFSET_BODY_CHECKSUM_STAMP_32);
+        if (bodyStamp != 0 && bodyStamp == ((int) areaTxn ^ TX_BODY_CHECKSUM_STAMP_XOR)) {
+            // A merged-format record must have a matching base-header geometry slot. Treat its absence as tearing.
+            return -1;
         }
-
-        this.size = calculateTxRecordSize(symbolsSize, partitionSegmentSize);
-        if (this.size + this.baseOffset > roTxMemBase.size()) {
-            roTxMemBase.extend(this.size + this.baseOffset);
+        // A pre-merge adaptive record has the legacy body-checksum stamp and no geometry field.
+        if (bodyStamp != 0 && bodyStamp == ((int) areaTxn ^ TX_BODY_CHECKSUM_LEGACY_STAMP_XOR)) {
+            return 0;
         }
-        return true;
+        // A record without a stamp keeps geometryVersion in the legacy body slot, which only 10.1.0 writes. Older
+        // releases never write [116,128), so their records hold stale bytes of an older, overlapping record there
+        // (often -1, the low word of an unset lagMinTimestamp), and 10.1.0 copies whatever it loaded into every
+        // later record. The value only keys the composite geometry cache, and the first commit moves it into the
+        // stamped base-header slot, so fold a negative value to 0 instead of reading it as tearing.
+        return Math.max(0, roTxMemBase.getInt(areaBaseOffset + TX_OFFSET_GEOMETRY_VERSION_32));
     }
 
     public int unsafeReadSymbolColumnCount() {
@@ -301,67 +1177,54 @@ public class TxReader implements Closeable, Mutable {
         return roTxMemBase.getLong(TX_BASE_OFFSET_VERSION_64);
     }
 
-    static int calculateTxRecordSize(int bytesSymbols, int bytesPartitions) {
-        return TX_RECORD_HEADER_SIZE + 4 + bytesSymbols + 4 + bytesPartitions;
-    }
-
-    private void clearData() {
-        baseOffset = 0;
-        size = 0;
-        partitionTableVersion = -1;
-        attachedPartitionsSize = -1;
-        attachedPartitions.clear();
-        version = -1;
-    }
-
-    private int findAttachedPartitionIndex(long ts) {
-        return findAttachedPartitionIndexByLoTimestamp(getPartitionTimestampLo(ts));
-    }
-
-    int findAttachedPartitionIndexByLoTimestamp(long ts) {
-        // Start from the end, usually it will be last partition searched / appended
-        return attachedPartitions.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, ts, BinarySearch.SCAN_UP);
-    }
-
-    protected long getPartitionTimestampLo(long timestamp) {
-        return partitionFloorMethod != null ? (timestamp != Long.MIN_VALUE ? partitionFloorMethod.floor(timestamp) : Long.MIN_VALUE) : DEFAULT_PARTITION_TIMESTAMP;
-    }
-
-    protected void initPartitionAt(int index, long partitionTimestampLo, long partitionSize, long columnVersion) {
-        attachedPartitions.setQuick(index + PARTITION_TS_OFFSET, partitionTimestampLo);
-        attachedPartitions.setQuick(index + PARTITION_SIZE_OFFSET, partitionSize);
-        attachedPartitions.setQuick(index + PARTITION_NAME_TX_OFFSET, -1);
-        attachedPartitions.setQuick(index + PARTITION_COLUMN_VERSION_OFFSET, columnVersion);
-    }
-
-    private void openTxnFile(FilesFacade ff, Path path) {
-        int pathLen = path.length();
-        try {
-            if (ff.exists(path.concat(TXN_FILE_NAME).$())) {
-                if (roTxMemBase == null) {
-                    roTxMemBase = Vm.getMRInstance(ff, path, ff.length(path), MemoryTag.MMAP_DEFAULT);
-                } else {
-                    roTxMemBase.of(ff, path, ff.getPageSize(), ff.length(path), MemoryTag.MMAP_DEFAULT);
-                }
-                return;
-            }
-            throw CairoException.instance(ff.errno()).put("Cannot append. File does not exist: ").put(path);
-        } finally {
-            path.trimTo(pathLen);
-        }
+    private boolean checkPartitionOptionBit(int indexRaw, int bitOffset) {
+        long maskedSize = attachedPartitions.getQuick(indexRaw + PARTITION_MASKED_SIZE_OFFSET);
+        return ((maskedSize >>> bitOffset) & 1) == 1;
     }
 
     private int getInt(long readOffset) {
-        assert readOffset + 4 <= size : "offset " + readOffset + ", size " + size + ", txn=" + txn;
+        assert readOffset + Integer.BYTES <= size : "offset " + readOffset + ", size " + size + ", txn=" + txn;
         return roTxMemBase.getInt(baseOffset + readOffset);
     }
 
-    protected long unsafeGetRawMemory() {
-        return roTxMemBase.getPageAddress(0);
+    private long getLong(long readOffset) {
+        assert readOffset + Long.BYTES <= size : "offset " + readOffset + ", size " + size + ", txn=" + txn;
+        return roTxMemBase.getLong(baseOffset + readOffset);
     }
 
-    protected long unsafeGetRawMemorySize() {
-        return this.size + this.baseOffset;
+    private long getPartitionVersionByRawIndex(int partitionRawIndex) {
+        final long word = attachedPartitions.getQuick(partitionRawIndex + PARTITION_VERSION_OFFSET);
+        return isPartitionOffset3Cleared(word) ? -1L : (word & PARTITION_VERSION_VALUE_MASK);
+    }
+
+    private boolean isPartitionParquetGeneratedByRawIndex(int indexRaw) {
+        return checkPartitionOptionBit(indexRaw, PARTITION_MASK_PARQUET_GENERATED_BIT_OFFSET);
+    }
+
+    private void openTxnFile(FilesFacade ff, LPSZ path) {
+        long len = ff.length(path);
+        // we check for length rather than file existence to account for possible delay
+        // in FS updating its catalog under pressure. Logically, the size of TXN file
+        // can never be less than the header. But async nature of FS updates have to be
+        // accounted for.
+        if (len >= TableUtils.TX_BASE_HEADER_SIZE) {
+            // This method is called from constructor, and it's possible that
+            // the code will run concurrently with table truncation. For that reason,
+            // we must not rely on the file size but only assume that header is present.
+            // The reload method will extend the file if needed.
+            long size = TableUtils.TX_BASE_HEADER_SIZE;
+            if (roTxMemBase == null) {
+                roTxMemBase = Vm.getCMRInstance(ff, path, size, MemoryTag.MMAP_DEFAULT);
+            } else {
+                roTxMemBase.of(ff, path, ff.getPageSize(), size, MemoryTag.MMAP_DEFAULT);
+            }
+            return;
+        }
+        throw CairoException.fileNotFound()
+                .put("could not open txn file [path=").put(path)
+                .put(", len=").put(len)
+                .put(", errno=").put(ff.errno())
+                .put(']');
     }
 
     private void unsafeLoadPartitions(long prevPartitionTableVersion, long prevColumnVersion, int partitionTableSize) {
@@ -370,33 +1233,182 @@ public class TxReader implements Closeable, Mutable {
             if (txAttachedPartitionsSize > 0) {
                 if (prevPartitionTableVersion != partitionTableVersion || prevColumnVersion != columnVersion) {
                     attachedPartitions.clear();
-                    unsafeLoadPartitions0(txAttachedPartitionsSize, 0);
+                    unsafeLoadPartitions0(0, txAttachedPartitionsSize);
                 } else {
                     if (attachedPartitionsSize < txAttachedPartitionsSize) {
                         unsafeLoadPartitions0(
-                                txAttachedPartitionsSize,
-                                Math.max(attachedPartitionsSize - LONGS_PER_TX_ATTACHED_PARTITION, 0)
+                                Math.max(attachedPartitionsSize - LONGS_PER_TX_ATTACHED_PARTITION, 0),
+                                txAttachedPartitionsSize
                         );
                     }
                 }
+                final int lastPartitionRawIndex = txAttachedPartitionsSize - LONGS_PER_TX_ATTACHED_PARTITION;
+                final long partitionTableOffset = getPartitionTableSizeOffset(symbolColumnCount) + Integer.BYTES;
+                // WAL appends can update the active partition's offset-1 flags and offset-3 word
+                // without changing partitionTableVersion, so refresh them alongside the transient row count.
                 attachedPartitions.setQuick(
-                        txAttachedPartitionsSize - LONGS_PER_TX_ATTACHED_PARTITION + PARTITION_SIZE_OFFSET,
-                        transientRowCount
+                        lastPartitionRawIndex + PARTITION_VERSION_OFFSET,
+                        getLong(partitionTableOffset + (lastPartitionRawIndex + PARTITION_VERSION_OFFSET) * Long.BYTES)
                 );
+                final int sizeOffset = lastPartitionRawIndex + PARTITION_MASKED_SIZE_OFFSET;
+                final long mask = getLong(partitionTableOffset + 8L * sizeOffset) & PARTITION_FLAGS_MASK;
+                attachedPartitions.setQuick(sizeOffset, mask | (transientRowCount & PARTITION_SIZE_MASK)); // preserve mask
+                attachedPartitions.setPos(txAttachedPartitionsSize);
             } else {
                 attachedPartitionsSize = 0;
                 attachedPartitions.clear();
             }
         } else {
-            // Add transient row count as the only partition in attached partitions list
+            // If partitionBy is NONE, we have no partitions, but we still need to
+            // have a single partition with transient row count.
             attachedPartitions.setPos(LONGS_PER_TX_ATTACHED_PARTITION);
-            initPartitionAt(0, DEFAULT_PARTITION_TIMESTAMP, transientRowCount, columnVersion);
+            initPartitionAt(0, DEFAULT_PARTITION_TIMESTAMP, transientRowCount, -1L);
+            attachedPartitionsSize = 1;
         }
     }
 
-    private long getLong(long readOffset) {
-        assert readOffset + 8 <= size : "offset " + readOffset + ", size " + size + ", txn=" + txn;
-        return roTxMemBase.getLong(baseOffset + readOffset);
+    private void unsafeLoadPartitions0(int lo, int hi) {
+        attachedPartitions.setPos(hi);
+        final long baseOffset = getPartitionTableSizeOffset(symbolColumnCount) + Integer.BYTES;
+        for (int i = lo; i < hi; i++) {
+            attachedPartitions.setQuick(i, getLong(baseOffset + 8L * i));
+        }
+        attachedPartitionsSize = hi;
+    }
+
+    private void unsafeLoadSymbolCounts(int symbolMapCount) {
+        symbolCountSnapshot.clear();
+        // No need to call setSize here, file mapped beyond symbol section already
+        // while reading attached partition count
+        for (int i = 0; i < symbolMapCount; i++) {
+            symbolCountSnapshot.add(getInt(TableUtils.getSymbolWriterIndexOffset(i)));
+        }
+    }
+
+    /**
+     * Extends the mapping to cover the A/B area at {@code [areaOffset, areaOffset + areaSize)}. Returns false,
+     * mapping nothing, when the area overlaps the header or reaches a page that lies wholly past the end of
+     * the file. The geometry comes from the header page, which a crash can make durable before the file grows
+     * to hold the area, and a read-only mapping faults on the first touch of such a page. The tail of the last
+     * page reads as zeros, as it always has. Only a growing mapping asks the file system for the length.
+     */
+    private boolean unsafeMapArea(long areaOffset, long areaSize) {
+        if (areaOffset < TX_BASE_HEADER_SIZE || areaSize < TX_RECORD_HEADER_SIZE) {
+            return false;
+        }
+        final long areaEnd = areaOffset + areaSize;
+        if (areaEnd > roTxMemBase.size()) {
+            if (areaEnd > Files.ceilPageSize(ff.length(roTxMemBase.getFd()))) {
+                return false;
+            }
+            roTxMemBase.extend(areaEnd);
+        }
+        return true;
+    }
+
+    /**
+     * Reads the version word and the geometry of the area it selects into {@link #version}, {@link #baseOffset},
+     * {@link #symbolsSize}, {@link #partitionSegmentSize} and {@link #size}. Returns false when the version
+     * moved while the geometry was read. Maps nothing: see {@link #unsafeMapArea(long, long)}.
+     */
+    private boolean unsafeReadLiveAreaGeometry() {
+        version = unsafeReadVersion();
+        Unsafe.loadFence();
+
+        boolean isA = (version & 1) == 0;
+        baseOffset = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_B_32);
+        symbolsSize = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_SYMBOLS_SIZE_B_32);
+        partitionSegmentSize = isA ? roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_A_32) : roTxMemBase.getInt(TX_BASE_OFFSET_PARTITIONS_SIZE_B_32);
+
+        // Before mapping the area, check that values read are not dirty
+        Unsafe.loadFence();
+        if (unsafeReadVersion() != version) {
+            return false;
+        }
+
+        size = calculateTxRecordSize(symbolsSize, partitionSegmentSize);
+        return true;
+    }
+
+    static int findPartitionRawIndex(LongList attachedPartitions, long partitionTimestamp) {
+        return attachedPartitions.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, partitionTimestamp, Vect.BIN_SEARCH_SCAN_UP);
+    }
+
+    static long getPartitionNameTxnByRawIndex(LongList attachedPartitions, int index) {
+        return attachedPartitions.getQuick(index + PARTITION_NAME_TX_OFFSET);
+    }
+
+    static long getPartitionSizeByRawIndex(LongList attachedPartitions, int index) {
+        return attachedPartitions.getQuick(index + PARTITION_MASKED_SIZE_OFFSET) & PARTITION_SIZE_MASK;
+    }
+
+    protected static boolean isPartitionOffset3Cleared(long word) {
+        return word == -1L || word == 0L;
+    }
+
+    void clearData() {
+        // Clearing a raced snapshot does not reopen the mapping or require another integrity scan.
+        baseOffset = 0;
+        size = 0;
+        partitionTableVersion = -1;
+        geometryVersion = -1;
+        attachedPartitionsSize = -1;
+        attachedPartitions.clear();
+        version = -1;
+        txn = -1;
+        seqTxn = -1;
+    }
+
+    protected int findAttachedPartitionRawIndex(long timestamp) {
+        int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(timestamp);
+        if (indexRaw > -1L) {
+            return indexRaw;
+        }
+
+        int prevIndexRaw = -indexRaw - 1 - LONGS_PER_TX_ATTACHED_PARTITION;
+        if (prevIndexRaw < 0) {
+            return -1;
+        }
+        long prevPartitionTimestamp = attachedPartitions.getQuick(prevIndexRaw + PARTITION_TS_OFFSET);
+        if (getPartitionFloor(prevPartitionTimestamp) == getPartitionFloor(timestamp)) {
+            return prevIndexRaw;
+        }
+        // Not found.
+        return -1;
+    }
+
+    int findAttachedPartitionRawIndexByLoTimestamp(long ts) {
+        // Start from the end, usually it will be last partition searched / appended
+        return attachedPartitions.binarySearchBlock(LONGS_PER_TX_ATTACHED_PARTITION_MSB, ts, Vect.BIN_SEARCH_SCAN_UP);
+    }
+
+    protected long getPartitionOffset3(int rawIndex) {
+        final long word = attachedPartitions.getQuick(rawIndex + PARTITION_VERSION_OFFSET);
+        return isPartitionOffset3Cleared(word) ? 0L : word;
+    }
+
+    int getPartitionSquashCountByRawIndex(int indexRaw) {
+        long partitionSizeMasked = attachedPartitions.getQuick(indexRaw + PARTITION_MASKED_SIZE_OFFSET);
+        return (int) ((partitionSizeMasked >>> PARTITION_SQUASH_COUNTER_BIT_OFFSET) & PARTITION_SQUASH_COUNTER_MAX);
+    }
+
+    protected void initPartitionAt(int index, long partitionTimestampLo, long partitionSize, long partitionNameTxn) {
+        attachedPartitions.setQuick(index + PARTITION_TS_OFFSET, partitionTimestampLo);
+        attachedPartitions.setQuick(index + PARTITION_MASKED_SIZE_OFFSET, partitionSize & PARTITION_SIZE_MASK);
+        attachedPartitions.setQuick(index + PARTITION_NAME_TX_OFFSET, partitionNameTxn);
+        attachedPartitions.setQuick(index + PARTITION_VERSION_OFFSET, 0L);
+    }
+
+    /**
+     * True when the loaded record carries a checksum stamp that names it, so the load verified its body
+     * checksum rather than skipping it. A record without one loads unverified, as legacy records do.
+     */
+    protected boolean isLoadedRecordChecksumVerified() {
+        return unsafeChecksumStampNamesThisRecord(baseOffset, txn);
+    }
+
+    protected void requireInitialChecksumVerification() {
+        isInitialChecksumVerificationRequired = true;
     }
 
     protected void switchRecord(int readBaseOffset, long readRecordSize) {
@@ -404,21 +1416,14 @@ public class TxReader implements Closeable, Mutable {
         size = readRecordSize;
     }
 
-    private void unsafeLoadPartitions0(int txAttachedPartitionsSize, int max) {
-        attachedPartitions.setPos(txAttachedPartitionsSize);
-        for (int i = max; i < txAttachedPartitionsSize; i++) {
-            attachedPartitions.setQuick(i, getLong(TableUtils.getPartitionTableIndexOffset(symbolColumnCount, i)));
-        }
-        attachedPartitionsSize = txAttachedPartitionsSize;
-    }
-
-    private void unsafeLoadSymbolCounts(int symbolMapCount) {
-        this.symbolCountSnapshot.clear();
-        // No need to call setSize here, file mapped beyond symbol section already
-        // while reading attached partition count
-        for (int i = 0; i < symbolMapCount; i++) {
-            symbolCountSnapshot.add(getInt(TableUtils.getSymbolWriterIndexOffset(i)));
-        }
+    /**
+     * Loads the record in the other A/B area, the one published just before the live record, in place of the
+     * live record, which may be intact. Returns false when that record fails to load or its checksum does not
+     * match; a record without a checksum stamp loads unverified, see {@link #isLoadedRecordChecksumVerified()}.
+     * For an exclusive owner of the file only: it does not bracket the load with version checks.
+     */
+    protected boolean unsafeLoadPreviousArea() {
+        return unsafeReadLiveAreaGeometry() && unsafeLoadAndVerifyOtherArea(version);
     }
 
     protected long unsafeReadFixedRowCount() {
@@ -427,43 +1432,5 @@ public class TxReader implements Closeable, Mutable {
 
     protected int unsafeReadSymbolWriterIndexOffset(int denseSymbolIndex) {
         return getInt(TableUtils.getSymbolWriterIndexOffset(denseSymbolIndex));
-    }
-
-    public void dumpTo(MemoryW mem) {
-        mem.putLong(TX_BASE_OFFSET_VERSION_64, version);
-        boolean isA = (version & 1L) == 0L;
-        int baseOffset = TX_BASE_HEADER_SIZE;
-        mem.putInt(isA ? TX_BASE_OFFSET_A_32 : TX_BASE_OFFSET_B_32, baseOffset);
-        mem.putInt(isA ? TX_BASE_OFFSET_SYMBOLS_SIZE_A_32 : TX_BASE_OFFSET_SYMBOLS_SIZE_B_32, symbolsSize);
-        mem.putInt(isA ? TX_BASE_OFFSET_PARTITIONS_SIZE_A_32 : TX_BASE_OFFSET_PARTITIONS_SIZE_B_32, partitionSegmentSize);
-
-        mem.putLong(baseOffset + TX_OFFSET_TXN_64, txn);
-        mem.putLong(baseOffset + TX_OFFSET_TRANSIENT_ROW_COUNT_64, transientRowCount);
-        mem.putLong(baseOffset + TX_OFFSET_FIXED_ROW_COUNT_64, fixedRowCount);
-        mem.putLong(baseOffset + TX_OFFSET_MIN_TIMESTAMP_64, minTimestamp);
-        mem.putLong(baseOffset + TX_OFFSET_MAX_TIMESTAMP_64, maxTimestamp);
-        mem.putLong(baseOffset + TX_OFFSET_DATA_VERSION_64, dataVersion);
-        mem.putLong(baseOffset + TX_OFFSET_STRUCT_VERSION_64, structureVersion);
-        mem.putLong(baseOffset + TX_OFFSET_PARTITION_TABLE_VERSION_64, partitionTableVersion);
-        mem.putLong(baseOffset + TX_OFFSET_COLUMN_VERSION_64, columnVersion);
-        mem.putLong(baseOffset + TX_OFFSET_TRUNCATE_VERSION_64, truncateVersion);
-        mem.putInt(baseOffset + TX_OFFSET_MAP_WRITER_COUNT_32, symbolColumnCount);
-
-        int symbolMapCount = symbolCountSnapshot.size();
-        for (int i = 0; i < symbolMapCount; i++) {
-            long offset = TableUtils.getSymbolWriterIndexOffset(i);
-            int symCount = symbolCountSnapshot.getQuick(i);
-            mem.putInt(baseOffset + offset, symCount);
-            offset += Integer.BYTES;
-            mem.putInt(baseOffset + offset, symCount);
-        }
-
-        final int size = attachedPartitions.size();
-        final long partitionTableOffset = TableUtils.getPartitionTableSizeOffset(symbolMapCount);
-        mem.putInt(baseOffset + partitionTableOffset, size * Long.BYTES);
-        for (int i = 0; i < size; i++) {
-            long offset = TableUtils.getPartitionTableIndexOffset(partitionTableOffset, i);
-            mem.putLong(baseOffset + offset, attachedPartitions.getQuick(i));
-        }
     }
 }

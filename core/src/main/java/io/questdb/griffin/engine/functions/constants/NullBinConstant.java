@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ package io.questdb.griffin.engine.functions.constants;
 
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.sql.Record;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.engine.functions.BinFunction;
 import io.questdb.std.BinarySequence;
 
@@ -41,5 +42,15 @@ public final class NullBinConstant extends BinFunction implements ConstantFuncti
     @Override
     public long getBinLen(Record rec) {
         return TableUtils.NULL_LEN;
+    }
+
+    @Override
+    public boolean isNullConstant() {
+        return true;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.val("null::binary");
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,18 +36,18 @@ import io.questdb.std.str.Path;
 import static io.questdb.cairo.TableUtils.*;
 
 final class Mig609 {
+    private static final Log LOG = LogFactory.getLog(EngineMigration.class);
     private static final long TX_OFFSET_FIXED_ROW_COUNT_505 = 16;
     private static final long TX_OFFSET_MAP_WRITER_COUNT_608 = 128;
-    private static final Log LOG = LogFactory.getLog(EngineMigration.class);
 
     static void migrate(MigrationContext migrationContext) {
         final FilesFacade ff = migrationContext.getFf();
         final Path path = migrationContext.getTablePath();
-        final int plen = path.length();
+        final int plen = path.size();
 
-        path.trimTo(plen).concat(META_FILE_NAME).$();
+        path.trimTo(plen).concat(META_FILE_NAME);
         try (MemoryMARW metaMem = migrationContext.getRwMemory()) {
-            metaMem.of(ff, path, ff.getPageSize(), ff.length(path), MemoryTag.NATIVE_DEFAULT);
+            metaMem.of(ff, path.$(), ff.getPageSize(), ff.length(path.$()), MemoryTag.NATIVE_MIG_MMAP);
 
             // we require partition by value to avoid processing non-partitioned tables
             final int partitionBy = metaMem.getInt(4);
@@ -56,8 +56,8 @@ final class Mig609 {
                     ff,
                     path.trimTo(plen).concat(TXN_FILE_NAME).$(),
                     ff.getPageSize(),
-                    ff.length(path),
-                    MemoryTag.NATIVE_DEFAULT,
+                    ff.length(path.$()),
+                    MemoryTag.NATIVE_MIG_MMAP,
                     migrationContext.getConfiguration().getWriterFileOpenOpts()
             )
             ) {

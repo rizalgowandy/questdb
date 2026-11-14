@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
-import io.questdb.griffin.SqlException;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.IntFunction;
@@ -53,10 +53,10 @@ public class StrPosFunctionFactory implements FunctionFactory {
             IntList argPositions,
             CairoConfiguration configuration,
             SqlExecutionContext sqlExecutionContext
-    ) throws SqlException {
+    ) {
         final Function substrFunc = args.getQuick(1);
         if (substrFunc.isConstant()) {
-            CharSequence substr = substrFunc.getStr(null);
+            CharSequence substr = substrFunc.getStrA(null);
             if (substr == null) {
                 return IntConstant.NULL;
             }
@@ -90,6 +90,36 @@ public class StrPosFunctionFactory implements FunctionFactory {
         return 0;
     }
 
+    public static class ConstFunc extends IntFunction implements UnaryFunction {
+
+        private final Function strFunc;
+        private final CharSequence substr;
+
+        public ConstFunc(Function strFunc, CharSequence substr) {
+            this.strFunc = strFunc;
+            this.substr = substr;
+        }
+
+        @Override
+        public Function getArg() {
+            return strFunc;
+        }
+
+        @Override
+        public int getInt(Record rec) {
+            final CharSequence str = this.strFunc.getStrA(rec);
+            if (str == null) {
+                return Numbers.INT_NULL;
+            }
+            return strpos(str, substr);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val("strpos(").val(strFunc).val(",'").val(substr).val("')");
+        }
+    }
+
     public static class Func extends IntFunction implements BinaryFunction {
 
         private final Function strFunc;
@@ -102,13 +132,13 @@ public class StrPosFunctionFactory implements FunctionFactory {
 
         @Override
         public int getInt(Record rec) {
-            final CharSequence str = this.strFunc.getStr(rec);
+            final CharSequence str = this.strFunc.getStrA(rec);
             if (str == null) {
-                return Numbers.INT_NaN;
+                return Numbers.INT_NULL;
             }
-            final CharSequence substr = this.substrFunc.getStr(rec);
+            final CharSequence substr = this.substrFunc.getStrA(rec);
             if (substr == null) {
-                return Numbers.INT_NaN;
+                return Numbers.INT_NULL;
             }
             return strpos(str, substr);
         }
@@ -119,33 +149,13 @@ public class StrPosFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public String getName() {
+            return "strpos";
+        }
+
+        @Override
         public Function getRight() {
             return substrFunc;
-        }
-    }
-
-    public static class ConstFunc extends IntFunction implements UnaryFunction {
-
-        private final Function strFunc;
-        private final CharSequence substr;
-
-        public ConstFunc(Function strFunc, CharSequence substr) {
-            this.strFunc = strFunc;
-            this.substr = substr;
-        }
-
-        @Override
-        public int getInt(Record rec) {
-            final CharSequence str = this.strFunc.getStr(rec);
-            if (str == null) {
-                return Numbers.INT_NaN;
-            }
-            return strpos(str, substr);
-        }
-
-        @Override
-        public Function getArg() {
-            return strFunc;
         }
     }
 }

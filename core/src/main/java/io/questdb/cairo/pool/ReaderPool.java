@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,358 +27,272 @@ package io.questdb.cairo.pool;
 import io.questdb.MessageBus;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
-import io.questdb.cairo.EntryUnavailableException;
+import io.questdb.cairo.PartitionOverwriteControl;
 import io.questdb.cairo.TableReader;
-import io.questdb.cairo.pool.ex.EntryLockedException;
-import io.questdb.cairo.pool.ex.PoolClosedException;
-import io.questdb.log.Log;
-import io.questdb.log.LogFactory;
-import io.questdb.std.ConcurrentHashMap;
-import io.questdb.std.Unsafe;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TxnScoreboardPool;
+import io.questdb.std.str.CharSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
-import java.util.Arrays;
-import java.util.Map;
+public class ReaderPool extends AbstractMultiTenantPool<ReaderPool.R> {
 
-public class ReaderPool extends AbstractPool implements ResourcePool<TableReader> {
-
-    private static final Log LOG = LogFactory.getLog(ReaderPool.class);
-    private static final long UNLOCKED = -1L;
-    private static final long NEXT_STATUS = Unsafe.getFieldOffset(Entry.class, "nextStatus");
-    private static final int ENTRY_SIZE = 32;
-    private static final long LOCK_OWNER = Unsafe.getFieldOffset(Entry.class, "lockOwner");
-    private static final int NEXT_OPEN = 0;
-    private static final int NEXT_ALLOCATED = 1;
-    private static final int NEXT_LOCKED = 2;
-    private final ConcurrentHashMap<Entry> entries = new ConcurrentHashMap<>();
-    private final int maxSegments;
     private final MessageBus messageBus;
-    private final int maxEntries;
+    private final PartitionOverwriteControl partitionOverwriteControl;
+    private final TxnScoreboardPool txnScoreboardPool;
+    private ReaderListener readerListener;
 
-    public ReaderPool(CairoConfiguration configuration, MessageBus messageBus) {
-        super(configuration, configuration.getInactiveReaderTTL());
-        this.maxSegments = configuration.getReaderPoolMaxSegments();
+    public ReaderPool(CairoConfiguration configuration, TxnScoreboardPool scoreboardPool, MessageBus messageBus, PartitionOverwriteControl partitionOverwriteControl) {
+        super(configuration, configuration.getReaderPoolMaxSegments(), configuration.getInactiveReaderTTL());
+        this.txnScoreboardPool = scoreboardPool;
         this.messageBus = messageBus;
-        this.maxEntries = maxSegments * ENTRY_SIZE;
+        this.partitionOverwriteControl = partitionOverwriteControl;
+    }
+
+    public ReaderPool(CairoConfiguration configuration, TxnScoreboardPool scoreboardPool, MessageBus messageBus) {
+        this(configuration, scoreboardPool, messageBus, null);
+    }
+
+    public void attach(TableReader reader) {
+        ReaderPool.R rdr = (ReaderPool.R) reader;
+        rdr.attach();
+    }
+
+    public void detach(TableReader reader) {
+        ReaderPool.R rdr = (ReaderPool.R) reader;
+        rdr.detach();
     }
 
     @Override
-    public TableReader get(CharSequence name) {
-
-        Entry e = getEntry(name);
-
-        long lockOwner = e.lockOwner;
-        long thread = Thread.currentThread().getId();
-
-        if (lockOwner != UNLOCKED) {
-            LOG.info().$('\'').utf8(name).$("' is locked [owner=").$(lockOwner).$(']').$();
-            throw EntryLockedException.instance("unknown");
-        }
-
-        do {
-            for (int i = 0; i < ENTRY_SIZE; i++) {
-                if (Unsafe.cas(e.allocations, i, UNALLOCATED, thread)) {
-                    // got lock, allocate if needed
-                    R r = e.readers[i];
-                    if (r == null) {
-                        try {
-                            LOG.info()
-                                    .$("open '").utf8(name)
-                                    .$("' [at=").$(e.index).$(':').$(i)
-                                    .$(']').$();
-                            r = new R(this, e, i, name, messageBus);
-                        } catch (CairoException ex) {
-                            Unsafe.arrayPutOrdered(e.allocations, i, UNALLOCATED);
-                            throw ex;
-                        }
-
-                        e.readers[i] = r;
-                        notifyListener(thread, name, PoolListener.EV_CREATE, e.index, i);
-                    } else {
-                        try {
-                            r.goActive();
-                        } catch (Throwable ex) {
-                            r.close();
-                            throw ex;
-                        }
-                        notifyListener(thread, name, PoolListener.EV_GET, e.index, i);
-                    }
-
-                    if (isClosed()) {
-                        e.readers[i] = null;
-                        r.goodbye();
-                        LOG.info().$('\'').utf8(name).$("' born free").$();
-                        return r;
-                    }
-
-                    LOG.debug().$('\'').utf8(name).$("' is assigned [at=").$(e.index).$(':').$(i).$(", thread=").$(thread).$(']').$();
-                    return r;
-                }
-            }
-
-            LOG.debug().$("Thread ").$(thread).$(" is moving to entry ").$(e.index + 1).$();
-
-            // all allocated, create next entry if possible
-            if (Unsafe.getUnsafe().compareAndSwapInt(e, NEXT_STATUS, NEXT_OPEN, NEXT_ALLOCATED)) {
-                LOG.debug().$("Thread ").$(thread).$(" allocated entry ").$(e.index + 1).$();
-                e.next = new Entry(e.index + 1, clock.getTicks());
-            }
-            e = e.next;
-        } while (e != null && e.index < maxSegments);
-
-        // max entries exceeded
-        notifyListener(thread, name, PoolListener.EV_FULL, -1, -1);
-        LOG.info().$("could not get, busy [table=`").utf8(name).$("`, thread=").$(thread).$(", retries=").$(this.maxSegments).$(']').$();
-        throw EntryUnavailableException.instance("unknown");
+    public ReaderPool.R get(TableToken tableToken) {
+        // Live views are WAL-backed tables backed by a real on-disk _meta + WAL;
+        // queries route through the standard TableReader machinery, and their
+        // tokens are not flagged isView(). Regular SQL views remain rejected here.
+        checkNotView(tableToken);
+        return super.get(tableToken);
     }
 
-    public int getBusyCount() {
-        int count = 0;
-        for (Map.Entry<CharSequence, Entry> me : entries.entrySet()) {
-            Entry e = me.getValue();
-            do {
-                for (int i = 0; i < ENTRY_SIZE; i++) {
-                    if (Unsafe.arrayGetVolatile(e.allocations, i) != UNALLOCATED && e.readers[i] != null) {
-                        count++;
-                    }
-                }
-                e = e.next;
-            } while (e != null);
-        }
-        return count;
+    public ReaderPool.R get(TableToken tableToken, @Nullable ResourcePoolSupervisor<TableReader> supervisor) {
+        checkNotView(tableToken);
+        return getWithSupervisor(tableToken, asReaderSupervisor(supervisor));
     }
 
-    public int getMaxEntries() {
-        return maxEntries;
+    public TableReader getCopyOf(TableReader srcReader, @Nullable ResourcePoolSupervisor<TableReader> supervisor) {
+        return getCopyOf((ReaderPool.R) srcReader, asReaderSupervisor(supervisor));
     }
 
-    public boolean lock(CharSequence name) {
-        Entry e = getEntry(name);
-        final long thread = Thread.currentThread().getId();
-        if (Unsafe.cas(e, LOCK_OWNER, UNLOCKED, thread) || Unsafe.cas(e, LOCK_OWNER, thread, thread)) {
-            do {
-                for (int i = 0; i < ENTRY_SIZE; i++) {
-                    if (Unsafe.cas(e.allocations, i, UNALLOCATED, thread)) {
-                        closeReader(thread, e, i, PoolListener.EV_LOCK_CLOSE, PoolConstants.CR_NAME_LOCK);
-                    } else if (Unsafe.cas(e.allocations, i, thread, thread)) {
-                        // same thread, don't need to order reads
-                        if (e.readers[i] != null) {
-                            // this thread has busy reader, it should close first
-                            e.lockOwner = -1L;
-                            return false;
-                        }
-                    } else {
-                        LOG.info().$("could not lock, busy [table=`").utf8(name).$("`, at=").$(e.index).$(':').$(i).$(", owner=").$(e.allocations[i]).$(", thread=").$(thread).$(']').$();
-                        e.lockOwner = -1L;
-                        return false;
-                    }
-                }
+    public int getDetachedRefCount(TableReader reader) {
+        return ((ReaderPool.R) reader).getDetachedRefCount();
+    }
 
-                // prevent new entries from being created
-                if (e.next == null && Unsafe.getUnsafe().compareAndSwapInt(e, NEXT_STATUS, NEXT_OPEN, NEXT_LOCKED)) {
-                    break;
-                }
+    public void incDetachedRefCount(TableReader reader) {
+        ((ReaderPool.R) reader).incrementDetachedRefCount();
+    }
 
-                e = e.next;
-            } while (e != null);
-        } else {
-            LOG.error().$("' already locked [table=`").utf8(name).$("`, owner=").$(e.lockOwner).$(']').$();
-            notifyListener(thread, name, PoolListener.EV_LOCK_BUSY, -1, -1);
-            return false;
-        }
-        notifyListener(thread, name, PoolListener.EV_LOCK_SUCCESS, -1, -1);
-        LOG.debug().$("locked [table=`").utf8(name).$("`, thread=").$(thread).$(']').$();
+    @Override
+    public boolean isCopyOfSupported() {
         return true;
     }
 
-    public void unlock(CharSequence name) {
-        Entry e = entries.get(name);
-        long thread = Thread.currentThread().getId();
-        if (e == null) {
-            LOG.info().$("not found, cannot unlock [table=`").$(name).$("`]").$();
-            notifyListener(thread, name, PoolListener.EV_NOT_LOCKED, -1, -1);
-            return;
-        }
-
-        if (e.lockOwner == thread) {
-            entries.remove(name);
-            while (e != null) {
-                e = e.next;
-            }
-        } else {
-            notifyListener(thread, name, PoolListener.EV_NOT_LOCK_OWNER);
-            throw CairoException.instance(0).put("Not the lock owner of ").put(name);
-        }
-
-        notifyListener(thread, name, PoolListener.EV_UNLOCKED, -1, -1);
-        LOG.debug().$("unlocked [table=`").utf8(name).$("`]").$();
+    public boolean isDetached(TableReader reader) {
+        return ((ReaderPool.R) reader).isDetached();
     }
 
-    private void checkClosed() {
-        if (isClosed()) {
-            LOG.info().$("is closed").$();
-            throw PoolClosedException.INSTANCE;
+    @TestOnly
+    public void setTableReaderListener(ReaderListener readerListener) {
+        this.readerListener = readerListener;
+    }
+
+    @Override
+    protected byte getListenerSrc() {
+        return PoolListener.SRC_READER;
+    }
+
+    // The public reader-pool API exposes the supervisor as ResourcePoolSupervisor<TableReader>
+    // (so callers never name the internal ReaderPool.R type), while the generic pool machinery
+    // is parameterized by R. The cast is safe by contravariance: the pool only ever hands R
+    // instances -- which are TableReaders -- to the supervisor, so a TableReader-typed consumer
+    // stands in for an R-typed one.
+    @SuppressWarnings("unchecked")
+    private static ResourcePoolSupervisor<R> asReaderSupervisor(@Nullable ResourcePoolSupervisor<TableReader> supervisor) {
+        return (ResourcePoolSupervisor<R>) (ResourcePoolSupervisor<?>) supervisor;
+    }
+
+    private static void checkNotView(TableToken tableToken) {
+        if (tableToken.isView()) {
+            throw CairoException.critical(0).put("cannot get a reader for view [view=").put(tableToken).put(']');
         }
     }
 
     @Override
-    protected void closePool() {
-        super.closePool();
-        LOG.info().$("closed").$();
+    protected R newCopyOfTenant(R srcReader, Entry<R> rootEntry, Entry<R> entry, int index, ResourcePoolSupervisor<R> supervisor) {
+        return new R(this, rootEntry, entry, index, srcReader, txnScoreboardPool, messageBus, readerListener, partitionOverwriteControl, supervisor);
     }
 
     @Override
-    protected boolean releaseAll(long deadline) {
-        long thread = Thread.currentThread().getId();
-        boolean removed = false;
-        int casFailures = 0;
-        int closeReason = deadline < Long.MAX_VALUE ? PoolConstants.CR_IDLE : PoolConstants.CR_POOL_CLOSE;
-
-        for (Entry e : entries.values()) {
-            do {
-                for (int i = 0; i < ENTRY_SIZE; i++) {
-                    R r;
-                    if (deadline > Unsafe.arrayGetVolatile(e.releaseTimes, i) && (r = e.readers[i]) != null) {
-                        if (Unsafe.cas(e.allocations, i, UNALLOCATED, thread)) {
-                            // check if deadline violation still holds
-                            if (deadline > e.releaseTimes[i]) {
-                                removed = true;
-                                closeReader(thread, e, i, PoolListener.EV_EXPIRE, closeReason);
-                            }
-                            Unsafe.arrayPutOrdered(e.allocations, i, UNALLOCATED);
-                        } else {
-                            casFailures++;
-                            if (deadline == Long.MAX_VALUE) {
-                                r.goodbye();
-                                LOG.info().$("shutting down. '").$(r.getTableName()).$("' is left behind").$();
-                            }
-                        }
-                    }
-                }
-                // this does not release the next
-                e = e.next;
-            } while (e != null);
-        }
-
-        // when we are timing out entries the result is "true" if there was any work done
-        // when we're closing pool, the result is true when pool is empty
-        if (closeReason == PoolConstants.CR_IDLE) {
-            return removed;
-        } else {
-            return casFailures == 0;
-        }
+    protected R newTenant(TableToken tableToken, Entry<R> rootEntry, Entry<R> entry, int index, ResourcePoolSupervisor<R> supervisor) {
+        return new R(this, rootEntry, entry, index, tableToken, txnScoreboardPool, messageBus, readerListener, partitionOverwriteControl, supervisor);
     }
 
-    private void closeReader(long thread, Entry entry, int index, short ev, int reason) {
-        R r = entry.readers[index];
-        if (r != null) {
-            r.goodbye();
-            r.close();
-            LOG.info().$("closed '").utf8(r.getTableName())
-                    .$("' [at=").$(entry.index).$(':').$(index)
-                    .$(", reason=").$(PoolConstants.closeReasonText(reason))
-                    .I$();
-            notifyListener(thread, r.getTableName(), ev, entry.index, index);
-            entry.readers[index] = null;
-        }
+    @TestOnly
+    @FunctionalInterface
+    public interface ReaderListener {
+        void onOpenPartition(TableToken tableToken, int partitionIndex);
     }
 
-    private Entry getEntry(CharSequence name) {
-        checkClosed();
-
-        Entry e = entries.get(name);
-        if (e == null) {
-            e = new Entry(0, clock.getTicks());
-            Entry other = entries.putIfAbsent(name, e);
-            if (other != null) {
-                e = other;
-            }
-        }
-        return e;
-    }
-
-    private void notifyListener(long thread, CharSequence name, short event, int segment, int position) {
-        PoolListener listener = getPoolListener();
-        if (listener != null) {
-            listener.onEvent(PoolListener.SRC_READER, thread, name, event, (short) segment, (short) position);
-        }
-    }
-
-    private boolean returnToPool(R reader) {
-        CharSequence name = reader.getTableName();
-
-        long thread = Thread.currentThread().getId();
-
-        int index = reader.index;
-        final ReaderPool.Entry e = reader.entry;
-        if (e == null) {
-            return false;
-        }
-
-        final long owner = Unsafe.arrayGetVolatile(e.allocations, index);
-        if (owner != UNALLOCATED) {
-
-            LOG.debug().$('\'').$(name).$("' is back [at=").$(e.index).$(':').$(index).$(", thread=").$(thread).$(']').$();
-            notifyListener(thread, name, PoolListener.EV_RETURN, e.index, index);
-
-            // release the entry for anyone to pick up
-            e.releaseTimes[index] = clock.getTicks();
-            Unsafe.arrayPutOrdered(e.allocations, index, UNALLOCATED);
-            final boolean closed = isClosed();
-
-            // When pool is closed we will race against release thread
-            // to release our entry. No need to bother releasing map entry, pool is going down.
-            return !closed || !Unsafe.cas(e.allocations, index, UNALLOCATED, owner);
-        }
-
-        throw CairoException.instance(0).put("double close [table=").put(name).put(", index=").put(index).put(']');
-    }
-
-    public static class Entry {
-        final long[] allocations = new long[ENTRY_SIZE];
-        final long[] releaseTimes = new long[ENTRY_SIZE];
-        final R[] readers = new R[ENTRY_SIZE];
-        final int index;
-        volatile long lockOwner = -1L;
-        @SuppressWarnings("unused")
-        int nextStatus = 0;
-        volatile Entry next;
-
-        public Entry(int index, long currentMicros) {
-            this.index = index;
-            Arrays.fill(allocations, UNALLOCATED);
-            Arrays.fill(releaseTimes, currentMicros);
-        }
-    }
-
-    public static class R extends TableReader {
+    public static class R extends TableReader implements PoolTenant<R> {
         private final int index;
-        private ReaderPool pool;
-        private Entry entry;
+        private final ReaderListener readerListener;
+        private final Entry<R> rootEntry;
+        private boolean detached;
+        // Reference counter that may be used to track usage of detached readers.
+        // A reader may be obtained from the pool and closed on different threads,
+        // but that's fine. In that case, there will be synchronization between the threads,
+        // so we don't need to make this field volatile/atomic.
+        private int detachedRefCount;
+        private Entry<R> entry;
+        private AbstractMultiTenantPool<R> pool;
+        private ResourcePoolSupervisor<R> supervisor;
 
-        public R(ReaderPool pool, Entry entry, int index, CharSequence name, MessageBus messageBus) {
-            super(pool.getConfiguration(), name, messageBus);
+        public R(
+                AbstractMultiTenantPool<R> pool,
+                Entry<R> rootEntry,
+                Entry<R> entry,
+                int index,
+                TableToken tableToken,
+                TxnScoreboardPool txnScoreboardPool,
+                MessageBus messageBus,
+                ReaderListener readerListener,
+                PartitionOverwriteControl partitionOverwriteControl,
+                ResourcePoolSupervisor<R> supervisor
+        ) {
+            super(entry.getIndex() * pool.getSegmentSize() + index, pool.getConfiguration(), tableToken, txnScoreboardPool, messageBus, partitionOverwriteControl);
             this.pool = pool;
+            this.rootEntry = rootEntry;
             this.entry = entry;
             this.index = index;
+            this.readerListener = readerListener;
+            this.supervisor = supervisor;
+        }
+
+        public R(
+                AbstractMultiTenantPool<R> pool,
+                Entry<R> rootEntry,
+                Entry<R> entry,
+                int index,
+                R srcReader,
+                TxnScoreboardPool txnScoreboardPool,
+                MessageBus messageBus,
+                ReaderListener readerListener,
+                PartitionOverwriteControl partitionOverwriteControl,
+                ResourcePoolSupervisor<R> supervisor
+        ) {
+            super(entry.getIndex() * pool.getSegmentSize() + index, pool.getConfiguration(), srcReader, txnScoreboardPool, messageBus, partitionOverwriteControl);
+            this.pool = pool;
+            this.rootEntry = rootEntry;
+            this.entry = entry;
+            this.index = index;
+            this.readerListener = readerListener;
+            this.supervisor = supervisor;
+        }
+
+        public void attach() {
+            assert detachedRefCount == 0;
+            detached = false;
         }
 
         @Override
         public void close() {
             if (isOpen()) {
-                goPassive();
-                final ReaderPool pool = this.pool;
-                if (pool != null && entry != null) {
-                    if (pool.returnToPool(this)) {
-                        return;
+                if (!detached) {
+                    // report reader closure to the supervisor
+                    // so that we do not freak out about reader leaks
+                    if (supervisor != null) {
+                        supervisor.onResourceReturned(this);
+                        supervisor = null;
                     }
+                    goPassive();
+                    final AbstractMultiTenantPool<R> pool = this.pool;
+                    if (pool == null || entry == null || !pool.returnToPool(this)) {
+                        super.close();
+                    }
+                } else {
+                    closeExcessPartitions();
+                    detachedRefCount--;
                 }
-                super.close();
             }
         }
 
-        private void goodbye() {
+        public void detach() {
+            detached = true;
+            detachedRefCount = 0;
+        }
+
+        public int getDetachedRefCount() {
+            return detachedRefCount;
+        }
+
+        @Override
+        public Entry<R> getEntry() {
+            return entry;
+        }
+
+        @Override
+        public int getIndex() {
+            return index;
+        }
+
+        @Override
+        public Entry<R> getRootEntry() {
+            return rootEntry;
+        }
+
+        public ResourcePoolSupervisor<R> getSupervisor() {
+            return supervisor;
+        }
+
+        public void goodbye() {
             entry = null;
             pool = null;
+        }
+
+        public void incrementDetachedRefCount() {
+            assert detached;
+            detachedRefCount++;
+        }
+
+        public boolean isDetached() {
+            return detached;
+        }
+
+        @Override
+        public long openPartition(int partitionIndex) {
+            if (readerListener != null) {
+                readerListener.onOpenPartition(getTableToken(), partitionIndex);
+            }
+            return super.openPartition(partitionIndex);
+        }
+
+        @Override
+        public void refresh(ResourcePoolSupervisor<R> supervisor) {
+            this.supervisor = supervisor;
+            // Do NOT close() here on failure: get0() owns disposal via goodbye()+close().
+            // Closing here returnToPool()'s the reader (slot released, tenant still assigned)
+            // before get0() disposes it, letting a concurrent get() acquire a torn-down reader.
+            goActive();
+        }
+
+        @Override
+        public void refreshAt(@Nullable ResourcePoolSupervisor<R> supervisor, R srcReader) {
+            this.supervisor = supervisor;
+            // See refresh(): get0() owns disposal on failure; closing here re-publishes the reader.
+            goActiveAtTxn(srcReader);
+        }
+
+        @Override
+        public void toSink(@NotNull CharSink<?> sink) {
+            sink.put("ReaderPool.R{index=").put(index).put(", detached=").put(detached).put(", detachedRefCount=").put(detachedRefCount).put('}');
         }
     }
 }

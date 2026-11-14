@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -64,23 +64,8 @@ public class LowerCaseAsciiCharSequenceHashSet extends AbstractLowerCaseAsciiCha
         }
     }
 
-    public boolean contains(CharSequence key) {
-        return keyIndex(key) < 0;
-    }
-
     public CharSequence keyAt(int index) {
         return keys[-index - 1];
-    }
-
-    @Override
-    protected void erase(int index) {
-        keys[index] = noEntryKey;
-    }
-
-    @Override
-    protected void move(int from, int to) {
-        keys[to] = keys[from];
-        erase(from);
     }
 
     private void rehash() {
@@ -99,5 +84,16 @@ public class LowerCaseAsciiCharSequenceHashSet extends AbstractLowerCaseAsciiCha
                 keys[keyIndex(key)] = key;
             }
         }
+    }
+
+    @Override
+    protected void erase(int index) {
+        keys[index] = noEntryKey;
+    }
+
+    @Override
+    protected void move(int from, int to) {
+        keys[to] = keys[from];
+        erase(from);
     }
 }

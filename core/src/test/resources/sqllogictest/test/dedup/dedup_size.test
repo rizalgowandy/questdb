@@ -1,0 +1,61 @@
+# description: Test dedup cases that check table size does not change on injesting full duplicates
+# group: [dedup]
+
+control iso_timestamp on
+
+statement ok
+create table size_control (s varchar, x int, ts timestamp)
+timestamp(ts) partition by HOUR DEDUP UPSERT KEYS(ts, s);
+
+# Insert some data
+statement ok
+insert into size_control(s, x, ts)
+select '2022-02-24' || '-' || x , x, timestamp_sequence('2022-02-24', 1000000)
+from long_sequence(cast(60 * 60 * 2.5 as long));
+
+# wait data inserted
+statement ok
+select wait_wal_table('size_control');
+
+# check dedup data
+query TI
+select name, numRows
+from table_partitions('size_control');
+----
+2022-02-24T00   3600
+2022-02-24T01   3600
+2022-02-24T02   1800
+
+# remember partition sizes; exact sizes depend on the platform's allocation alignment
+statement ok
+create table size_before as (select name, numRows, diskSize from table_partitions('size_control'));
+
+# Insert same data
+statement ok
+insert into size_control(s, x, ts)
+select  '2022-02-24' || '-' || x, x, timestamp_sequence('2022-02-24', 1000000)
+from long_sequence(cast(60 * 60 * 2.5 as long));
+
+# wait data inserted
+statement ok
+select wait_wal_table('size_control');
+
+# check dedup data
+query TI
+select name, numRows
+from table_partitions('size_control');
+----
+2022-02-24T00   3600
+2022-02-24T01   3600
+2022-02-24T02   1800
+
+# full duplicates must not change partition sizes
+query I
+select count()
+from table_partitions('size_control') a
+join size_before b on (name)
+where a.numRows = b.numRows and a.diskSize = b.diskSize;
+----
+3
+
+

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,26 +26,30 @@ package io.questdb.cutlass.line.tcp;
 
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.mp.Job;
 import io.questdb.network.IODispatcher;
 import io.questdb.network.IOOperation;
 import io.questdb.network.IORequestProcessor;
-import io.questdb.std.CharSequenceObjHashMap;
 import io.questdb.std.Misc;
-import io.questdb.std.ObjList;
+import io.questdb.std.Pool;
+import io.questdb.std.Utf8StringObjHashMap;
+import io.questdb.std.WeakClosableObjectPool;
 import io.questdb.std.datetime.millitime.MillisecondClock;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.Utf8String;
+import org.jetbrains.annotations.NotNull;
 
+import static io.questdb.network.IODispatcher.DISCONNECT_REASON_RETRY_FAILED;
 import static io.questdb.network.IODispatcher.DISCONNECT_REASON_UNKNOWN_OPERATION;
 
-class LineTcpNetworkIOJob implements NetworkIOJob, Job {
+class LineTcpNetworkIOJob implements NetworkIOJob {
     private final static Log LOG = LogFactory.getLog(LineTcpNetworkIOJob.class);
     private final IODispatcher<LineTcpConnectionContext> dispatcher;
-    private final int workerId;
-    private final CharSequenceObjHashMap<TableUpdateDetails> tableUpdateDetailsUtf8 = new CharSequenceObjHashMap<>();
-    private final ObjList<SymbolCache> unusedSymbolCaches = new ObjList<>();
-    private final MillisecondClock millisecondClock;
     private final long maintenanceInterval;
+    private final MillisecondClock millisecondClock;
     private final LineTcpMeasurementScheduler scheduler;
+    private final Utf8StringObjHashMap<TableUpdateDetails> tableUpdateDetailsUtf8 = new Utf8StringObjHashMap<>();
+    private final WeakClosableObjectPool<SymbolCache> unusedSymbolCaches;
+    private final int workerId;
     // Context blocked on LineTcpMeasurementScheduler queue
     private LineTcpConnectionContext busyContext = null;
     private final IORequestProcessor<LineTcpConnectionContext> onRequest = this::onRequest;
@@ -54,33 +58,45 @@ class LineTcpNetworkIOJob implements NetworkIOJob, Job {
     LineTcpNetworkIOJob(
             LineTcpReceiverConfiguration configuration,
             LineTcpMeasurementScheduler scheduler,
-            IODispatcher<LineTcpConnectionContext> dispatcher, int workerId) {
-        this.millisecondClock = configuration.getMillisecondClock();
-        this.maintenanceInterval = configuration.getMaintenanceInterval();
-        this.scheduler = scheduler;
-        this.maintenanceJobDeadline = millisecondClock.getTicks() + maintenanceInterval;
-        this.dispatcher = dispatcher;
-        this.workerId = workerId;
+            IODispatcher<LineTcpConnectionContext> dispatcher,
+            int workerId
+    ) {
+        try {
+            this.millisecondClock = configuration.getMillisecondClock();
+            this.maintenanceInterval = configuration.getMaintenanceInterval();
+            this.scheduler = scheduler;
+            this.maintenanceJobDeadline = millisecondClock.getTicks() + maintenanceInterval;
+            this.dispatcher = dispatcher;
+            this.workerId = workerId;
+            this.unusedSymbolCaches = new WeakClosableObjectPool<>(() -> new SymbolCache(configuration), 10, true);
+        } catch (Throwable t) {
+            close();
+            throw t;
+        }
     }
 
     @Override
-    public void addTableUpdateDetails(String tableNameUtf8, TableUpdateDetails tableUpdateDetails) {
+    public void addTableUpdateDetails(Utf8String tableNameUtf8, TableUpdateDetails tableUpdateDetails) {
         tableUpdateDetailsUtf8.put(tableNameUtf8, tableUpdateDetails);
         tableUpdateDetails.addReference(workerId);
     }
 
     @Override
     public void close() {
-        Misc.freeObjList(unusedSymbolCaches);
+        if (busyContext != null) {
+            dispatcher.disconnect(busyContext, DISCONNECT_REASON_RETRY_FAILED);
+            busyContext = null;
+        }
+        Misc.free(unusedSymbolCaches);
     }
 
     @Override
-    public TableUpdateDetails getLocalTableDetails(CharSequence tableName) {
-        return tableUpdateDetailsUtf8.get(tableName);
+    public TableUpdateDetails getLocalTableDetails(DirectUtf8Sequence tableNameUtf8) {
+        return tableUpdateDetailsUtf8.get(tableNameUtf8);
     }
 
     @Override
-    public ObjList<SymbolCache> getUnusedSymbolCaches() {
+    public Pool<SymbolCache> getSymbolCachePool() {
         return unusedSymbolCaches;
     }
 
@@ -90,11 +106,20 @@ class LineTcpNetworkIOJob implements NetworkIOJob, Job {
     }
 
     @Override
-    public boolean run(int workerId) {
-        assert this.workerId == workerId;
+    public void releaseWalTableDetails() {
+        scheduler.releaseWalTableDetails(tableUpdateDetailsUtf8);
+    }
+
+    @Override
+    public boolean run(@NotNull WorkerContext workerContext) {
+        // This job ignores workerContext.carrierId(): legacy ILP scratch
+        // (TableUpdateDetails.localDetailsArray) is keyed by the pool-local writer
+        // slot baked into this.workerId at construction time, so all routing and
+        // array-indexing below uses this.workerId.
         boolean busy = false;
         if (busyContext != null) {
-            if (handleIO(busyContext)) {
+            if (handleIO(busyContext, dispatcher)) {
+                // queue is still full
                 return true;
             }
             LOG.debug().$("context is no longer waiting on a full queue [fd=").$(busyContext.getFd()).$(']').$();
@@ -117,30 +142,36 @@ class LineTcpNetworkIOJob implements NetworkIOJob, Job {
         return busy;
     }
 
-    private boolean handleIO(LineTcpConnectionContext context) {
+    private boolean handleIO(LineTcpConnectionContext context, IODispatcher<LineTcpConnectionContext> dispatcher) {
         if (!context.invalid()) {
             switch (context.handleIO(this)) {
                 case NEEDS_READ:
-                    context.getDispatcher().registerChannel(context, IOOperation.READ);
+                    dispatcher.registerChannel(context, IOOperation.READ);
                     return false;
                 case NEEDS_WRITE:
-                    context.getDispatcher().registerChannel(context, IOOperation.WRITE);
+                    dispatcher.registerChannel(context, IOOperation.WRITE);
                     return false;
                 case QUEUE_FULL:
                     return true;
                 case NEEDS_DISCONNECT:
-                    context.getDispatcher().disconnect(context, DISCONNECT_REASON_UNKNOWN_OPERATION);
+                    dispatcher.disconnect(context, DISCONNECT_REASON_UNKNOWN_OPERATION);
                     return false;
             }
         }
         return false;
     }
 
-    private void onRequest(int operation, LineTcpConnectionContext context) {
-        if (handleIO(context)) {
+    private boolean onRequest(int operation, LineTcpConnectionContext context, IODispatcher<LineTcpConnectionContext> dispatcher) {
+        if (operation == IOOperation.HEARTBEAT) {
+            context.doMaintenance(millisecondClock.getTicks());
+            dispatcher.registerChannel(context, IOOperation.HEARTBEAT);
+            return false;
+        }
+        if (handleIO(context, dispatcher)) {
             busyContext = context;
             LOG.debug().$("context is waiting on a full queue [fd=").$(context.getFd()).$(']').$();
+            return false;
         }
+        return true;
     }
-
 }

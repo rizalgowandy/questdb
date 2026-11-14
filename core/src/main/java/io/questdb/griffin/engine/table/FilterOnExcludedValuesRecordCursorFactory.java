@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,73 +24,107 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.SymbolMapReaderImpl;
-import io.questdb.cairo.TableReader;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.griffin.OrderByMnemonic;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.std.*;
+import io.questdb.griffin.model.IQueryModel;
+import io.questdb.std.Chars;
+import io.questdb.std.IntHashSet;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class FilterOnExcludedValuesRecordCursorFactory extends AbstractDataFrameRecordCursorFactory {
-    private final DataFrameRecordCursor cursor;
+import java.util.Comparator;
+
+public class FilterOnExcludedValuesRecordCursorFactory extends AbstractPageFrameRecordCursorFactory {
     private final int columnIndex;
-    private final Function filter;
+    private final Comparator<SymbolFunctionRowCursorFactory> comparator;
+    private final Comparator<SymbolFunctionRowCursorFactory> comparatorDesc;
     private final ObjList<SymbolFunctionRowCursorFactory> cursorFactories;
     // Points at the next factory to be reused.
-    private int cursorFactoriesIdx;
-    private final ObjList<Function> keyExcludedValueFunctions = new ObjList<>();
-    private final IntHashSet includedKeys = new IntHashSet();
+    private final int[] cursorFactoriesIdx; // used to disable unneeded factories if there are duplicate excluded keys
     private final IntHashSet excludedKeys = new IntHashSet();
-    private final boolean dynamicExcludedKeys;
     private final boolean followedOrderByAdvice;
+    private final boolean heapCursorUsed;
     private final int indexDirection;
     private final int maxSymbolNotEqualsCount;
-    private final IntList columnIndexes;
+    // Drives the cursorFactories sort and the plan's symbolOrder attribute. It keeps reading the
+    // withdrawn key-column claim on purpose: recalculateIncludedValues() sorts so that
+    // upsertRowCursorFactory() groups equal symbols, and the sort direction is plan-visible, so it
+    // must not follow followedOrderByAdvice() into "false".
+    private final boolean symbolOrderAsc;
+    private PageFrameRecordCursorImpl cursor;
+    private Function filter;
+    private ObjList<Function> keyExcludedValueFunctions = new ObjList<>();
+    private StaticSymbolTable symbolMapReader;
 
     public FilterOnExcludedValuesRecordCursorFactory(
+            @NotNull CairoConfiguration configuration,
             @NotNull RecordMetadata metadata,
-            @NotNull DataFrameCursorFactory dataFrameCursorFactory,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
             @NotNull @Transient ObjList<Function> keyValues,
             int columnIndex,
             @Nullable Function filter,
             int orderByMnemonic,
-            boolean followedOrderByAdvice,
+            boolean orderByKeyColumn,
+            boolean orderByTimestamp,
+            int orderDirection,
             int indexDirection,
             @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts,
             int maxSymbolNotEqualsCount
     ) {
-        super(metadata, dataFrameCursorFactory);
+        super(metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
+        this.symbolOrderAsc = (orderByKeyColumn || orderByTimestamp) && orderDirection == IQueryModel.ORDER_DIRECTION_ASCENDING;
         this.indexDirection = indexDirection;
         this.maxSymbolNotEqualsCount = maxSymbolNotEqualsCount;
-        final int nKeyValues = keyValues.size();
-        boolean dynamicValues = false;
-        for (int i = 0; i < nKeyValues; i++) {
-            if (!keyValues.getQuick(i).isConstant()) {
-                dynamicValues = true;
-                break;
-            }
-        }
-        this.dynamicExcludedKeys = dynamicValues;
-        this.keyExcludedValueFunctions.addAll(keyValues);
+        keyExcludedValueFunctions.addAll(keyValues);
         this.columnIndex = columnIndex;
         this.filter = filter;
-        cursorFactories = new ObjList<>(nKeyValues);
-        if (orderByMnemonic == OrderByMnemonic.ORDER_BY_INVARIANT) {
-            this.cursor = new DataFrameRecordCursor(new SequentialRowCursorFactory(cursorFactories), false, filter, columnIndexes);
+        cursorFactoriesIdx = new int[]{0};
+        cursorFactories = new ObjList<>(keyValues.size());
+        if (orderByMnemonic == OrderByMnemonic.ORDER_BY_INVARIANT && !orderByTimestamp) {
+            heapCursorUsed = false;
+            cursor = new PageFrameRecordCursorImpl(
+                    configuration,
+                    metadata,
+                    new SequentialRowCursorFactory(cursorFactories, cursorFactoriesIdx),
+                    false,
+                    filter
+            );
         } else {
-            this.cursor = new DataFrameRecordCursor(new HeapRowCursorFactory(cursorFactories), false, filter, columnIndexes);
+            heapCursorUsed = true;
+            cursor = new PageFrameRecordCursorImpl(
+                    configuration,
+                    metadata,
+                    new HeapRowCursorFactory(cursorFactories, cursorFactoriesIdx),
+                    false,
+                    filter
+            );
         }
-        this.followedOrderByAdvice = followedOrderByAdvice;
-        this.columnIndexes = columnIndexes;
-    }
+        // SequentialRowCursorFactory rebuilds one cursor per key for the page frame it is handed and
+        // restarts at key 0 on the next frame, so an "ORDER BY key" claim would hold only while the
+        // scan produced a single frame. Only the timestamp claim survives frame concatenation: it
+        // forces HeapRowCursorFactory, which emits rows in row-id order within a frame, and the
+        // frames themselves arrive in timestamp order.
+        this.followedOrderByAdvice = orderByTimestamp;
 
-    @Override
-    public void close() {
-        Misc.free(filter);
-        Misc.free(keyExcludedValueFunctions);
+        comparator = this::compareStrFunctions;
+        comparatorDesc = this::compareStrFunctionsDesc;
     }
 
     @Override
@@ -99,59 +133,105 @@ public class FilterOnExcludedValuesRecordCursorFactory extends AbstractDataFrame
     }
 
     @Override
+    public int getScanDirection() {
+        if (partitionFrameCursorFactory.getOrder() == PartitionFrameCursorFactory.ORDER_ASC && heapCursorUsed) {
+            return SCAN_DIRECTION_FORWARD;
+        }
+        return SCAN_DIRECTION_OTHER;
+    }
+
+    public void recalculateIncludedValues(PageFrameCursor pageFrameCursor) {
+        cursorFactoriesIdx[0] = 0;
+        excludedKeys.clear();
+        try {
+            symbolMapReader = pageFrameCursor.getSymbolTable(columnIndex);
+
+            // Generate excluded key set.
+            for (int i = 0, n = keyExcludedValueFunctions.size(); i < n; i++) {
+                final CharSequence value = keyExcludedValueFunctions.getQuick(i).getStrA(null);
+                excludedKeys.add(symbolMapReader.keyOf(value));
+            }
+
+            // TRUNCATE can reassign symbol keys, so a previous execution's key set cannot be reused.
+            for (int k = 0, n = symbolMapReader.getSymbolCount(); k < n; k++) {
+                if (!excludedKeys.contains(k)) {
+                    upsertRowCursorFactory(k);
+                }
+            }
+
+            if (symbolMapReader.containsNullValue() && !excludedKeys.contains(SymbolTable.VALUE_IS_NULL)) {
+                // If the table contains null values, and they're not excluded, we need to include
+                // them to the result set to match the behavior of the NOT IN() SQL function.
+                upsertRowCursorFactory(SymbolTable.VALUE_IS_NULL);
+            }
+
+            // sorting values makes no sense for heap row cursor
+            if (!heapCursorUsed) {
+                // sorting here can produce order of cursorFactories different from one shown by explain command
+                if (symbolOrderAsc) {
+                    cursorFactories.sort(0, cursorFactoriesIdx[0], comparator);
+                } else {
+                    cursorFactories.sort(0, cursorFactoriesIdx[0], comparatorDesc);
+                }
+            }
+        } finally {
+            symbolMapReader = null;
+        }
+    }
+
+    @Override
     public boolean recordCursorSupportsRandomAccess() {
         return true;
     }
 
-    public void recalculateIncludedValues(TableReader tableReader) {
-        cursorFactoriesIdx = 0;
-        excludedKeys.clear();
-        if (dynamicExcludedKeys) {
-            // In case of bind variable excluded values that may change between
-            // query executions the sets have to be subtracted from scratch.
-            includedKeys.clear();
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("FilterOnExcludedValues");
+        if (!heapCursorUsed) { // sorting symbols makes no sense for heap factory
+            sink.meta("symbolOrder").val(symbolOrderAsc ? "asc" : "desc");
         }
+        sink.attr("symbolFilter").putBaseColumnName(columnIndex).val(" not in ").val(keyExcludedValueFunctions);
+        sink.optAttr("filter", filter);
+        sink.child(cursor.getRowCursorFactory());
+        sink.child(partitionFrameCursorFactory);
+    }
 
-        final SymbolMapReaderImpl symbolMapReader = (SymbolMapReaderImpl) tableReader.getSymbolMapReader(columnIndex);
+    @Override
+    public boolean usesIndex() {
+        return true;
+    }
 
-        // Generate excluded key set.
-        for (int i = 0, n = keyExcludedValueFunctions.size(); i < n; i++) {
-            final CharSequence value = keyExcludedValueFunctions.getQuick(i).getStr(null);
-            excludedKeys.add(symbolMapReader.keyOf(value));
-        }
+    /**
+     * Orders two per-symbol cursor factories by their symbol value.
+     * <p>
+     * The two sides must come from {@code valueOf} and {@code valueBOf}: an
+     * uncached symbol map answers {@code valueOf} with a single flyweight bound to
+     * its char memory, so reading both sides through it hands the comparator the
+     * same object twice, which compares equal for every pair and leaves the
+     * factories in symbol-key order. {@code valueBOf} is the second flyweight that
+     * exists for exactly this.
+     */
+    private int compareStrFunctions(SymbolFunctionRowCursorFactory a, SymbolFunctionRowCursorFactory b) {
+        return Chars.compare(symbolMapReader.valueOf(a.getSymbolKey()), symbolMapReader.valueBOf(b.getSymbolKey()));
+    }
 
-        // Append new keys to the included set filtering out the excluded ones.
-        // Note: both includedKeys and cursorFactories are guaranteed to be monotonically
-        // growing in terms of the collection size.
-        for (int k = 0, n = symbolMapReader.getSymbolCount(); k < n; k++) {
-            if (!excludedKeys.contains(k) && includedKeys.add(k)) {
-                upsertRowCursorFactory(k);
-            }
-        }
-
-        if (symbolMapReader.containsNullValue()
-                && !excludedKeys.contains(SymbolTable.VALUE_IS_NULL) && includedKeys.add(SymbolTable.VALUE_IS_NULL)) {
-            // If the table contains null values and they're not excluded, we need to include
-            // them to the result set to match the behavior of the NOT IN() SQL function.
-            upsertRowCursorFactory(SymbolTable.VALUE_IS_NULL);
-        }
+    private int compareStrFunctionsDesc(SymbolFunctionRowCursorFactory a, SymbolFunctionRowCursorFactory b) {
+        return Chars.compareDescending(symbolMapReader.valueOf(a.getSymbolKey()), symbolMapReader.valueBOf(b.getSymbolKey()));
     }
 
     private void upsertRowCursorFactory(int symbolKey) {
-        if (cursorFactoriesIdx < cursorFactories.size()) {
+        if (cursorFactoriesIdx[0] < cursorFactories.size()) {
             // Reuse the existing factory.
-            cursorFactories.get(cursorFactoriesIdx).of(symbolKey);
-            cursorFactoriesIdx++;
+            cursorFactories.get(cursorFactoriesIdx[0]).of(symbolKey);
+            cursorFactoriesIdx[0]++;
             return;
         }
 
-        // Create a new factory.
         final SymbolFunctionRowCursorFactory rowCursorFactory;
         if (filter == null) {
             rowCursorFactory = new SymbolIndexRowCursorFactory(
                     columnIndex,
                     symbolKey,
-                    false,
                     indexDirection,
                     null
             );
@@ -160,29 +240,51 @@ public class FilterOnExcludedValuesRecordCursorFactory extends AbstractDataFrame
                     columnIndex,
                     symbolKey,
                     filter,
-                    false,
                     indexDirection,
-                    columnIndexes,
                     null
             );
         }
         cursorFactories.add(rowCursorFactory);
-        cursorFactoriesIdx++;
+        cursorFactoriesIdx[0]++;
     }
 
     @Override
-    protected RecordCursor getCursorInstance(DataFrameCursor dataFrameCursor, SqlExecutionContext executionContext)
-            throws SqlException {
-        TableReader reader = dataFrameCursor.getTableReader();
-        if (reader.getSymbolMapReader(columnIndex).getSymbolCount() > maxSymbolNotEqualsCount) {
-            throw ReaderOutOfDateException.of(reader.getTableName());
+    protected void _close() {
+        final PageFrameRecordCursorImpl cursor = this.cursor;
+        this.cursor = null;
+        final Function filter = this.filter;
+        this.filter = null;
+        final ObjList<Function> keyExcludedValueFunctions = this.keyExcludedValueFunctions;
+        this.keyExcludedValueFunctions = null;
+        final var rowCursorFactory = cursor != null ? cursor.getRowCursorFactory() : null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
         }
-        Function.init(keyExcludedValueFunctions, reader, executionContext);
-        this.recalculateIncludedValues(reader);
-        this.cursor.of(dataFrameCursor, executionContext);
+        failure = Misc.freeBestEffort(failure, filter);
+        failure = Misc.freeBestEffort(failure, rowCursorFactory);
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeObjListBestEffort(failure, keyExcludedValueFunctions);
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    @Override
+    protected RecordCursor initRecordCursor(
+            PageFrameCursor pageFrameCursor,
+            SqlExecutionContext executionContext
+    ) throws SqlException {
+        if (pageFrameCursor.getSymbolTable(columnIndex).getSymbolCount() > maxSymbolNotEqualsCount) {
+            throw TableReferenceOutOfDateException.of(partitionFrameCursorFactory.getTableToken());
+        }
+
+        Function.init(keyExcludedValueFunctions, pageFrameCursor, executionContext, null);
+        recalculateIncludedValues(pageFrameCursor);
+        cursor.of(pageFrameCursor, executionContext);
         if (filter != null) {
-            filter.init(this.cursor, executionContext);
+            filter.init(cursor, executionContext);
         }
-        return this.cursor;
+        return cursor;
     }
 }

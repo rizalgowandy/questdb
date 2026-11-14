@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,23 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.EntityColumnFilter;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.RecordSinkFactory;
-import io.questdb.cairo.map.FastMap;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.map.OrderedMap;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.BytecodeAssembler;
@@ -40,16 +48,9 @@ import io.questdb.std.Misc;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 
-public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactory {
-
-    protected final RecordCursorFactory base;
-    private final Map dataMap;
-    private final DistinctTimeSeriesRecordCursor cursor;
-    // this sink is used to copy recordKeyMap keys to dataMap
-    private final RecordMetadata metadata;
-    public static final byte COMPUTE_NEXT = 0;
-    public static final byte REUSE_CURRENT = 1;
-    public static final byte NO_ROWS = 2;
+public class DistinctTimeSeriesRecordCursorFactory extends AbstractRecordCursorFactory {
+    protected RecordCursorFactory base;
+    private DistinctTimeSeriesRecordCursor cursor;
 
     public DistinctTimeSeriesRecordCursorFactory(
             CairoConfiguration configuration,
@@ -57,42 +58,57 @@ public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactor
             @Transient @NotNull EntityColumnFilter columnFilter,
             @Transient @NotNull BytecodeAssembler asm
     ) {
-        assert base.recordCursorSupportsRandomAccess();
-        final RecordMetadata metadata = base.getMetadata();
-        // sink will be storing record columns to map key
-        columnFilter.of(metadata.getColumnCount());
-        RecordSink recordSink = RecordSinkFactory.getInstance(asm, metadata, columnFilter, false);
-        this.dataMap = new FastMap(
-                configuration.getSqlMapPageSize(),
-                metadata,
-                configuration.getSqlDistinctTimestampKeyCapacity(),
-                configuration.getSqlDistinctTimestampLoadFactor(),
-                Integer.MAX_VALUE
-        ) ;
-
+        super(base.getMetadata());
         this.base = base;
-        this.metadata = metadata;
-        this.cursor = new DistinctTimeSeriesRecordCursor(
-                getMetadata().getTimestampIndex(),
-                dataMap,
-                recordSink
-        );
+        try {
+            assert base.recordCursorSupportsRandomAccess();
+            final RecordMetadata metadata = base.getMetadata();
+            // sink will be storing record columns to map key
+            columnFilter.of(metadata.getColumnCount());
+            RecordSink recordSink = RecordSinkFactory.getInstance(configuration, asm, metadata, columnFilter);
+            // Lazy variant (openOnInit=false): the map allocates no native backing until the first
+            // cursor's of() binds a MemoryTracker and calls reopen(), keeping malloc/free symmetric on
+            // the per-query counter from the very first cursor.
+            Map dataMap = new OrderedMap(
+                    configuration.getSqlSmallMapPageSize(),
+                    metadata,
+                    null,
+                    configuration.getSqlDistinctTimestampKeyCapacity(),
+                    configuration.getSqlDistinctTimestampLoadFactor(),
+                    Integer.MAX_VALUE,
+                    false
+            );
+            this.cursor = new DistinctTimeSeriesRecordCursor(
+                    getMetadata().getTimestampIndex(),
+                    dataMap,
+                    recordSink
+            );
+        } catch (Throwable t) {
+            close();
+            throw t;
+        }
     }
 
     @Override
-    public void close() {
-        dataMap.close();
-        base.close();
+    public RecordCursorFactory getBaseFactory() {
+        return base;
     }
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        return cursor.of(base.getCursor(executionContext), executionContext);
+        final RecordCursor baseCursor = base.getCursor(executionContext);
+        try {
+            baseCursor.setParquetDecodeHint(ParquetDecodeHint.MONOTONIC);
+            return cursor.of(baseCursor, executionContext);
+        } catch (Throwable th) {
+            cursor.close();
+            throw th;
+        }
     }
 
     @Override
-    public RecordMetadata getMetadata() {
-        return metadata;
+    public int getScanDirection() {
+        return base.getScanDirection();
     }
 
     @Override
@@ -101,8 +117,21 @@ public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactor
     }
 
     @Override
-    public boolean hasDescendingOrder() {
-        return base.hasDescendingOrder();
+    public void toPlan(PlanSink sink) {
+        sink.type("DistinctTimeSeries");
+        sink.attr("keys").val(getMetadata());
+        sink.child(base);
+    }
+
+    @Override
+    protected void _close() {
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final DistinctTimeSeriesRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        Throwable failure = Misc.freeBestEffort(null, base);
+        failure = Misc.freeBestEffort(failure, cursor);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private static class DistinctTimeSeriesRecordCursor implements RecordCursor {
@@ -110,23 +139,29 @@ public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactor
         private final RecordSink recordSink;
         private final int timestampIndex;
         private RecordCursor baseCursor;
+        private SqlExecutionCircuitBreaker circuitBreaker;
+        private boolean isFirstRow;
+        private boolean isOpen;
+        private long prevRowId;
+        private long prevTimestamp;
         private Record record;
         private Record recordB;
-        private long prevTimestamp;
-        private long prevRowId;
-        private byte state = 0;
-        private SqlExecutionCircuitBreaker circuitBreaker;
 
         public DistinctTimeSeriesRecordCursor(int timestampIndex, Map dataMap, RecordSink recordSink) {
             this.timestampIndex = timestampIndex;
             this.dataMap = dataMap;
             this.recordSink = recordSink;
+            // Start closed so the first of() binds the tracker and reopens the lazy map.
+            this.isOpen = false;
         }
 
         @Override
         public void close() {
-            Misc.free(baseCursor);
-            dataMap.restoreInitialCapacity();
+            if (isOpen) {
+                isOpen = false;
+                baseCursor = Misc.free(baseCursor);
+                Misc.free(dataMap);
+            }
         }
 
         @Override
@@ -135,8 +170,41 @@ public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactor
         }
 
         @Override
+        public Record getRecordB() {
+            return baseCursor.getRecordB();
+        }
+
+        @Override
         public SymbolTable getSymbolTable(int columnIndex) {
             return baseCursor.getSymbolTable(columnIndex);
+        }
+
+        @Override
+        public boolean hasNext() {
+            if (isFirstRow) {
+                isFirstRow = false;
+                if (baseCursor.hasNext()) {
+                    prevTimestamp = record.getTimestamp(timestampIndex);
+                    prevRowId = record.getRowId();
+                    return true;
+                }
+                return false;
+            }
+
+            while (baseCursor.hasNext()) {
+                circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+                final long timestamp = record.getTimestamp(timestampIndex);
+                if (timestamp != prevTimestamp) {
+                    prevTimestamp = timestamp;
+                    prevRowId = record.getRowId();
+                    return true;
+                }
+
+                if (checkIfNotDupe()) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         @Override
@@ -144,32 +212,24 @@ public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactor
             return baseCursor.newSymbolTable(columnIndex);
         }
 
-        @Override
-        public boolean hasNext() {
-            if (state == COMPUTE_NEXT) {
-                while (baseCursor.hasNext()) {
-                    circuitBreaker.statefulThrowExceptionIfTripped();
-                    final long timestamp = record.getTimestamp(timestampIndex);
-                    if (timestamp != prevTimestamp) {
-                        prevTimestamp = timestamp;
-                        prevRowId = record.getRowId();
-                        return true;
-                    }
-
-                    if (checkIfNotDupe()) {
-                        return true;
-                    }
-                }
-                return false;
+        public RecordCursor of(RecordCursor baseCursor, SqlExecutionContext sqlExecutionContext) {
+            this.baseCursor = baseCursor;
+            record = baseCursor.getRecord();
+            recordB = baseCursor.getRecordB();
+            if (!isOpen) {
+                isOpen = true;
+                dataMap.setMemoryTracker(sqlExecutionContext.getMemoryTracker());
+                dataMap.reopen();
             }
-            boolean next = state == REUSE_CURRENT;
-            state = COMPUTE_NEXT;
-            return next;
+            circuitBreaker = sqlExecutionContext.getCircuitBreaker();
+            isFirstRow = true;
+            return this;
         }
 
         @Override
-        public Record getRecordB() {
-            return baseCursor.getRecordB();
+        public long preComputedStateSize() {
+            // no pre-computed state
+            return 0;
         }
 
         @Override
@@ -178,9 +238,8 @@ public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactor
         }
 
         @Override
-        public void toTop() {
-            baseCursor.toTop();
-            dataMap.clear();
+        public void setParquetDecodeHint(ParquetDecodeHint hint) {
+            baseCursor.setParquetDecodeHint(hint);
         }
 
         @Override
@@ -188,23 +247,11 @@ public class DistinctTimeSeriesRecordCursorFactory implements RecordCursorFactor
             return -1;
         }
 
-        public RecordCursor of(RecordCursor baseCursor, SqlExecutionContext sqlExecutionContext) {
-            this.baseCursor = baseCursor;
-            this.circuitBreaker = sqlExecutionContext.getCircuitBreaker();
-            this.record = baseCursor.getRecord();
-            this.recordB = baseCursor.getRecordB();
-            this.dataMap.clear();
-
-            // first iteration to get initial timestamp value
-            if (baseCursor.hasNext()) {
-                prevTimestamp = record.getTimestamp(timestampIndex);
-                prevRowId = record.getRowId();
-                state = REUSE_CURRENT;
-            } else {
-                // edge case - base cursor is empty, avoid calling hasNext() again
-                state = NO_ROWS;
-            }
-            return this;
+        @Override
+        public void toTop() {
+            baseCursor.toTop();
+            dataMap.clear();
+            isFirstRow = true;
         }
 
         private boolean checkIfNotDupe() {

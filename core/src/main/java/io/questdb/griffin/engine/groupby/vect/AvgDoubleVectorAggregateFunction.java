@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,91 +28,66 @@ import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.DoubleFunction;
-import io.questdb.std.*;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.Rosti;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 
 import java.util.concurrent.atomic.DoubleAdder;
 import java.util.concurrent.atomic.LongAdder;
 
-import static io.questdb.griffin.SqlCodeGenerator.GKK_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_MICRO_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_NANO_HOUR_INT;
 
 public class AvgDoubleVectorAggregateFunction extends DoubleFunction implements VectorAggregateFunction {
 
-    private final DoubleAdder sum = new DoubleAdder();
-    private final LongAdder count = new LongAdder();
     private final int columnIndex;
+    private final LongAdder count = new LongAdder();
     private final DistinctFunc distinctFunc;
     private final KeyValueFunc keyValueFunc;
+    private final DoubleAdder sum = new DoubleAdder();
     private final int workerCount;
+    private long countsAddr;
     private int valueOffset;
-    private long counts;
 
-    public AvgDoubleVectorAggregateFunction(int keyKind, int columnIndex, int workerCount) {
+    @SuppressWarnings("unused")
+    public AvgDoubleVectorAggregateFunction(int keyKind, int columnIndex, int timestampIndex, int workerCount) {
         this.columnIndex = columnIndex;
-        if (keyKind == GKK_HOUR_INT) {
-            distinctFunc = Rosti::keyedHourDistinct;
-            keyValueFunc = Rosti::keyedHourSumDouble;
+        if (keyKind == GKK_MICRO_HOUR_INT) {
+            distinctFunc = Rosti::keyedMicroHourDistinct;
+            keyValueFunc = Rosti::keyedMicroHourSumDouble;
+        } else if (keyKind == GKK_NANO_HOUR_INT) {
+            distinctFunc = Rosti::keyedNanoHourDistinct;
+            keyValueFunc = Rosti::keyedNanoHourSumDouble;
         } else {
             distinctFunc = Rosti::keyedIntDistinct;
             keyValueFunc = Rosti::keyedIntSumDouble;
         }
-        counts = Unsafe.malloc((long) workerCount * Misc.CACHE_LINE_SIZE, MemoryTag.NATIVE_DEFAULT);
+        countsAddr = Unsafe.malloc((long) workerCount * Misc.CACHE_LINE_SIZE, MemoryTag.NATIVE_FUNC_RSS);
         this.workerCount = workerCount;
     }
 
     @Override
-    public void aggregate(long address, long addressSize, int columnSizeHint, int workerId) {
+    public void aggregate(long address, long frameRowCount, int workerId) {
         if (address != 0) {
-            double value = Vect.avgDoubleAcc(address, addressSize / Double.BYTES, counts + (long) workerId * Misc.CACHE_LINE_SIZE);
-            if (value == value) {
-                final long count = Unsafe.getUnsafe().getLong(counts + (long) workerId * Misc.CACHE_LINE_SIZE);
-                // we have to include "weight" of this avg value in the formula,
-                // which calculates final result
-                sum.add(value * count);
-                this.count.add(count);
+            final double s = Vect.sumDoubleAcc(address, frameRowCount, countsAddr + (long) workerId * Misc.CACHE_LINE_SIZE);
+            if (Numbers.isFinite(s)) {
+                final long c = Unsafe.getLong(countsAddr + (long) workerId * Misc.CACHE_LINE_SIZE);
+                sum.add(s);
+                count.add(c);
             }
         }
     }
 
     @Override
-    public void aggregate(long pRosti, long keyAddress, long valueAddress, long valueAddressSize, int columnSizeShr, int workerId) {
+    public boolean aggregate(long pRosti, long keyAddress, long valueAddress, long frameRowCount) {
         if (valueAddress == 0) {
-            distinctFunc.run(pRosti, keyAddress, valueAddressSize / Double.BYTES);
+            return distinctFunc.run(pRosti, keyAddress, frameRowCount);
         } else {
-            keyValueFunc.run(pRosti, keyAddress, valueAddress, valueAddressSize / Double.BYTES, valueOffset);
+            return keyValueFunc.run(pRosti, keyAddress, valueAddress, frameRowCount, valueOffset);
         }
-    }
-
-    @Override
-    public int getColumnIndex() {
-        return columnIndex;
-    }
-
-    @Override
-    public int getValueOffset() {
-        return valueOffset;
-    }
-
-    @Override
-    public void initRosti(long pRosti) {
-        Unsafe.getUnsafe().putDouble(Rosti.getInitialValueSlot(pRosti, this.valueOffset), 0);
-        Unsafe.getUnsafe().putLong(Rosti.getInitialValueSlot(pRosti, this.valueOffset + 1), 0);
-    }
-
-    @Override
-    public void merge(long pRostiA, long pRostiB) {
-        Rosti.keyedIntSumDoubleMerge(pRostiA, pRostiB, valueOffset);
-    }
-
-    @Override
-    public void pushValueTypes(ArrayColumnTypes types) {
-        this.valueOffset = types.getColumnCount();
-        types.add(ColumnType.DOUBLE);
-        types.add(ColumnType.LONG);
-    }
-
-    @Override
-    public void wrapUp(long pRosti) {
-        Rosti.keyedIntAvgDoubleWrapUp(pRosti, valueOffset, this.sum.sum(), this.count.sum());
     }
 
     @Override
@@ -123,11 +98,15 @@ public class AvgDoubleVectorAggregateFunction extends DoubleFunction implements 
 
     @Override
     public void close() {
-        if (counts != 0) {
-            Unsafe.free(counts, (long) workerCount * Misc.CACHE_LINE_SIZE, MemoryTag.NATIVE_DEFAULT);
-            counts = 0;
+        if (countsAddr != 0) {
+            countsAddr = Unsafe.free(countsAddr, (long) workerCount * Misc.CACHE_LINE_SIZE, MemoryTag.NATIVE_FUNC_RSS);
         }
         super.close();
+    }
+
+    @Override
+    public int getColumnIndex() {
+        return columnIndex;
     }
 
     @Override
@@ -140,9 +119,35 @@ public class AvgDoubleVectorAggregateFunction extends DoubleFunction implements 
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        // group-by functions are not stateless when values are computed
-        // however, once values are calculated, the read becomes stateless
-        return false;
+    public String getName() {
+        return "avg";
+    }
+
+    @Override
+    public int getValueOffset() {
+        return valueOffset;
+    }
+
+    @Override
+    public void initRosti(long pRosti) {
+        Unsafe.putDouble(Rosti.getInitialValueSlot(pRosti, this.valueOffset), 0);
+        Unsafe.putLong(Rosti.getInitialValueSlot(pRosti, this.valueOffset + 1), 0);
+    }
+
+    @Override
+    public boolean merge(long pRostiA, long pRostiB) {
+        return Rosti.keyedIntSumDoubleMerge(pRostiA, pRostiB, valueOffset);
+    }
+
+    @Override
+    public void pushValueTypes(ArrayColumnTypes types) {
+        this.valueOffset = types.getColumnCount();
+        types.add(ColumnType.DOUBLE);
+        types.add(ColumnType.LONG);
+    }
+
+    @Override
+    public boolean wrapUp(long pRosti) {
+        return Rosti.keyedIntAvgDoubleWrapUp(pRosti, valueOffset, this.sum.sum(), this.count.sum());
     }
 }

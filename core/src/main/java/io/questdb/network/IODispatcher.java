@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,37 +28,49 @@ import io.questdb.mp.Job;
 
 import java.io.Closeable;
 
-public interface IODispatcher<C extends IOContext> extends Closeable, Job {
-    int DISCONNECT_REASON_UNKNOWN_OPERATION = 0;
+public interface IODispatcher<C extends IOContext<C>> extends Closeable, Job {
     int DISCONNECT_REASON_KEEPALIVE_OFF = 1;
+    int DISCONNECT_REASON_KEEPALIVE_OFF_RECV = 4;
+    int DISCONNECT_REASON_KICKED_OUT_AT_EXTRA_BYTES = 13;
+    int DISCONNECT_REASON_KICKED_OUT_AT_RECV = 5;
     int DISCONNECT_REASON_KICKED_OUT_AT_RERUN = 2;
     int DISCONNECT_REASON_KICKED_OUT_AT_SEND = 3;
-    int DISCONNECT_REASON_KEEPALIVE_OFF_RECV = 4;
-    int DISCONNECT_REASON_KICKED_OUT_AT_RECV = 5;
-    int DISCONNECT_REASON_RETRY_FAILED = 6;
-    int DISCONNECT_REASON_PROTOCOL_VIOLATION = 7;
-    int DISCONNECT_REASON_PEER_DISCONNECT_AT_MULTIPART_RECV = 8;
+    int DISCONNECT_REASON_KICKED_TXT_NOT_ENOUGH_LINES = 14;
     int DISCONNECT_REASON_MULTIPART_HEADER_TOO_BIG = 9;
+    int DISCONNECT_REASON_PEER_DISCONNECT_AT_HEADER_RECV = 12;
+    int DISCONNECT_REASON_PEER_DISCONNECT_AT_MULTIPART_RECV = 8;
+    int DISCONNECT_REASON_PEER_DISCONNECT_AT_RECV = 15;
     int DISCONNECT_REASON_PEER_DISCONNECT_AT_RERUN = 10;
     int DISCONNECT_REASON_PEER_DISCONNECT_AT_SEND = 11;
-    int DISCONNECT_REASON_PEER_DISCONNECT_AT_HEADER_RECV = 12;
-    int DISCONNECT_REASON_KICKED_OUT_AT_EXTRA_BYTES = 13;
-    int DISCONNECT_REASON_KICKED_TXT_NOT_ENOUGH_LINES = 14;
-    int DISCONNECT_REASON_PEER_DISCONNECT_AT_RECV = 15;
-    int DISCONNECT_REASON_TEST = 16;
-
+    int DISCONNECT_REASON_PROTOCOL_VIOLATION = 7;
+    int DISCONNECT_REASON_RETRY_FAILED = 6;
     /**
      * Unexpected server error caused connection disconnect (to avoid client working with potentially corrupt server state).
      */
     int DISCONNECT_REASON_SERVER_ERROR = 17;
+    int DISCONNECT_REASON_SERVER_SHUTDOWN = 19;
+    int DISCONNECT_REASON_TEST = 16;
+    int DISCONNECT_REASON_TLS_SESSION_INIT_FAILED = 18;
+    int DISCONNECT_REASON_UNKNOWN_OPERATION = 0;
 
     void disconnect(C context, int reason);
 
+    default void drainIOQueue(IORequestProcessor<C> processor) {
+        //noinspection StatementWithEmptyBody
+        while (processIOQueue(processor)) ;
+    }
+
     int getConnectionCount();
 
-    boolean processIOQueue(IORequestProcessor<C> processor);
+    int getPort();
+
+    default boolean hasPendingIOEvents() {
+        return true;
+    }
 
     boolean isListening();
+
+    boolean processIOQueue(IORequestProcessor<C> processor);
 
     void registerChannel(C context, int operation);
 }

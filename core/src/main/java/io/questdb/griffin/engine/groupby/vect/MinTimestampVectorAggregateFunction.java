@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,24 +36,38 @@ import io.questdb.std.Vect;
 import java.util.concurrent.atomic.LongAccumulator;
 import java.util.function.LongBinaryOperator;
 
-import static io.questdb.griffin.SqlCodeGenerator.GKK_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_MICRO_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_NANO_HOUR_INT;
 
 public class MinTimestampVectorAggregateFunction extends TimestampFunction implements VectorAggregateFunction {
-
-    public static final LongBinaryOperator MIN = Math::min;
+    public static final LongBinaryOperator MIN = (long l1, long l2) -> {
+        if (l1 == Numbers.LONG_NULL) {
+            return l2;
+        }
+        if (l2 == Numbers.LONG_NULL) {
+            return l1;
+        }
+        return Math.min(l1, l2);
+    };
     private final LongAccumulator accumulator = new LongAccumulator(
-            MIN, Long.MAX_VALUE
+            MIN, Numbers.LONG_NULL
     );
     private final int columnIndex;
     private final DistinctFunc distinctFunc;
+    private final boolean isDesignated;
     private final KeyValueFunc keyValueFunc;
     private int valueOffset;
 
-    public MinTimestampVectorAggregateFunction(int keyKind, int columnIndex, int workerCount) {
+    public MinTimestampVectorAggregateFunction(int keyKind, int columnIndex, int timestampType, int timestampIndex) {
+        super(timestampType);
         this.columnIndex = columnIndex;
-        if (keyKind == GKK_HOUR_INT) {
-            this.distinctFunc = Rosti::keyedHourDistinct;
-            this.keyValueFunc = Rosti::keyedHourMinLong;
+        this.isDesignated = columnIndex == timestampIndex;
+        if (keyKind == GKK_MICRO_HOUR_INT) {
+            this.distinctFunc = Rosti::keyedMicroHourDistinct;
+            this.keyValueFunc = Rosti::keyedMicroHourMinLong;
+        } else if (keyKind == GKK_NANO_HOUR_INT) {
+            this.distinctFunc = Rosti::keyedNanoHourDistinct;
+            this.keyValueFunc = Rosti::keyedNanoHourMinLong;
         } else {
             this.distinctFunc = Rosti::keyedIntDistinct;
             this.keyValueFunc = Rosti::keyedIntMinLong;
@@ -61,27 +75,47 @@ public class MinTimestampVectorAggregateFunction extends TimestampFunction imple
     }
 
     @Override
-    public void aggregate(long address, long addressSize, int columnSizeHint, int workerId) {
+    public void aggregate(long address, long frameRowCount, int workerId) {
         if (address != 0) {
-            final long value = Vect.minLong(address, addressSize / Long.BYTES);
-            if (value != Numbers.LONG_NaN) {
+            if (isDesignated) {
+                final long value = Unsafe.getLong(address);
                 accumulator.accumulate(value);
+            } else {
+                final long value = Vect.minLong(address, frameRowCount);
+                if (value != Numbers.LONG_NULL) {
+                    accumulator.accumulate(value);
+                }
             }
         }
     }
 
     @Override
-    public void aggregate(long pRosti, long keyAddress, long valueAddress, long valueAddressSize, int columnSizeShr, int workerId) {
+    public boolean aggregate(long pRosti, long keyAddress, long valueAddress, long frameRowCount) {
         if (valueAddress == 0) {
-            distinctFunc.run(pRosti, keyAddress, valueAddressSize / Long.BYTES);
+            return distinctFunc.run(pRosti, keyAddress, frameRowCount);
         } else {
-            keyValueFunc.run(pRosti, keyAddress, valueAddress, valueAddressSize / Long.BYTES, valueOffset);
+            return keyValueFunc.run(pRosti, keyAddress, valueAddress, frameRowCount, valueOffset);
         }
+    }
+
+    @Override
+    public void clear() {
+        accumulator.reset();
     }
 
     @Override
     public int getColumnIndex() {
         return columnIndex;
+    }
+
+    @Override
+    public String getName() {
+        return isDesignated ? "min_designated" : "min";
+    }
+
+    @Override
+    public long getTimestamp(Record rec) {
+        return accumulator.longValue();
     }
 
     @Override
@@ -91,12 +125,12 @@ public class MinTimestampVectorAggregateFunction extends TimestampFunction imple
 
     @Override
     public void initRosti(long pRosti) {
-        Unsafe.getUnsafe().putLong(Rosti.getInitialValueSlot(pRosti, valueOffset), Long.MAX_VALUE);
+        Unsafe.putLong(Rosti.getInitialValueSlot(pRosti, valueOffset), Numbers.LONG_NULL);
     }
 
     @Override
-    public void merge(long pRostiA, long pRostiB) {
-        Rosti.keyedIntMinLongMerge(pRostiA, pRostiB, valueOffset);
+    public boolean merge(long pRostiA, long pRostiB) {
+        return Rosti.keyedIntMinLongMerge(pRostiA, pRostiB, valueOffset);
     }
 
     @Override
@@ -106,23 +140,7 @@ public class MinTimestampVectorAggregateFunction extends TimestampFunction imple
     }
 
     @Override
-    public void wrapUp(long pRosti) {
-        Rosti.keyedIntMinLongWrapUp(pRosti, valueOffset, accumulator.longValue());
-    }
-
-    @Override
-    public void clear() {
-        accumulator.reset();
-    }
-
-    @Override
-    public long getTimestamp(Record rec) {
-        final long value = accumulator.longValue();
-        return value == Long.MAX_VALUE ? Numbers.LONG_NaN : value;
-    }
-
-    @Override
-    public boolean isReadThreadSafe() {
-        return false;
+    public boolean wrapUp(long pRosti) {
+        return Rosti.keyedIntMinLongWrapUp(pRosti, valueOffset, accumulator.longValue());
     }
 }

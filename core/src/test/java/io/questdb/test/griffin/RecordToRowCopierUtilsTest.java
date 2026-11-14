@@ -1,0 +1,1575 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin;
+
+import io.questdb.PropertyKey;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.ImplicitCastException;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.LoopingRecordToRowCopier;
+import io.questdb.griffin.RecordToRowCopier;
+import io.questdb.griffin.RecordToRowCopierUtils;
+import io.questdb.griffin.SqlException;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Decimals;
+import io.questdb.std.Long256;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.Rnd;
+import io.questdb.std.str.Utf8String;
+import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.tools.TestUtils;
+import org.jetbrains.annotations.NotNull;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.lang.reflect.Proxy;
+import java.math.BigDecimal;
+
+public class RecordToRowCopierUtilsTest extends AbstractCairoTest {
+
+    // 500 INT columns estimate to 9,000 bytes of copy bytecode: more than one 6,000-byte chunk, so the chunked
+    // generator splits instead of falling back to the single-method one, and more than the 8,000-byte method
+    // limit, so the default auto-selection picks the chunked copier too.
+    private static final int CHUNKING_PAD_COUNT = 500;
+    private static final int[] COPIER_TYPES = {
+            RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD,
+            RecordToRowCopierUtils.COPIER_TYPE_CHUNKED,
+            RecordToRowCopierUtils.COPIER_TYPE_LOOPING
+    };
+
+    @Test
+    public void testChunkedCopierCountsConversionsWithinTag() throws Exception {
+        // generateChunkedCopier() sizes each chunk with estimateColumnBytecodeSize(); a conversion the
+        // estimate misses lets a chunk method outgrow the method size limit
+        assertMemoryLeak(() -> {
+            assertWideInsertSelect("GEOHASH(5c)", "GEOHASH(1c)", "#u33d8", "u");
+            assertWideInsertSelect("GEOHASH(5c)", "GEOHASH(4c)", "#u33d8", "u33d");
+            assertWideInsertSelect("TIMESTAMP", "TIMESTAMP_NS", "'2024-01-01T00:00:00.000001Z'::TIMESTAMP", "2024-01-01T00:00:00.000001000Z");
+        });
+    }
+
+    @Test
+    public void testCompareAllCopiersWithWideTable() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int colCount = 50 + rnd.nextInt(50); // 50-100 columns
+            int rowCount = 5 + rnd.nextInt(15);  // 5-20 rows
+
+            // Build column definitions
+            StringBuilder cols = new StringBuilder("ts timestamp");
+            for (int i = 0; i < colCount; i++) {
+                cols.append(", col").append(i).append(" int");
+            }
+
+            execute("create table src (" + cols + ") timestamp(ts) partition by DAY");
+            execute("create table dst_loop (" + cols + ") timestamp(ts) partition by DAY");
+            execute("create table dst_single (" + cols + ") timestamp(ts) partition by DAY");
+            execute("create table dst_chunk (" + cols + ") timestamp(ts) partition by DAY");
+
+            // Build insert with random values
+            String insertVals = "select x::timestamp" + ", rnd_int()".repeat(Math.max(0, colCount)) +
+                    " from long_sequence(" + rowCount + ")";
+            execute("insert into src " + insertVals);
+
+            // Copy with each copier type
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_LOOPING);
+            execute("insert into dst_loop select * from src");
+
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD);
+            execute("insert into dst_single select * from src");
+
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_CHUNKED);
+            execute("insert into dst_chunk select * from src");
+
+            // All should match
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst_loop order by ts", "dst_single order by ts", LOG);
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst_loop order by ts", "dst_chunk order by ts", LOG);
+        });
+    }
+
+    @Test
+    public void testCopierByteToDecimal() {
+        RecordToRowCopier copier = generateCopier(ColumnType.BYTE, ColumnType.getDecimalType(16, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.BYTE, 123), getLongAsserter(123000));
+    }
+
+    @Test(expected = ImplicitCastException.class)
+    public void testCopierByteToDecimalOverflow() {
+        RecordToRowCopier copier = generateCopier(ColumnType.BYTE, ColumnType.getDecimalType(4, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.BYTE, 99), new RowAsserter());
+    }
+
+    @Test
+    public void testCopierDecimal8ToDecimal32() {
+        // Converting 1.2 from a Decimal8 with a scale of 1 (1.2) to a Decimal32 with a scale of 3 (1.200)
+        int fromType = ColumnType.getDecimalType(2, 1);
+        Assert.assertEquals("Unexpected from type", ColumnType.DECIMAL8, ColumnType.tagOf(fromType));
+        int toType = ColumnType.getDecimalType(8, 3);
+        Assert.assertEquals("Unexpected to type", ColumnType.DECIMAL32, ColumnType.tagOf(toType));
+
+        RecordToRowCopier copier = generateCopier(fromType, toType);
+
+        Record rec = new Record() {
+            @Override
+            public byte getDecimal8(int col) {
+                return 12;
+            }
+        };
+
+        copier.copy(sqlExecutionContext, rec, getIntAsserter());
+    }
+
+    @Test
+    public void testCopierDecimalCases() {
+        Decimal256 d = new Decimal256();
+        Decimal256 c = new Decimal256();
+        Decimal256 dnull = new Decimal256();
+        BytecodeAssembler asm = new BytecodeAssembler();
+        dnull.ofNull();
+        boolean[] isNull = new boolean[]{false, true};
+        int[] fromPrecisions = new int[]{1, 2, 3, 4, 5, 8, 15, 25, 30, 50, 75};
+        int[] toPrecisions = new int[]{1, 2, 3, 4, 5, 8, 15, 25, 30, 50, 75};
+        for (int fromPrecision : fromPrecisions) {
+            for (int toPrecision : toPrecisions) {
+                for (boolean nulled : isNull) {
+                    if (nulled) {
+                        testDecimalCast(asm, fromPrecision, toPrecision, 0, dnull, true);
+                        continue;
+                    }
+
+                    for (int fromScale = 1; fromScale <= fromPrecision; fromScale <<= 1) {
+                        for (int toScale = 1; toScale <= toPrecision; toScale <<= 1) {
+                            boolean fit;
+                            generateValue(d, fromPrecision, fromScale);
+                            try {
+                                c.copyFrom(d);
+                                c.rescale(toScale);
+                                fit = c.comparePrecision(toPrecision);
+                            } catch (NumericException ignored) {
+                                fit = false;
+                            }
+                            testDecimalCast(asm, fromPrecision, toPrecision, toScale, d, fit);
+                            d.negate();
+                            testDecimalCast(asm, fromPrecision, toPrecision, toScale, d, fit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testCopierIntToDecimal() {
+        RecordToRowCopier copier = generateCopier(ColumnType.INT, ColumnType.getDecimalType(16, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.INT, 123456), getLongAsserter(123456000));
+    }
+
+    @Test(expected = ImplicitCastException.class)
+    public void testCopierIntToDecimalOverflow() {
+        RecordToRowCopier copier = generateCopier(ColumnType.INT, ColumnType.getDecimalType(8, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.INT, 999999), new RowAsserter());
+    }
+
+    @Test
+    public void testCopierLongToDecimal() {
+        RecordToRowCopier copier = generateCopier(ColumnType.LONG, ColumnType.getDecimalType(16, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.LONG, 123456L), getLongAsserter(123456000L));
+    }
+
+    @Test(expected = ImplicitCastException.class)
+    public void testCopierLongToDecimalOverflow() {
+        RecordToRowCopier copier = generateCopier(ColumnType.LONG, ColumnType.getDecimalType(8, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.LONG, 999999L), new RowAsserter());
+    }
+
+    @Test
+    public void testCopierNullIntToDecimal() {
+        RecordToRowCopier copier = generateCopier(ColumnType.INT, ColumnType.getDecimalType(16, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.INT, Numbers.INT_NULL), getLongAsserter(Decimals.DECIMAL64_NULL));
+    }
+
+    @Test
+    public void testCopierNullLongToDecimal() {
+        RecordToRowCopier copier = generateCopier(ColumnType.LONG, ColumnType.getDecimalType(16, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.LONG, Numbers.LONG_NULL), getLongAsserter(Decimals.DECIMAL64_NULL));
+    }
+
+    @Test
+    public void testCopierShortToDecimal() {
+        RecordToRowCopier copier = generateCopier(ColumnType.SHORT, ColumnType.getDecimalType(16, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.SHORT, 1234), getLongAsserter(1234000));
+    }
+
+    @Test(expected = ImplicitCastException.class)
+    public void testCopierShortToDecimalOverflow() {
+        RecordToRowCopier copier = generateCopier(ColumnType.SHORT, ColumnType.getDecimalType(5, 3));
+        copier.copy(sqlExecutionContext, getLongRecord(ColumnType.SHORT, 9999), new RowAsserter());
+    }
+
+    @Test
+    public void testFuzzAllTypesLoopingVsChunked() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        testFuzzAllTypes(rnd, RecordToRowCopierUtils.COPIER_TYPE_LOOPING, RecordToRowCopierUtils.COPIER_TYPE_CHUNKED);
+    }
+
+    @Test
+    public void testFuzzAllTypesLoopingVsSingleMethod() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        testFuzzAllTypes(rnd, RecordToRowCopierUtils.COPIER_TYPE_LOOPING, RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD);
+    }
+
+    @Test
+    public void testFuzzAllTypesSingleMethodVsChunked() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        testFuzzAllTypes(rnd, RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD, RecordToRowCopierUtils.COPIER_TYPE_CHUNKED);
+    }
+
+    @Test
+    public void testFuzzBinaryColumn() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            execute("create table src (ts timestamp, b binary) timestamp(ts) partition by DAY");
+            execute("create table dst (ts timestamp, b binary) timestamp(ts) partition by DAY");
+
+            execute("insert into src select x::timestamp, rnd_bin(10, 20, 1) from long_sequence(5)");
+            execute("insert into dst select * from src");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "src order by ts", "dst order by ts", LOG);
+        });
+    }
+
+    @Test
+    public void testFuzzCharToStringConversion() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType1 = randomCopierType(rnd);
+            int copierType2 = randomCopierType(rnd);
+
+            execute("create table src (ts timestamp, c char) timestamp(ts) partition by DAY");
+            execute("create table dst1 (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst1_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+            execute("create table dst2 (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst2_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+
+            execute("insert into src values (0, 'A'), (1000, 'Z'), (2000, null)");
+
+            setCopierType(copierType1);
+            execute("insert into dst1 select * from src");
+            execute("insert into dst1_vc select * from src");
+
+            setCopierType(copierType2);
+            execute("insert into dst2 select * from src");
+            execute("insert into dst2_vc select * from src");
+
+            // Compare results
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst1 order by ts", "dst2 order by ts", LOG);
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst1_vc order by ts", "dst2_vc order by ts", LOG);
+        });
+    }
+
+    @Test
+    public void testFuzzDateTimestampConversions() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            // Timestamp to Date (loses microseconds)
+            execute("create table src_ts (ts timestamp, t timestamp) timestamp(ts) partition by DAY");
+            execute("create table dst_date (ts timestamp, d date) timestamp(ts) partition by DAY");
+
+            execute("insert into src_ts values (0, '2023-06-15T14:30:00.123456Z')");
+            execute("insert into dst_date select * from src_ts");
+
+            assertQuery("dst_date")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\td
+                            1970-01-01T00:00:00.000000Z\t2023-06-15T14:30:00.123Z
+                            """);
+
+            // Date to Timestamp
+            execute("create table src_date (ts timestamp, d date) timestamp(ts) partition by DAY");
+            execute("create table dst_ts (ts timestamp, t timestamp) timestamp(ts) partition by DAY");
+
+            execute("insert into src_date values (0, '2023-06-15T14:30:00.000Z')");
+            execute("insert into dst_ts select * from src_date");
+
+            assertQuery("dst_ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tt
+                            1970-01-01T00:00:00.000000Z\t2023-06-15T14:30:00.000000Z
+                            """);
+        });
+    }
+
+    @Test
+    public void testFuzzDecimalTypes() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            execute("create table src_dec (ts timestamp, d decimal(18,3)) timestamp(ts) partition by DAY");
+            execute("create table dst_dec (ts timestamp, d decimal(18,3)) timestamp(ts) partition by DAY");
+
+            // Insert using cast to decimal
+            execute("insert into src_dec select 0::timestamp, 123.456::decimal(18,3)");
+            execute("insert into src_dec select 1000::timestamp, (-789.012)::decimal(18,3)");
+            execute("insert into src_dec select 2000::timestamp, null::decimal(18,3)");
+            execute("insert into dst_dec select * from src_dec");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "src_dec order by ts", "dst_dec order by ts", LOG);
+        });
+    }
+
+    @Test
+    public void testFuzzGeoHashNulls() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            // Use geohash sizes that match the bit counts exactly
+            execute("create table src (ts timestamp, g4 geohash(4b), g10 geohash(10b), g20 geohash(20b), g40 geohash(40b)) timestamp(ts) partition by DAY");
+            execute("create table dst (ts timestamp, g4 geohash(4b), g10 geohash(10b), g20 geohash(20b), g40 geohash(40b)) timestamp(ts) partition by DAY");
+
+            // Insert nulls
+            execute("insert into src values (0, null, null, null, null)");
+            // Insert valid values using rnd_geohash which generates exact bit counts
+            execute("insert into src select 1000::timestamp, rnd_geohash(4), rnd_geohash(10), rnd_geohash(20), rnd_geohash(40)");
+            execute("insert into dst select * from src");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "src order by ts", "dst order by ts", LOG);
+        });
+    }
+
+    @Test
+    public void testFuzzIPv4Conversions() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            // String to IPv4
+            execute("create table src_str (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst_ipv4 (ts timestamp, ip ipv4) timestamp(ts) partition by DAY");
+
+            execute("insert into src_str values (0, '192.168.1.1'), (1000, '10.0.0.1')");
+            execute("insert into dst_ipv4 select * from src_str");
+
+            assertQuery("dst_ipv4")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tip
+                            1970-01-01T00:00:00.000000Z\t192.168.1.1
+                            1970-01-01T00:00:00.001000Z\t10.0.0.1
+                            """);
+
+            // Varchar to IPv4
+            execute("create table src_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+            execute("create table dst_ipv4_2 (ts timestamp, ip ipv4) timestamp(ts) partition by DAY");
+
+            execute("insert into src_vc values (0, '172.16.0.1'), (1000, '8.8.8.8')");
+            execute("insert into dst_ipv4_2 select * from src_vc");
+
+            assertQuery("dst_ipv4_2")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tip
+                            1970-01-01T00:00:00.000000Z\t172.16.0.1
+                            1970-01-01T00:00:00.001000Z\t8.8.8.8
+                            """);
+        });
+    }
+
+    @Test
+    public void testFuzzLong128Column() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            execute("create table src (ts timestamp, l long128) timestamp(ts) partition by DAY");
+            execute("create table dst (ts timestamp, l long128) timestamp(ts) partition by DAY");
+
+            // Long128 can only be inserted via ILP or API, test with nulls
+            execute("insert into src values (0, null), (1000, null)");
+            execute("insert into dst select * from src");
+
+            assertQuery("select count(*) from dst")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("count\n2\n");
+        });
+    }
+
+    @Test
+    public void testFuzzLong256Conversions() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            // Long256 copy
+            execute("create table src (ts timestamp, l long256) timestamp(ts) partition by DAY");
+            execute("create table dst (ts timestamp, l long256) timestamp(ts) partition by DAY");
+
+            execute("insert into src values (0, '0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20'), (1000, null)");
+            execute("insert into dst select * from src");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "src order by ts", "dst order by ts", LOG);
+
+            // Varchar to Long256
+            execute("create table src_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+            execute("create table dst_l256 (ts timestamp, l long256) timestamp(ts) partition by DAY");
+
+            execute("insert into src_vc values (0, '0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'), (1000, null)");
+            execute("insert into dst_l256 select * from src_vc");
+
+            assertQuery("select count(*) from dst_l256")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("count\n2\n");
+
+            // Varchar expression (cast) to Long256 - tests non-DirectUtf8Sequence path
+            execute("create table src_str (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst_l256_cast (ts timestamp, l long256) timestamp(ts) partition by DAY");
+
+            execute("insert into src_str values (0, '0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'), (1000, null)");
+            execute("insert into dst_l256_cast select ts, s::varchar from src_str");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst_l256 order by ts", "dst_l256_cast order by ts", LOG);
+
+            // Negative test: non-ASCII varchar to Long256 should fail
+            execute("create table src_non_ascii (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst_l256_fail (ts timestamp, l long256) timestamp(ts) partition by DAY");
+            execute("insert into src_non_ascii values (0, '0xкириллица')");
+
+            assertException(
+                    "insert into dst_l256_fail select ts, s::varchar from src_non_ascii",
+                    0,
+                    "inconvertible value"
+            );
+        });
+    }
+
+    @Test
+    public void testFuzzNullHandlingLoopingVsSingleMethod() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        testFuzzNullHandling(rnd);
+    }
+
+    @Test
+    public void testFuzzSymbolConversions() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            // Symbol to String
+            execute("create table src_sym (ts timestamp, sym symbol) timestamp(ts) partition by DAY");
+            execute("create table dst_str (ts timestamp, s string) timestamp(ts) partition by DAY");
+
+            execute("insert into src_sym values (0, 'apple'), (1000, 'banana'), (2000, null)");
+            execute("insert into dst_str select * from src_sym");
+
+            assertQuery("dst_str")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\ts
+                            1970-01-01T00:00:00.000000Z\tapple
+                            1970-01-01T00:00:00.001000Z\tbanana
+                            1970-01-01T00:00:00.002000Z\t
+                            """);
+
+            // Symbol to Varchar
+            execute("create table dst_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+            execute("insert into dst_vc select * from src_sym");
+
+            assertQuery("dst_vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tv
+                            1970-01-01T00:00:00.000000Z\tapple
+                            1970-01-01T00:00:00.001000Z\tbanana
+                            1970-01-01T00:00:00.002000Z\t
+                            """);
+
+            // String to Symbol
+            execute("create table src_str2 (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst_sym (ts timestamp, sym symbol) timestamp(ts) partition by DAY");
+
+            execute("insert into src_str2 values (0, 'foo'), (1000, 'bar')");
+            execute("insert into dst_sym select * from src_str2");
+
+            assertQuery("dst_sym")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tsym
+                            1970-01-01T00:00:00.000000Z\tfoo
+                            1970-01-01T00:00:00.001000Z\tbar
+                            """);
+        });
+    }
+
+    @Test
+    public void testFuzzTypeConversionsLoopingVsChunked() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        testFuzzTypeConversions(rnd, RecordToRowCopierUtils.COPIER_TYPE_CHUNKED);
+    }
+
+    @Test
+    public void testFuzzTypeConversionsLoopingVsSingleMethod() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        testFuzzTypeConversions(rnd, RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD);
+    }
+
+    @Test
+    public void testFuzzUuidConversions() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            execute("create table src (ts timestamp, u uuid) timestamp(ts) partition by DAY");
+            execute("create table dst_str (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+
+            execute("insert into src values (0, '550e8400-e29b-41d4-a716-446655440000'), (1000, null)");
+            execute("insert into dst_str select * from src");
+            execute("insert into dst_vc select * from src");
+
+            assertQuery("dst_str")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\ts
+                            1970-01-01T00:00:00.000000Z\t550e8400-e29b-41d4-a716-446655440000
+                            1970-01-01T00:00:00.001000Z\t
+                            """);
+
+            assertQuery("dst_vc")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tv
+                            1970-01-01T00:00:00.000000Z\t550e8400-e29b-41d4-a716-446655440000
+                            1970-01-01T00:00:00.001000Z\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testFuzzVarcharToNumericConversions() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            execute("create table src (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+            execute("create table dst_byte (ts timestamp, b byte) timestamp(ts) partition by DAY");
+            execute("create table dst_short (ts timestamp, s short) timestamp(ts) partition by DAY");
+            execute("create table dst_int (ts timestamp, i int) timestamp(ts) partition by DAY");
+            execute("create table dst_long (ts timestamp, l long) timestamp(ts) partition by DAY");
+            execute("create table dst_float (ts timestamp, f float) timestamp(ts) partition by DAY");
+            execute("create table dst_double (ts timestamp, d double) timestamp(ts) partition by DAY");
+
+            execute("insert into src values (0, '42'), (1000, '-17'), (2000, '100')");
+
+            execute("insert into dst_byte select * from src");
+            execute("insert into dst_short select * from src");
+            execute("insert into dst_int select * from src");
+            execute("insert into dst_long select * from src");
+            execute("insert into dst_float select * from src");
+            execute("insert into dst_double select * from src");
+
+            assertQuery("select b from dst_byte order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("b\n42\n-17\n100\n");
+            assertQuery("select s from dst_short order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("s\n42\n-17\n100\n");
+            assertQuery("select i from dst_int order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("i\n42\n-17\n100\n");
+            assertQuery("select l from dst_long order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("l\n42\n-17\n100\n");
+            assertQuery("select f from dst_float order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("f\n42.0\n-17.0\n100.0\n");
+            assertQuery("select d from dst_double order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("d\n42.0\n-17.0\n100.0\n");
+        });
+    }
+
+    @Test
+    public void testFuzzVarcharStringConversions() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        assertMemoryLeak(() -> {
+            int copierType = randomCopierType(rnd);
+            setCopierType(copierType);
+
+            // VARCHAR column to STRING column
+            execute("create table src_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+            execute("create table dst_str (ts timestamp, s string) timestamp(ts) partition by DAY");
+
+            execute("insert into src_vc values (0, 'hello'), (1000, 'world'), (2000, null), (3000, 'über'), (4000, '日本語')");
+            execute("insert into dst_str select * from src_vc");
+
+            assertQuery("dst_str order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\ts
+                            1970-01-01T00:00:00.000000Z\thello
+                            1970-01-01T00:00:00.001000Z\tworld
+                            1970-01-01T00:00:00.002000Z\t
+                            1970-01-01T00:00:00.003000Z\tüber
+                            1970-01-01T00:00:00.004000Z\t日本語
+                            """);
+
+            // STRING column to VARCHAR column
+            execute("create table src_str (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("create table dst_vc (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+
+            execute("insert into src_str values (0, 'foo'), (1000, 'bar'), (2000, null), (3000, 'café'), (4000, '日本語'), (5000, 'Привет'), (6000, '🎉emoji🚀')");
+            execute("insert into dst_vc select * from src_str");
+
+            assertQuery("dst_vc order by ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tv
+                            1970-01-01T00:00:00.000000Z\tfoo
+                            1970-01-01T00:00:00.001000Z\tbar
+                            1970-01-01T00:00:00.002000Z\t
+                            1970-01-01T00:00:00.003000Z\tcafé
+                            1970-01-01T00:00:00.004000Z\t日本語
+                            1970-01-01T00:00:00.005000Z\tПривет
+                            1970-01-01T00:00:00.006000Z\t🎉emoji🚀
+                            """);
+
+            // STRING expression (cast) to VARCHAR column with non-ASCII
+            execute("create table dst_vc2 (ts timestamp, v varchar) timestamp(ts) partition by DAY");
+            execute("insert into dst_vc2 select ts, v::string from src_vc");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "src_vc order by ts", "dst_vc2 order by ts", LOG);
+
+            // VARCHAR expression (cast) to STRING column - tests function result path
+            // This exercises the transferVarcharToStrCol helper with non-DirectUtf8Sequence values
+            execute("create table dst_str2 (ts timestamp, s string) timestamp(ts) partition by DAY");
+            execute("insert into dst_str2 select ts, s::varchar from src_str");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "src_str order by ts", "dst_str2 order by ts", LOG);
+        });
+    }
+
+    @Test
+    public void testIsCopierConvertible() throws Exception {
+        // Every pair isCopierConvertible() admits must get a target-typed put from all three copiers, or an
+        // ImplicitCastException for a value the target cannot hold, and the three copiers must agree.
+        assertMemoryLeak(() -> {
+            execute("""
+                    CREATE TABLE src (
+                        c_boolean BOOLEAN, c_byte BYTE, c_short SHORT, c_char CHAR, c_int INT, c_long LONG, c_date DATE,
+                        c_ts TIMESTAMP, c_tsns TIMESTAMP_NS, c_float FLOAT, c_double DOUBLE, c_string STRING,
+                        c_symbol SYMBOL, c_varchar VARCHAR, c_binary BINARY, c_long256 LONG256, c_uuid UUID, c_ipv4 IPv4,
+                        c_geo3b GEOHASH(3b), c_geo1c GEOHASH(1c), c_geo3c GEOHASH(3c), c_geo6c GEOHASH(6c),
+                        c_geo12c GEOHASH(12c), c_dec8 DECIMAL(2,1), c_dec16 DECIMAL(4,1), c_dec32 DECIMAL(9,2),
+                        c_dec64 DECIMAL(18,2), c_dec128 DECIMAL(38,2), c_dec256 DECIMAL(60,2), c_darr DOUBLE[],
+                        c_darr2 DOUBLE[][], ts TIMESTAMP
+                    ) TIMESTAMP(ts) PARTITION BY DAY
+                    """);
+            // The first row holds a value in every column, the second row holds only NULLs.
+            execute("""
+                    INSERT INTO src
+                    SELECT true, 5::BYTE, 300::SHORT, '7', 70_000, 1_726_000_000_000_000L, '2024-09-10T12:01:02.123Z'::DATE,
+                    '2024-09-10T12:01:02.123456Z'::TIMESTAMP, '2024-09-10T12:01:02.123456789Z'::TIMESTAMP_NS, 1.5f,
+                    1725969662123456.0, '42', '42', '42', rnd_bin(4, 4, 0), '0x01'::LONG256,
+                    '11111111-1111-1111-1111-111111111111'::UUID, '1.2.3.4'::IPv4, ##101, #u, #u33, #u33d8b, #u33d8b121234,
+                    '1.5'::DECIMAL(2,1), '1.5'::DECIMAL(4,1), '1.5'::DECIMAL(9,2), '1.5'::DECIMAL(18,2),
+                    '1.5'::DECIMAL(38,2), '1.5'::DECIMAL(60,2), ARRAY[1.0, 2.0], ARRAY[[1.0], [2.0]],
+                    '2024-09-10T12:00:00.000000Z'::TIMESTAMP
+                    FROM long_sequence(1)
+                    """);
+            execute("INSERT INTO src (ts) VALUES ('2024-09-10T13:00:00.000000Z')");
+
+            final String[] sourceExpressions = {
+                    "c_boolean", "c_byte", "c_short", "c_char", "c_int", "c_long", "c_date", "c_ts", "c_tsns", "c_float",
+                    "c_double", "c_string", "c_symbol", "c_varchar", "c_binary", "c_long256", "c_uuid", "c_ipv4",
+                    "c_geo3b", "c_geo1c", "c_geo3c", "c_geo6c", "c_geo12c", "c_dec8", "c_dec16", "c_dec32", "c_dec64",
+                    "c_dec128", "c_dec256", "c_darr", "c_darr2", "NULL", "to_long128(1, 2)", "interval(c_ts, c_ts)"
+            };
+            final int[] targetTypes = {
+                    ColumnType.BOOLEAN, ColumnType.BYTE, ColumnType.SHORT, ColumnType.CHAR, ColumnType.INT, ColumnType.LONG,
+                    ColumnType.DATE, ColumnType.TIMESTAMP_MICRO, ColumnType.TIMESTAMP_NANO, ColumnType.FLOAT,
+                    ColumnType.DOUBLE, ColumnType.STRING, ColumnType.SYMBOL, ColumnType.VARCHAR, ColumnType.BINARY,
+                    ColumnType.LONG256, ColumnType.UUID, ColumnType.IPv4, ColumnType.getGeoHashTypeWithBits(3),
+                    ColumnType.getGeoHashTypeWithBits(5), ColumnType.getGeoHashTypeWithBits(15),
+                    ColumnType.getGeoHashTypeWithBits(30), ColumnType.getGeoHashTypeWithBits(60),
+                    ColumnType.getDecimalType(2, 1), ColumnType.getDecimalType(4, 1), ColumnType.getDecimalType(9, 2),
+                    ColumnType.getDecimalType(18, 2), ColumnType.getDecimalType(38, 2), ColumnType.getDecimalType(60, 2),
+                    ColumnType.encodeArrayType(ColumnType.DOUBLE, 1), ColumnType.encodeArrayType(ColumnType.DOUBLE, 2)
+            };
+            // The chunked copier splits only a schema that exceeds one chunk, so pad it with INT columns.
+            final StringBuilder pads = new StringBuilder();
+            for (int i = 0; i < CHUNKING_PAD_COUNT; i++) {
+                pads.append(", 0 p").append(i);
+            }
+            for (String expression : sourceExpressions) {
+                try (RecordCursorFactory factory = select("SELECT " + expression + " x" + pads + " FROM src")) {
+                    final int fromType = factory.getMetadata().getColumnType(0);
+                    for (int toType : targetTypes) {
+                        final String pair = ColumnType.nameOf(fromType) + " -> " + ColumnType.nameOf(toType);
+                        // Outside CHAR targets, the copiers admit every pair ColumnType.isConvertibleFrom() admits.
+                        if (ColumnType.tagOf(toType) != ColumnType.CHAR) {
+                            Assert.assertTrue(
+                                    pair,
+                                    !ColumnType.isConvertibleFrom(fromType, toType) || RecordToRowCopierUtils.isCopierConvertible(fromType, toType)
+                            );
+                        }
+                        if (RecordToRowCopierUtils.isCopierConvertible(fromType, toType)) {
+                            final String singleMethod = describeCopy(factory, toType, RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD, 0, pair);
+                            final String chunked = describeCopy(factory, toType, RecordToRowCopierUtils.COPIER_TYPE_CHUNKED, CHUNKING_PAD_COUNT, pair);
+                            final String looping = describeCopy(factory, toType, RecordToRowCopierUtils.COPIER_TYPE_LOOPING, 0, pair);
+                            Assert.assertEquals(pair + " [chunked]", singleMethod, chunked);
+                            Assert.assertEquals(pair + " [looping]", singleMethod, looping);
+                        }
+                    }
+                }
+            }
+        });
+
+        Assert.assertFalse(RecordToRowCopierUtils.isCopierConvertible(ColumnType.BYTE, ColumnType.BOOLEAN));
+        for (int fromType : new int[]{
+                ColumnType.BYTE, ColumnType.SHORT, ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP_MICRO,
+                ColumnType.TIMESTAMP_NANO, ColumnType.FLOAT, ColumnType.DOUBLE
+        }) {
+            Assert.assertFalse(ColumnType.nameOf(fromType), RecordToRowCopierUtils.isCopierConvertible(fromType, ColumnType.CHAR));
+        }
+        for (int fromType : new int[]{
+                ColumnType.CHAR, ColumnType.STRING, ColumnType.VARCHAR, ColumnType.VARCHAR_SLICE, ColumnType.NULL
+        }) {
+            Assert.assertTrue(ColumnType.nameOf(fromType), RecordToRowCopierUtils.isCopierConvertible(fromType, ColumnType.CHAR));
+        }
+        for (int toType : new int[]{ColumnType.DATE, ColumnType.TIMESTAMP_MICRO, ColumnType.TIMESTAMP_NANO}) {
+            Assert.assertTrue(ColumnType.nameOf(toType), RecordToRowCopierUtils.isCopierConvertible(ColumnType.DOUBLE, toType));
+        }
+    }
+
+    @Test
+    public void testTransferDecimalIntoNonDecimalTargetRejected() {
+        // RowAsserter fails on any put, so a silent write into a non-decimal column is caught too.
+        // Zero is what clears transferDecimal's precision guard, leaving the storage switch to reject.
+        final Decimal256 decimal256 = new Decimal256();
+        final Decimal128 decimal128 = new Decimal128();
+        final RowAsserter row = new RowAsserter();
+
+        for (int toType : new int[]{ColumnType.INT, ColumnType.LONG, ColumnType.DOUBLE, ColumnType.UUID}) {
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferDecimal8(row, 0, decimal256, ColumnType.getDecimalType(1, 0), toType, (byte) 0));
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferDecimal16(row, 0, decimal256, ColumnType.getDecimalType(4, 0), toType, (short) 0));
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferDecimal32(row, 0, decimal256, ColumnType.getDecimalType(9, 0), toType, 0));
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferDecimal64(row, 0, decimal256, ColumnType.getDecimalType(18, 0), toType, 0L));
+            assertTransferDecimalRejected(toType, () -> {
+                decimal128.ofLong(0, 0);
+                RecordToRowCopierUtils.transferDecimal128(row, 0, decimal256, ColumnType.getDecimalType(38, 0), toType, decimal128);
+            });
+            assertTransferDecimalRejected(toType, () -> {
+                decimal256.ofLong(0, 0);
+                RecordToRowCopierUtils.transferDecimal256(row, 0, decimal256, ColumnType.getDecimalType(76, 0), toType);
+            });
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferByteToDecimal(row, 0, (byte) 0, decimal256, toType));
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferShortToDecimal(row, 0, (short) 0, decimal256, toType));
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferIntToDecimal(row, 0, 0, decimal256, toType));
+            assertTransferDecimalRejected(toType, () ->
+                    RecordToRowCopierUtils.transferLongToDecimal(row, 0, 0L, decimal256, toType));
+        }
+    }
+
+    private static void assertTransferDecimalRejected(int toType, Runnable transfer) {
+        try {
+            transfer.run();
+            Assert.fail("expected the transfer to be rejected");
+        } catch (CairoException e) {
+            TestUtils.assertContains(e.getFlyweightMessage(), "cannot store decimal into column type: " + ColumnType.nameOf(toType));
+        }
+    }
+
+    @Test
+    public void testMalformedVarcharConversionsAreNull() throws Exception {
+        assertMemoryLeak(() -> {
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD);
+            execute("CREATE TABLE src (v VARCHAR)");
+            execute("CREATE TABLE dst_direct_str (s STRING)");
+            execute("CREATE TABLE dst_str (s STRING)");
+            execute("CREATE TABLE dst_sym (sym SYMBOL)");
+
+            try (TableWriter writer = getWriter("src")) {
+                TableWriter.Row row = writer.newRow();
+                row.putVarchar(0, new Utf8String(new byte[]{'1', (byte) 0xC3}, false));
+                row.append();
+                writer.commit();
+            }
+
+            execute("INSERT INTO dst_direct_str SELECT v FROM src");
+            execute("INSERT INTO dst_str SELECT replace(v, 'z', 'z') FROM src");
+            execute("INSERT INTO dst_sym SELECT v FROM src");
+
+            assertQuery("""
+                    SELECT direct.s IS NULL AS direct_str_null,
+                           decoded.s IS NULL AS decoded_str_null,
+                           sym IS NULL AS sym_null
+                    FROM dst_direct_str direct
+                    CROSS JOIN dst_str decoded
+                    CROSS JOIN dst_sym
+                    """)
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            direct_str_null\tdecoded_str_null\tsym_null
+                            true\ttrue\ttrue
+                            """);
+        });
+    }
+
+    @Test
+    public void testNullSourceColumnsAddNoBytecode() {
+        // a NULL-typed source column generates no copy, so a thousand of them leave one INT copy in a
+        // single method; counted as copies they would exceed the 8000-byte method limit
+        final ArrayColumnTypes fromTypes = new ArrayColumnTypes();
+        final GenericRecordMetadata toMetadata = new GenericRecordMetadata();
+        final ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0; i <= 1000; i++) {
+            fromTypes.add(i < 1000 ? ColumnType.NULL : ColumnType.INT);
+            toMetadata.add(new TableColumnMetadata("c" + i, ColumnType.INT));
+            columnFilter.add(i + 1);
+        }
+        Assert.assertEquals(
+                RecordToRowCopierTestUtils.CopierMode.SINGLE_METHOD,
+                RecordToRowCopierTestUtils.copierModeOf(RecordToRowCopierUtils.generateCopier(
+                        new BytecodeAssembler(),
+                        fromTypes,
+                        toMetadata,
+                        columnFilter,
+                        configuration
+                ))
+        );
+    }
+
+    @Test
+    public void testO3InsertSelectVarcharToString() throws Exception {
+        assertMemoryLeak(() -> {
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD);
+            execute("CREATE TABLE src (v VARCHAR, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("CREATE TABLE dst (s STRING, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY");
+            execute("INSERT INTO dst VALUES ('tail', '1970-01-01T03:00:00.000000Z')");
+
+            try (TableWriter writer = getWriter("src")) {
+                TableWriter.Row row = writer.newRow(3_600_000_000L);
+                row.putVarchar(0, new Utf8String("über"));
+                row.append();
+
+                row = writer.newRow(7_200_000_000L);
+                row.putVarchar(0, new Utf8String(new byte[]{'1', (byte) 0xC3}, false));
+                row.append();
+                writer.commit();
+            }
+
+            execute("INSERT INTO dst SELECT v, ts FROM src");
+
+            assertQuery("SELECT ts, s, s IS NULL AS is_null FROM dst")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\ts\tis_null
+                            1970-01-01T01:00:00.000000Z\tüber\tfalse
+                            1970-01-01T02:00:00.000000Z\t\ttrue
+                            1970-01-01T03:00:00.000000Z\ttail\tfalse
+                            """);
+        });
+    }
+
+    @Test
+    public void testSymbolToTimestamp() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE src (s SYMBOL)");
+            execute("INSERT INTO src VALUES ('2024-09-10T12:01:02.123456789Z'), (NULL)");
+            for (int copierType : COPIER_TYPES) {
+                setCopierType(copierType);
+                execute("CREATE TABLE dst (us TIMESTAMP, ns TIMESTAMP_NS)");
+                execute("INSERT INTO dst SELECT s, s FROM src");
+                assertQuery("dst").expectSize().noLeakCheck().returns("""
+                        us\tns
+                        2024-09-10T12:01:02.123456Z\t2024-09-10T12:01:02.123456789Z
+                        \t
+                        """);
+                execute("DROP TABLE dst");
+            }
+        });
+    }
+
+    @Test
+    public void testSymbolToTimestampChunked() throws Exception {
+        // us lands in the first chunk method of the copier and ns in the last one.
+        assertMemoryLeak(() -> {
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_CHUNKED);
+            final String pads = chunkingPadColumns();
+            execute("CREATE TABLE src (us SYMBOL" + pads + ", ns SYMBOL)");
+            execute("CREATE TABLE dst (us TIMESTAMP" + pads + ", ns TIMESTAMP_NS)");
+            assertChunkedCopier("src", "dst");
+            execute("""
+                    INSERT INTO src (us, ns) VALUES
+                    ('2024-09-10T12:01:02.123456789Z', '2024-09-10T12:01:02.123456789Z'),
+                    (NULL, NULL)
+                    """);
+            execute("INSERT INTO dst SELECT * FROM src");
+            assertQuery("SELECT us, ns FROM dst").expectSize().noLeakCheck().returns("""
+                    us\tns
+                    2024-09-10T12:01:02.123456Z\t2024-09-10T12:01:02.123456789Z
+                    \t
+                    """);
+        });
+    }
+
+    @Test
+    public void testSymbolToTimestampMalformed() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE src (s SYMBOL)");
+            execute("INSERT INTO src VALUES ('not-a-timestamp')");
+            final StringBuilder expectedMessages = new StringBuilder();
+            final StringBuilder actualMessages = new StringBuilder();
+            for (int copierType : COPIER_TYPES) {
+                setCopierType(copierType);
+                for (int type : new int[]{ColumnType.TIMESTAMP_MICRO, ColumnType.TIMESTAMP_NANO}) {
+                    execute("CREATE TABLE dst (at " + ColumnType.nameOf(type) + ")");
+                    try {
+                        execute("INSERT INTO dst SELECT s FROM src");
+                        Assert.fail("expected timestamp conversion failure");
+                    } catch (ImplicitCastException e) {
+                        expectedMessages.append(copierType).append(": inconvertible value: `not-a-timestamp` [SYMBOL -> ").append(ColumnType.nameOf(type)).append("]\n");
+                        actualMessages.append(copierType).append(": ").append(e.getFlyweightMessage()).append('\n');
+                    }
+                    assertQuery("SELECT count(*) FROM dst").expectSize().noRandomAccess().noLeakCheck().returns("count\n0\n");
+                    execute("DROP TABLE dst");
+                }
+            }
+            Assert.assertEquals(expectedMessages.toString(), actualMessages.toString());
+        });
+    }
+
+    @Test
+    public void testSymbolToTimestampMalformedChunked() throws Exception {
+        assertMemoryLeak(() -> {
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_CHUNKED);
+            final String pads = chunkingPadColumns();
+            execute("CREATE TABLE src (at SYMBOL" + pads + ")");
+            execute("INSERT INTO src (at) VALUES ('not-a-timestamp')");
+            for (int type : new int[]{ColumnType.TIMESTAMP_MICRO, ColumnType.TIMESTAMP_NANO}) {
+                execute("CREATE TABLE dst (at " + ColumnType.nameOf(type) + pads + ")");
+                assertChunkedCopier("src", "dst");
+                try {
+                    execute("INSERT INTO dst SELECT * FROM src");
+                    Assert.fail("expected timestamp conversion failure");
+                } catch (ImplicitCastException e) {
+                    TestUtils.assertEquals(
+                            "inconvertible value: `not-a-timestamp` [SYMBOL -> " + ColumnType.nameOf(type) + ']',
+                            e.getFlyweightMessage()
+                    );
+                }
+                assertQuery("SELECT count(*) FROM dst").expectSize().noRandomAccess().noLeakCheck().returns("count\n0\n");
+                execute("DROP TABLE dst");
+            }
+        });
+    }
+
+    private static @NotNull Record getLongRecord(int fromType, long value) {
+        return new Record() {
+            @Override
+            public byte getByte(int col) {
+                Assert.assertEquals(ColumnType.BYTE, fromType);
+                return (byte) value;
+            }
+
+            @Override
+            public int getInt(int col) {
+                Assert.assertEquals(ColumnType.INT, fromType);
+                return (int) value;
+            }
+
+            @Override
+            public long getLong(int col) {
+                Assert.assertEquals(ColumnType.LONG, fromType);
+                return value;
+            }
+
+            @Override
+            public short getShort(int col) {
+                Assert.assertEquals(ColumnType.SHORT, fromType);
+                return (short) value;
+            }
+        };
+    }
+
+    // Asserts that the copier is neither the single-method nor the looping fallback: a split copier has at least
+    // two chunk methods.
+    private static void assertMultiChunkCopier(String context, RecordToRowCopier copier) {
+        Assert.assertTrue(
+                context + ": " + copier.getClass().getName(),
+                RecordToRowCopierTestUtils.countChunkMethods(copier) >= 2
+        );
+    }
+
+    private static String chunkingPadColumns() {
+        final StringBuilder pads = new StringBuilder();
+        for (int i = 0; i < CHUNKING_PAD_COUNT; i++) {
+            pads.append(", p").append(i).append(" INT");
+        }
+        return pads.toString();
+    }
+
+    private static String describePutArg(Object arg) {
+        if (arg instanceof Long256 long256) {
+            return "long256(" + long256.getLong0() + ',' + long256.getLong1() + ',' + long256.getLong2() + ',' + long256.getLong3() + ')';
+        }
+        if (arg instanceof ArrayView array) {
+            return "array(" + ColumnType.nameOf(array.getType()) + (array.isNull() ? ",null)" : ")");
+        }
+        if (arg instanceof BinarySequence binary) {
+            return "binary(" + binary.length() + ')';
+        }
+        return String.valueOf(arg);
+    }
+
+    private static boolean isTargetShapedPut(int toType, String putName) {
+        return switch (ColumnType.tagOf(toType)) {
+            case ColumnType.BOOLEAN -> putName.equals("putBool");
+            case ColumnType.BYTE -> putName.equals("putByte");
+            case ColumnType.SHORT -> putName.equals("putShort");
+            case ColumnType.CHAR -> putName.equals("putChar");
+            case ColumnType.INT -> putName.equals("putInt");
+            case ColumnType.LONG -> putName.equals("putLong");
+            case ColumnType.DATE -> putName.equals("putDate");
+            case ColumnType.TIMESTAMP -> putName.equals("putTimestamp");
+            case ColumnType.FLOAT -> putName.equals("putFloat");
+            case ColumnType.DOUBLE -> putName.equals("putDouble");
+            case ColumnType.STRING -> putName.startsWith("putStr");
+            case ColumnType.SYMBOL -> putName.equals("putSym");
+            case ColumnType.VARCHAR -> putName.equals("putVarchar");
+            case ColumnType.BINARY -> putName.equals("putBin");
+            case ColumnType.LONG256 -> putName.startsWith("putLong256");
+            case ColumnType.UUID -> putName.startsWith("putUuid") || putName.equals("putLong128");
+            case ColumnType.IPv4 -> putName.equals("putIPv4") || putName.equals("putInt");
+            case ColumnType.GEOBYTE -> putName.equals("putByte") || putName.startsWith("putGeo");
+            case ColumnType.GEOSHORT -> putName.equals("putShort") || putName.startsWith("putGeo");
+            case ColumnType.GEOINT -> putName.equals("putInt") || putName.startsWith("putGeo");
+            case ColumnType.GEOLONG -> putName.equals("putLong") || putName.startsWith("putGeo");
+            case ColumnType.DECIMAL8 -> putName.equals("putByte") || putName.startsWith("putDecimal");
+            case ColumnType.DECIMAL16 -> putName.equals("putShort") || putName.startsWith("putDecimal");
+            case ColumnType.DECIMAL32 -> putName.equals("putInt") || putName.startsWith("putDecimal");
+            case ColumnType.DECIMAL64 -> putName.equals("putLong") || putName.startsWith("putDecimal");
+            case ColumnType.DECIMAL128, ColumnType.DECIMAL256 -> putName.startsWith("putDecimal");
+            case ColumnType.ARRAY -> putName.equals("putArray");
+            default -> false;
+        };
+    }
+
+    private static int randomCopierType(Rnd rnd) {
+        return COPIER_TYPES[rnd.nextInt(COPIER_TYPES.length)];
+    }
+
+    // Generates the copier INSERT INTO dst SELECT * FROM src compiles to and asserts that it is a multi-chunk copier.
+    private void assertChunkedCopier(String srcTableName, String dstTableName) {
+        try (
+                TableReader src = getReader(srcTableName);
+                TableReader dst = getReader(dstTableName)
+        ) {
+            assertMultiChunkCopier(
+                    srcTableName + " -> " + dstTableName,
+                    RecordToRowCopierTestUtils.generateInsertSelectCopier(src, dst, configuration)
+            );
+        }
+    }
+
+    private void assertWideInsertSelect(String fromType, String toType, String fromValue, String expectedValue) throws Exception {
+        final int columnCount = 1000;
+        final StringBuilder fromColumns = new StringBuilder();
+        final StringBuilder toColumns = new StringBuilder();
+        for (int i = 0; i < columnCount; i++) {
+            if (i > 0) {
+                fromColumns.append(", ");
+                toColumns.append(", ");
+            }
+            fromColumns.append(fromValue).append(" c").append(i);
+            toColumns.append('c').append(i).append(' ').append(toType);
+        }
+        execute("CREATE TABLE src AS (SELECT " + fromColumns + " FROM long_sequence(1))");
+        execute("CREATE TABLE dst (" + toColumns + ")");
+        assertQuery("SELECT typeOf(c0) t FROM src")
+                .noLeakCheck()
+                .expectSize()
+                .returns("t\n" + fromType + "\n");
+        execute("INSERT INTO dst SELECT * FROM src");
+        assertQuery("SELECT c0, c999 FROM dst")
+                .noLeakCheck()
+                .expectSize()
+                .returns("c0\tc999\n" + expectedValue + "\t" + expectedValue + "\n");
+        execute("DROP TABLE src");
+        execute("DROP TABLE dst");
+    }
+
+    // Copies every row of the factory's cursor into a recording row and describes the puts into column x.
+    private String describeCopy(RecordCursorFactory factory, int toType, int copierType, int padCount, String pair) throws SqlException {
+        final String context = pair + " [copierType=" + copierType + ']';
+        final GenericRecordMetadata toMetadata = new GenericRecordMetadata();
+        final ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0; i <= padCount; i++) {
+            final String name = i == 0 ? "x" : "p" + (i - 1);
+            final int type = i == 0 ? toType : ColumnType.INT;
+            toMetadata.add(new TableColumnMetadata(name, type, IndexType.NONE, 0, false, null, i, false));
+            columnFilter.add(i + 1);
+        }
+        setCopierType(copierType);
+        final RecordToRowCopier copier;
+        try {
+            copier = RecordToRowCopierUtils.generateCopier(new BytecodeAssembler(), factory.getMetadata(), toMetadata, columnFilter, configuration);
+        } catch (Throwable th) {
+            throw new AssertionError(context + ": copier generation failed", th);
+        }
+        Assert.assertEquals(context, copierType == RecordToRowCopierUtils.COPIER_TYPE_LOOPING, copier instanceof LoopingRecordToRowCopier);
+        if (copierType == RecordToRowCopierUtils.COPIER_TYPE_CHUNKED) {
+            assertMultiChunkCopier(context, copier);
+        }
+
+        final StringBuilder outcome = new StringBuilder();
+        final TableWriter.Row row = (TableWriter.Row) Proxy.newProxyInstance(
+                TableWriter.Row.class.getClassLoader(),
+                new Class<?>[]{TableWriter.Row.class},
+                (proxy, method, args) -> {
+                    // Column x has writer index 0; the INT pads use the other indexes.
+                    if (args != null && args.length > 0 && args[0] instanceof Integer columnIndex && columnIndex == 0) {
+                        Assert.assertTrue(context + ": unexpected " + method.getName(), isTargetShapedPut(toType, method.getName()));
+                        outcome.append(method.getName()).append('(');
+                        for (int i = 1; i < args.length; i++) {
+                            outcome.append(i > 1 ? "," : "").append(describePutArg(args[i]));
+                        }
+                        outcome.append(");");
+                    }
+                    return null;
+                }
+        );
+        final boolean isNullSource = ColumnType.isNull(factory.getMetadata().getColumnType(0));
+        try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+            final Record record = cursor.getRecord();
+            boolean isValueRow = true;
+            while (cursor.hasNext()) {
+                final int rowStart = outcome.length();
+                try {
+                    copier.copy(sqlExecutionContext, record, row);
+                } catch (ImplicitCastException e) {
+                    outcome.append("ImplicitCastException: ").append(e.getFlyweightMessage());
+                } catch (Throwable th) {
+                    throw new AssertionError(context + ": copy failed", th);
+                }
+                if (isNullSource) {
+                    // a NULL-typed column has no value to copy: the writer fills the column with NULL
+                    Assert.assertEquals(context + ": copier wrote a NULL-typed column", rowStart, outcome.length());
+                } else if (isValueRow) {
+                    Assert.assertTrue(context + ": copier wrote nothing for a non-NULL value", outcome.length() > rowStart);
+                    isValueRow = false;
+                }
+                outcome.append('\n');
+            }
+        }
+        return outcome.toString();
+    }
+
+    private RecordToRowCopier generateCopier(int fromType, int toType) {
+        ArrayColumnTypes from = new ArrayColumnTypes();
+        from.add(fromType);
+        GenericRecordMetadata to = new GenericRecordMetadata();
+        TableColumnMetadata toCol = new TableColumnMetadata("x", toType);
+        to.add(toCol);
+        ListColumnFilter mapping = new ListColumnFilter();
+        mapping.add(1);
+        return RecordToRowCopierUtils.generateCopier(new BytecodeAssembler(), from, to, mapping, configuration);
+    }
+
+    private void generateValue(Decimal256 d, int precision, int scale) {
+        String maxValue = "98765432109876543210987654321098765432109876543210987654321098765432109876543210";
+        BigDecimal value = new BigDecimal(maxValue.substring(0, precision));
+        Decimal256 v = Decimal256.fromBigDecimal(value);
+        d.of(v.getHh(), v.getHl(), v.getLh(), v.getLl(), scale);
+    }
+
+    private TableWriter.Row getIntAsserter() {
+        return new RowAsserter() {
+            @Override
+            public void putInt(int col, int value) {
+                Assert.assertEquals(1200, value);
+            }
+        };
+    }
+
+    private TableWriter.Row getLongAsserter(long expected) {
+        return new RowAsserter() {
+            @Override
+            public void putLong(int col, long value) {
+                Assert.assertEquals(expected, value);
+            }
+        };
+    }
+
+    private void setCopierType(int copierType) {
+        node1.setProperty(PropertyKey.DEBUG_CAIRO_COPIER_TYPE, copierType);
+    }
+
+    private void testDecimalCast(BytecodeAssembler asm, int fromPrecision, int toPrecision, int toScale, Decimal256 value, boolean fitInTargetType) {
+        int fromType = ColumnType.getDecimalType(fromPrecision, value.getScale());
+        int toType = ColumnType.getDecimalType(toPrecision, toScale);
+        ArrayColumnTypes from = new ArrayColumnTypes();
+        from.add(fromType);
+        GenericRecordMetadata to = new GenericRecordMetadata();
+        TableColumnMetadata toCol = new TableColumnMetadata("x", toType);
+        to.add(toCol);
+        ListColumnFilter mapping = new ListColumnFilter();
+        mapping.add(1);
+        RecordToRowCopier copier = RecordToRowCopierUtils.generateCopier(asm, from, to, mapping, configuration);
+
+        Decimal256 expectedValue;
+        if (fitInTargetType) {
+            expectedValue = new Decimal256();
+            expectedValue.copyFrom(value);
+            expectedValue.rescale(toScale);
+        } else {
+            expectedValue = null;
+        }
+
+        Record rec = DecimalUtilTest.getDecimalRecord(fromType, value);
+        TableWriter.Row row = DecimalUtilTest.getRowAsserter(toType, -1, expectedValue);
+        try {
+            copier.copy(sqlExecutionContext, rec, row);
+            if (!fitInTargetType) {
+                Assert.fail(String.format("Expected cast to fail from (%s - p:%s - s:%s) to (%s - p:%s - s:%s) for %s",
+                        ColumnType.nameOf(ColumnType.tagOf(fromType)), ColumnType.getDecimalPrecision(fromType), ColumnType.getDecimalScale(fromType),
+                        ColumnType.nameOf(ColumnType.tagOf(toType)), ColumnType.getDecimalPrecision(toType), ColumnType.getDecimalScale(toType),
+                        value));
+            }
+        } catch (ImplicitCastException e) {
+            if (fitInTargetType) {
+                throw e;
+            }
+        } catch (AssertionError e) {
+            System.err.printf("Cast failed from (%s - p:%s - s:%s) to (%s - p:%s - s:%s) for '%s'\n",
+                    ColumnType.nameOf(ColumnType.tagOf(fromType)), ColumnType.getDecimalPrecision(fromType), ColumnType.getDecimalScale(fromType),
+                    ColumnType.nameOf(ColumnType.tagOf(toType)), ColumnType.getDecimalPrecision(toType), ColumnType.getDecimalScale(toType),
+                    value);
+            throw e;
+        }
+    }
+
+    private void testFuzzAllTypes(Rnd rnd, int copierType1, int copierType2) throws Exception {
+        assertMemoryLeak(() -> {
+            int rowCount = 10 + rnd.nextInt(90); // 10-100 rows
+
+            // Create source table with all supported types
+            execute("create table src (" +
+                    "ts timestamp, " +
+                    "col_boolean boolean, " +
+                    "col_byte byte, " +
+                    "col_short short, " +
+                    "col_char char, " +
+                    "col_int int, " +
+                    "col_long long, " +
+                    "col_date date, " +
+                    "col_float float, " +
+                    "col_double double, " +
+                    "col_string string, " +
+                    "col_symbol symbol, " +
+                    "col_long256 long256, " +
+                    "col_geobyte geohash(4b), " +
+                    "col_geoshort geohash(12b), " +
+                    "col_geoint geohash(24b), " +
+                    "col_geolong geohash(44b), " +
+                    "col_binary binary, " +
+                    "col_uuid uuid, " +
+                    "col_ipv4 ipv4, " +
+                    "col_varchar varchar" +
+                    ") timestamp(ts) partition by DAY");
+
+            // Insert random data
+            execute("insert into src select " +
+                    "x::timestamp, " +
+                    "rnd_boolean(), " +
+                    "rnd_byte(), " +
+                    "rnd_short(), " +
+                    "rnd_char(), " +
+                    "rnd_int(), " +
+                    "rnd_long(), " +
+                    "rnd_date(to_date('2020', 'yyyy'), to_date('2025', 'yyyy'), 0), " +
+                    "rnd_float(), " +
+                    "rnd_double(), " +
+                    "rnd_str(5, 10, 2), " +
+                    "rnd_symbol('A','B','C','D','E'), " +
+                    "rnd_long256(), " +
+                    "rnd_geohash(4), " +
+                    "rnd_geohash(12), " +
+                    "rnd_geohash(24), " +
+                    "rnd_geohash(44), " +
+                    "rnd_bin(10, 20, 2), " +
+                    "rnd_uuid4(), " +
+                    "rnd_ipv4(), " +
+                    "rnd_varchar(5, 10, 2) " +
+                    "from long_sequence(" + rowCount + ")");
+
+            // Create destination tables
+            execute("create table dst1 (" +
+                    "ts timestamp, " +
+                    "col_boolean boolean, " +
+                    "col_byte byte, " +
+                    "col_short short, " +
+                    "col_char char, " +
+                    "col_int int, " +
+                    "col_long long, " +
+                    "col_date date, " +
+                    "col_float float, " +
+                    "col_double double, " +
+                    "col_string string, " +
+                    "col_symbol symbol, " +
+                    "col_long256 long256, " +
+                    "col_geobyte geohash(4b), " +
+                    "col_geoshort geohash(12b), " +
+                    "col_geoint geohash(24b), " +
+                    "col_geolong geohash(44b), " +
+                    "col_binary binary, " +
+                    "col_uuid uuid, " +
+                    "col_ipv4 ipv4, " +
+                    "col_varchar varchar" +
+                    ") timestamp(ts) partition by DAY");
+
+            execute("create table dst2 (" +
+                    "ts timestamp, " +
+                    "col_boolean boolean, " +
+                    "col_byte byte, " +
+                    "col_short short, " +
+                    "col_char char, " +
+                    "col_int int, " +
+                    "col_long long, " +
+                    "col_date date, " +
+                    "col_float float, " +
+                    "col_double double, " +
+                    "col_string string, " +
+                    "col_symbol symbol, " +
+                    "col_long256 long256, " +
+                    "col_geobyte geohash(4b), " +
+                    "col_geoshort geohash(12b), " +
+                    "col_geoint geohash(24b), " +
+                    "col_geolong geohash(44b), " +
+                    "col_binary binary, " +
+                    "col_uuid uuid, " +
+                    "col_ipv4 ipv4, " +
+                    "col_varchar varchar" +
+                    ") timestamp(ts) partition by DAY");
+
+            // Copy using first copier type
+            setCopierType(copierType1);
+            execute("insert into dst1 select * from src");
+
+            // Copy using second copier type
+            setCopierType(copierType2);
+            execute("insert into dst2 select * from src");
+
+            // Compare results
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst1 order by ts", "dst2 order by ts", LOG);
+        });
+    }
+
+    private void testFuzzNullHandling(Rnd rnd) throws Exception {
+        assertMemoryLeak(() -> {
+            int rowCount = 20 + rnd.nextInt(30);
+
+            // Create table with high null rate
+            execute("create table src_nulls (" +
+                    "ts timestamp, " +
+                    "col_int int, " +
+                    "col_long long, " +
+                    "col_double double, " +
+                    "col_string string, " +
+                    "col_symbol symbol, " +
+                    "col_uuid uuid, " +
+                    "col_binary binary" +
+                    ") timestamp(ts) partition by DAY");
+
+            execute("create table dst1_nulls (" +
+                    "ts timestamp, " +
+                    "col_int int, " +
+                    "col_long long, " +
+                    "col_double double, " +
+                    "col_string string, " +
+                    "col_symbol symbol, " +
+                    "col_uuid uuid, " +
+                    "col_binary binary" +
+                    ") timestamp(ts) partition by DAY");
+
+            execute("create table dst2_nulls (" +
+                    "ts timestamp, " +
+                    "col_int int, " +
+                    "col_long long, " +
+                    "col_double double, " +
+                    "col_string string, " +
+                    "col_symbol symbol, " +
+                    "col_uuid uuid, " +
+                    "col_binary binary" +
+                    ") timestamp(ts) partition by DAY");
+
+            // Insert with 50% nulls
+            execute("insert into src_nulls select " +
+                    "x::timestamp, " +
+                    "case when x % 2 = 0 then null else rnd_int() end, " +
+                    "case when x % 3 = 0 then null else rnd_long() end, " +
+                    "case when x % 2 = 1 then null else rnd_double() end, " +
+                    "rnd_str(3, 8, 5), " +  // 5 = high null rate
+                    "rnd_symbol(null, 'A', 'B'), " +
+                    "case when x % 4 = 0 then null else rnd_uuid4() end, " +
+                    "rnd_bin(5, 10, 5) " +
+                    "from long_sequence(" + rowCount + ")");
+
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_LOOPING);
+            execute("insert into dst1_nulls select * from src_nulls");
+
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_SINGLE_METHOD);
+            execute("insert into dst2_nulls select * from src_nulls");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst1_nulls order by ts", "dst2_nulls order by ts", LOG);
+        });
+    }
+
+    private void testFuzzTypeConversions(Rnd rnd, int copierType2) throws Exception {
+        assertMemoryLeak(() -> {
+            int rowCount = 10 + rnd.nextInt(40); // 10-50 rows
+
+            // Test numeric widening conversions: byte -> short -> int -> long -> float -> double
+            execute("create table src_numeric (ts timestamp, b byte, s short, i int, l long) timestamp(ts) partition by DAY");
+            execute("create table dst1_numeric (ts timestamp, b long, s long, i long, l double) timestamp(ts) partition by DAY");
+            execute("create table dst2_numeric (ts timestamp, b long, s long, i long, l double) timestamp(ts) partition by DAY");
+
+            execute("insert into src_numeric select x::timestamp, rnd_byte(), rnd_short(), rnd_int(), rnd_long() from long_sequence(" + rowCount + ")");
+
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_LOOPING);
+            execute("insert into dst1_numeric select * from src_numeric");
+
+            setCopierType(copierType2);
+            execute("insert into dst2_numeric select * from src_numeric");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst1_numeric order by ts", "dst2_numeric order by ts", LOG);
+
+            // Test string/varchar/symbol conversions
+            execute("create table src_text (ts timestamp, str string, vc varchar, sym symbol) timestamp(ts) partition by DAY");
+            execute("create table dst1_text (ts timestamp, str varchar, vc string, sym varchar) timestamp(ts) partition by DAY");
+            execute("create table dst2_text (ts timestamp, str varchar, vc string, sym varchar) timestamp(ts) partition by DAY");
+
+            execute("insert into src_text select x::timestamp, rnd_str(3,8,1), rnd_varchar(3,8,1), rnd_symbol('X','Y','Z') from long_sequence(" + rowCount + ")");
+
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_LOOPING);
+            execute("insert into dst1_text select * from src_text");
+
+            setCopierType(copierType2);
+            execute("insert into dst2_text select * from src_text");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst1_text order by ts", "dst2_text order by ts", LOG);
+
+            // Test geohash same-size copy
+            execute("create table src_geo (ts timestamp, g4 geohash(4b), g8 geohash(8b)) timestamp(ts) partition by DAY");
+            execute("create table dst1_geo (ts timestamp, g4 geohash(4b), g8 geohash(8b)) timestamp(ts) partition by DAY");
+            execute("create table dst2_geo (ts timestamp, g4 geohash(4b), g8 geohash(8b)) timestamp(ts) partition by DAY");
+
+            execute("insert into src_geo select x::timestamp, rnd_geohash(4), rnd_geohash(8) from long_sequence(" + rowCount + ")");
+
+            setCopierType(RecordToRowCopierUtils.COPIER_TYPE_LOOPING);
+            execute("insert into dst1_geo select * from src_geo");
+
+            setCopierType(copierType2);
+            execute("insert into dst2_geo select * from src_geo");
+
+            TestUtils.assertSqlCursors(engine, sqlExecutionContext, "dst1_geo order by ts", "dst2_geo order by ts", LOG);
+        });
+    }
+}

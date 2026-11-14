@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,26 +25,88 @@
 package io.questdb.griffin.engine;
 
 import io.questdb.cairo.AbstractRecordCursorFactory;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.std.IntHashSet;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
 import org.jetbrains.annotations.Nullable;
 
 public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
     private final RecordCursorFactory base;
     private final LimitRecordCursor cursor;
 
-    public LimitRecordCursorFactory(RecordCursorFactory base, Function loFunction, @Nullable Function hiFunction) {
+    public LimitRecordCursorFactory(
+            RecordCursorFactory base,
+            Function loFunction,
+            @Nullable Function hiFunction,
+            int argPos
+    ) {
         super(base.getMetadata());
         this.base = base;
-        this.cursor = new LimitRecordCursor(loFunction, hiFunction);
+        this.cursor = new LimitRecordCursor(loFunction, hiFunction, argPos);
+    }
+
+    @Override
+    public RecordCursorFactory getBaseFactory() {
+        return base;
     }
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        cursor.of(base.getCursor(executionContext), executionContext);
-        return cursor;
+        final RecordCursor baseCursor = base.getCursor(executionContext);
+        try {
+            cursor.of(baseCursor, executionContext);
+            return cursor;
+        } catch (Throwable th) {
+            cursor.close();
+            throw th;
+        }
+    }
+
+    @Override
+    public int getScanDirection() {
+        return base.getScanDirection();
+    }
+
+    @Override
+    public boolean implementsLimit() {
+        return true;
+    }
+
+    // Stable iff the limit expressions (which may be arbitrary functions) and the base are stable.
+    @Override
+    public boolean isNonDeterministic() {
+        final Function leftFunc = cursor.leftFunction;
+        if (leftFunc != null && leftFunc.isNonDeterministic()) {
+            return true;
+        }
+        final Function rightFunc = cursor.rightFunction;
+        if (rightFunc != null && rightFunc.isNonDeterministic()) {
+            return true;
+        }
+        return base.isNonDeterministic();
+    }
+
+    @Override
+    public boolean isStableWithinExecution() {
+        final Function leftFunc = cursor.leftFunction;
+        if (leftFunc != null && !leftFunc.isStableWithinExecution()) {
+            return false;
+        }
+        final Function rightFunc = cursor.rightFunction;
+        if (rightFunc != null && !rightFunc.isStableWithinExecution()) {
+            return false;
+        }
+        return base.isStableWithinExecution();
     }
 
     @Override
@@ -53,43 +115,109 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Limit");
+        Function leftFunc = cursor.leftFunction;
+        Function rightFunc = cursor.rightFunction;
+        boolean isCursorOpen = cursor.base != null;
+        if (leftFunc != null) {
+            sink.meta(rightFunc != null ? "left" : "value");
+            sink.val(leftFunc);
+            if (leftFunc.isRuntimeConstant() && isCursorOpen) {
+                sink.val('[').val(leftFunc.getLong(null)).val(']');
+            }
+        }
+        if (rightFunc != null) {
+            sink.meta("right").val(rightFunc);
+            if (rightFunc.isRuntimeConstant() && isCursorOpen) {
+                sink.val('[').val(rightFunc.getLong(null)).val(']');
+            }
+        }
+
+        if (isCursorOpen && leftFunc != null && leftFunc.getLong(null) != Numbers.LONG_NULL) {
+            if (cursor.isBaseSizeKnown()) {
+                sink.meta("skip-rows").val(cursor.baseRowsToSkip);
+                sink.meta("take-rows").val(cursor.baseRowsToTake);
+            } else if (cursor.areBoundsResolved()) {
+                sink.meta("skip-rows-max").val(cursor.baseRowsToSkip);
+                sink.meta("take-rows-max").val(cursor.baseRowsToTake);
+            } else {
+                long lo = cursor.lo;
+                long hi = cursor.hi;
+                if (lo < 0) {
+                    sink.meta("skip-rows").val("baseRows").val(lo);
+                    // if lo < 0, hi should always be <= 0, but guard it just in case.
+                    // We don't want any exceptions in toPlan(), so just silently skip unexpected value.
+                    if (hi <= 0) {
+                        sink.meta("take-rows-max").val(hi - lo);
+                    }
+                } else {
+                    // lo >= 0
+                    // If both lo and hi were >= 0, bounds would already have been resolved in cursor.of().
+                    // But cursor bounds aren't resolved, therefore hi < 0.
+                    sink.meta("skip-rows-max").val(lo);
+                    sink.meta("take-rows").val("baseRows").val(hi - lo);
+                }
+            }
+        }
+        sink.child(base);
+    }
+
+    @Override
     public boolean usesCompiledFilter() {
         return base.usesCompiledFilter();
     }
 
     @Override
-    public void close() {
-        base.close();
+    public boolean usesIndex() {
+        return base.usesIndex();
     }
 
     @Override
-    public boolean implementsLimit() {
-        return true;
+    protected void _close() {
+        base.close();
     }
 
     private static class LimitRecordCursor implements RecordCursor {
-        private final Function loFunction;
-        private final Function hiFunction;
+        private final int argPos;
+        private final RecordCursor.Counter counter = new Counter();
+        private final Function leftFunction;
+        private final Function rightFunction;
         private RecordCursor base;
-        private long limit;
+        private long baseRowsToSkip;
+        private long baseRowsToTake;
+        private long baseSize;
+        private SqlExecutionCircuitBreaker circuitBreaker;
+        private long hi;
+        private long lo;
+        private long remaining;
         private long size;
 
-        public LimitRecordCursor(Function loFunction, Function hiFunction) {
-            this.loFunction = loFunction;
-            this.hiFunction = hiFunction;
+        public LimitRecordCursor(Function leftFunction, Function rightFunction, int argPos) {
+            this.leftFunction = leftFunction;
+            this.rightFunction = rightFunction;
+            this.argPos = argPos;
+        }
+
+        @Override
+        public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter sizeCounter) {
+            ensureReadyToConsume();
+            if (isBaseSizeKnown()) {
+                sizeCounter.add(remaining);
+            } else {
+                counter.set(remaining);
+                // No further reads after the skip -- max=0 lets the base
+                // skip the landing-frame decode altogether.
+                base.skipRows(counter, 0);
+                sizeCounter.add(remaining - counter.get());
+                counter.clear();
+            }
+            remaining = 0;
         }
 
         @Override
         public void close() {
-            base.close();
-        }
-
-        @Override
-        public long size() {
-            if (size > -1) {
-                return size;
-            }
-            return -1;
+            base = Misc.free(base);
         }
 
         @Override
@@ -98,8 +226,27 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
+        public Record getRecordB() {
+            return base.getRecordB();
+        }
+
+        @Override
         public SymbolTable getSymbolTable(int columnIndex) {
             return base.getSymbolTable(columnIndex);
+        }
+
+        @Override
+        public boolean hasNext() {
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+            ensureReadyToConsume();
+            if (remaining <= 0) {
+                return false;
+            }
+            if (base.hasNext()) {
+                remaining--;
+                return true;
+            }
+            return false;
         }
 
         @Override
@@ -108,13 +255,8 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public boolean hasNext() {
-            return limit-- > 0 && base.hasNext();
-        }
-
-        @Override
-        public Record getRecordB() {
-            return base.getRecordB();
+        public long preComputedStateSize() {
+            return RecordCursor.fromBool(isBaseSizeKnown()) + RecordCursor.fromBool(areBoundsResolved()) + base.preComputedStateSize();
         }
 
         @Override
@@ -122,108 +264,182 @@ public class LimitRecordCursorFactory extends AbstractRecordCursorFactory {
             base.recordAt(record, atRowId);
         }
 
-        public void of(RecordCursor base, SqlExecutionContext executionContext) throws SqlException {
-            this.base = base;
-            loFunction.init(base, executionContext);
-            if (hiFunction != null) {
-                hiFunction.init(base, executionContext);
+        @Override
+        public void setParentUsedColumns(@Nullable IntHashSet columnIndexes) {
+            base.setParentUsedColumns(columnIndexes);
+        }
+
+        @Override
+        public void setParquetDecodeHint(ParquetDecodeHint hint) {
+            base.setParquetDecodeHint(hint);
+        }
+
+        @Override
+        public void setRecordAtRows(@Nullable RowIdSource source) {
+            base.setRecordAtRows(source);
+        }
+
+        @Override
+        public long size() {
+            return size;
+        }
+
+        @Override
+        public void skipRows(Counter skipCounter, long maxRowsAfterSkip) {
+            ensureReadyToConsume();
+            long rowsToSkip = skipCounter.get();
+            long excessCount = Math.max(0, rowsToSkip - remaining);
+            rowsToSkip -= excessCount;
+            skipCounter.dec(excessCount);
+            final long baseMax = Math.min(maxRowsAfterSkip, remaining - rowsToSkip);
+            base.skipRows(skipCounter, baseMax);
+            long counterAfterSkip = skipCounter.get();
+            if (counterAfterSkip > 0) {
+                remaining = 0;
+            } else {
+                // counterAfterSkip should never be negative, so normally it will be zero here.
+                // However, if the base cursor is broken and makes it negative, it's better
+                // not to erase the trace of that bug, so we preserve its effect.
+                remaining -= (rowsToSkip - counterAfterSkip);
+                if (remaining < 0) {
+                    remaining = 0;
+                }
             }
-            toTop();
+            skipCounter.add(excessCount);
         }
 
         @Override
         public void toTop() {
+            ensureBoundsResolved();
             base.toTop();
-            long lo = loFunction.getLong(null);
-            if (lo < 0 && hiFunction == null) {
-                // last N rows
-                long count = countRows();
+            counter.set(baseRowsToSkip);
+            // Unconditional call: even with baseRowsToSkip == 0, this pushes
+            // baseRowsToTake as the post-skip cap so the base can clamp
+            // decoding of the first frames.
+            base.skipRows(counter, baseRowsToTake);
+            remaining = baseRowsToTake;
+            counter.clear();
+        }
 
+        private boolean areBoundsResolved() {
+            return baseRowsToTake != -1;
+        }
+
+        private void ensureBoundsResolved() {
+            if (!areBoundsResolved()) {
+                // If baseSize was cheap to get, bounds would already have been sorted out in of().
+                // Now it's time to use the heavy-handed approach to getting baseSize.
                 base.toTop();
-                // lo is negative, -5 for example
-                // if we have 12 records we need to skip 12-5 = 7
-                // if we have 4 records = return all of them
-                if (count > -lo) {
-                    skipTo(count + lo);
-                }
-                // set limit to return remaining rows
-                limit = Math.min(count, -lo);
-                size = limit;
-            } else if (lo > -1 && hiFunction == null) {
-                // first N rows
-                long baseRowCount = base.size();
-                if (baseRowCount > -1L) {//don't want to cause a pass-through whole data set
-                    limit = Math.min(baseRowCount, lo);
+                base.calculateSize(circuitBreaker, counter);
+                baseSize = counter.get();
+                counter.clear();
+                // If both LIMIT args were non-negative, we would have resolved the bounds without
+                // needing to know baseSize. Since we're here, one of the args must be negative.
+                resolveBoundsFromNegativeArgs();
+            }
+        }
+
+        private void ensureReadyToConsume() {
+            if (remaining != -1) {
+                return;
+            }
+            ensureBoundsResolved();
+            toTop();
+        }
+
+        private boolean isBaseSizeKnown() {
+            return baseSize >= 0;
+        }
+
+        private void resolveBoundsCheap() {
+            if (lo == hi) {
+                // There's either a single zero argument (LIMIT 0) or two equal arguments (LIMIT n, n).
+                // In both cases the result is an empty cursor.
+                size = baseRowsToSkip = baseRowsToTake = 0;
+                return;
+            }
+            baseSize = base.size();
+            if (lo >= 0 && hi >= 0) {
+                resolveBoundsTail(lo, hi);
+            } else if (baseSize >= 0) {
+                resolveBoundsFromNegativeArgs();
+            }
+        }
+
+        private void resolveBoundsFromNegativeArgs() {
+            assert baseSize >= 0 : "baseSize < 0";
+            long startInclusive, endExclusive;
+            if (lo < 0) {
+                startInclusive = baseSize + lo;
+                if (hi <= 0) {
+                    endExclusive = baseSize + hi;
                 } else {
-                    limit = lo;
+                    // "LIMIT <negative>, <positive> is validated against in of() because it's confusing.
+                    // We handle it here anyway, in case this decision changes.
+                    endExclusive = hi;
                 }
-                size = limit;
             } else {
-                // at this stage we have 'hi'
-                long hi = hiFunction.getLong(null);
-                if (lo < 0) {
-                    // right, here we are looking for something like
-                    // -10,-5 five rows away from tail
+                // This method is called only when lo < 0 || hi < 0.
+                // In this branch, we know that lo >= 0, therefore hi < 0.
+                startInclusive = lo;
+                endExclusive = baseSize + hi;
+            }
+            startInclusive = Math.max(0, startInclusive);
+            resolveBoundsTail(startInclusive, endExclusive);
+        }
 
-                    if (lo < hi) {
-                        long count = countRows();
-                        // when count < -hi we have empty cursor
-                        if (count >= -hi) {
-                            base.toTop();
+        private void resolveBoundsTail(long startInclusive, long endExclusive) {
+            if (baseSize >= 0) {
+                endExclusive = Math.min(baseSize, endExclusive);
+            }
+            if (startInclusive >= endExclusive) {
+                size = baseRowsToSkip = baseRowsToTake = 0;
+                return;
+            }
+            baseRowsToSkip = startInclusive;
+            baseRowsToTake = endExclusive - startInclusive;
+            if (baseSize >= 0) {
+                size = baseRowsToTake;
+            }
+        }
 
-                            if (count < -lo) {
-                                // if we asked for -9,-4 but there are 7 records in cursor
-                                // we would first ignore last 4 and return first 3
-                                limit = count + hi;
-                            } else {
-                                skipTo(count + lo);
-                                limit = Math.min(count, -lo + hi);
-                            }
-                            size = limit;
-                        }
-                    } else {
-                        // this is invalid bottom range, for example -3, -10
-                        limit = 0;
-                        size = 0;
-                    }
+        void of(RecordCursor base, SqlExecutionContext executionContext) throws SqlException {
+            this.base = base;
+            this.circuitBreaker = executionContext.getCircuitBreaker();
+
+            leftFunction.init(base, executionContext);
+            if (rightFunction != null) {
+                rightFunction.init(base, executionContext);
+            }
+            long leftArg = leftFunction.getLong(null);
+            if (rightFunction == null) {
+                if (leftArg >= 0) {
+                    lo = 0;
+                    hi = leftArg;
                 } else {
-                    if (hi < 0) {
-                        limit = Math.max(countRows() - lo + hi, 0);
-                        size = limit;
-                        base.toTop();
-                    } else {
-                        long baseRowCount = base.size();
-                        if (baseRowCount > -1L) {//don't want to cause a pass-through whole data set
-                            limit = Math.max(0, Math.min(baseRowCount, hi) - lo);
-                            size = limit;
-                        } else {
-                            limit = Math.max(0, hi - lo);//doesn't handle hi exceeding number of rows
-                            size = limit;
-                        }
-                    }
-
-                    if (lo > 0 && limit > 0) {
-                        skipTo(lo);
-                    }
+                    lo = leftArg;
+                    hi = 0;
+                }
+            } else {
+                lo = leftArg;
+                hi = rightFunction.getLong(null);
+                if (lo < 0 && hi > 0) {
+                    throw SqlException.$(argPos, "LIMIT <negative>, <positive> is not allowed");
+                }
+                if (lo > hi && Numbers.sameSign(lo, hi)) {
+                    final long l = hi;
+                    hi = lo;
+                    lo = l;
                 }
             }
-        }
 
-        private long countRows() {
-            long count = base.size();
-            if (count > -1L) {
-                return count;
-            }
-
-            count = 0L;
-            while (base.hasNext()) {
-                count++;
-            }
-            return count;
-        }
-
-        public void skipTo(long rowCount) {
-            base.skipTo(Math.max(0, rowCount));
+            baseSize = -1;
+            size = -1;
+            baseRowsToSkip = -1;
+            baseRowsToTake = -1;
+            remaining = -1;
+            counter.clear();
+            resolveBoundsCheap();
         }
     }
 }

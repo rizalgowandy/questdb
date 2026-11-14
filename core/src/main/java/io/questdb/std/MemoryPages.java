@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,31 +24,51 @@
 
 package io.questdb.std;
 
+import io.questdb.cairo.Reopenable;
 import io.questdb.griffin.engine.LimitOverflowException;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
 
-public class MemoryPages implements Closeable, Mutable {
+public class MemoryPages implements Closeable, Mutable, Reopenable {
 
     private static final Log LOG = LogFactory.getLog(MemoryPages.class);
-
-    private final long pageSize;
-    private final long mask;
     private final int bits;
-
+    private final long mask;
+    private final int maxPages;
+    private final String maxPagesConfigKey;
+    private final long pageSize;
     private final LongList pages = new LongList();
     private long cachePageHi;
     private long cachePageLo;
-    private final int maxPages;
+    // Per-query native memory tracker bound by the owning factory at cursor
+    // start. Null when no per-query limit applies; all Unsafe.{malloc,free}
+    // calls degrade to the global-only overloads in that case.
+    @Nullable
+    private MemoryTracker memoryTracker;
 
     public MemoryPages(long pageSize, int maxPages) {
+        this(pageSize, maxPages, null, true);
+    }
+
+    public MemoryPages(long pageSize, int maxPages, String maxPagesConfigKey, boolean openOnInit) {
         this.pageSize = Numbers.ceilPow2(pageSize);
         this.bits = Numbers.msb(this.pageSize);
         this.mask = this.pageSize - 1;
         this.maxPages = maxPages;
-        allocate0(0);
+        this.maxPagesConfigKey = maxPagesConfigKey;
+        if (openOnInit) {
+            try {
+                allocate0(0);
+            } catch (Throwable th) {
+                close();
+                throw th;
+            }
+        }
+        // else: first reopen() allocates the initial page under whatever
+        // MemoryTracker is bound at that time.
     }
 
     public long addressOf(long offset) {
@@ -77,10 +97,21 @@ public class MemoryPages implements Closeable, Mutable {
         for (int i = 0; i < pages.size(); i++) {
             long address = pages.getQuick(i);
             if (address != 0) {
-                Unsafe.free(address, pageSize, MemoryTag.NATIVE_TREE_CHAIN);
+                Unsafe.free(address, pageSize, MemoryTag.NATIVE_TREE_CHAIN, memoryTracker);
             }
         }
         pages.clear();
+        cachePageLo = 0;
+        cachePageHi = 0;
+    }
+
+    @Override
+    public void reopen() {
+        allocate0(0);
+    }
+
+    public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+        this.memoryTracker = tracker;
     }
 
     public long size() {
@@ -93,21 +124,20 @@ public class MemoryPages implements Closeable, Mutable {
         }
 
         if (index > maxPages) {
-            throw LimitOverflowException.instance().put("Maximum number of pages (").put(maxPages).put(") breached in MemoryPages");
+            LimitOverflowException ex = LimitOverflowException.instance();
+            ex.put("Maximum number of pages (").put(maxPages).put(") breached in MemoryPages");
+            if (maxPagesConfigKey != null) {
+                ex.put(" (raise ").put(maxPagesConfigKey).put(')');
+            }
+            throw ex;
         }
 
         if (index >= pages.size()) {
-            pages.extendAndSet((int) index, Unsafe.malloc(pageSize, MemoryTag.NATIVE_TREE_CHAIN));
+            pages.extendAndSet((int) index, Unsafe.malloc(pageSize, MemoryTag.NATIVE_TREE_CHAIN, memoryTracker));
             LOG.debug().$("new page [size=").$(pageSize).$(']').$();
         }
 
         cachePageLo = index << bits;
         cachePageHi = cachePageLo + pageSize;
-    }
-
-    /* Returns number of chunks of chunkSize that fits in allocated memory (assuming there could be unused space at end of each page) */
-    public long countNumberOf(int chunkSize) {
-        return (cachePageLo >> bits) * (pageSize / chunkSize) + //full pages 
-                (cachePageLo & mask) / chunkSize; //last page
     }
 }

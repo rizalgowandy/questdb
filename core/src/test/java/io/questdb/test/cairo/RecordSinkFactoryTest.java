@@ -1,0 +1,2160 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.cairo;
+
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoConfigurationWrapper;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.LoopingRecordSink;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.RecordSinkFactory;
+import io.questdb.cairo.RecordSinkSPI;
+import io.questdb.cairo.RecordSinkTemplate;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.MapFactory;
+import io.questdb.cairo.map.MapKey;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.FunctionExtension;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.BitSet;
+import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.IntList;
+import io.questdb.std.Interval;
+import io.questdb.std.Long256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8String;
+import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.griffin.engine.TestBinarySequence;
+import org.jetbrains.annotations.NotNull;
+import org.junit.Assert;
+import org.junit.Test;
+
+/**
+ * Tests for RecordSinkFactory and LoopingRecordSink.
+ * Covers various column types, conversions, and edge cases.
+ */
+public class RecordSinkFactoryTest extends AbstractCairoTest {
+    // what TestRecordSink records for skipVarSize(); no column type is negative
+    private static final int SKIP_VAR_SIZE = -1;
+    private static final int[] SINK_TYPES = {
+            RecordSinkFactory.SINK_TYPE_SINGLE_METHOD,
+            RecordSinkFactory.SINK_TYPE_CHUNKED,
+            RecordSinkFactory.SINK_TYPE_LOOPING
+    };
+
+    @Test
+    public void testChunkedSinkFunctionKeysAllSupportedTypes() {
+        // 700 INT column keys push the estimated bytecode over DEFAULT_METHOD_SIZE_LIMIT, so
+        // getInstance() takes the chunked generator, whose main copy() method emits the
+        // key-function arms. Each key function type must load as a chunked class, not fall back
+        // to LoopingRecordSink, and copy the same values the single-method sink copies.
+        final int columnCount = 700;
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0; i < columnCount; i++) {
+            columnTypes.add(ColumnType.INT);
+            columnFilter.add(i + 1);
+        }
+
+        ObjList<Function> allKeyFunctions = allKeyFunctionTypes();
+        for (int f = 0, n = allKeyFunctions.size(); f < n; f++) {
+            TestFunction func = (TestFunction) allKeyFunctions.getQuick(f);
+            ObjList<Function> keyFunctions = new ObjList<>();
+            keyFunctions.add(func);
+
+            IntList expectedPutTypes = new IntList();
+            for (int i = 0; i < columnCount; i++) {
+                expectedPutTypes.add(ColumnType.INT);
+            }
+            BitSet writeSymbolAsString = new BitSet();
+            writeSymbolAsString.set(0);
+            prepareExpectedPutType(0, func.type, expectedPutTypes, writeSymbolAsString);
+
+            final String typeName = ColumnType.nameOf(func.type);
+            final RecordSink sink;
+            try {
+                sink = RecordSinkFactory.getInstance(configuration, new BytecodeAssembler(), columnTypes, columnFilter, keyFunctions, null);
+            } catch (AssertionError e) {
+                throw new AssertionError("chunked sink class does not load for key function type " + typeName, e);
+            }
+            Assert.assertFalse(typeName, sink instanceof LoopingRecordSink);
+
+            TestRecordSink testRecordSink = new TestRecordSink();
+            sink.copy(new TestRecord(), testRecordSink);
+            Assert.assertEquals(typeName, expectedPutTypes, testRecordSink.recordedTypes);
+        }
+    }
+
+    @Test
+    public void testColumnKeysAllSupportedTypes() {
+        testColumnKeysAllSupportedTypes(null);
+    }
+
+    @Test
+    public void testColumnKeysSkewIndex() {
+        ArrayColumnTypes columnTypes = allArrayColumnTypes();
+        int skew = 42;
+        IntList skewIndex = new IntList();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            skewIndex.add(i + skew);
+        }
+
+        IntList expectedGetIndexes = new IntList();
+        IntList expectedGetTypes = new IntList();
+        IntList expectedPutTypes = new IntList();
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        prepareExpectedIndexesAndTypes(columnTypes, expectedGetIndexes, expectedGetTypes, expectedPutTypes, skew, null);
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        RecordSink sink = RecordSinkFactory.getInstance(configuration, new BytecodeAssembler(), columnTypes, columnFilter, null, skewIndex, null, null);
+        sink.copy(testRecord, testRecordSink);
+
+        Assert.assertEquals(expectedGetIndexes, testRecord.recordedIndexes);
+        Assert.assertEquals(expectedGetTypes, testRecord.recordedTypes);
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testColumnKeysSymAsString() {
+        BitSet writeSymbolAsString = new BitSet();
+        testColumnKeysAllSupportedTypes(writeSymbolAsString);
+    }
+
+    @Test
+    public void testFunctionKeysAllSupportedTypes() {
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        BitSet writeSymbolAsString = new BitSet();
+
+        ObjList<Function> keyFunctions = allKeyFunctionTypes();
+
+        IntList expectedPutTypes = new IntList();
+        for (int i = 0, n = keyFunctions.size(); i < n; i++) {
+            TestFunction func = (TestFunction) keyFunctions.getQuick(i);
+            if (func.type == ColumnType.SYMBOL) {
+                writeSymbolAsString.set(i);
+            }
+            prepareExpectedPutType(i, func.type, expectedPutTypes, writeSymbolAsString);
+        }
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        RecordSink sink = RecordSinkFactory.getInstance(configuration, new BytecodeAssembler(), columnTypes, columnFilter, keyFunctions, null);
+        sink.copy(testRecord, testRecordSink);
+
+        for (int i = 0, n = keyFunctions.size(); i < n; i++) {
+            TestFunction func = (TestFunction) keyFunctions.getQuick(i);
+            switch (func.type) {
+                case ColumnType.LONG128:
+                case ColumnType.UUID:
+                    Assert.assertEquals(2, func.callCount);
+                    break;
+                default:
+                    Assert.assertEquals(1, func.callCount);
+                    break;
+            }
+        }
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLargeSchemaUsesLoopingRecordSink() {
+        // Test that creating a sink with many columns produces a LoopingRecordSink
+        // when chunking is disabled and schema exceeds methodSizeLimit.
+        // BASE_BYTECODE_PER_COLUMN = 12, DEFAULT_METHOD_SIZE_LIMIT = 8000
+        // So we need > 666 columns (8000/12) to exceed the limit
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        ListColumnFilter columnFilter = new ListColumnFilter();
+
+        // Add 700 columns to exceed bytecode generation threshold (700 * 12 = 8400 > 8000)
+        for (int i = 0; i < 700; i++) {
+            columnTypes.add(ColumnType.INT);
+            columnFilter.add(i + 1);
+        }
+
+        // Disable chunking to force LoopingRecordSink when over the limit
+        CairoConfiguration configWithChunkedDisabled = new CairoConfigurationWrapper(configuration) {
+            @Override
+            public boolean isCopierChunkedEnabled() {
+                return false;
+            }
+        };
+        RecordSink sink = RecordSinkFactory.getInstance(
+                configWithChunkedDisabled,
+                new BytecodeAssembler(),
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null
+        );
+
+        // The sink should be a LoopingRecordSink for large schemas when chunking is disabled
+        Assert.assertTrue(sink instanceof io.questdb.cairo.LoopingRecordSink);
+
+        // Verify it works correctly
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        Assert.assertEquals(700, testRecordSink.recordedTypes.size());
+        for (int i = 0; i < 700; i++) {
+            Assert.assertEquals(ColumnType.INT, testRecordSink.recordedTypes.get(i));
+        }
+    }
+
+    @Test
+    public void testLargeSchemaWithMixedTypes() {
+        // Test large schema with various column types
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        ListColumnFilter columnFilter = new ListColumnFilter();
+
+        // Add 100 columns of each major type
+        int colIndex = 0;
+        int[] types = {ColumnType.INT, ColumnType.LONG, ColumnType.DOUBLE, ColumnType.STRING, ColumnType.TIMESTAMP};
+        for (int typeIdx = 0; typeIdx < types.length; typeIdx++) {
+            for (int i = 0; i < 100; i++) {
+                columnTypes.add(types[typeIdx]);
+                columnFilter.add(++colIndex);
+            }
+        }
+
+        RecordSink sink = RecordSinkFactory.getInstance(
+                configuration,
+                new BytecodeAssembler(),
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        Assert.assertEquals(500, testRecordSink.recordedTypes.size());
+    }
+
+    @Test
+    public void testLoopingRecordSinkAllDecimalTypes() {
+        // Test all decimal types in LoopingRecordSink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.DECIMAL8);
+        columnTypes.add(ColumnType.DECIMAL16);
+        columnTypes.add(ColumnType.DECIMAL32);
+        columnTypes.add(ColumnType.DECIMAL64);
+        columnTypes.add(ColumnType.DECIMAL128);
+        columnTypes.add(ColumnType.DECIMAL256);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        // DECIMAL8/16/32/64 use BYTE/SHORT/INT/LONG for storage
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.BYTE);       // DECIMAL8
+        expectedPutTypes.add(ColumnType.SHORT);      // DECIMAL16
+        expectedPutTypes.add(ColumnType.INT);        // DECIMAL32
+        expectedPutTypes.add(ColumnType.LONG);       // DECIMAL64
+        expectedPutTypes.add(ColumnType.DECIMAL128); // DECIMAL128
+        expectedPutTypes.add(ColumnType.DECIMAL256); // DECIMAL256
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkDateAndTimestamp() {
+        // Test DATE and TIMESTAMP types
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.DATE);
+        columnTypes.add(ColumnType.TIMESTAMP);
+        columnTypes.add(ColumnType.DATE);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0; i < columnTypes.getColumnCount(); i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.DATE);
+        expectedPutTypes.add(ColumnType.TIMESTAMP);
+        expectedPutTypes.add(ColumnType.DATE);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkDecimalsNotLastColumn() {
+        // This test verifies that decimal128/256 fields are properly initialized
+        // even when these columns are not at the end of the column list.
+        // The bug was that the decimal128/256 objects would not be initialized
+        // if they appeared before other columns in the list.
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.INT);           // 0
+        columnTypes.add(ColumnType.DECIMAL128);    // 1 - decimal not at end
+        columnTypes.add(ColumnType.LONG);          // 2
+        columnTypes.add(ColumnType.DECIMAL256);    // 3 - decimal not at end
+        columnTypes.add(ColumnType.STRING);        // 4 - columns after decimals
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        // Directly instantiate LoopingRecordSink to test it specifically
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        // This should not throw NullPointerException when accessing decimal128/256
+        sink.copy(testRecord, testRecordSink);
+
+        // Verify all columns were processed
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.INT);
+        expectedPutTypes.add(ColumnType.DECIMAL128);
+        expectedPutTypes.add(ColumnType.LONG);
+        expectedPutTypes.add(ColumnType.DECIMAL256);
+        expectedPutTypes.add(ColumnType.STRING);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkGeoTypes() {
+        // Test geospatial type handling in LoopingRecordSink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.GEOBYTE);
+        columnTypes.add(ColumnType.GEOSHORT);
+        columnTypes.add(ColumnType.GEOINT);
+        columnTypes.add(ColumnType.GEOLONG);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        // GEO types are mapped to BYTE, SHORT, INT, LONG respectively in the sink
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.BYTE);
+        expectedPutTypes.add(ColumnType.SHORT);
+        expectedPutTypes.add(ColumnType.INT);
+        expectedPutTypes.add(ColumnType.LONG);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+
+        // Verify the record was accessed with correct GEO types
+        IntList expectedGetTypes = new IntList();
+        expectedGetTypes.add(ColumnType.GEOBYTE);
+        expectedGetTypes.add(ColumnType.GEOSHORT);
+        expectedGetTypes.add(ColumnType.GEOINT);
+        expectedGetTypes.add(ColumnType.GEOLONG);
+
+        Assert.assertEquals(expectedGetTypes, testRecord.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkIPv4() {
+        // Test IPv4 type handling
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.IPv4);
+        columnTypes.add(ColumnType.INT);
+        columnTypes.add(ColumnType.IPv4);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0; i < columnTypes.getColumnCount(); i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.IPv4);
+        expectedPutTypes.add(ColumnType.INT);
+        expectedPutTypes.add(ColumnType.IPv4);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkIntervalType() {
+        // Test INTERVAL type handling in LoopingRecordSink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.INTERVAL);
+        columnTypes.add(ColumnType.INT);
+        columnTypes.add(ColumnType.INTERVAL);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.INTERVAL);
+        expectedPutTypes.add(ColumnType.INT);
+        expectedPutTypes.add(ColumnType.INTERVAL);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkLong128AndUUID() {
+        // Test LONG128 and UUID handling in LoopingRecordSink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.LONG128);
+        columnTypes.add(ColumnType.UUID);
+        columnTypes.add(ColumnType.INT);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.LONG128);
+        expectedPutTypes.add(ColumnType.LONG128); // UUID uses same LONG128 put
+        expectedPutTypes.add(ColumnType.INT);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+
+        // Verify record was accessed for both lo and hi parts
+        IntList expectedGetTypes = new IntList();
+        expectedGetTypes.add(ColumnType.LONG128); // getLong128Lo
+        expectedGetTypes.add(ColumnType.LONG128); // getLong128Hi
+        expectedGetTypes.add(ColumnType.LONG128); // getLong128Lo for UUID
+        expectedGetTypes.add(ColumnType.LONG128); // getLong128Hi for UUID
+        expectedGetTypes.add(ColumnType.INT);
+
+        Assert.assertEquals(expectedGetTypes, testRecord.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkSkipNegativeTypes() {
+        // Test that negative types cause skip in LoopingRecordSink
+        // This tests the column skip functionality
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.INT);
+        columnTypes.add(ColumnType.LONG);
+
+        // Use negative index in column filter to indicate skipped column
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        columnFilter.add(-1); // First column should be skipped (negative factor)
+        columnFilter.add(2);  // Second column should be copied
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        // First column is skipped (UNDEFINED for skip), second is LONG
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.UNDEFINED); // skip
+        expectedPutTypes.add(ColumnType.LONG);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkStringAsVarchar() {
+        // Test string to varchar conversion in LoopingRecordSink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.STRING);
+        columnTypes.add(ColumnType.STRING);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        columnFilter.add(1);
+        columnFilter.add(2);
+
+        BitSet writeStringAsVarchar = new BitSet();
+        writeStringAsVarchar.set(0); // First string should be written as varchar
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                writeStringAsVarchar,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.VARCHAR); // First string written as varchar
+        expectedPutTypes.add(ColumnType.STRING);  // Second string written normally
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkSymbolAsString() {
+        // Test symbol to string conversion in LoopingRecordSink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.SYMBOL);
+        columnTypes.add(ColumnType.SYMBOL);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        columnFilter.add(1);
+        columnFilter.add(2);
+
+        BitSet writeSymbolAsString = new BitSet();
+        writeSymbolAsString.set(0); // First symbol should be written as string
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                writeSymbolAsString,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.STRING); // First symbol written as string
+        expectedPutTypes.add(ColumnType.INT);    // Second symbol written as int (default)
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkSymbolAsVarchar() {
+        // Test symbol to varchar conversion when both symAsString and strAsVarchar are set
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.SYMBOL);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        columnFilter.add(1);
+
+        BitSet writeSymbolAsString = new BitSet();
+        writeSymbolAsString.set(0);
+
+        BitSet writeStringAsVarchar = new BitSet();
+        writeStringAsVarchar.set(0);
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                writeSymbolAsString,
+                writeStringAsVarchar,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.VARCHAR); // Symbol written as varchar
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkTimestampAsNanos() {
+        // Test timestamp nanosecond scaling in LoopingRecordSink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.TIMESTAMP);
+        columnTypes.add(ColumnType.TIMESTAMP);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        columnFilter.add(1);
+        columnFilter.add(2);
+
+        BitSet writeTimestampAsNanos = new BitSet();
+        writeTimestampAsNanos.set(0); // First timestamp should be scaled to nanos
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                writeTimestampAsNanos
+        );
+
+        // Create record that returns specific timestamp values
+        final long[] recordedTimestamps = new long[2];
+        TestRecordSink testRecordSink = new TestRecordSink() {
+            int timestampIdx = 0;
+
+            @Override
+            public void putTimestamp(long value) {
+                recordedTimestamps[timestampIdx++] = value;
+                super.putTimestamp(value);
+            }
+        };
+
+        TestRecord testRecord = new TestRecord();
+        sink.copy(testRecord, testRecordSink);
+
+        // First timestamp should be scaled by 1000 (to nanos), second should not be scaled
+        Assert.assertEquals(1000L, recordedTimestamps[0]); // 1 * 1000
+        Assert.assertEquals(1L, recordedTimestamps[1]);    // not scaled
+    }
+
+    @Test
+    public void testLoopingRecordSinkWithAllPrimitiveTypes() {
+        // Test all primitive types in one sink
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.BYTE);
+        columnTypes.add(ColumnType.SHORT);
+        columnTypes.add(ColumnType.CHAR);
+        columnTypes.add(ColumnType.INT);
+        columnTypes.add(ColumnType.LONG);
+        columnTypes.add(ColumnType.FLOAT);
+        columnTypes.add(ColumnType.DOUBLE);
+        columnTypes.add(ColumnType.BOOLEAN);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0; i < columnTypes.getColumnCount(); i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.BYTE);
+        expectedPutTypes.add(ColumnType.SHORT);
+        expectedPutTypes.add(ColumnType.CHAR);
+        expectedPutTypes.add(ColumnType.INT);
+        expectedPutTypes.add(ColumnType.LONG);
+        expectedPutTypes.add(ColumnType.FLOAT);
+        expectedPutTypes.add(ColumnType.DOUBLE);
+        expectedPutTypes.add(ColumnType.BOOLEAN);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkWithComplexTypes() {
+        // Test complex types: STRING, VARCHAR, BINARY, LONG256
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.STRING);
+        columnTypes.add(ColumnType.VARCHAR);
+        columnTypes.add(ColumnType.BINARY);
+        columnTypes.add(ColumnType.LONG256);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0; i < columnTypes.getColumnCount(); i++) {
+            columnFilter.add(i + 1);
+        }
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.STRING);
+        expectedPutTypes.add(ColumnType.VARCHAR);
+        expectedPutTypes.add(ColumnType.BINARY);
+        expectedPutTypes.add(ColumnType.LONG256);
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    @Test
+    public void testLoopingRecordSinkWithFunctions() {
+        // Test LoopingRecordSink with key functions
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.INT);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        columnFilter.add(1);
+
+        ObjList<Function> keyFunctions = new ObjList<>();
+        keyFunctions.add(new TestFunction(ColumnType.LONG));
+        keyFunctions.add(new TestFunction(ColumnType.STRING));
+        keyFunctions.add(new TestFunction(ColumnType.DOUBLE));
+
+        io.questdb.cairo.LoopingRecordSink sink = new io.questdb.cairo.LoopingRecordSink(
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null,
+                null
+        );
+        sink.setFunctions(keyFunctions);
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        sink.copy(testRecord, testRecordSink);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.INT);    // Column
+        expectedPutTypes.add(ColumnType.LONG);   // Function 1
+        expectedPutTypes.add(ColumnType.STRING); // Function 2
+        expectedPutTypes.add(ColumnType.DOUBLE); // Function 3
+
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+
+        // Verify functions were called
+        Assert.assertEquals(1, ((TestFunction) keyFunctions.get(0)).callCount);
+        Assert.assertEquals(1, ((TestFunction) keyFunctions.get(1)).callCount);
+        Assert.assertEquals(1, ((TestFunction) keyFunctions.get(2)).callCount);
+    }
+
+    @Test
+    public void testRecordSinkFactoryWithEmptyFilter() {
+        // Test with empty column filter
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.INT);
+        columnTypes.add(ColumnType.LONG);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        // Don't add any columns to filter
+
+        RecordSink sink = RecordSinkFactory.getInstance(
+                configuration,
+                new BytecodeAssembler(),
+                columnTypes,
+                columnFilter,
+                null,
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        // No columns should be copied
+        Assert.assertEquals(0, testRecordSink.recordedTypes.size());
+    }
+
+    @Test
+    public void testRecordSinkFactoryWithNullBitSet() {
+        // Test that null BitSet is handled correctly
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.SYMBOL);
+        columnTypes.add(ColumnType.STRING);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        columnFilter.add(1);
+        columnFilter.add(2);
+
+        // Pass null for writeSymbolAsString
+        RecordSink sink = RecordSinkFactory.getInstance(
+                configuration,
+                new BytecodeAssembler(),
+                columnTypes,
+                columnFilter,
+                null, // null writeSymbolAsString
+                null,
+                null
+        );
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+        sink.copy(testRecord, testRecordSink);
+
+        // Symbol should default to INT (symbol index), not STRING
+        Assert.assertEquals(ColumnType.INT, testRecordSink.recordedTypes.get(0));
+        Assert.assertEquals(ColumnType.STRING, testRecordSink.recordedTypes.get(1));
+    }
+
+    @Test
+    public void testSinkWithOnlySkippedColumns() {
+        // A row made of nothing but window outputs: the sink reads nothing from the record and
+        // steps past every column in order, the var-size ones included.
+        final int arrayType = ColumnType.encodeArrayType(ColumnType.DOUBLE, 1);
+        // enough skips for the chunked generator to split the copy across two methods
+        final int paddingCount = 700;
+        for (int sinkType : SINK_TYPES) {
+            final ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+            final ListColumnFilter columnFilter = new ListColumnFilter();
+            final IntList expectedPutTypes = new IntList();
+
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, arrayType);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.VARCHAR);
+            for (int i = 0; i < paddingCount; i++) {
+                addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.INT);
+            }
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.NULL);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.LONG256);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.STRING);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.BINARY);
+
+            final RecordSink sink = RecordSinkFactory.getInstance(
+                    copierConfiguration(sinkType),
+                    new BytecodeAssembler(),
+                    columnTypes,
+                    columnFilter,
+                    null,
+                    null,
+                    null,
+                    null
+            );
+            assertSinkKind(sink, sinkType);
+
+            final TestRecord testRecord = new TestRecord();
+            final TestRecordSink testRecordSink = new TestRecordSink();
+            sink.copy(testRecord, testRecordSink);
+            Assert.assertEquals(0, testRecord.recordedIndexes.size());
+            Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+        }
+    }
+
+    @Test
+    public void testSkipVarSizeFailsOnMapKeys() throws Exception {
+        // Only RecordChain gives a var-size column a slot to step past. A map key has none, so
+        // a sink that skips a var-size column fails on it rather than build a key that
+        // silently lacks the column.
+        assertMemoryLeak(() -> {
+            final ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+            columnTypes.add(ColumnType.encodeArrayType(ColumnType.DOUBLE, 1));
+            columnTypes.add(ColumnType.INT);
+            final ListColumnFilter columnFilter = new ListColumnFilter();
+            columnFilter.add(-1);
+            columnFilter.add(2);
+            final ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            final ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            for (int sinkType : new int[]{RecordSinkFactory.SINK_TYPE_SINGLE_METHOD, RecordSinkFactory.SINK_TYPE_LOOPING}) {
+                final RecordSink sink = RecordSinkFactory.getInstance(
+                        copierConfiguration(sinkType),
+                        new BytecodeAssembler(),
+                        columnTypes,
+                        columnFilter,
+                        null,
+                        null,
+                        null,
+                        null
+                );
+                try (Map map = MapFactory.createOrderedMap(configuration, keyTypes, valueTypes)) {
+                    final MapKey key = map.withKey();
+                    try {
+                        key.put(new TestRecord(), sink);
+                        Assert.fail("a map key accepted a var-size skip");
+                    } catch (UnsupportedOperationException ignore) {
+                        // RecordSinkSPI.skipVarSize() rejects it by default
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSkippedColumnsConsumeTheirChainSpace() {
+        // A negative filter entry marks a column the sink leaves for its caller to fill, a
+        // window output. Every sink kind must step past it - skip(size) when it is fixed-size,
+        // skipVarSize() when it is var-size, nothing when it takes no space - and must neither
+        // read it from the record nor look it up in the skew index: the window path's skew
+        // index has no entry for a trailing window column.
+        final int arrayType = ColumnType.encodeArrayType(ColumnType.DOUBLE, 1);
+        // enough columns for the chunked generator to split the copy across two methods
+        final int paddingCount = 500;
+        for (int sinkType : SINK_TYPES) {
+            final ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+            final ListColumnFilter columnFilter = new ListColumnFilter();
+            final IntList skewIndex = new IntList();
+            final IntList expectedGetIndexes = new IntList();
+            final IntList expectedPutTypes = new IntList();
+
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, arrayType);
+            addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.VARCHAR);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.INT);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.NULL);
+            for (int i = 0; i < paddingCount; i++) {
+                addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.INT);
+            }
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.STRING);
+            addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.STRING);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.BINARY);
+            addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.BINARY);
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.VARCHAR);
+
+            final RecordSink sink = RecordSinkFactory.getInstance(
+                    copierConfiguration(sinkType),
+                    new BytecodeAssembler(),
+                    columnTypes,
+                    columnFilter,
+                    null,
+                    skewIndex,
+                    null,
+                    null
+            );
+            assertSinkKind(sink, sinkType);
+
+            final TestRecord testRecord = new TestRecord();
+            final TestRecordSink testRecordSink = new TestRecordSink();
+            sink.copy(testRecord, testRecordSink);
+            Assert.assertEquals(expectedGetIndexes, testRecord.recordedIndexes);
+            Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+        }
+    }
+
+    @Test
+    public void testSkippedColumnsIgnoreConversionFlags() {
+        // The conversion flags are indexed by column, so a skipped column can carry one. The
+        // skip takes precedence: a skipped STRING flagged as VARCHAR still takes one var-size
+        // slot, and a skipped SYMBOL or TIMESTAMP still steps over its fixed width.
+        final int paddingCount = 500;
+        for (int sinkType : SINK_TYPES) {
+            final ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+            final ListColumnFilter columnFilter = new ListColumnFilter();
+            final IntList skewIndex = new IntList();
+            final IntList expectedGetIndexes = new IntList();
+            final IntList expectedPutTypes = new IntList();
+            final BitSet symbolAsString = new BitSet();
+            final BitSet stringAsVarchar = new BitSet();
+            final BitSet timestampAsNanos = new BitSet();
+
+            symbolAsString.set(columnTypes.getColumnCount());
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.SYMBOL);
+            stringAsVarchar.set(columnTypes.getColumnCount());
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.STRING);
+            timestampAsNanos.set(columnTypes.getColumnCount());
+            addSkippedColumn(columnTypes, columnFilter, expectedPutTypes, ColumnType.TIMESTAMP);
+            for (int i = 0; i < paddingCount; i++) {
+                addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.INT);
+            }
+            // the same flags convert the copied columns
+            symbolAsString.set(columnTypes.getColumnCount());
+            addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.SYMBOL, ColumnType.STRING);
+            stringAsVarchar.set(columnTypes.getColumnCount());
+            addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.STRING, ColumnType.VARCHAR);
+            timestampAsNanos.set(columnTypes.getColumnCount());
+            addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, ColumnType.TIMESTAMP);
+
+            final RecordSink sink = RecordSinkFactory.getInstance(
+                    copierConfiguration(sinkType),
+                    new BytecodeAssembler(),
+                    columnTypes,
+                    columnFilter,
+                    null,
+                    skewIndex,
+                    symbolAsString,
+                    stringAsVarchar,
+                    timestampAsNanos
+            );
+            assertSinkKind(sink, sinkType);
+
+            final TestRecord testRecord = new TestRecord();
+            final TestRecordSink testRecordSink = new TestRecordSink();
+            sink.copy(testRecord, testRecordSink);
+            Assert.assertEquals(expectedGetIndexes, testRecord.recordedIndexes);
+            Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+        }
+    }
+
+    private static void addCopiedColumn(
+            ArrayColumnTypes columnTypes,
+            ListColumnFilter columnFilter,
+            IntList skewIndex,
+            IntList expectedGetIndexes,
+            IntList expectedPutTypes,
+            int type
+    ) {
+        addCopiedColumn(columnTypes, columnFilter, skewIndex, expectedGetIndexes, expectedPutTypes, type, type);
+    }
+
+    private static void addCopiedColumn(
+            ArrayColumnTypes columnTypes,
+            ListColumnFilter columnFilter,
+            IntList skewIndex,
+            IntList expectedGetIndexes,
+            IntList expectedPutTypes,
+            int type,
+            int putType
+    ) {
+        final int index = columnTypes.getColumnCount();
+        columnTypes.add(type);
+        columnFilter.add(index + 1);
+        // like the window path, where only copied columns map to a base column
+        skewIndex.extendAndSet(index, index + 1_000);
+        expectedGetIndexes.add(index + 1_000);
+        expectedPutTypes.add(putType);
+    }
+
+    private static void addSkippedColumn(
+            ArrayColumnTypes columnTypes,
+            ListColumnFilter columnFilter,
+            IntList expectedPutTypes,
+            int type
+    ) {
+        final int index = columnTypes.getColumnCount();
+        columnTypes.add(type);
+        columnFilter.add(-index - 1);
+        if (ColumnType.isVarSize(type)) {
+            expectedPutTypes.add(SKIP_VAR_SIZE);
+        } else if (ColumnType.sizeOf(type) > 0) {
+            // TestRecordSink.skip()
+            expectedPutTypes.add(ColumnType.UNDEFINED);
+        }
+    }
+
+    @Test
+    public void testRecordSinkTemplateKeepsWriteFlagsForAllCopierTypes() {
+        // The template keeps the column types, filter and write flags, so every copier type
+        // (single-method, chunked and looping) writes the same key, and each call returns a new
+        // instance. The looping type covers the fallback: getInstanceClass() returns null when
+        // CairoConfiguration#getCopierType() forces the looping sink (SINK_TYPE_LOOPING), and a
+        // bare null class has nothing to build the LoopingRecordSink from.
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.SYMBOL);
+        columnTypes.add(ColumnType.SYMBOL);
+        columnTypes.add(ColumnType.STRING);
+        columnTypes.add(ColumnType.TIMESTAMP);
+
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        BitSet writeSymbolAsString = new BitSet();
+        writeSymbolAsString.set(1);
+        BitSet writeStringAsVarchar = new BitSet();
+        writeStringAsVarchar.set(2);
+        BitSet writeTimestampAsNanos = new BitSet();
+        writeTimestampAsNanos.set(3);
+
+        IntList expectedPutTypes = new IntList();
+        expectedPutTypes.add(ColumnType.INT);
+        expectedPutTypes.add(ColumnType.STRING);
+        expectedPutTypes.add(ColumnType.VARCHAR);
+        expectedPutTypes.add(ColumnType.TIMESTAMP);
+
+        final int[] copierTypes = {
+                RecordSinkFactory.SINK_TYPE_SINGLE_METHOD,
+                RecordSinkFactory.SINK_TYPE_CHUNKED,
+                RecordSinkFactory.SINK_TYPE_LOOPING
+        };
+        for (int copierType : copierTypes) {
+            CairoConfiguration copierConfiguration = new CairoConfigurationWrapper(configuration) {
+                @Override
+                public int getCopierType() {
+                    return copierType;
+                }
+            };
+            RecordSinkTemplate template = new RecordSinkTemplate(
+                    copierConfiguration,
+                    new BytecodeAssembler(),
+                    columnTypes,
+                    columnFilter,
+                    writeSymbolAsString,
+                    writeStringAsVarchar,
+                    writeTimestampAsNanos
+            );
+            RecordSink first = template.newInstance();
+            RecordSink second = template.newInstance();
+            Assert.assertNotSame(first, second);
+            Assert.assertEquals(copierType == RecordSinkFactory.SINK_TYPE_LOOPING, first instanceof LoopingRecordSink);
+            Assert.assertSame(first.getClass(), second.getClass());
+
+            for (RecordSink sink : new RecordSink[]{first, second}) {
+                final long[] recordedTimestamp = new long[1];
+                TestRecordSink testRecordSink = new TestRecordSink() {
+                    @Override
+                    public void putTimestamp(long value) {
+                        recordedTimestamp[0] = value;
+                        super.putTimestamp(value);
+                    }
+                };
+                sink.copy(new TestRecord(), testRecordSink);
+                Assert.assertEquals("copierType=" + copierType, expectedPutTypes, testRecordSink.recordedTypes);
+                // the test record returns 1 for every timestamp, and the flag scales it to nanos
+                Assert.assertEquals("copierType=" + copierType, 1000L, recordedTimestamp[0]);
+            }
+        }
+    }
+
+    @Test
+    public void testTimestampAsNanosKeepsNull() {
+        // A join key widens a TIMESTAMP column to nanos when its partner is TIMESTAMP_NS. NULL has to
+        // stay NULL: multiplied, it overflows to 0, so a NULL key would match epoch keys instead of
+        // NULL keys. 500 columns make the chunked sink split the copy across two methods.
+        final int columnCount = 500;
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        BitSet writeTimestampAsNanos = new BitSet();
+        final long[] timestamps = new long[columnCount];
+        final long[] expected = new long[columnCount];
+        for (int i = 0; i < columnCount; i++) {
+            columnTypes.add(ColumnType.TIMESTAMP);
+            columnFilter.add(i + 1);
+            timestamps[i] = switch (i % 3) {
+                case 0 -> Numbers.LONG_NULL;
+                case 1 -> 0;
+                default -> i;
+            };
+            // the last column stays in micros
+            if (i < columnCount - 1) {
+                writeTimestampAsNanos.set(i);
+                expected[i] = timestamps[i] == Numbers.LONG_NULL ? Numbers.LONG_NULL : timestamps[i] * 1000;
+            } else {
+                expected[i] = timestamps[i];
+            }
+        }
+
+        for (int sinkType : new int[]{RecordSinkFactory.SINK_TYPE_SINGLE_METHOD, RecordSinkFactory.SINK_TYPE_CHUNKED, RecordSinkFactory.SINK_TYPE_LOOPING}) {
+            CairoConfiguration sinkTypeConfiguration = new CairoConfigurationWrapper(configuration) {
+                @Override
+                public int getCopierType() {
+                    return sinkType;
+                }
+            };
+            RecordSink sink = RecordSinkFactory.getInstance(
+                    sinkTypeConfiguration,
+                    new BytecodeAssembler(),
+                    columnTypes,
+                    columnFilter,
+                    null,
+                    null,
+                    writeTimestampAsNanos
+            );
+            // a generated class name carries a hidden class suffix after the slash
+            final String expectedSinkClass = switch (sinkType) {
+                case RecordSinkFactory.SINK_TYPE_SINGLE_METHOD -> "io.questdb.cairo.sink/";
+                case RecordSinkFactory.SINK_TYPE_CHUNKED -> "io.questdb.cairo.chunkedsink/";
+                default -> LoopingRecordSink.class.getName();
+            };
+            final String sinkClass = sink.getClass().getName();
+            Assert.assertTrue(sinkClass, sinkClass.startsWith(expectedSinkClass));
+
+            final long[] written = new long[columnCount];
+            TestRecordSink testRecordSink = new TestRecordSink() {
+                private int writtenCount;
+
+                @Override
+                public void putTimestamp(long value) {
+                    written[writtenCount++] = value;
+                    super.putTimestamp(value);
+                }
+            };
+            TestRecord testRecord = new TestRecord() {
+                @Override
+                public long getTimestamp(int col) {
+                    super.getTimestamp(col);
+                    return timestamps[col];
+                }
+            };
+            sink.copy(testRecord, testRecordSink);
+            Assert.assertArrayEquals(expectedSinkClass, expected, written);
+        }
+    }
+
+    @NotNull
+    private static ArrayColumnTypes allArrayColumnTypes() {
+        ArrayColumnTypes columnTypes = new ArrayColumnTypes();
+        columnTypes.add(ColumnType.INT);
+        columnTypes.add(ColumnType.IPv4);
+        columnTypes.add(ColumnType.SYMBOL);
+        columnTypes.add(ColumnType.LONG);
+        columnTypes.add(ColumnType.DATE);
+        columnTypes.add(ColumnType.TIMESTAMP);
+        columnTypes.add(ColumnType.BYTE);
+        columnTypes.add(ColumnType.SHORT);
+        columnTypes.add(ColumnType.CHAR);
+        columnTypes.add(ColumnType.BOOLEAN);
+        columnTypes.add(ColumnType.FLOAT);
+        columnTypes.add(ColumnType.DOUBLE);
+        columnTypes.add(ColumnType.STRING);
+        columnTypes.add(ColumnType.VARCHAR);
+        columnTypes.add(ColumnType.BINARY);
+        columnTypes.add(ColumnType.LONG256);
+        columnTypes.add(ColumnType.GEOBYTE);
+        columnTypes.add(ColumnType.GEOSHORT);
+        columnTypes.add(ColumnType.GEOINT);
+        columnTypes.add(ColumnType.GEOLONG);
+        columnTypes.add(ColumnType.LONG128);
+        columnTypes.add(ColumnType.UUID);
+        columnTypes.add(ColumnType.INTERVAL);
+        columnTypes.add(ColumnType.DECIMAL8);
+        columnTypes.add(ColumnType.DECIMAL16);
+        columnTypes.add(ColumnType.DECIMAL32);
+        columnTypes.add(ColumnType.DECIMAL64);
+        columnTypes.add(ColumnType.DECIMAL128);
+        columnTypes.add(ColumnType.DECIMAL256);
+        return columnTypes;
+    }
+
+    @NotNull
+    private static ObjList<Function> allKeyFunctionTypes() {
+        ObjList<Function> keyFunctions = new ObjList<>();
+        keyFunctions.add(new TestFunction(ColumnType.INT));
+        keyFunctions.add(new TestFunction(ColumnType.IPv4));
+        keyFunctions.add(new TestFunction(ColumnType.SYMBOL));
+        keyFunctions.add(new TestFunction(ColumnType.LONG));
+        keyFunctions.add(new TestFunction(ColumnType.DATE));
+        keyFunctions.add(new TestFunction(ColumnType.TIMESTAMP));
+        keyFunctions.add(new TestFunction(ColumnType.BYTE));
+        keyFunctions.add(new TestFunction(ColumnType.SHORT));
+        keyFunctions.add(new TestFunction(ColumnType.CHAR));
+        keyFunctions.add(new TestFunction(ColumnType.BOOLEAN));
+        keyFunctions.add(new TestFunction(ColumnType.FLOAT));
+        keyFunctions.add(new TestFunction(ColumnType.DOUBLE));
+        keyFunctions.add(new TestFunction(ColumnType.STRING));
+        keyFunctions.add(new TestFunction(ColumnType.VARCHAR));
+        keyFunctions.add(new TestFunction(ColumnType.BINARY));
+        keyFunctions.add(new TestFunction(ColumnType.LONG256));
+        keyFunctions.add(new TestFunction(ColumnType.GEOBYTE));
+        keyFunctions.add(new TestFunction(ColumnType.GEOSHORT));
+        keyFunctions.add(new TestFunction(ColumnType.GEOINT));
+        keyFunctions.add(new TestFunction(ColumnType.GEOLONG));
+        keyFunctions.add(new TestFunction(ColumnType.LONG128));
+        keyFunctions.add(new TestFunction(ColumnType.UUID));
+        keyFunctions.add(new TestFunction(ColumnType.INTERVAL));
+        keyFunctions.add(new TestFunction(ColumnType.DECIMAL8));
+        keyFunctions.add(new TestFunction(ColumnType.DECIMAL16));
+        keyFunctions.add(new TestFunction(ColumnType.DECIMAL32));
+        keyFunctions.add(new TestFunction(ColumnType.DECIMAL64));
+        keyFunctions.add(new TestFunction(ColumnType.DECIMAL128));
+        keyFunctions.add(new TestFunction(ColumnType.DECIMAL256));
+        return keyFunctions;
+    }
+
+    private static void assertSinkKind(RecordSink sink, int sinkType) {
+        // a generated sink is a hidden class: its name carries a '/' suffix
+        final String expectedSinkClass = switch (sinkType) {
+            case RecordSinkFactory.SINK_TYPE_SINGLE_METHOD -> "io.questdb.cairo.sink/";
+            case RecordSinkFactory.SINK_TYPE_CHUNKED -> "io.questdb.cairo.chunkedsink/";
+            default -> LoopingRecordSink.class.getName();
+        };
+        final String sinkClass = sink.getClass().getName();
+        Assert.assertTrue(sinkClass, sinkClass.startsWith(expectedSinkClass));
+    }
+
+    private static CairoConfiguration copierConfiguration(int copierType) {
+        return new CairoConfigurationWrapper(configuration) {
+            @Override
+            public int getCopierType() {
+                return copierType;
+            }
+        };
+    }
+
+    private static void prepareExpectedIndexesAndTypes(
+            ArrayColumnTypes columnTypes,
+            IntList expectedGetIndexes,
+            IntList expectedGetTypes,
+            IntList expectedPutTypes,
+            int indexSkew,
+            BitSet writeSymbolAsString
+    ) {
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            int type = columnTypes.getColumnType(i);
+            prepareExpectedPutType(i, type, expectedPutTypes, writeSymbolAsString);
+            boolean symAsString = writeSymbolAsString != null && writeSymbolAsString.get(i);
+            switch (ColumnType.tagOf(type)) {
+                case ColumnType.LONG128:
+                case ColumnType.UUID:
+                    // LONG128 and UUID are accessed via two get calls, for low and high parts
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(ColumnType.LONG128);
+                    expectedGetTypes.add(ColumnType.LONG128);
+                    break;
+                case ColumnType.SYMBOL:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(symAsString ? ColumnType.SYMBOL : ColumnType.INT);
+                    break;
+                case ColumnType.IPv4:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(ColumnType.IPv4);
+                    break;
+                case ColumnType.GEOBYTE:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(ColumnType.GEOBYTE);
+                    break;
+                case ColumnType.GEOSHORT:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(ColumnType.GEOSHORT);
+                    break;
+                case ColumnType.GEOINT:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(ColumnType.GEOINT);
+                    break;
+                case ColumnType.GEOLONG:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(ColumnType.GEOLONG);
+                    break;
+                case ColumnType.DECIMAL8:
+                case ColumnType.DECIMAL16:
+                case ColumnType.DECIMAL32:
+                case ColumnType.DECIMAL64:
+                case ColumnType.DECIMAL128:
+                case ColumnType.DECIMAL256:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(ColumnType.tagOf(type));
+                    break;
+                default:
+                    expectedGetIndexes.add(i + indexSkew);
+                    expectedGetTypes.add(type);
+            }
+        }
+    }
+
+    private static void prepareExpectedPutType(int index, int type, IntList expectedPutTypes, BitSet writeSymbolAsString) {
+        boolean symAsString = writeSymbolAsString != null && writeSymbolAsString.get(index);
+        switch (ColumnType.tagOf(type)) {
+            case ColumnType.LONG128:
+            case ColumnType.UUID:
+                // LONG128 and UUID are accessed via two get calls, for low and high parts
+                expectedPutTypes.add(ColumnType.LONG128);
+                break;
+            case ColumnType.SYMBOL:
+                if (symAsString) {
+                    expectedPutTypes.add(ColumnType.STRING);
+                } else {
+                    expectedPutTypes.add(ColumnType.INT);
+                }
+                break;
+            case ColumnType.IPv4:
+                expectedPutTypes.add(ColumnType.IPv4);
+                break;
+            case ColumnType.GEOINT:
+            case ColumnType.DECIMAL32:
+                expectedPutTypes.add(ColumnType.INT);
+                break;
+            case ColumnType.GEOBYTE:
+            case ColumnType.DECIMAL8:
+                expectedPutTypes.add(ColumnType.BYTE);
+                break;
+            case ColumnType.GEOSHORT:
+            case ColumnType.DECIMAL16:
+                expectedPutTypes.add(ColumnType.SHORT);
+                break;
+            case ColumnType.GEOLONG:
+            case ColumnType.DECIMAL64:
+                expectedPutTypes.add(ColumnType.LONG);
+                break;
+            default:
+                expectedPutTypes.add(type);
+        }
+    }
+
+    private static void testColumnKeysAllSupportedTypes(BitSet writeSymbolAsString) {
+        ArrayColumnTypes columnTypes = allArrayColumnTypes();
+
+        IntList expectedGetIndexes = new IntList();
+        IntList expectedGetTypes = new IntList();
+        IntList expectedPutTypes = new IntList();
+        ListColumnFilter columnFilter = new ListColumnFilter();
+        for (int i = 0, n = columnTypes.getColumnCount(); i < n; i++) {
+            columnFilter.add(i + 1);
+        }
+
+        prepareExpectedIndexesAndTypes(columnTypes, expectedGetIndexes, expectedGetTypes, expectedPutTypes, 0, writeSymbolAsString);
+
+        TestRecord testRecord = new TestRecord();
+        TestRecordSink testRecordSink = new TestRecordSink();
+
+        RecordSink sink = RecordSinkFactory.getInstance(configuration, new BytecodeAssembler(), columnTypes, columnFilter, writeSymbolAsString, null, null);
+        sink.copy(testRecord, testRecordSink);
+
+        Assert.assertEquals(expectedGetIndexes, testRecord.recordedIndexes);
+        Assert.assertEquals(expectedGetTypes, testRecord.recordedTypes);
+        Assert.assertEquals(expectedPutTypes, testRecordSink.recordedTypes);
+    }
+
+    private static class TestFunction implements Function, FunctionExtension {
+        final int type;
+        int callCount;
+
+        private TestFunction(int type) {
+            this.type = type;
+        }
+
+        @Override
+        public FunctionExtension extendedOps() {
+            return this;
+        }
+
+        @Override
+        public ArrayView getArray(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public int getArrayLength() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public BinarySequence getBin(Record rec) {
+            Assert.assertEquals(ColumnType.BINARY, type);
+            callCount++;
+            return new TestBinarySequence().of(new byte[]{1, 2, 3});
+        }
+
+        @Override
+        public long getBinLen(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            Assert.assertEquals(ColumnType.BOOLEAN, type);
+            callCount++;
+            return true;
+        }
+
+        @Override
+        public byte getByte(Record rec) {
+            Assert.assertEquals(ColumnType.BYTE, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public char getChar(Record rec) {
+            Assert.assertEquals(ColumnType.CHAR, type);
+            callCount++;
+            return 'a';
+        }
+
+        @Override
+        public long getDate(Record rec) {
+            Assert.assertEquals(ColumnType.DATE, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public void getDecimal128(Record rec, Decimal128 sink) {
+            Assert.assertEquals(ColumnType.DECIMAL128, type);
+            callCount++;
+        }
+
+        @Override
+        public short getDecimal16(Record rec) {
+            Assert.assertEquals(ColumnType.DECIMAL16, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public void getDecimal256(Record rec, Decimal256 sink) {
+            Assert.assertEquals(ColumnType.DECIMAL256, type);
+            callCount++;
+        }
+
+        @Override
+        public int getDecimal32(Record rec) {
+            Assert.assertEquals(ColumnType.DECIMAL32, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public long getDecimal64(Record rec) {
+            Assert.assertEquals(ColumnType.DECIMAL64, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public byte getDecimal8(Record rec) {
+            Assert.assertEquals(ColumnType.DECIMAL8, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public double getDouble(Record rec) {
+            Assert.assertEquals(ColumnType.DOUBLE, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public float getFloat(Record rec) {
+            Assert.assertEquals(ColumnType.FLOAT, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public byte getGeoByte(Record rec) {
+            Assert.assertEquals(ColumnType.GEOBYTE, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public int getGeoInt(Record rec) {
+            Assert.assertEquals(ColumnType.GEOINT, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public long getGeoLong(Record rec) {
+            Assert.assertEquals(ColumnType.GEOLONG, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public short getGeoShort(Record rec) {
+            Assert.assertEquals(ColumnType.GEOSHORT, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public int getIPv4(Record rec) {
+            Assert.assertEquals(ColumnType.IPv4, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public int getInt(Record rec) {
+            Assert.assertEquals(ColumnType.INT, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public @NotNull Interval getInterval(Record rec) {
+            Assert.assertEquals(ColumnType.INTERVAL, type);
+            callCount++;
+            return Interval.NULL;
+        }
+
+        @Override
+        public long getLong(Record rec) {
+            Assert.assertEquals(ColumnType.LONG, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public long getLong128Hi(Record rec) {
+            if (type != ColumnType.LONG128 && type != ColumnType.UUID) {
+                Assert.fail("LONG128 or UUID expected, was " + ColumnType.nameOf(type));
+            }
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public long getLong128Lo(Record rec) {
+            if (type != ColumnType.LONG128 && type != ColumnType.UUID) {
+                Assert.fail("LONG128 or UUID expected, was " + ColumnType.nameOf(type));
+            }
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public void getLong256(Record rec, CharSink<?> sink) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Long256 getLong256A(Record rec) {
+            Assert.assertEquals(ColumnType.LONG256, type);
+            callCount++;
+            Long256Impl long256 = new Long256Impl();
+            long256.setAll(1, 1, 1, 1);
+            return long256;
+        }
+
+        @Override
+        public Long256 getLong256B(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Record getRecord(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public RecordCursorFactory getRecordCursorFactory() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public short getShort(Record rec) {
+            Assert.assertEquals(ColumnType.SHORT, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public CharSequence getStrA(Record rec) {
+            Assert.assertEquals(ColumnType.STRING, type);
+            callCount++;
+            return "abc";
+        }
+
+        @Override
+        public CharSequence getStrA(Record rec, int arrayIndex) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CharSequence getStrB(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CharSequence getStrB(Record rec, int arrayIndex) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public int getStrLen(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public int getStrLen(Record rec, int arrayIndex) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public CharSequence getSymbol(Record rec) {
+            Assert.assertEquals(ColumnType.SYMBOL, type);
+            callCount++;
+            return "abc";
+        }
+
+        @Override
+        public CharSequence getSymbolB(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public long getTimestamp(Record rec) {
+            Assert.assertEquals(ColumnType.TIMESTAMP, type);
+            callCount++;
+            return 1;
+        }
+
+        @Override
+        public int getType() {
+            return type;
+        }
+
+        @Override
+        public Utf8Sequence getVarcharA(Record rec) {
+            Assert.assertEquals(ColumnType.VARCHAR, type);
+            callCount++;
+            return new Utf8String("abc");
+        }
+
+        @Override
+        public Utf8Sequence getVarcharB(Record rec) {
+            Assert.assertEquals(ColumnType.VARCHAR, type);
+            callCount++;
+            return new Utf8String("abc");
+        }
+
+        @Override
+        public int getVarcharSize(Record rec) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    private static class TestRecord implements Record {
+        final IntList recordedIndexes = new IntList();
+        final IntList recordedTypes = new IntList();
+
+        @Override
+        public BinarySequence getBin(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.BINARY);
+            return new TestBinarySequence().of(new byte[]{1, 2, 3});
+        }
+
+        @Override
+        public boolean getBool(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.BOOLEAN);
+            return true;
+        }
+
+        @Override
+        public byte getByte(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.BYTE);
+            return 1;
+        }
+
+        @Override
+        public char getChar(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.CHAR);
+            return 'a';
+        }
+
+        @Override
+        public long getDate(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DATE);
+            return 1;
+        }
+
+        public void getDecimal128(int col, Decimal128 sink) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DECIMAL128);
+        }
+
+        @Override
+        public short getDecimal16(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DECIMAL16);
+            return 1;
+        }
+
+        public void getDecimal256(int col, Decimal256 sink) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DECIMAL256);
+        }
+
+        @Override
+        public int getDecimal32(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DECIMAL32);
+            return 1;
+        }
+
+        @Override
+        public long getDecimal64(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DECIMAL64);
+            return 1;
+        }
+
+        @Override
+        public byte getDecimal8(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DECIMAL8);
+            return 1;
+        }
+
+        @Override
+        public double getDouble(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.DOUBLE);
+            return 1;
+        }
+
+        @Override
+        public float getFloat(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.FLOAT);
+            return 1;
+        }
+
+        @Override
+        public byte getGeoByte(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.GEOBYTE);
+            return 1;
+        }
+
+        @Override
+        public int getGeoInt(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.GEOINT);
+            return 1;
+        }
+
+        @Override
+        public long getGeoLong(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.GEOLONG);
+            return 1;
+        }
+
+        @Override
+        public short getGeoShort(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.GEOSHORT);
+            return 1;
+        }
+
+        @Override
+        public int getIPv4(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.IPv4);
+            return 1;
+        }
+
+        @Override
+        public int getInt(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.INT);
+            return 1;
+        }
+
+        @Override
+        public Interval getInterval(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.INTERVAL);
+            return Interval.NULL;
+        }
+
+        @Override
+        public long getLong(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.LONG);
+            return 1;
+        }
+
+        @Override
+        public long getLong128Hi(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.LONG128);
+            return 1;
+        }
+
+        @Override
+        public long getLong128Lo(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.LONG128);
+            return 1;
+        }
+
+        @Override
+        public Long256 getLong256A(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.LONG256);
+            Long256Impl long256 = new Long256Impl();
+            long256.setAll(1, 1, 1, 1);
+            return long256;
+        }
+
+        @Override
+        public short getShort(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.SHORT);
+            return 1;
+        }
+
+        @Override
+        public CharSequence getStrA(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.STRING);
+            return "abc";
+        }
+
+        @Override
+        public CharSequence getSymA(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.SYMBOL);
+            return "abc";
+        }
+
+        @Override
+        public long getTimestamp(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.TIMESTAMP);
+            return 1;
+        }
+
+        @Override
+        public Utf8Sequence getVarcharA(int col) {
+            recordedIndexes.add(col);
+            recordedTypes.add(ColumnType.VARCHAR);
+            return new Utf8String("abc");
+        }
+    }
+
+    private static class TestRecordSink implements RecordSinkSPI {
+        final IntList recordedTypes = new IntList();
+
+        @Override
+        public void putArray(ArrayView view) {
+            recordedTypes.add(view.getType());
+        }
+
+        @Override
+        public void putBin(BinarySequence value) {
+            recordedTypes.add(ColumnType.BINARY);
+        }
+
+        @Override
+        public void putBool(boolean value) {
+            recordedTypes.add(ColumnType.BOOLEAN);
+        }
+
+        @Override
+        public void putByte(byte value) {
+            recordedTypes.add(ColumnType.BYTE);
+        }
+
+        @Override
+        public void putChar(char value) {
+            recordedTypes.add(ColumnType.CHAR);
+        }
+
+        @Override
+        public void putDate(long value) {
+            recordedTypes.add(ColumnType.DATE);
+        }
+
+        @Override
+        public void putDecimal128(Decimal128 decimal128) {
+            recordedTypes.add(ColumnType.DECIMAL128);
+        }
+
+        @Override
+        public void putDecimal256(Decimal256 decimal256) {
+            recordedTypes.add(ColumnType.DECIMAL256);
+        }
+
+        @Override
+        public void putDouble(double value) {
+            recordedTypes.add(ColumnType.DOUBLE);
+        }
+
+        @Override
+        public void putFloat(float value) {
+            recordedTypes.add(ColumnType.FLOAT);
+        }
+
+        @Override
+        public void putIPv4(int value) {
+            recordedTypes.add(ColumnType.IPv4);
+        }
+
+        @Override
+        public void putInt(int value) {
+            recordedTypes.add(ColumnType.INT);
+        }
+
+        @Override
+        public void putInterval(Interval interval) {
+            recordedTypes.add(ColumnType.INTERVAL);
+        }
+
+        @Override
+        public void putLong(long value) {
+            recordedTypes.add(ColumnType.LONG);
+        }
+
+        @Override
+        public void putLong128(long lo, long hi) {
+            recordedTypes.add(ColumnType.LONG128);
+        }
+
+        @Override
+        public void putLong256(Long256 value) {
+            recordedTypes.add(ColumnType.LONG256);
+        }
+
+        @Override
+        public void putLong256(long l0, long l1, long l2, long l3) {
+            recordedTypes.add(ColumnType.LONG256);
+        }
+
+        @Override
+        public void putRecord(Record value) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putShort(short value) {
+            recordedTypes.add(ColumnType.SHORT);
+        }
+
+        @Override
+        public void putStr(CharSequence value) {
+            recordedTypes.add(ColumnType.STRING);
+        }
+
+        @Override
+        public void putStr(CharSequence value, int lo, int hi) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void putTimestamp(long value) {
+            recordedTypes.add(ColumnType.TIMESTAMP);
+        }
+
+        @Override
+        public void putVarchar(Utf8Sequence value) {
+            recordedTypes.add(ColumnType.VARCHAR);
+        }
+
+        @Override
+        public void skip(int bytes) {
+            recordedTypes.add(ColumnType.UNDEFINED);
+        }
+
+        @Override
+        public void skipVarSize() {
+            recordedTypes.add(SKIP_VAR_SIZE);
+        }
+    }
+}

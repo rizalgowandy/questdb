@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,13 +24,26 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.Numbers;
-import io.questdb.std.NumericException;
-import io.questdb.std.datetime.microtime.Timestamps;
+import io.questdb.std.datetime.CommonUtils;
 import org.jetbrains.annotations.NotNull;
 
 public final class TimestampSamplerFactory {
+
+    public static TimestampSampler getInstance(TimestampDriver driver, long interval, CharSequence units, int position) throws SqlException {
+        if (units.length() == 1) {
+            return getInstance(driver, interval, units.charAt(0), position);
+        }
+        // Just in case SqlParser will allow this in the future
+        throw SqlException.$(position, "expected one character interval qualifier");
+    }
+
+    @NotNull
+    public static TimestampSampler getInstance(TimestampDriver driver, long interval, char timeUnit, int position) throws SqlException {
+        return driver.getTimestampSampler(interval, timeUnit, position);
+    }
 
     /**
      * Parses strings such as '10m', '3M', '5d', '12h', 'y', '35s'
@@ -40,92 +53,11 @@ public final class TimestampSamplerFactory {
      * @return instance of appropriate TimestampSampler
      * @throws SqlException when input string is invalid
      */
-    public static TimestampSampler getInstance(CharSequence cs, int position) throws SqlException {
-        int k = -1;
+    public static TimestampSampler getInstance(TimestampDriver driver, CharSequence cs, int position) throws SqlException {
+        int k = CommonUtils.findPositiveIntervalEndIndex(cs, position, "sample");
+        assert cs.length() > k;
 
-        if (cs == null) {
-            throw SqlException.$(position, "missing interval");
-        }
-
-        final int len = cs.length();
-
-        // look for end of digits
-        for (int i = 0; i < len; i++) {
-            char c = cs.charAt(i);
-            if (c < '0' || c > '9') {
-                k = i;
-                break;
-            }
-        }
-
-        if (k == -1) {
-            throw SqlException.$(position + len, "expected interval qualifier");
-        }
-
-        // expect 1 letter qualifier
-        if (k + 1 < len) {
-            throw SqlException.$(position + k, "expected single letter qualifier");
-        }
-
-        try {
-            final int n;
-            if (k == 0) {
-                n = 1;
-            } else {
-                n = Numbers.parseInt(cs, 0, k);
-                if (n == 0) {
-                    throw SqlException.$(position, "zero is not a valid sample value");
-                }
-            }
-
-            return createTimestampSampler(n, cs.charAt(k), position + k);
-        } catch (NumericException ignore) {
-            // we are parsing a pre-validated number
-            // but we have to deal with checked exception anyway
-            assert false;
-        }
-
-        throw SqlException.$(position + k, "unsupported interval qualifier");
-    }
-
-    public static TimestampSampler getInstance(long period, CharSequence units, int position) throws SqlException {
-        if (units.length() == 1) {
-            return createTimestampSampler(period, units.charAt(0), position);
-        }
-        // Just in case SqlParser will allow this in the future
-        throw SqlException.$(position, "expected one character interval qualifier");
-    }
-
-    @NotNull
-    private static TimestampSampler createTimestampSampler(long interval, char timeUnit, int position) throws SqlException {
-        switch (timeUnit) {
-            case 'U':
-                // micros
-                return new MicroTimestampSampler(interval);
-            case 'T':
-                // millis
-                return new MicroTimestampSampler(Timestamps.MILLI_MICROS * interval);
-            case 's':
-                // seconds
-                return new MicroTimestampSampler(Timestamps.SECOND_MICROS * interval);
-            case 'm':
-                // minutes
-                return new MicroTimestampSampler(Timestamps.MINUTE_MICROS * interval);
-            case 'h':
-                // hours
-                return new MicroTimestampSampler(Timestamps.HOUR_MICROS * interval);
-            case 'd':
-                // days
-                return new MicroTimestampSampler(Timestamps.DAY_MICROS * interval);
-            case 'M':
-                // months
-                return new MonthTimestampSampler((int) interval);
-            case 'y':
-                return new YearTimestampSampler((int) interval);
-            default:
-                // Just in case SqlParser will allow this in the future
-                throw SqlException.$(position, "unsupported interval qualifier");
-
-        }
+        long n = CommonUtils.parsePositiveInterval(cs, k, position, "sample", Numbers.INT_NULL, '?');
+        return getInstance(driver, n, cs.charAt(k), position + k);
     }
 }

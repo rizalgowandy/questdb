@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,22 +24,37 @@
 
 package io.questdb.cutlass.http.processors;
 
+import io.questdb.FactoryProvider;
+import io.questdb.griffin.QueryFutureUpdateListener;
 import io.questdb.std.FilesFacade;
+import io.questdb.std.datetime.NanosecondClock;
 import io.questdb.std.datetime.millitime.MillisecondClock;
+
+import static io.questdb.cairo.SecurityContext.AUTH_TYPE_CREDENTIALS;
 
 public interface JsonQueryProcessorConfiguration {
 
-    MillisecondClock getClock();
-
     int getConnectionCheckFrequency();
 
+    long getExportTimeout();
+
+    FactoryProvider getFactoryProvider();
+
     FilesFacade getFilesFacade();
-
-    int getFloatScale();
-
-    int getDoubleScale();
 
     CharSequence getKeepAliveHeader();
 
     long getMaxQueryResponseRowLimit();
+
+    MillisecondClock getMillisecondClock();
+
+    NanosecondClock getNanosecondClock();
+
+    default QueryFutureUpdateListener getQueryFutureUpdateListener() {
+        return QueryFutureUpdateListener.EMPTY;
+    }
+
+    default byte getRequiredAuthType() {
+        return AUTH_TYPE_CREDENTIALS;
+    }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,8 +29,6 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.DateFunction;
-import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
@@ -48,25 +46,20 @@ public class CastSymbolToDateFunctionFactory implements FunctionFactory {
         return new Func(args.getQuick(0));
     }
 
-    private static class Func extends DateFunction implements UnaryFunction {
-        private final Function arg;
+    public static class Func extends AbstractCastToDateFunction {
 
         public Func(Function arg) {
-            this.arg = arg;
+            super(arg);
         }
 
-        @Override
-        public Function getArg() {
-            return arg;
-        }
 
         @Override
         public long getDate(Record rec) {
             final CharSequence value = arg.getSymbol(rec);
             try {
-                return value == null ? Numbers.LONG_NaN : DateFormatUtils.parseUTCDate(value);
+                return value == null ? Numbers.LONG_NULL : DateFormatUtils.parseUTCDate(value);
             } catch (NumericException e) {
-                return Numbers.LONG_NaN;
+                return Numbers.LONG_NULL;
             }
         }
     }

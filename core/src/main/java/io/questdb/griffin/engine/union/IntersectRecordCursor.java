@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,98 +29,125 @@ import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Misc;
 
-class IntersectRecordCursor implements RecordCursor {
-    private final Map map;
+class IntersectRecordCursor extends AbstractSetRecordCursor {
+    private final Map mapA;
+    private final Map mapB;
     private final RecordSink recordSink;
-    private RecordCursor masterCursor;
-    private RecordCursor slaveCursor;
-    private Record masterRecord;
-    private RecordCursor symbolCursor;
-    private SqlExecutionCircuitBreaker circuitBreaker;
+    private boolean isCursorBHashed;
+    private boolean isOpen;
+    private Record recordA;
+    private Record recordB;
 
-    public IntersectRecordCursor(Map map, RecordSink recordSink) {
-        this.map = map;
+    public IntersectRecordCursor(Map mapA, Map mapB, RecordSink recordSink) {
+        this.mapA = mapA;
+        this.mapB = mapB;
         this.recordSink = recordSink;
-    }
-
-    void of(RecordCursor masterCursor, RecordCursor slaveCursor, SqlExecutionContext executionContext) {
-        this.masterCursor = masterCursor;
-        this.slaveCursor = slaveCursor;
-        this.masterRecord = masterCursor.getRecord();
-        circuitBreaker = executionContext.getCircuitBreaker();
-        map.clear();
-        populateSlaveMap(slaveCursor);
-        toTop();
-    }
-
-    private void populateSlaveMap(RecordCursor cursor) {
-        final Record record = cursor.getRecord();
-        while (cursor.hasNext()) {
-            MapKey key = map.withKey();
-            key.put(record, recordSink);
-            key.createValue();
-            circuitBreaker.statefulThrowExceptionIfTripped();
-        }
-    }
-
-    @Override
-    public Record getRecordB() {
-        return masterCursor.getRecordB();
-    }
-
-    @Override
-    public void recordAt(Record record, long atRowId) {
-        masterCursor.recordAt(record, atRowId);
+        this.isOpen = false;
     }
 
     @Override
     public void close() {
-        Misc.free(this.masterCursor);
-        Misc.free(this.slaveCursor);
-        circuitBreaker = null;
+        if (isOpen) {
+            isOpen = false;
+            mapA.close();
+            mapB.close();
+            super.close();
+        }
     }
 
     @Override
     public Record getRecord() {
-        return masterRecord;
+        return recordA;
+    }
+
+    @Override
+    public Record getRecordB() {
+        return cursorA.getRecordB();
+    }
+
+    @Override
+    public SymbolTable getSymbolTable(int columnIndex) {
+        return cursorA.getSymbolTable(columnIndex);
     }
 
     @Override
     public boolean hasNext() {
-        while (masterCursor.hasNext()) {
-            MapKey key = map.withKey();
-            key.put(masterRecord, recordSink);
-            if (key.findValue() != null) {
-                return true;
+        if (!isCursorBHashed) {
+            hashCursorB();
+            toTop();
+            isCursorBHashed = true;
+        }
+        while (cursorA.hasNext()) {
+            MapKey keyB = mapB.withKey();
+            keyB.put(recordA, recordSink);
+            if (!keyB.notFound()) {
+                MapKey keyA = mapA.withKey();
+                keyA.put(recordA, recordSink);
+                if (keyA.create()) {
+                    return true;
+                }
             }
-            circuitBreaker.statefulThrowExceptionIfTripped();
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
         }
         return false;
     }
 
     @Override
-    public SymbolTable getSymbolTable(int columnIndex) {
-        return symbolCursor.getSymbolTable(columnIndex);
-    }
-
-    @Override
     public SymbolTable newSymbolTable(int columnIndex) {
-        return symbolCursor.newSymbolTable(columnIndex);
+        return cursorA.newSymbolTable(columnIndex);
     }
 
     @Override
-    public void toTop() {
-        symbolCursor = masterCursor;
-        masterCursor.toTop();
+    public long preComputedStateSize() {
+        return RecordCursor.fromBool(isCursorBHashed);
+    }
+
+    @Override
+    public void recordAt(Record record, long atRowId) {
+        cursorA.recordAt(record, atRowId);
     }
 
     @Override
     public long size() {
         return -1;
+    }
+
+    @Override
+    public void toTop() {
+        cursorA.toTop();
+        mapA.clear();
+    }
+
+    private void hashCursorB() {
+        while (cursorB.hasNext()) {
+            MapKey keyB = mapB.withKey();
+            keyB.put(recordB, recordSink);
+            keyB.createValue();
+            circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+        }
+        // this is an optimisation to release TableReader in case "this"
+        // cursor lingers around. If there is exception or circuit breaker fault
+        // we will rely on close() method to release the reader.
+        cursorB = Misc.free(cursorB);
+    }
+
+    void of(RecordCursor cursorA, RecordCursor cursorB, SqlExecutionContext executionContext) throws SqlException {
+        if (!isOpen) {
+            isOpen = true;
+            mapA.setMemoryTracker(executionContext.getMemoryTracker());
+            mapB.setMemoryTracker(executionContext.getMemoryTracker());
+            mapA.reopen();
+            mapB.reopen();
+        }
+
+        super.of(cursorA, cursorB, executionContext);
+        recordA = cursorA.getRecord();
+        recordB = cursorB.getRecord();
+        isCursorBHashed = false;
     }
 }

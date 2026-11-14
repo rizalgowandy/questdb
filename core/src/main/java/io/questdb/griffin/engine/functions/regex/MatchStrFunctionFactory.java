@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,18 +29,17 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BooleanFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
-import io.questdb.std.Chars;
+import io.questdb.griffin.engine.functions.constants.BooleanConstant;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 public class MatchStrFunctionFactory implements FunctionFactory {
     @Override
@@ -60,31 +59,22 @@ public class MatchStrFunctionFactory implements FunctionFactory {
         final Function pattern = args.getQuick(1);
         final int patternPosition = argPositions.getQuick(1);
         if (pattern.isConstant()) {
-            return new MatchConstPatternFunction(value, createMatcher(pattern, patternPosition));
+            Matcher matcher = RegexUtils.createMatcher(pattern, patternPosition);
+            if (matcher == null) {
+                return BooleanConstant.FALSE;
+            }
+            return new MatchStrConstPatternFunction(value, matcher);
         } else if (pattern.isRuntimeConstant()) {
-            return new MatchRuntimeConstPatternFunction(value, pattern, patternPosition);
+            return new MatchStrRuntimeConstPatternFunction(value, pattern, patternPosition);
         }
-        throw SqlException.$(patternPosition, "not implemented: dynamic patter would be very slow to execute");
+        throw SqlException.$(patternPosition, "not implemented: dynamic pattern would be very slow to execute");
     }
 
-    @NotNull
-    private static Matcher createMatcher(Function pattern, int position) throws SqlException {
-        final CharSequence regex = pattern.getStr(null);
-        if (regex == null) {
-            throw SqlException.$(position, "NULL regex");
-        }
-        try {
-            return Pattern.compile(Chars.toString(regex)).matcher("");
-        } catch (PatternSyntaxException e) {
-            throw SqlException.$(position + e.getIndex() + 1, e.getMessage());
-        }
-    }
-
-    private static class MatchConstPatternFunction extends BooleanFunction implements UnaryFunction {
-        private final Function value;
+    static class MatchStrConstPatternFunction extends BooleanFunction implements UnaryFunction {
         private final Matcher matcher;
+        private final Function value;
 
-        public MatchConstPatternFunction(Function value, Matcher matcher) {
+        public MatchStrConstPatternFunction(Function value, @NotNull Matcher matcher) {
             this.value = value;
             this.matcher = matcher;
         }
@@ -96,41 +86,76 @@ public class MatchStrFunctionFactory implements FunctionFactory {
 
         @Override
         public boolean getBool(Record rec) {
-            CharSequence cs = getArg().getStr(rec);
+            CharSequence cs = getArg().getStrA(rec);
             return cs != null && matcher.reset(cs).find();
         }
 
         @Override
-        public boolean isReadThreadSafe() {
+        public int getComplexity() {
+            return Function.addComplexity(COMPLEXITY_REGEX, UnaryFunction.super.getComplexity());
+        }
+
+        @Override
+        public boolean isConstant() {
+            return UnaryFunction.super.isConstant();
+        }
+
+        @Override
+        public boolean isThreadSafe() {
             return false;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(value).val(" ~ ").val(matcher.pattern().toString());
         }
     }
 
-    private static class MatchRuntimeConstPatternFunction extends BooleanFunction implements UnaryFunction {
-        private final Function value;
+    static class MatchStrRuntimeConstPatternFunction extends BooleanFunction implements UnaryFunction {
+        private final Function fun;
         private final Function pattern;
         private final int patternPosition;
         private Matcher matcher;
 
-        public MatchRuntimeConstPatternFunction(Function value, Function pattern, int patternPosition) {
-            this.value = value;
+        public MatchStrRuntimeConstPatternFunction(Function fun, Function pattern, int patternPosition) {
+            this.fun = fun;
             this.pattern = pattern;
             this.patternPosition = patternPosition;
         }
 
         @Override
         public Function getArg() {
-            return value;
+            return fun;
         }
 
         @Override
         public boolean getBool(Record rec) {
-            CharSequence cs = getArg().getStr(rec);
-            return cs != null && matcher.reset(cs).find();
+            if (matcher != null) {
+                CharSequence cs = getArg().getStrA(rec);
+                return cs != null && matcher.reset(cs).find();
+            }
+            return false;
+        }
+
+        @Override
+        public int getComplexity() {
+            return Function.addComplexity(COMPLEXITY_REGEX, UnaryFunction.super.getComplexity());
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            UnaryFunction.super.init(symbolTableSource, executionContext);
+            pattern.init(symbolTableSource, executionContext);
+            this.matcher = RegexUtils.createMatcher(pattern, patternPosition);
         }
 
         @Override
         public boolean isConstant() {
+            return false;
+        }
+
+        @Override
+        public boolean isThreadSafe() {
             return false;
         }
 
@@ -140,15 +165,8 @@ public class MatchStrFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
-            return false;
-        }
-
-        @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
-            UnaryFunction.super.init(symbolTableSource, executionContext);
-            pattern.init(symbolTableSource, executionContext);
-            this.matcher = createMatcher(pattern, patternPosition);
+        public void toPlan(PlanSink sink) {
+            sink.val(fun).val(" ~ ").val(pattern.toString());
         }
     }
 }

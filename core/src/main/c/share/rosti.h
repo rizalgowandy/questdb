@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,24 +40,26 @@
 #endif
 
 #if defined(_ARM64)
-    static inline uint32_t bit_scan_forward(uint32_t a) {
-        uint32_t r;
-        __asm("rbit %w0, %w1; clz %w0, %w0;" : "=r"(r) : "r"(a) : );
-        return r;
-    }
-    static inline uint32_t bit_scan_forward(uint64_t a) {
+static inline uint32_t bit_scan_forward(uint32_t a) {
+    uint32_t r;
+    __asm("rbit %w0, %w1; clz %w0, %w0;" : "=r"(r) : "r"(a) : );
+    return r;
+}
+static inline uint32_t bit_scan_forward(uint64_t a) {
 #ifdef __APPLE__
-        return __builtin_ffsll(a) - 1;
+    return __builtin_ffsll(a) - 1;
 #else
-        uint64_t r;
-        __asm("rbit %0, %1; clz %0, %0;" : "=r"(r) : "r"(a) : );
-        return r;
+    uint64_t r;
+    __asm("rbit %0, %1; clz %0, %0;" : "=r"(r) : "r"(a) : );
+    return r;
 #endif
-    }
+}
 #define BITS_SHIFT 3
 #else
-    #include "vcl/vectorclass.h"
-    #define BITS_SHIFT 0
+
+#include "vcl/vectorclass.h"
+
+#define BITS_SHIFT 0
 #endif
 
 using ctrl_t = signed char;
@@ -103,7 +105,7 @@ struct rosti_t {
 
 // An abstraction over a bitmask. It provides an easy way to iterate through the
 // indexes of the set bits of a bitmask.  When Shift=0 (platforms with SSE),
-// this is a true bitmask.  On non-SSE, platforms the arithematic used to
+// this is a true bitmask.  On non-SSE, platforms the arithmetic used to
 // emulate the SSE behavior works in bytes (Shift=3) and leaves each bytes as
 // either 0x00 or 0x80.
 //
@@ -188,6 +190,7 @@ struct GroupPortableImpl {
 };
 using Group = GroupPortableImpl;
 #else
+
 struct GroupSse2Impl {
 
     explicit GroupSse2Impl(const ctrl_t *pos) {
@@ -211,14 +214,18 @@ struct GroupSse2Impl {
 
     Vec16c ctrl;
 };
+
 using Group = GroupSse2Impl;
 #endif
 
 //-----------------------------------------
 
+//internal function
+void *rosti_malloc(size_t size);
+
 rosti_t *alloc_rosti(const int32_t *column_types, int32_t column_count, uint64_t map_capacity);
 
-static void initialize_slots(rosti_t *map);
+static bool initialize_slots(rosti_t **map);
 
 // We use 7/8th as maximum load factor.
 // For 16-wide groups, that gives an average of two empty slots per group.
@@ -245,7 +252,7 @@ inline uint64_t H1(uint64_t hash, const ctrl_t *ctrl) {
     return (hash >> 7u) ^ HashSeed(ctrl);
 }
 
-inline ctrl_t H2(uint64_t hash) { return hash & 0x7Fu; }
+inline ctrl_t H2(uint64_t hash) { return (ctrl_t) (hash & 0x7Fu); }
 
 template<uint64_t Width>
 class probe_seq {
@@ -284,22 +291,27 @@ inline probe_seq<sizeof(Group)> probe(const rosti_t *map, uint64_t hash) {
 
 // Reset all ctrl bytes back to kEmpty, except the sentinel.
 inline void reset_ctrl(rosti_t *map) {
-    uint64_t l = (map->capacity_ + 1) * sizeof(Group);
-    memset(map->ctrl_, kEmpty, l);
+    const uint64_t ctrl_capacity = 2 * sizeof(Group) * (map->capacity_ + 1);
+    memset(map->ctrl_, kEmpty, ctrl_capacity);
     map->ctrl_[map->capacity_] = kSentinel;
 }
 
-void initialize_slots(rosti_t *map) {
+bool initialize_slots(rosti_t **ppMap) {
+    rosti_t *map = *ppMap;
     const uint64_t ctrl_capacity = 2 * sizeof(Group) * (map->capacity_ + 1);
-    auto *mem = reinterpret_cast<unsigned char *>(malloc(
+    auto *mem = reinterpret_cast<unsigned char *>(rosti_malloc(
             map->slot_size_ +
             ctrl_capacity +
             map->slot_size_ * (map->capacity_ + 1)));
-    map->ctrl_ = reinterpret_cast<ctrl_t *>(mem) + map->slot_size_;
-    map->slots_ = mem + ctrl_capacity;
+    if (mem == nullptr) {
+        return false;
+    }
+    map->ctrl_ = reinterpret_cast<ctrl_t *>(mem + map->slot_size_);
+    map->slots_ = mem + map->slot_size_ + ctrl_capacity;
     map->slot_initial_values_ = mem;
     reset_ctrl(map);
     reset_growth_left(map);
+    return true;
 }
 
 inline void clear(rosti_t *map) {
@@ -307,6 +319,15 @@ inline void clear(rosti_t *map) {
     reset_ctrl(map);
     reset_growth_left(map);
     memset(map->slots_, 0, map->capacity_ << map->slot_size_shift_);
+}
+
+//returns amount of memory allocated to this rosti instance
+inline int64_t memorySize(rosti_t *map) {
+    return (int64_t) (sizeof(rosti_t) +
+                      sizeof(int32_t) * 1 + //inexact because we don't have count of columns
+                      map->slot_size_ +
+                      2 * sizeof(Group) * (map->capacity_ + 1) +
+                      map->slot_size_ * (map->capacity_ + 1));
 }
 
 inline bool IsEmpty(ctrl_t c) { return c == kEmpty; }
@@ -351,37 +372,46 @@ inline FindInfo find_first_non_full(rosti_t *map, uint64_t hash) {
 }
 
 template<typename HASH_M, typename CPY>
-void resize(rosti_t *map, uint64_t new_capacity, HASH_M hash_m, CPY cpy) {
+bool resize(rosti_t *map, uint64_t new_capacity, HASH_M hash_m, CPY cpy) {
     auto *old_init = map->slot_initial_values_;
     auto *old_ctrl = map->ctrl_;
     auto *old_slots = map->slots_;
     const uint64_t old_capacity = map->capacity_;
     map->capacity_ = new_capacity;
-    initialize_slots(map);
+    if (initialize_slots(&map)) {
+        cpy(map->slot_initial_values_, old_init, map->slot_size_);
 
-    uint64_t total_probe_length = 0;
-    for (uint64_t i = 0; i != old_capacity; ++i) {
-        if (IsFull(old_ctrl[i])) {
-            auto p = old_slots + (i << map->slot_size_shift_);
-            const uint64_t hash = hash_m(p);
-            auto target = find_first_non_full(map, hash);
-            uint64_t new_i = target.offset;
-            total_probe_length += target.probe_length;
-            set_ctrl(map, new_i, H2(hash));
-            cpy(map->slots_ + (new_i << map->slot_size_shift_), p, map->slot_size_);
-//            *(reinterpret_cast<int32_t *>(map->slots_ + (new_i << map->slot_size_shift_))) = *p;
+        uint64_t total_probe_length = 0;
+        for (uint64_t i = 0; i != old_capacity; ++i) {
+            if (IsFull(old_ctrl[i])) {
+                auto p = old_slots + (i << map->slot_size_shift_);
+                const uint64_t hash = hash_m(p);
+                auto target = find_first_non_full(map, hash);
+                uint64_t new_i = target.offset;
+                total_probe_length += target.probe_length;
+                set_ctrl(map, new_i, H2(hash));
+                cpy(map->slots_ + (new_i << map->slot_size_shift_), p, map->slot_size_);
+            }
         }
+        if (old_init) {
+            free(old_init);
+        }
+
+        return true;
+    } else {
+        map->capacity_ = old_capacity;
     }
-    if (old_capacity) {
-        free(old_init);
-    }
+
+    return false;
 }
 
 template<typename HASH_M_T, typename CPY_T>
 ATTRIBUTE_NEVER_INLINE uint64_t prepare_insert(rosti_t *map, uint64_t hash, HASH_M_T hash_f, CPY_T cpy_f) {
     auto target = find_first_non_full(map, hash);
     if (PREDICT_FALSE(map->growth_left_ == 0 && !IsDeleted(map->ctrl_[target.offset]))) {
-        resize(map, map->capacity_ * 2 + 1, hash_f, cpy_f);
+        if (!resize(map, map->capacity_ * 2 + 1, hash_f, cpy_f)) {
+            return UL_MAX;
+        }
         target = find_first_non_full(map, hash);
     }
     ++map->size_;
@@ -403,7 +433,7 @@ inline std::pair<uint64_t, bool> find_or_prepare_insert(
     auto seq = probe(map, hash);
     while (true) {
         Group g{map->ctrl_ + seq.offset()};
-        for (int i : g.Match(H2(hash))) {
+        for (int i: g.Match(H2(hash))) {
             const uint64_t offset = seq.offset(i) << map->slot_size_shift_;
             if (PREDICT_TRUE(eq_f(map->slots_ + offset, key))) {
                 return {offset, false};
@@ -444,5 +474,29 @@ inline void cpySlot(void *to, void *from, uint64_t size) {
 inline std::pair<uint64_t, bool> find(rosti_t *map, const int32_t key) {
     return find_or_prepare_insert<int32_t>(map, key, hashInt, eqInt, hashIntMem, cpySlot);
 }
+
+
+inline bool reset(rosti_t *map, uint64_t newSize) {
+    if (map->capacity_ > newSize) {
+        auto *old_init = map->slot_initial_values_;
+        const uint64_t old_capacity = map->capacity_;
+        map->capacity_ = newSize;
+        map->size_ = 0;
+        if (initialize_slots(&map)) {
+            cpySlot(map->slot_initial_values_, old_init, map->slot_size_);
+            if (old_init) {
+                free(old_init);
+            }
+            return true;
+        } else {
+            map->capacity_ = old_capacity;
+        }
+        return false;
+    } else {
+        clear(map);
+        return true;
+    }
+}
+
 
 #endif //ROSTI_H

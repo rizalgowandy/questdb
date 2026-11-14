@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
 
 package io.questdb.std;
 
-import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf16Sink;
 
 import java.util.Arrays;
 
@@ -43,7 +43,7 @@ public class BoolList implements Mutable {
     }
 
     public void add(boolean value) {
-        ensureCapacity(pos + 1);
+        checkCapacity(pos + 1);
         buffer[pos++] = value;
     }
 
@@ -63,22 +63,27 @@ public class BoolList implements Mutable {
     }
 
     public void clear(int capacity) {
-        ensureCapacity(capacity);
+        checkCapacity(capacity);
         pos = 0;
         Arrays.fill(buffer, NO_ENTRY_VALUE);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean equals(Object that) {
+        return this == that || that instanceof BoolList && equals((BoolList) that);
+    }
+
+    public boolean extendAndReplace(int index, boolean value) {
+        extendCapacity(index + 1);
+        return replace0(index, value);
     }
 
     public void extendAndSet(int index, boolean value) {
         extendCapacity(index + 1);
         buffer[index] = value;
-    }
-
-    private void extendCapacity(int newPos) {
-        if (newPos > pos) {
-            ensureCapacity(newPos);
-            Arrays.fill(buffer, pos, newPos, NO_ENTRY_VALUE);
-            pos = newPos;
-        }
     }
 
     public boolean get(int index) {
@@ -108,41 +113,22 @@ public class BoolList implements Mutable {
         return NO_ENTRY_VALUE;
     }
 
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public boolean equals(Object that) {
-        return this == that || that instanceof BoolList && equals((BoolList) that);
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public String toString() {
-        CharSink b = Misc.getThreadLocalBuilder();
-
-        b.put('[');
-        for (int i = 0, k = size(); i < k; i++) {
-            if (i > 0) {
-                b.put(',');
+    public int getTrueCount() {
+        int cnt = 0;
+        for (int i = 0, n = pos; i < n; i++) {
+            if (buffer[i]) {
+                cnt++;
             }
-            b.put(get(i));
         }
-        b.put(']');
-        return b.toString();
+        return cnt;
     }
 
     public void insert(int index, boolean element) {
-        ensureCapacity(++pos);
+        checkCapacity(++pos);
         System.arraycopy(buffer, index, buffer, index + 1, pos - index - 1);
         buffer[index] = element;
     }
 
-    /**
-     * {@inheritDoc}
-     */
     public void removeIndex(int index) {
         if (pos < 1 || index >= pos) {
             return;
@@ -160,17 +146,6 @@ public class BoolList implements Mutable {
         return replace0(index, value);
     }
 
-    public boolean extendAndReplace(int index, boolean value) {
-        extendCapacity(index + 1);
-        return replace0(index, value);
-    }
-
-    private boolean replace0(int index, boolean value) {
-        boolean val = buffer[index];
-        buffer[index] = value;
-        return val;
-    }
-
     public void set(int index, boolean element) {
         if (index < pos) {
             buffer[index] = element;
@@ -185,7 +160,7 @@ public class BoolList implements Mutable {
     }
 
     public void setPos(int capacity) {
-        ensureCapacity(capacity);
+        checkCapacity(capacity);
         pos = capacity;
     }
 
@@ -198,11 +173,29 @@ public class BoolList implements Mutable {
         return pos;
     }
 
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public String toString() {
+        Utf16Sink b = Misc.getThreadLocalSink();
+
+        b.put('[');
+        for (int i = 0, k = size(); i < k; i++) {
+            if (i > 0) {
+                b.put(',');
+            }
+            b.put(get(i));
+        }
+        b.put(']');
+        return b.toString();
+    }
+
     public void zero(boolean value) {
         Arrays.fill(buffer, 0, pos, value);
     }
 
-    private void ensureCapacity(int capacity) {
+    private void checkCapacity(int capacity) {
         int l = buffer.length;
         if (capacity > l) {
             int newCap = Math.max(l << 1, capacity);
@@ -223,5 +216,19 @@ public class BoolList implements Mutable {
             }
         }
         return true;
+    }
+
+    private void extendCapacity(int newPos) {
+        if (newPos > pos) {
+            checkCapacity(newPos);
+            Arrays.fill(buffer, pos, newPos, NO_ENTRY_VALUE);
+            pos = newPos;
+        }
+    }
+
+    private boolean replace0(int index, boolean value) {
+        boolean val = buffer[index];
+        buffer[index] = value;
+        return val;
     }
 }

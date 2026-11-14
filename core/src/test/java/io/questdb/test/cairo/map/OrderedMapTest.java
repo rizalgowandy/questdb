@@ -1,0 +1,4054 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.cairo.map;
+
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.EntityColumnFilter;
+import io.questdb.cairo.GeoHashes;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.RecordSinkFactory;
+import io.questdb.cairo.RecordSinkSPI;
+import io.questdb.cairo.SingleColumnType;
+import io.questdb.cairo.SymbolAsIntTypes;
+import io.questdb.cairo.SymbolAsStrTypes;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.arr.DirectArray;
+import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.MapKey;
+import io.questdb.cairo.map.MapRecord;
+import io.questdb.cairo.map.MapRecordCursor;
+import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.map.MapValueMergeFunction;
+import io.questdb.cairo.map.OrderedMap;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.griffin.engine.CompressedOffsets;
+import io.questdb.griffin.engine.LimitOverflowException;
+import io.questdb.griffin.engine.functions.columns.LongColumn;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.BitSet;
+import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.Chars;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.DirectLongLongAscList;
+import io.questdb.std.DirectLongLongSortedList;
+import io.questdb.std.Interval;
+import io.questdb.std.Long256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
+import io.questdb.std.Rnd;
+import io.questdb.std.Unsafe;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8String;
+import io.questdb.std.str.Utf8StringSink;
+import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.cairo.TableModel;
+import io.questdb.test.cairo.TestRecord;
+import io.questdb.test.cairo.TestTableReaderRecordCursor;
+import io.questdb.test.tools.LimitedMemoryTracker;
+import io.questdb.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Test;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+public class OrderedMapTest extends AbstractCairoTest {
+
+    @Test
+    public void testAllTypesFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Decimal128 decimal128 = new Decimal128();
+            Decimal256 decimal256 = new Decimal256();
+            Rnd rnd = new Rnd();
+
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.BYTE);
+            keyTypes.add(ColumnType.SHORT);
+            keyTypes.add(ColumnType.CHAR);
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+            keyTypes.add(ColumnType.FLOAT);
+            keyTypes.add(ColumnType.DOUBLE);
+            keyTypes.add(ColumnType.BOOLEAN);
+            keyTypes.add(ColumnType.DATE);
+            keyTypes.add(ColumnType.TIMESTAMP);
+            keyTypes.add(ColumnType.getGeoHashTypeWithBits(13));
+            keyTypes.add(ColumnType.LONG256);
+            keyTypes.add(ColumnType.INTERVAL);
+            keyTypes.add(ColumnType.getDecimalType(2, 0)); // DECIMAL8
+            keyTypes.add(ColumnType.getDecimalType(4, 0)); // DECIMAL16
+            keyTypes.add(ColumnType.getDecimalType(8, 0)); // DECIMAL32
+            keyTypes.add(ColumnType.getDecimalType(16, 0)); // DECIMAL64
+            keyTypes.add(ColumnType.getDecimalType(32, 0)); // DECIMAL128
+            keyTypes.add(ColumnType.getDecimalType(64, 0)); // DECIMAL256
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.BYTE);
+            valueTypes.add(ColumnType.SHORT);
+            valueTypes.add(ColumnType.CHAR);
+            valueTypes.add(ColumnType.INT);
+            valueTypes.add(ColumnType.LONG);
+            valueTypes.add(ColumnType.FLOAT);
+            valueTypes.add(ColumnType.DOUBLE);
+            valueTypes.add(ColumnType.BOOLEAN);
+            valueTypes.add(ColumnType.DATE);
+            valueTypes.add(ColumnType.TIMESTAMP);
+            valueTypes.add(ColumnType.getGeoHashTypeWithBits(20));
+            valueTypes.add(ColumnType.LONG256);
+            valueTypes.add(ColumnType.getDecimalType(2, 0)); // DECIMAL8
+            valueTypes.add(ColumnType.getDecimalType(4, 0)); // DECIMAL16
+            valueTypes.add(ColumnType.getDecimalType(8, 0)); // DECIMAL32
+            valueTypes.add(ColumnType.getDecimalType(16, 0)); // DECIMAL64
+            valueTypes.add(ColumnType.getDecimalType(32, 0)); // DECIMAL128
+            valueTypes.add(ColumnType.getDecimalType(64, 0)); // DECIMAL256
+
+            try (OrderedMap map = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putByte(rnd.nextByte());
+                    key.putShort(rnd.nextShort());
+                    key.putChar(rnd.nextChar());
+                    key.putInt(rnd.nextInt());
+                    key.putLong(rnd.nextLong());
+                    key.putFloat(rnd.nextFloat());
+                    key.putDouble(rnd.nextDouble());
+                    key.putBool(rnd.nextBoolean());
+                    key.putDate(rnd.nextLong());
+                    key.putTimestamp(rnd.nextLong());
+                    key.putShort(rnd.nextShort());
+                    Long256Impl long256 = new Long256Impl();
+                    long256.fromRnd(rnd);
+                    key.putLong256(long256);
+                    key.putInterval(new Interval().of(rnd.nextPositiveInt(), rnd.nextPositiveInt()));
+                    key.putByte(rnd.nextByte());
+                    key.putShort(rnd.nextShort());
+                    key.putInt(rnd.nextInt());
+                    key.putLong(rnd.nextLong());
+                    decimal128.ofRaw(
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    key.putDecimal128(decimal128);
+                    decimal256.ofRaw(
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    key.putDecimal256(decimal256);
+
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+
+                    value.putByte(0, rnd.nextByte());
+                    value.putShort(1, rnd.nextShort());
+                    value.putChar(2, rnd.nextChar());
+                    value.putInt(3, rnd.nextInt());
+                    value.putLong(4, rnd.nextLong());
+                    value.putFloat(5, rnd.nextFloat());
+                    value.putDouble(6, rnd.nextDouble());
+                    value.putBool(7, rnd.nextBoolean());
+                    value.putDate(8, rnd.nextLong());
+                    value.putTimestamp(9, rnd.nextLong());
+                    value.putInt(10, rnd.nextInt());
+                    value.putLong256(11, long256);
+                    value.putByte(12, rnd.nextByte());
+                    value.putShort(13, rnd.nextShort());
+                    value.putInt(14, rnd.nextInt());
+                    value.putLong(15, rnd.nextLong());
+                    decimal128.ofRaw(
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    value.putDecimal128(16, decimal128);
+                    decimal256.ofRaw(
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    value.putDecimal256(17, decimal256);
+                }
+
+                rnd.reset();
+
+                // assert that all values are good
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putByte(rnd.nextByte());
+                    key.putShort(rnd.nextShort());
+                    key.putChar(rnd.nextChar());
+                    key.putInt(rnd.nextInt());
+                    key.putLong(rnd.nextLong());
+                    key.putFloat(rnd.nextFloat());
+                    key.putDouble(rnd.nextDouble());
+                    key.putBool(rnd.nextBoolean());
+                    key.putDate(rnd.nextLong());
+                    key.putTimestamp(rnd.nextLong());
+                    key.putShort(rnd.nextShort());
+                    Long256Impl long256 = new Long256Impl();
+                    long256.fromRnd(rnd);
+                    key.putLong256(long256);
+                    key.putInterval(new Interval().of(rnd.nextPositiveInt(), rnd.nextPositiveInt()));
+                    key.putByte(rnd.nextByte());
+                    key.putShort(rnd.nextShort());
+                    key.putInt(rnd.nextInt());
+                    key.putLong(rnd.nextLong());
+                    decimal128.ofRaw(
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    key.putDecimal128(decimal128);
+                    decimal256.ofRaw(
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    key.putDecimal256(decimal256);
+
+                    MapValue value = key.createValue();
+                    Assert.assertFalse(value.isNew());
+
+                    Assert.assertEquals(rnd.nextByte(), value.getByte(0));
+                    Assert.assertEquals(rnd.nextShort(), value.getShort(1));
+                    Assert.assertEquals(rnd.nextChar(), value.getChar(2));
+                    Assert.assertEquals(rnd.nextInt(), value.getInt(3));
+                    Assert.assertEquals(rnd.nextLong(), value.getLong(4));
+                    Assert.assertEquals(rnd.nextFloat(), value.getFloat(5), 0.000000001f);
+                    Assert.assertEquals(rnd.nextDouble(), value.getDouble(6), 0.000000001d);
+                    Assert.assertEquals(rnd.nextBoolean(), value.getBool(7));
+                    Assert.assertEquals(rnd.nextLong(), value.getDate(8));
+                    Assert.assertEquals(rnd.nextLong(), value.getTimestamp(9));
+                    Assert.assertEquals(rnd.nextInt(), value.getInt(10));
+                    Assert.assertEquals(long256, value.getLong256A(11));
+                    Assert.assertEquals(rnd.nextByte(), value.getDecimal8(12));
+                    Assert.assertEquals(rnd.nextShort(), value.getDecimal16(13));
+                    Assert.assertEquals(rnd.nextInt(), value.getDecimal32(14));
+                    Assert.assertEquals(rnd.nextLong(), value.getDecimal64(15));
+                    value.getDecimal128(16, decimal128);
+                    Assert.assertEquals(rnd.nextLong(), decimal128.getHigh());
+                    Assert.assertEquals(rnd.nextLong(), decimal128.getLow());
+                    value.getDecimal256(17, decimal256);
+                    Assert.assertEquals(rnd.nextLong(), decimal256.getHh());
+                    Assert.assertEquals(rnd.nextLong(), decimal256.getHl());
+                    Assert.assertEquals(rnd.nextLong(), decimal256.getLh());
+                    Assert.assertEquals(rnd.nextLong(), decimal256.getLl());
+                }
+
+                // RecordCursor is covered in testAllTypesVarSizeKey
+            }
+        });
+    }
+
+    @Test
+    public void testAllTypesReverseColumnAccess() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Decimal128 decimal128 = new Decimal128();
+            Decimal256 decimal256 = new Decimal256();
+
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.BYTE);
+            keyTypes.add(ColumnType.SHORT);
+            keyTypes.add(ColumnType.CHAR);
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+            keyTypes.add(ColumnType.FLOAT);
+            keyTypes.add(ColumnType.DOUBLE);
+            keyTypes.add(ColumnType.STRING);
+            keyTypes.add(ColumnType.STRING);
+            keyTypes.add(ColumnType.BINARY);
+            keyTypes.add(ColumnType.BOOLEAN);
+            keyTypes.add(ColumnType.DATE);
+            keyTypes.add(ColumnType.TIMESTAMP);
+            keyTypes.add(ColumnType.getGeoHashTypeWithBits(13));
+            keyTypes.add(ColumnType.LONG256);
+            keyTypes.add(ColumnType.getDecimalType(2, 0)); // DECIMAL8
+            keyTypes.add(ColumnType.getDecimalType(4, 0)); // DECIMAL16
+            keyTypes.add(ColumnType.getDecimalType(8, 0)); // DECIMAL32
+            keyTypes.add(ColumnType.getDecimalType(16, 0)); // DECIMAL64
+            keyTypes.add(ColumnType.getDecimalType(32, 0)); // DECIMAL128
+            keyTypes.add(ColumnType.getDecimalType(64, 0)); // DECIMAL256
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.BYTE);
+            valueTypes.add(ColumnType.SHORT);
+            valueTypes.add(ColumnType.CHAR);
+            valueTypes.add(ColumnType.INT);
+            valueTypes.add(ColumnType.LONG);
+            valueTypes.add(ColumnType.FLOAT);
+            valueTypes.add(ColumnType.DOUBLE);
+            valueTypes.add(ColumnType.BOOLEAN);
+            valueTypes.add(ColumnType.DATE);
+            valueTypes.add(ColumnType.TIMESTAMP);
+            valueTypes.add(ColumnType.getGeoHashTypeWithBits(20));
+            valueTypes.add(ColumnType.LONG256);
+            valueTypes.add(ColumnType.getDecimalType(2, 0)); // DECIMAL8
+            valueTypes.add(ColumnType.getDecimalType(4, 0)); // DECIMAL16
+            valueTypes.add(ColumnType.getDecimalType(8, 0)); // DECIMAL32
+            valueTypes.add(ColumnType.getDecimalType(16, 0)); // DECIMAL64
+            valueTypes.add(ColumnType.getDecimalType(32, 0)); // DECIMAL128
+            valueTypes.add(ColumnType.getDecimalType(64, 0)); // DECIMAL256
+
+            final TestRecord.ArrayBinarySequence binarySequence = new TestRecord.ArrayBinarySequence();
+            final Long256Impl long256 = new Long256Impl();
+
+            try (OrderedMap map = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, Integer.MAX_VALUE)) {
+                MapKey key = map.withKey();
+                key.putByte((byte) 1);
+                key.putShort((short) 2);
+                key.putChar('3');
+                key.putInt(4);
+                key.putLong(5);
+                key.putFloat(6.0f);
+                key.putDouble(7.0);
+                key.putStr("888", 0, 1);
+                key.putStrLowerCase("99", 0, 1);
+                key.putBin(binarySequence.of(new byte[]{10}));
+                key.putBool(true);
+                key.putDate(12);
+                key.putTimestamp(13);
+                key.putShort((short) 14);
+                long256.setAll(15, 15, 15, 15);
+                key.putLong256(long256);
+                key.putByte((byte) 16);
+                key.putShort((short) 17);
+                key.putInt(18);
+                key.putLong(19);
+                decimal128.ofRaw(20, 20);
+                key.putDecimal128(decimal128);
+                decimal256.ofRaw(21, 21, 21, 21);
+                key.putDecimal256(decimal256);
+
+                MapValue value = key.createValue();
+                Assert.assertTrue(value.isNew());
+
+                // use addXYZ() method to initialize values where possible
+                value.putByte(0, (byte) 0);
+                value.addByte(0, (byte) 1);
+                value.putShort(1, (short) 0);
+                value.addShort(1, (short) 2);
+                value.putChar(2, '3');
+                value.putInt(3, 0);
+                value.addInt(3, 4);
+                value.putLong(4, 0);
+                value.addLong(4, 5);
+                value.putFloat(5, 0);
+                value.addFloat(5, 6);
+                value.putDouble(6, 0);
+                value.addDouble(6, 7);
+                value.putBool(7, true);
+                value.putDate(8, 9);
+                value.putTimestamp(9, 10);
+                value.putInt(10, 11);
+                value.putLong256(11, Long256Impl.ZERO_LONG256);
+                long256.setAll(12, 12, 12, 12);
+                value.addLong256(11, long256);
+                value.putByte(12, (byte) 13);
+                value.putShort(13, (short) 14);
+                value.putInt(14, 15);
+                value.putLong(15, 16);
+                decimal128.ofRaw(17, 17);
+                value.putDecimal128(16, decimal128);
+                decimal256.ofRaw(18, 18, 18, 18);
+                value.putDecimal256(17, decimal256);
+
+                // assert that all values are good
+
+                key = map.withKey();
+                key.putByte((byte) 1);
+                key.putShort((short) 2);
+                key.putChar('3');
+                key.putInt(4);
+                key.putLong(5);
+                key.putFloat(6.0f);
+                key.putDouble(7.0);
+                key.putStrLowerCase("8");
+                key.putStr("9");
+                key.putBin(binarySequence.of(new byte[]{10}));
+                key.putBool(true);
+                key.putDate(12);
+                key.putTimestamp(13);
+                key.putShort((short) 14);
+                long256.setAll(15, 15, 15, 15);
+                key.putLong256(long256);
+                key.putByte((byte) 16);
+                key.putShort((short) 17);
+                key.putInt(18);
+                key.putLong(19);
+                decimal128.ofRaw(20, 20);
+                key.putDecimal128(decimal128);
+                decimal256.ofRaw(21, 21, 21, 21);
+                key.putDecimal256(decimal256);
+
+                value = key.createValue();
+                Assert.assertFalse(value.isNew());
+
+                // access the value columns in reverse order
+                value.getDecimal256(17, decimal256);
+                Assert.assertEquals(18, decimal256.getHh());
+                Assert.assertEquals(18, decimal256.getHl());
+                Assert.assertEquals(18, decimal256.getLh());
+                Assert.assertEquals(18, decimal256.getLl());
+                value.getDecimal128(16, decimal128);
+                Assert.assertEquals(17, decimal128.getHigh());
+                Assert.assertEquals(17, decimal128.getLow());
+                Assert.assertEquals(16, value.getDecimal64(15));
+                Assert.assertEquals(15, value.getDecimal32(14));
+                Assert.assertEquals(14, value.getDecimal16(13));
+                Assert.assertEquals(13, value.getDecimal8(12));
+                long256.setAll(12, 12, 12, 12);
+                Assert.assertEquals(long256, value.getLong256A(11));
+                Assert.assertEquals(11, value.getInt(10));
+                Assert.assertEquals(10, value.getTimestamp(9));
+                Assert.assertEquals(9, value.getDate(8));
+                Assert.assertTrue(value.getBool(7));
+                Assert.assertEquals(7, value.getDouble(6), 0.000000001d);
+                Assert.assertEquals(6, value.getFloat(5), 0.000000001f);
+                Assert.assertEquals(5, value.getLong(4));
+                Assert.assertEquals(4, value.getInt(3));
+                Assert.assertEquals('3', value.getChar(2));
+                Assert.assertEquals(2, value.getShort(1));
+                Assert.assertEquals(1, value.getByte(0));
+
+                try (RecordCursor cursor = map.getCursor()) {
+                    assertCursorAllTypesReverseOrder(cursor);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAllTypesVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Rnd rnd = new Rnd();
+
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.BYTE);
+            keyTypes.add(ColumnType.SHORT);
+            keyTypes.add(ColumnType.CHAR);
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+            keyTypes.add(ColumnType.FLOAT);
+            keyTypes.add(ColumnType.DOUBLE);
+            keyTypes.add(ColumnType.STRING);
+            keyTypes.add(ColumnType.VARCHAR);
+            keyTypes.add(ColumnType.BOOLEAN);
+            keyTypes.add(ColumnType.DATE);
+            keyTypes.add(ColumnType.TIMESTAMP);
+            keyTypes.add(ColumnType.getGeoHashTypeWithBits(13));
+            keyTypes.add(ColumnType.LONG256);
+            keyTypes.add(ColumnType.UUID);
+            keyTypes.add(ColumnType.INTERVAL);
+            keyTypes.add(ColumnType.encodeArrayType(ColumnType.DOUBLE, 1));
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.BYTE);
+            valueTypes.add(ColumnType.SHORT);
+            valueTypes.add(ColumnType.CHAR);
+            valueTypes.add(ColumnType.INT);
+            valueTypes.add(ColumnType.LONG);
+            valueTypes.add(ColumnType.FLOAT);
+            valueTypes.add(ColumnType.DOUBLE);
+            valueTypes.add(ColumnType.BOOLEAN);
+            valueTypes.add(ColumnType.DATE);
+            valueTypes.add(ColumnType.TIMESTAMP);
+            valueTypes.add(ColumnType.getGeoHashTypeWithBits(20));
+            valueTypes.add(ColumnType.LONG256);
+            valueTypes.add(ColumnType.UUID);
+
+            try (OrderedMap map = new OrderedMap(128, keyTypes, valueTypes, 64, 0.8, 24);
+                 DirectArray array = new DirectArray(configuration)) {
+                final Utf8StringSink utf8Sink = new Utf8StringSink();
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putByte(rnd.nextByte());
+                    key.putShort(rnd.nextShort());
+                    key.putChar(rnd.nextChar());
+                    key.putInt(rnd.nextInt());
+                    key.putLong(rnd.nextLong());
+                    key.putFloat(rnd.nextFloat());
+                    key.putDouble(rnd.nextDouble());
+                    if ((rnd.nextPositiveInt() % 4) == 0) {
+                        key.putStr(null);
+                        key.putVarchar((Utf8Sequence) null);
+                    } else {
+                        key.putStr(rnd.nextChars(rnd.nextPositiveInt() % 32));
+                        utf8Sink.clear();
+                        rnd.nextUtf8Str(rnd.nextPositiveInt() % 32, utf8Sink);
+                        key.putVarchar(utf8Sink);
+                    }
+                    key.putBool(rnd.nextBoolean());
+                    key.putDate(rnd.nextLong());
+                    key.putTimestamp(rnd.nextLong());
+                    key.putShort(rnd.nextShort());
+                    Long256Impl long256 = new Long256Impl();
+                    long256.setAll(
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    key.putLong256(long256);
+                    key.putLong128(rnd.nextLong(), rnd.nextLong()); // UUID
+                    key.putInterval(new Interval().of(rnd.nextPositiveInt(), rnd.nextPositiveInt()));
+                    array.clear();
+                    rnd.nextDoubleArray(1, array, 0, 8, -1);
+                    key.putArray(array);
+
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+
+                    value.putByte(0, rnd.nextByte());
+                    value.putShort(1, rnd.nextShort());
+                    value.putChar(2, rnd.nextChar());
+                    value.putInt(3, rnd.nextInt());
+                    value.putLong(4, rnd.nextLong());
+                    value.putFloat(5, rnd.nextFloat());
+                    value.putDouble(6, rnd.nextDouble());
+                    value.putBool(7, rnd.nextBoolean());
+                    value.putDate(8, rnd.nextLong());
+                    value.putTimestamp(9, rnd.nextLong());
+                    value.putInt(10, rnd.nextInt());
+                    value.putLong256(11, long256);
+                    value.putLong128(12, rnd.nextLong(), rnd.nextLong());
+                }
+
+                rnd.reset();
+
+                // assert that all values are good
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putByte(rnd.nextByte());
+                    key.putShort(rnd.nextShort());
+                    key.putChar(rnd.nextChar());
+                    key.putInt(rnd.nextInt());
+                    key.putLong(rnd.nextLong());
+                    key.putFloat(rnd.nextFloat());
+                    key.putDouble(rnd.nextDouble());
+                    if ((rnd.nextPositiveInt() % 4) == 0) {
+                        key.putStr(null);
+                        key.putVarchar((Utf8Sequence) null);
+                    } else {
+                        key.putStr(rnd.nextChars(rnd.nextPositiveInt() % 32));
+                        utf8Sink.clear();
+                        rnd.nextUtf8Str(rnd.nextPositiveInt() % 32, utf8Sink);
+                        key.putVarchar(utf8Sink);
+                    }
+                    key.putBool(rnd.nextBoolean());
+                    key.putDate(rnd.nextLong());
+                    key.putTimestamp(rnd.nextLong());
+                    key.putShort(rnd.nextShort());
+                    Long256Impl long256 = new Long256Impl();
+                    long256.setAll(
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong(),
+                            rnd.nextLong()
+                    );
+                    key.putLong256(long256);
+                    key.putLong128(rnd.nextLong(), rnd.nextLong()); // UUID
+                    key.putInterval(new Interval().of(rnd.nextPositiveInt(), rnd.nextPositiveInt()));
+                    array.clear();
+                    rnd.nextDoubleArray(1, array, 0, 8, -1);
+                    key.putArray(array);
+
+                    MapValue value = key.createValue();
+                    Assert.assertFalse(value.isNew());
+
+                    Assert.assertEquals(rnd.nextByte(), value.getByte(0));
+                    Assert.assertEquals(rnd.nextShort(), value.getShort(1));
+                    Assert.assertEquals(rnd.nextChar(), value.getChar(2));
+                    Assert.assertEquals(rnd.nextInt(), value.getInt(3));
+                    Assert.assertEquals(rnd.nextLong(), value.getLong(4));
+                    Assert.assertEquals(rnd.nextFloat(), value.getFloat(5), 0.000000001f);
+                    Assert.assertEquals(rnd.nextDouble(), value.getDouble(6), 0.000000001d);
+                    Assert.assertEquals(rnd.nextBoolean(), value.getBool(7));
+                    Assert.assertEquals(rnd.nextLong(), value.getDate(8));
+                    Assert.assertEquals(rnd.nextLong(), value.getTimestamp(9));
+                    Assert.assertEquals(rnd.nextInt(), value.getInt(10));
+                    Assert.assertEquals(long256, value.getLong256A(11));
+                    Assert.assertEquals(rnd.nextLong(), value.getLong128Lo(12));
+                    Assert.assertEquals(rnd.nextLong(), value.getLong128Hi(12));
+                }
+
+                try (RecordCursor cursor = map.getCursor()) {
+                    rnd.reset();
+                    assertCursorAllTypesVarSizeKey(rnd, cursor, array);
+
+                    rnd.reset();
+                    cursor.toTop();
+                    assertCursorAllTypesVarSizeKey(rnd, cursor, array);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAppendExistingStringKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Rnd rnd = new Rnd();
+            int N = 10;
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, new SingleColumnType(ColumnType.STRING), new SingleColumnType(ColumnType.LONG), N / 2, 0.5f, 1)) {
+                ObjList<String> keys = new ObjList<>();
+                for (int i = 0; i < N; i++) {
+                    CharSequence s = rnd.nextChars(11);
+                    keys.add(s.toString());
+                    MapKey key = map.withKey();
+                    key.putStr(s);
+
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i + 1);
+                }
+                Assert.assertEquals(N, map.size());
+
+                for (int i = 0, n = keys.size(); i < n; i++) {
+                    MapKey key = map.withKey();
+                    CharSequence s = keys.getQuick(i);
+                    key.putStr(s);
+
+                    MapValue value = key.createValue();
+                    Assert.assertFalse(value.isNew());
+                    Assert.assertEquals(i + 1, value.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAppendUnique() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Rnd rnd = new Rnd();
+            int maxResizes = 3;
+            int N = 100000;
+            int M = 25;
+            try (
+                    OrderedMap map = new OrderedMap(
+                            Numbers.SIZE_1MB,
+                            new SingleColumnType(ColumnType.STRING),
+                            new SingleColumnType(ColumnType.LONG),
+                            N / 4, 0.5f, maxResizes
+                    )
+            ) {
+                for (int i = 0; i < N; i++) {
+                    CharSequence s = rnd.nextChars(M);
+                    MapKey key = map.withKey();
+                    key.putStr(s);
+                    MapValue value = key.createValue();
+                    value.putLong(0, i + 1);
+                }
+                Assert.assertEquals(N, map.size());
+
+                long expectedAppendOffset = map.getAppendOffset();
+
+                rnd.reset();
+                for (int i = 0; i < N; i++) {
+                    CharSequence s = rnd.nextChars(M);
+                    MapKey key = map.withKey();
+                    key.putStr(s);
+                    MapValue value = key.findValue();
+                    Assert.assertNotNull(value);
+                    Assert.assertEquals(i + 1, value.getLong(0));
+                }
+                Assert.assertEquals(N, map.size());
+                Assert.assertEquals(expectedAppendOffset, map.getAppendOffset());
+            }
+        });
+    }
+
+    @Test
+    public void testArrayKeyFollowedByLongKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Rnd rnd = new Rnd();
+            int N = 1000;
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.encodeArrayType(ColumnType.DOUBLE, 2));
+            keyTypes.add(ColumnType.LONG);
+
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, new SingleColumnType(ColumnType.LONG), N / 2, 0.5f, 1);
+                 DirectArray array = new DirectArray(configuration)) {
+                for (int i = 0; i < N; i++) {
+                    array.clear();
+                    rnd.nextDoubleArray(2, array, 0, 8, -1);
+                    MapKey key = map.withKey();
+                    key.putArray(array);
+                    key.putLong(rnd.nextLong());
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i + 1);
+                }
+
+                rnd.reset();
+
+                for (int i = 0; i < N; i++) {
+                    array.clear();
+                    rnd.nextDoubleArray(2, array, 0, 8, -1);
+                    MapKey key = map.withKey();
+                    key.putArray(array);
+                    key.putLong(rnd.nextLong());
+                    MapValue value = key.createValue();
+                    Assert.assertFalse(value.isNew());
+                    Assert.assertEquals(i + 1, value.getLong(0));
+                }
+
+            }
+        });
+    }
+
+    @Test
+    public void testAsciiVarcharKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Rnd rnd = new Rnd();
+            Utf8StringSink utf8Sink = new Utf8StringSink();
+            int N = 100;
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, new SingleColumnType(ColumnType.VARCHAR), new SingleColumnType(ColumnType.LONG), N / 2, 0.5f, 1)) {
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    utf8Sink.clear();
+                    rnd.nextUtf8AsciiStr(rnd.nextPositiveInt() % 32, utf8Sink);
+                    key.putVarchar(utf8Sink);
+
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, rnd.nextLong());
+                }
+                Assert.assertEquals(N, map.size());
+
+                rnd.reset();
+
+                MapRecordCursor cursor = map.getCursor();
+                Record record = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    utf8Sink.clear();
+                    rnd.nextUtf8AsciiStr(rnd.nextPositiveInt() % 32, utf8Sink);
+                    Utf8Sequence varchar = record.getVarcharA(1);
+                    Assert.assertNotNull(varchar);
+                    TestUtils.assertEquals(utf8Sink, varchar);
+                    TestUtils.assertAsciiCompliance(varchar);
+                    Assert.assertEquals(rnd.nextLong(), record.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAsciiVarcharKeyIgnoresFlag() throws Exception {
+        // Two identical ASCII VARCHAR values with different isAscii() flags must
+        // hash and compare as the same key. Before the fix, the ASCII flag was
+        // preserved in the serialized header, causing GROUP BY / DISTINCT to treat
+        // visually identical values as separate groups.
+        TestUtils.assertMemoryLeak(() -> {
+            try (OrderedMap map = new OrderedMap(
+                    Numbers.SIZE_1MB,
+                    new SingleColumnType(ColumnType.VARCHAR),
+                    new SingleColumnType(ColumnType.LONG),
+                    16, 0.5f, 1
+            )) {
+                Utf8String withAscii = new Utf8String(new byte[]{'h', 'e', 'l', 'l', 'o'}, true);
+                Utf8String withoutAscii = new Utf8String(new byte[]{'h', 'e', 'l', 'l', 'o'}, false);
+
+                MapKey key1 = map.withKey();
+                key1.putVarchar(withAscii);
+                MapValue val1 = key1.createValue();
+                Assert.assertTrue(val1.isNew());
+                val1.putLong(0, 42);
+
+                MapKey key2 = map.withKey();
+                key2.putVarchar(withoutAscii);
+                MapValue val2 = key2.createValue();
+                Assert.assertFalse("same content with different ASCII flag must resolve to existing key", val2.isNew());
+                Assert.assertEquals(42, val2.getLong(0));
+
+                Assert.assertEquals(1, map.size());
+            }
+        });
+    }
+
+    @Test
+    public void testCollisionPerformance() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+
+            keyTypes.add(ColumnType.STRING);
+            keyTypes.add(ColumnType.STRING);
+
+            valueTypes.add(ColumnType.LONG);
+
+            // These used to be the default FastMap configuration for a join
+            try (OrderedMap map = new OrderedMap(4194304, keyTypes, valueTypes, 2097152 / 4, 0.5, 2147483647)) {
+                for (int i = 0; i < 40_000_000; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(Integer.toString(i / 151));
+                    key.putStr(Integer.toString((i + 3) / 151));
+
+                    MapValue value = key.createValue();
+                    value.putLong(0, i);
+                }
+
+                final long keyCapacityBefore = map.getKeyCapacity();
+                final long memUsedBefore = Unsafe.getMemUsed();
+                final long areaSizeBefore = map.getHeapSize();
+
+                map.restoreInitialCapacity();
+
+                Assert.assertTrue(keyCapacityBefore > map.getKeyCapacity());
+                Assert.assertTrue(memUsedBefore > Unsafe.getMemUsed());
+                Assert.assertTrue(areaSizeBefore > map.getHeapSize());
+            }
+        });
+    }
+
+    @Test
+    public void testConstructorRejectsHeapAboveCompressedOffsetCeiling() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // resize() clamps to the ceiling, but the initial page was allocated raw and only
+            // checked against BATCH_OFFSET_MASK, which sits 16x higher. A page above the ceiling
+            // therefore reached the heap intact and every entry starting past the 32GB mark
+            // compressed to a truncated offset or to the empty-slot encoding, so a probe aliased an
+            // earlier entry or read a live one as empty. Nothing in the map ran before that: the
+            // growth guard only fires once the oversized page fills.
+            //
+            // openOnInit == false keeps both halves allocation-free, so the boundary can be pinned
+            // exactly rather than approached with a 32GB malloc.
+            try (
+                    OrderedMap map = new OrderedMap(
+                            CompressedOffsets.MAX_ALIGNED8_HEAP_SIZE,
+                            new SingleColumnType(ColumnType.LONG),
+                            new SingleColumnType(ColumnType.LONG),
+                            16,
+                            0.5,
+                            Integer.MAX_VALUE,
+                            false
+                    )
+            ) {
+                // A page at the ceiling is accepted: the last entry it can hold still starts below
+                // the first offset that collides. This is what makes the guard `>` and not `>=`.
+                Assert.assertEquals(0, map.size());
+            }
+
+            try {
+                new OrderedMap(
+                        CompressedOffsets.MAX_ALIGNED8_HEAP_SIZE + 8,
+                        new SingleColumnType(ColumnType.LONG),
+                        new SingleColumnType(ColumnType.LONG),
+                        16,
+                        0.5,
+                        Integer.MAX_VALUE,
+                        false
+                ).close();
+                Assert.fail("expected CairoException");
+            } catch (CairoException e) {
+                TestUtils.assertContains(
+                        e.getFlyweightMessage(),
+                        "OrderedMap heap size exceeds compressed offset addressable range "
+                                + "[heapBytes=34359738360, maxAddressable=34359738352]"
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testCopyToKeyFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putLong(i + 1);
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putLong(i + 1);
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    valueB.putLong(0, i + 2);
+                }
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map A keys can be found in map B
+                RecordCursor cursorA = mapA.getCursor();
+                MapRecord recordA = mapA.getRecord();
+                while (cursorA.hasNext()) {
+                    MapValue valueA = recordA.getValue();
+
+                    MapKey keyB = mapB.withKey();
+                    recordA.copyToKey(keyB);
+                    MapValue valueB = keyB.findValue();
+
+                    Assert.assertFalse(valueB.isNew());
+                    Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCopyToKeyVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.STRING);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putStr(Chars.repeat("a", i % 32));
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putStr(Chars.repeat("a", i % 32));
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    valueB.putLong(0, i + 2);
+                }
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map A keys can be found in map B
+                RecordCursor cursorA = mapA.getCursor();
+                MapRecord recordA = mapA.getRecord();
+                while (cursorA.hasNext()) {
+                    MapValue valueA = recordA.getValue();
+
+                    MapKey keyB = mapB.withKey();
+                    recordA.copyToKey(keyB);
+                    MapValue valueB = keyB.findValue();
+
+                    Assert.assertFalse(valueB.isNew());
+                    Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCopyValueFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putLong(i + 1);
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+                }
+
+                RecordCursor cursorA = mapA.getCursor();
+                MapRecord recordA = mapA.getRecord();
+                while (cursorA.hasNext()) {
+                    MapKey keyB = mapB.withKey();
+                    recordA.copyToKey(keyB);
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    recordA.copyValue(valueB);
+                }
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map A keys and values are in map B
+                cursorA.toTop();
+                while (cursorA.hasNext()) {
+                    MapValue valueA = recordA.getValue();
+
+                    MapKey keyB = mapB.withKey();
+                    recordA.copyToKey(keyB);
+                    MapValue valueB = keyB.findValue();
+
+                    Assert.assertFalse(valueB.isNew());
+                    Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCopyValueVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.STRING);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putStr(Chars.repeat("a", i % 32));
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+                }
+
+                RecordCursor cursorA = mapA.getCursor();
+                MapRecord recordA = mapA.getRecord();
+                while (cursorA.hasNext()) {
+                    MapKey keyB = mapB.withKey();
+                    recordA.copyToKey(keyB);
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    recordA.copyValue(valueB);
+                }
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map A keys and values are in map B
+                cursorA.toTop();
+                while (cursorA.hasNext()) {
+                    MapValue valueA = recordA.getValue();
+
+                    MapKey keyB = mapB.withKey();
+                    recordA.copyToKey(keyB);
+                    MapValue valueB = keyB.findValue();
+
+                    Assert.assertFalse(valueB.isNew());
+                    Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFixedSizeKeyOnly() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ColumnTypes types = new SingleColumnType(ColumnType.INT);
+
+            final int N = 10000;
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, types, null, 64, 0.5, Integer.MAX_VALUE)) {
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putInt(i);
+                    MapValue values = key.createValue();
+                    Assert.assertTrue(values.isNew());
+                }
+
+                try (RecordCursor cursor = map.getCursor()) {
+                    final MapRecord record = (MapRecord) cursor.getRecord();
+                    int i = 0;
+                    while (cursor.hasNext()) {
+                        Assert.assertEquals(i, record.getInt(0));
+                        i++;
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testFuzz() throws Exception {
+        final Rnd rnd = TestUtils.generateRandom(LOG);
+        TestUtils.assertMemoryLeak(() -> {
+            SingleColumnType keyTypes = new SingleColumnType(ColumnType.STRING);
+            SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+
+            HashMap<String, Long> oracle = new HashMap<>();
+            try (OrderedMap map = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, Integer.MAX_VALUE)) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    CharSequence s = rnd.nextString(i % 64);
+                    key.putStr(s);
+
+                    MapValue value = key.createValue();
+                    value.putLong(0, s.length());
+
+                    oracle.put(Chars.toString(s), (long) s.length());
+                }
+
+                Assert.assertEquals(oracle.size(), map.size());
+
+                // assert map contents
+                for (java.util.Map.Entry<String, Long> e : oracle.entrySet()) {
+                    MapKey key = map.withKey();
+                    key.putStr(e.getKey());
+
+                    MapValue value = key.findValue();
+                    Assert.assertFalse(value.isNew());
+                    Assert.assertEquals(e.getKey().length(), value.getLong(0));
+                    Assert.assertEquals((long) e.getValue(), value.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testGeoHashRecordAsKey() throws Exception {
+        assertMemoryLeak(() -> {
+            final int N = 5000;
+            final Rnd rnd = new Rnd();
+            int precisionBits = 10;
+            int geohashType = ColumnType.getGeoHashTypeWithBits(precisionBits);
+
+            BytecodeAssembler asm = new BytecodeAssembler();
+            TableModel model = new TableModel(configuration, "x", PartitionBy.NONE);
+            model.col("a", ColumnType.LONG).col("b", geohashType);
+            AbstractCairoTest.create(model);
+
+            try (TableWriter writer = newOffPoolWriter(configuration, "x")) {
+                for (int i = 0; i < N; i++) {
+                    TableWriter.Row row = writer.newRow();
+                    long rndGeohash = GeoHashes.fromCoordinatesDeg(rnd.nextDouble() * 180 - 90, rnd.nextDouble() * 360 - 180, precisionBits);
+                    row.putLong(0, i);
+                    row.putGeoHash(1, rndGeohash);
+                    row.append();
+                }
+                writer.commit();
+            }
+
+            try (
+                    TableReader reader = newOffPoolReader(configuration, "x");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                EntityColumnFilter entityColumnFilter = new EntityColumnFilter();
+                entityColumnFilter.of(reader.getMetadata().getColumnCount());
+
+                try (
+                        OrderedMap map = new OrderedMap(
+                                Numbers.SIZE_1MB,
+                                new SymbolAsStrTypes(reader.getMetadata()),
+                                new ArrayColumnTypes()
+                                        .add(ColumnType.LONG)
+                                        .add(ColumnType.INT)
+                                        .add(ColumnType.SHORT)
+                                        .add(ColumnType.BYTE)
+                                        .add(ColumnType.FLOAT)
+                                        .add(ColumnType.DOUBLE)
+                                        .add(ColumnType.DATE)
+                                        .add(ColumnType.TIMESTAMP)
+                                        .add(ColumnType.BOOLEAN)
+                                        .add(ColumnType.UUID),
+                                N,
+                                0.9f,
+                                1
+                        )
+                ) {
+                    BitSet writeSymbolAsString = new BitSet();
+                    for (int i = 0, n = reader.getMetadata().getColumnCount(); i < n; i++) {
+                        if (reader.getMetadata().getColumnType(i) == ColumnType.SYMBOL) {
+                            writeSymbolAsString.set(i);
+                        }
+                    }
+                    RecordSink sink = RecordSinkFactory.getInstance(configuration, asm, reader.getMetadata(), entityColumnFilter, writeSymbolAsString);
+                    // this random will be populating values
+                    Rnd rnd2 = new Rnd();
+
+                    populateMap(map, rnd2, cursor, sink);
+
+                    try (RecordCursor mapCursor = map.getCursor()) {
+                        long c = 0;
+                        rnd.reset();
+                        rnd2.reset();
+                        final Record record = mapCursor.getRecord();
+                        while (mapCursor.hasNext()) {
+                            // value
+                            Assert.assertEquals(++c, record.getLong(0));
+                            Assert.assertEquals(rnd2.nextInt(), record.getInt(1));
+                            Assert.assertEquals(rnd2.nextShort(), record.getShort(2));
+                            Assert.assertEquals(rnd2.nextByte(), record.getByte(3));
+                            Assert.assertEquals(rnd2.nextFloat(), record.getFloat(4), 0.000001f);
+                            Assert.assertEquals(rnd2.nextDouble(), record.getDouble(5), 0.000000001);
+                            Assert.assertEquals(rnd2.nextLong(), record.getDate(6));
+                            Assert.assertEquals(rnd2.nextLong(), record.getTimestamp(7));
+                            Assert.assertEquals(rnd2.nextBoolean(), record.getBool(8));
+                            Assert.assertEquals(rnd2.nextLong(), record.getLong128Lo(9));
+                            Assert.assertEquals(rnd2.nextLong(), record.getLong128Hi(9));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testHeapBoundariesFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Here, the entry size is 16 bytes, so that we fill the heap up to the boundary exactly before growing it.
+            Rnd rnd = new Rnd();
+            int expectedEntrySize = 16;
+
+            try (
+                    OrderedMap map = new OrderedMap(
+                            32,
+                            new SingleColumnType(ColumnType.LONG),
+                            new SingleColumnType(ColumnType.LONG),
+                            16,
+                            0.8,
+                            1024
+                    )
+            ) {
+                final int N = 100;
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(rnd.nextLong());
+
+                    long usedHeap = map.getUsedHeapSize();
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    Assert.assertEquals(expectedEntrySize, (int) (map.getUsedHeapSize() - usedHeap));
+
+                    value.putLong(0, rnd.nextLong());
+                }
+
+                rnd.reset();
+
+                // assert that all values are good
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(rnd.nextLong());
+
+                    MapValue value = key.createValue();
+                    Assert.assertFalse(value.isNew());
+
+                    Assert.assertEquals(rnd.nextLong(), value.getLong(0));
+                }
+
+                Assert.assertEquals(N, map.size());
+            }
+        });
+    }
+
+    @Test
+    public void testHeapBoundariesVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Here, the entry size is 32 bytes, so that we fill the heap up to the boundary exactly before growing it.
+            Rnd rnd = new Rnd();
+            int expectedEntrySize = 32;
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap map = new OrderedMap(
+                            32,
+                            new SingleColumnType(ColumnType.STRING),
+                            valueTypes,
+                            16,
+                            0.8,
+                            1024
+                    )
+            ) {
+                final int N = 100;
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(rnd.nextString(4));
+
+                    long usedHeap = map.getUsedHeapSize();
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    Assert.assertEquals(expectedEntrySize, (int) (map.getUsedHeapSize() - usedHeap));
+
+                    value.putLong(0, rnd.nextLong());
+                    value.putLong(1, rnd.nextLong());
+                }
+
+                rnd.reset();
+
+                // assert that all values are good
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(rnd.nextString(4));
+
+                    MapValue value = key.createValue();
+                    Assert.assertFalse(value.isNew());
+
+                    Assert.assertEquals(rnd.nextLong(), value.getLong(0));
+                    Assert.assertEquals(rnd.nextLong(), value.getLong(1));
+                }
+
+                Assert.assertEquals(N, map.size());
+            }
+        });
+    }
+
+    @Test
+    public void testHeapSizeBetweenStructuralMinimumAndEntrySize() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // 24 bytes against a 16-byte entry: one entry fits and every later one grows the heap, so a
+            // map configured this small runs its queries rather than failing them. That is what ties
+            // MIN_MAP_PAGE_SIZE to the map's own structural bound - it asserts heapSize > 3 - instead of
+            // to an entry size: a floor picked above the bound rejects working page sizes like this one
+            // at startup, and the per-query check below already covers the rest.
+            try (
+                    OrderedMap map = new OrderedMap(
+                            24,
+                            new SingleColumnType(ColumnType.LONG),
+                            new SingleColumnType(ColumnType.LONG),
+                            16,
+                            0.5,
+                            Integer.MAX_VALUE
+                    )
+            ) {
+                final int N = 100;
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(i);
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i * 3L);
+                }
+
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(i);
+                    MapValue value = key.findValue();
+                    Assert.assertNotNull(value);
+                    Assert.assertEquals(i * 3L, value.getLong(0));
+                }
+                Assert.assertEquals(N, map.size());
+            }
+
+            // The entry size is the boundary the map itself enforces, and it names the property while
+            // doing so, so the query-dependent half of the minimum needs no startup floor. A page equal
+            // to the entry size is rejected: the check is `>=`, since the heap has to hold the entry
+            // and still have somewhere to append the next one from.
+            try {
+                new OrderedMap(
+                        16,
+                        new SingleColumnType(ColumnType.LONG),
+                        new SingleColumnType(ColumnType.LONG),
+                        16,
+                        0.5,
+                        Integer.MAX_VALUE
+                ).close();
+                Assert.fail("expected CairoException");
+            } catch (CairoException e) {
+                TestUtils.assertContains(
+                        e.getFlyweightMessage(),
+                        "page size is too small to fit a single key, consider increasing "
+                                + "`cairo.sql.small.map.page.size` [expected=16, actual=16]"
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testKeyCopyFromFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putLong(i + 1);
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.copyFrom(keyA);
+
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    valueB.putLong(0, i + 2);
+                }
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map A keys can be found in map B
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putLong(i + 1);
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putLong(i + 1);
+
+                    MapValue valueA = keyA.findValue();
+                    Assert.assertFalse(valueA.isNew());
+
+                    MapValue valueB = keyB.findValue();
+                    Assert.assertFalse(valueB.isNew());
+
+                    Assert.assertEquals(i + 2, valueA.getLong(0));
+                    Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testKeyCopyFromVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.STRING);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putStr(Chars.repeat("a", i % 32));
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.copyFrom(keyA);
+
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    valueB.putLong(0, i + 2);
+                }
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map A keys can be found in map B
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putStr(Chars.repeat("a", i % 32));
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putStr(Chars.repeat("a", i % 32));
+
+                    MapValue valueA = keyA.findValue();
+                    Assert.assertFalse(valueA.isNew());
+
+                    MapValue valueB = keyB.findValue();
+                    Assert.assertFalse(valueB.isNew());
+
+                    Assert.assertEquals(i + 2, valueA.getLong(0));
+                    Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testKeyCapacityOverflow() throws Exception {
+        // Verify that the map throws CairoException when key capacity would overflow int range.
+        // Before the fix, MAX_SAFE_INT_POW_2 was 1L << 31 (which doesn't fit in a signed int),
+        // so rehash() could set keyCapacity = (int)(1L << 31) = Integer.MIN_VALUE, and the
+        // subsequent clear() would pass a negative size to native memset, causing a SIGSEGV.
+        TestUtils.assertMemoryLeak(() -> {
+            ColumnTypes types = new SingleColumnType(ColumnType.LONG);
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, types, null, 16, 0.5, Integer.MAX_VALUE)) {
+                try {
+                    // should fail with 0.75 load factor
+                    map.setKeyCapacity(Integer.MAX_VALUE / 4 * 3 + 1);
+                    Assert.fail("expected CairoException");
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "map capacity overflow");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testKeyHashCodeFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (OrderedMap map = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)) {
+                final int N = 100000;
+                final LongList keyHashCodes = new LongList(N);
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putInt(i);
+                    key.putLong(i + 1);
+                    long hashCode = key.hash();
+                    keyHashCodes.add(hashCode);
+
+                    MapValue value = key.createValue(hashCode);
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i + 2);
+                }
+
+                final LongList recordHashCodes = new LongList(N);
+                RecordCursor cursor = map.getCursor();
+                MapRecord record = map.getRecord();
+                while (cursor.hasNext()) {
+                    recordHashCodes.add(record.keyHashCode());
+                }
+
+                TestUtils.assertEquals(keyHashCodes, recordHashCodes);
+            }
+        });
+    }
+
+    @Test
+    public void testKeyHashCodeVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.STRING);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (OrderedMap map = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)) {
+                final int N = 100000;
+                final LongList keyHashCodes = new LongList(N);
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putInt(i);
+                    key.putStr(Chars.repeat("a", i % 32));
+                    key.commit();
+                    long hashCode = key.hash();
+                    keyHashCodes.add(hashCode);
+
+                    MapValue value = key.createValue(hashCode);
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i + 2);
+                }
+
+                final LongList recordHashCodes = new LongList(N);
+                RecordCursor cursor = map.getCursor();
+                MapRecord record = map.getRecord();
+                while (cursor.hasNext()) {
+                    recordHashCodes.add(record.keyHashCode());
+                }
+
+                TestUtils.assertEquals(keyHashCodes, recordHashCodes);
+            }
+        });
+    }
+
+    @Test
+    public void testLargeBinSequence() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ColumnTypes keyTypes = new SingleColumnType(ColumnType.BINARY);
+            ColumnTypes valueTypes = new SingleColumnType(ColumnType.INT);
+            TestRecord.ArrayBinarySequence binarySequence = new TestRecord.ArrayBinarySequence();
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, valueTypes, 64, 0.5, 1)) {
+                final Rnd rnd = new Rnd();
+                MapKey key = map.withKey();
+                key.putBin(binarySequence.of(rnd.nextBytes(10)));
+                MapValue value = key.createValue();
+                value.putInt(0, rnd.nextInt());
+
+                BinarySequence bad = new BinarySequence() {
+                    @Override
+                    public byte byteAt(long index) {
+                        return 0;
+                    }
+
+                    @Override
+                    public long length() {
+                        return Integer.MAX_VALUE + 1L;
+                    }
+                };
+
+                try {
+                    map.withKey().putBin(bad);
+                    Assert.fail();
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "binary column is too large");
+                }
+
+                key = map.withKey();
+                key.putBin(binarySequence.of(rnd.nextBytes(20)));
+                value = key.createValue();
+                value.putInt(0, rnd.nextInt());
+
+                Assert.assertEquals(2, map.size());
+
+                // and read
+                rnd.reset();
+                key = map.withKey();
+                key.putBin(binarySequence.of(rnd.nextBytes(10)));
+                Assert.assertEquals(rnd.nextInt(), key.findValue().getInt(0));
+
+                key = map.withKey();
+                key.putBin(binarySequence.of(rnd.nextBytes(20)));
+                Assert.assertEquals(rnd.nextInt(), key.findValue().getInt(0));
+            }
+        });
+    }
+
+    @Test
+    public void testLong256AndCharAsKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            Rnd rnd = new Rnd();
+
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.LONG256);
+            keyTypes.add(ColumnType.CHAR);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.DOUBLE);
+
+            Long256Impl long256 = new Long256Impl();
+
+            try (OrderedMap map = new OrderedMap(64, keyTypes, valueTypes, 64, 0.8, 24)) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    long256.fromRnd(rnd);
+                    key.putLong256(long256);
+                    key.putChar(rnd.nextChar());
+
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putDouble(0, rnd.nextDouble());
+                }
+
+                rnd.reset();
+
+                // assert that all values are good
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    long256.fromRnd(rnd);
+                    key.putLong256(long256);
+                    key.putChar(rnd.nextChar());
+
+                    MapValue value = key.createValue();
+                    Assert.assertFalse(value.isNew());
+                    Assert.assertEquals(rnd.nextDouble(), value.getDouble(0), 0.000000001d);
+                }
+
+                try (RecordCursor cursor = map.getCursor()) {
+                    rnd.reset();
+                    assertCursorLong256(rnd, cursor, long256);
+
+                    rnd.reset();
+                    cursor.toTop();
+                    assertCursorLong256(rnd, cursor, long256);
+                }
+            }
+        });
+    }
+
+    // This test crashes CircleCI, probably due to the amount of memory it needs to run
+    // I'm going to find out how to deal with that
+    @Test
+    public void testMemoryStretch() throws Exception {
+        if (System.getProperty("questdb.enable_heavy_tests") != null) {
+            TestUtils.assertMemoryLeak(() -> {
+                ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+                ColumnTypes valueTypes = new SingleColumnType(ColumnType.LONG);
+                int N = 1500000;
+                for (int i = 0; i < N; i++) {
+                    keyTypes.add(ColumnType.STRING);
+                }
+
+                final Rnd rnd = new Rnd();
+                try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, valueTypes, 1024, 0.5f, 1)) {
+                    try {
+                        MapKey key = map.withKey();
+                        for (int i = 0; i < N; i++) {
+                            key.putStr(rnd.nextChars(1024));
+                        }
+                        key.createValue();
+                        Assert.fail();
+                    } catch (CairoException e) {
+                        TestUtils.assertContains(e.getFlyweightMessage(), "row data is too large");
+                    }
+                }
+            });
+        }
+    }
+
+    @Test
+    public void testMergeFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.LONG);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putLong(i + 1);
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+                }
+
+                for (int i = 0; i < 2 * N; i++) {
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putLong(i + 1);
+
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    valueB.putLong(0, i + 2);
+                }
+
+                Assert.assertEquals(2 * mapA.size(), mapB.size());
+
+                mapA.merge(mapB, new TestMapValueMergeFunction());
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map B keys can be found in map A
+                RecordCursor cursorA = mapA.getCursor();
+                MapRecord recordA = mapA.getRecord();
+                while (cursorA.hasNext()) {
+                    int i = recordA.getInt(1);
+                    MapValue valueA = recordA.getValue();
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putLong(i + 1);
+                    MapValue valueB = keyB.findValue();
+
+                    Assert.assertFalse(valueB.isNew());
+                    if (i < N) {
+                        Assert.assertEquals(valueA.getLong(0), 2 * valueB.getLong(0));
+                    } else {
+                        Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testMergeStressTest() throws Exception {
+        // Here we aim to resize both map A's hash table and heap as many times as possible
+        // to catch possible bugs with append-address initialization.
+        TestUtils.assertMemoryLeak(() -> {
+            SingleColumnType keyTypes = new SingleColumnType(ColumnType.STRING);
+            SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(64, keyTypes, valueTypes, 16, 0.9, Integer.MAX_VALUE);
+                    OrderedMap mapB = new OrderedMap(64, keyTypes, valueTypes, 16, 0.9, Integer.MAX_VALUE)
+            ) {
+                final int N = 100;
+                final int M = 1000;
+                for (int i = 0; i < N; i++) {
+                    mapB.clear();
+                    for (int j = 0; j < M; j++) {
+                        MapKey keyB = mapB.withKey();
+                        keyB.putStr(String.valueOf((long) M * i + j));
+
+                        MapValue valueB = keyB.createValue();
+                        Assert.assertTrue(valueB.isNew());
+                        valueB.putLong(0, M * i + j);
+                    }
+
+                    mapA.merge(mapB, new TestMapValueMergeFunction());
+                    Assert.assertEquals((i + 1) * M, mapA.size());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testMergeTopBitOffsetSlotStaysOccupiedFixedSizeKey() throws Exception {
+        assertMergeSkipsPlantedSlot(false);
+    }
+
+    @Test
+    public void testMergeTopBitOffsetSlotStaysOccupiedVarSizeKey() throws Exception {
+        assertMergeSkipsPlantedSlot(true);
+    }
+
+    @Test
+    public void testMergeTopBitOffsetSourceSlotIsNotSkipped() throws Exception {
+        // The merge source scan decides a slot is empty on "raw offset == 0" alone. A signed test
+        // reads every entry from 16GB up - exactly the offsets whose top bit is set - as an empty
+        // slot and drops it, which is the parallel GROUP BY shard-merge silently losing a group
+        // with no exception raised.
+        //
+        // A planted source offset cannot address a real entry without a 16GB heap, and the merge
+        // dereferences it as soon as it decides to process the slot. So the observable is the step
+        // immediately before that dereference: against a destination heap that is exactly full,
+        // copying the entry has to ask resize() for room, and resize() rejects it at the ceiling
+        // before reading a single source byte. Skipping the slot never reaches resize() at all.
+        //
+        // Only the fixed-size-key merge can be driven this way - mergeVarSizeKey() reads the key
+        // length off the source address before it probes, and no planted offset both sets the top
+        // bit and lands inside a test-sized heap, since the smallest such offset decodes to
+        // 17,179,869,176 bytes. That is why both merge loops resolve their source slot through the
+        // single OrderedMap.srcEntryAddr(): this test therefore covers the line the var-size loop
+        // actually executes, not a copy of it. CompressedOffsetsTest pins the underlying predicate
+        // at the boundary as well.
+        //
+        // The throw below depends on resize() rejecting the entry before the Unsafe.copyMemory on
+        // the next line, which holds today but is statement ordering rather than a contract. A
+        // refactor to copy-then-reserve would turn this red test into a SIGSEGV, so re-check the
+        // order here before changing either merge loop's tail.
+        TestUtils.assertMemoryLeak(() -> {
+            SingleColumnType keyTypes = new SingleColumnType(ColumnType.LONG);
+            SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+
+            // LONG key plus LONG value is a 16-byte entry, so a 32-byte ceiling holds exactly the
+            // two entries seeded below and has no room for a third.
+            final long maxHeapSize = 32;
+            try (
+                    OrderedMap dest = new OrderedMap(32, keyTypes, valueTypes, 16, 0.5, Integer.MAX_VALUE, true, maxHeapSize);
+                    OrderedMap src = new OrderedMap(1024, keyTypes, valueTypes, 16, 0.5, Integer.MAX_VALUE)
+            ) {
+                for (int i = 0; i < 2; i++) {
+                    MapKey destKey = dest.withKey();
+                    destKey.putLong(i);
+                    destKey.createValue().putLong(0, i);
+
+                    // The same keys in the source, so every live source entry merges into an
+                    // existing destination entry and never asks the destination heap for room.
+                    MapKey srcKey = src.withKey();
+                    srcKey.putLong(i);
+                    srcKey.createValue().putLong(0, i);
+                }
+                // A destination heap with room to spare would dereference the planted offset
+                // instead of throwing, so assert the precondition rather than assume it.
+                Assert.assertEquals(maxHeapSize, dest.getUsedHeapSize());
+                Assert.assertEquals(maxHeapSize, dest.getHeapSize());
+
+                // Control: the very same merge without a planted slot must complete. It makes the
+                // throw below differential - a live key that stopped matching its destination entry
+                // would ask the full heap for room and fail here, rather than leave the test green
+                // for a reason that has nothing to do with the planted slot.
+                dest.merge(src, new TestMapValueMergeFunction());
+                Assert.assertEquals(2, dest.size());
+                Assert.assertEquals(maxHeapSize, dest.getUsedHeapSize());
+
+                // The lowest offset that compresses with its top bit set already needs a 16GB
+                // heap, so the slot has to be planted rather than grown into.
+                final int plantedOffset = 0x8000_0001;
+                final int plantedHash = 0x5EED_BEEF;
+                // Keeping the planted hash off every live key's keeps the destination probe on the
+                // hash-mismatch branch, which never dereferences the offset it is walking past.
+                assertHashUnused(dest, plantedHash);
+                src.pokeRawSlot(firstEmptySlot(src), plantedOffset, plantedHash);
+
+                try {
+                    dest.merge(src, new TestMapValueMergeFunction());
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "limit of 32 memory exceeded in FastMap");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testMergeVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            keyTypes.add(ColumnType.STRING);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap mapA = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24);
+                    OrderedMap mapB = new OrderedMap(1024, keyTypes, valueTypes, 64, 0.8, 24)
+            ) {
+                final int N = 100000;
+                for (int i = 0; i < N; i++) {
+                    MapKey keyA = mapA.withKey();
+                    keyA.putInt(i);
+                    keyA.putStr(Chars.repeat("a", i % 32));
+
+                    MapValue valueA = keyA.createValue();
+                    Assert.assertTrue(valueA.isNew());
+                    valueA.putLong(0, i + 2);
+                }
+
+                for (int i = 0; i < 2 * N; i++) {
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putStr(Chars.repeat("a", i % 32));
+
+                    MapValue valueB = keyB.createValue();
+                    Assert.assertTrue(valueB.isNew());
+                    valueB.putLong(0, i + 2);
+                }
+
+                Assert.assertEquals(2 * mapA.size(), mapB.size());
+
+                mapA.merge(mapB, new TestMapValueMergeFunction());
+
+                Assert.assertEquals(mapA.size(), mapB.size());
+
+                // assert that all map B keys can be found in map A
+                RecordCursor cursorA = mapA.getCursor();
+                MapRecord recordA = mapA.getRecord();
+                while (cursorA.hasNext()) {
+                    int i = recordA.getInt(1);
+                    MapValue valueA = recordA.getValue();
+
+                    MapKey keyB = mapB.withKey();
+                    keyB.putInt(i);
+                    keyB.putStr(Chars.repeat("a", i % 32));
+                    MapValue valueB = keyB.findValue();
+
+                    Assert.assertFalse(valueB.isNew());
+                    if (i < N) {
+                        Assert.assertEquals(valueA.getLong(0), 2 * valueB.getLong(0));
+                    } else {
+                        Assert.assertEquals(valueA.getLong(0), valueB.getLong(0));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testNoValueColumns() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final SingleColumnType keyTypes = new SingleColumnType();
+            final Rnd rnd = new Rnd();
+            final int N = 100;
+            try (OrderedMap map = new OrderedMap(2 * Numbers.SIZE_1MB, keyTypes.of(ColumnType.INT), 128, 0.7f, 1)) {
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putInt(rnd.nextInt());
+                    Assert.assertTrue(key.create());
+                }
+
+                Assert.assertEquals(N, map.size());
+
+                rnd.reset();
+
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putInt(rnd.nextInt());
+                    Assert.assertFalse(key.notFound());
+                }
+                Assert.assertEquals(N, map.size());
+            }
+        });
+    }
+
+    @Test
+    public void testNullKeyMergeFixedSizeKey() throws Exception {
+        // An all-NULL key is zero bytes wide. A merge copies the entry into a map that lacks it
+        // and merges the values into the entry of a map that has it, as parallel GROUP BY does.
+        TestUtils.assertMemoryLeak(() -> {
+            final SingleColumnType keyTypes = new SingleColumnType(ColumnType.NULL);
+            final SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+            try (
+                    OrderedMap dest = new OrderedMap(64, keyTypes, valueTypes, 16, 0.5, Integer.MAX_VALUE);
+                    OrderedMap src = new OrderedMap(64, keyTypes, valueTypes, 16, 0.5, Integer.MAX_VALUE)
+            ) {
+                src.withKey().createValue().putLong(0, 5);
+                dest.merge(src, new TestMapValueMergeFunction());
+                Assert.assertEquals(1, dest.size());
+                // a zero-byte key and an 8-byte value; a length header would make it 16
+                Assert.assertEquals(8, dest.getUsedHeapSize());
+                Assert.assertEquals(5, dest.withKey().findValue().getLong(0));
+
+                src.clear();
+                src.withKey().createValue().putLong(0, 7);
+                dest.merge(src, new TestMapValueMergeFunction());
+                Assert.assertEquals(1, dest.size());
+                Assert.assertEquals(8, dest.getUsedHeapSize());
+                Assert.assertEquals(12, dest.withKey().findValue().getLong(0));
+            }
+        });
+    }
+
+    @Test
+    public void testNullKeyUsesFixedSizeLayout() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final ArrayColumnTypes valueTypes = new ArrayColumnTypes()
+                    .add(ColumnType.LONG)
+                    .add(ColumnType.LONG);
+            try (
+                    OrderedMap map = new OrderedMap(
+                            17,
+                            new SingleColumnType(ColumnType.NULL),
+                            valueTypes,
+                            16,
+                            0.5,
+                            Integer.MAX_VALUE
+                    )
+            ) {
+                final MapKey key = map.withKey();
+                final MapValue value = key.createValue();
+                Assert.assertTrue(value.isNew());
+                Assert.assertEquals(16, map.getUsedHeapSize());
+
+                value.putLong(0, 42);
+                value.putLong(1, 84);
+
+                final MapValue existing = map.withKey().createValue();
+                Assert.assertFalse(existing.isNew());
+                Assert.assertEquals(42, existing.getLong(0));
+                Assert.assertEquals(84, existing.getLong(1));
+            }
+        });
+    }
+
+    @Test
+    public void testProbeTreatsTopBitOffsetSlotAsOccupied() throws Exception {
+        // A compressed offset with the top bit set is a legal, occupied slot: it encodes a heap
+        // offset at or above 16GB. Testing emptiness as "raw > 0" instead of "raw != 0" reads such
+        // a slot as free and silently overwrites a live group - no exception, just a wrong GROUP BY
+        // result. A 16GB heap is not constructible here, so plant the slot directly.
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (OrderedMap map = new OrderedMap(1024, keyTypes, valueTypes, 16, 0.5, 24)) {
+                final int key = 42;
+
+                // Learn which slot the key probes to, then empty the table again.
+                MapKey k = map.withKey();
+                k.putInt(key);
+                Assert.assertTrue(k.createValue().isNew());
+                final int home = onlyOccupiedSlot(map);
+                final int keyHash = hashCodeAt(map, home);
+                map.clear();
+
+                // Plant an occupied slot with the top bit set right where the key probes. Flipping
+                // only the top hash bit keeps the planted hash distinct from the key's, so every
+                // consumer stays on the hash-mismatch branch and never dereferences the offset.
+                final int plantedOffset = 0x8000_0001;
+                final int plantedHash = keyHash ^ 0x8000_0000;
+                map.pokeRawSlot(home, plantedOffset, plantedHash);
+
+                // createValue() has to probe past the planted slot instead of overwriting it.
+                k = map.withKey();
+                k.putInt(key);
+                Assert.assertTrue(k.createValue().isNew());
+
+                Assert.assertEquals("planted slot must survive the probe", plantedOffset, rawOffsetAt(map, home));
+                Assert.assertEquals(plantedHash, hashCodeAt(map, home));
+
+                final int next = (home + 1) & (map.getKeyCapacity() - 1);
+                Assert.assertTrue("key must land in the slot after the planted one", isSlotOccupied(map, next));
+                Assert.assertEquals(keyHash, hashCodeAt(map, next));
+
+                // The read-only probe has to walk past the planted slot too, otherwise it reports
+                // a live key as absent.
+                k = map.withKey();
+                k.putInt(key);
+                Assert.assertFalse("lookup must find the key beyond the planted slot", k.notFound());
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewBillsTheTrackerForItsStagingBuffer() throws Exception {
+        // The staging buffer is the view's own native memory, so the tracker that charged it has
+        // to be the one credited for its release. Changing the tracker therefore releases the
+        // buffer up front rather than leaving it to bill a tracker that never paid for it.
+        assertMemoryLeak(() -> {
+            try (LimitedMemoryTracker tracker = new LimitedMemoryTracker(64 * 1024)) {
+                // The map stays off the tracker, so every byte it reports belongs to the view.
+                try (OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.STRING), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024)) {
+                    fillVarSizeKeys(map, 16);
+                    try (OrderedMap.ProbeView view = new OrderedMap.ProbeView()) {
+                        view.setMemoryTracker(tracker);
+                        view.of(map);
+                        final long initialCapacity = view.getSizeInBytes();
+                        Assert.assertTrue(initialCapacity > 0);
+                        Assert.assertEquals(initialCapacity, tracker.getUsed());
+
+                        // A key well past the initial capacity grows the buffer under the tracker.
+                        view.withKey().putStr(varSizeKeyOfLength(512));
+                        Assert.assertNull(view.findValue());
+                        Assert.assertTrue(view.getSizeInBytes() > initialCapacity);
+                        Assert.assertEquals(view.getSizeInBytes(), tracker.getUsed());
+
+                        // The tracker change hands the view back whole, at its initial capacity,
+                        // under the new tracker - here none, so the old tracker returns to zero.
+                        view.setMemoryTracker(null);
+                        Assert.assertEquals("the tracker that charged the buffer has to be credited for it", 0, tracker.getUsed());
+                        Assert.assertEquals(initialCapacity, view.getSizeInBytes());
+                        view.withKey().putStr(varSizeKeyOfLength(3));
+                        Assert.assertEquals(3, view.findValue().getLong(0));
+                        Assert.assertEquals(0, tracker.getUsed());
+                    }
+                }
+                Assert.assertEquals(0, tracker.getUsed());
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewBreachedStagingGrowthLeavesTheBufferItOwns() throws Exception {
+        // Unsafe.realloc checks the limit before it reallocates, so a breach leaves the view
+        // pointing at the block it still owns. Nothing may be lost or double-freed: the view has
+        // to keep probing with the buffer it has, and close() has to return every charged byte.
+        assertMemoryLeak(() -> {
+            try (LimitedMemoryTracker tracker = new LimitedMemoryTracker(1024)) {
+                // The map stays off the tracker, so every byte it reports belongs to the view.
+                try (OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.STRING), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024)) {
+                    fillVarSizeKeys(map, 16);
+                    try (OrderedMap.ProbeView view = new OrderedMap.ProbeView()) {
+                        view.setMemoryTracker(tracker);
+                        view.of(map);
+                        final long initialCapacity = view.getSizeInBytes();
+                        Assert.assertEquals(initialCapacity, tracker.getUsed());
+
+                        try {
+                            view.withKey().putStr(varSizeKeyOfLength(512));
+                            Assert.fail();
+                        } catch (CairoException e) {
+                            TestUtils.assertContains(e.getFlyweightMessage(), "query memory limit exceeded");
+                        }
+                        Assert.assertEquals("the breach must not lose the block the view owns", initialCapacity, view.getSizeInBytes());
+                        Assert.assertEquals(initialCapacity, tracker.getUsed());
+
+                        // The view still works off the buffer it kept.
+                        view.withKey().putStr(varSizeKeyOfLength(3));
+                        Assert.assertEquals(3, view.findValue().getLong(0));
+
+                        // And it grows once the limit allows it.
+                        tracker.setLimit(64 * 1024);
+                        view.withKey().putStr(varSizeKeyOfLength(512));
+                        Assert.assertNull(view.findValue());
+                        Assert.assertTrue(view.getSizeInBytes() > initialCapacity);
+                        Assert.assertEquals(view.getSizeInBytes(), tracker.getUsed());
+                    }
+                }
+                Assert.assertEquals("close() must return every tracker-charged byte", 0, tracker.getUsed());
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewCompositeKeyThroughRecordSink() throws Exception {
+        // The view's real driver is a generated RecordSink, which reaches it through RecordSinkSPI
+        // and not through MapKey. Populate a wide var-size key through one sink, then read every
+        // row back through the same sink and the view.
+        assertMemoryLeak(() -> {
+            final int N = 5000;
+            final Rnd rnd = new Rnd();
+            TestRecord.ArrayBinarySequence binarySequence = new TestRecord.ArrayBinarySequence();
+
+            createTestTable(N, rnd, binarySequence);
+
+            BytecodeAssembler asm = new BytecodeAssembler();
+
+            try (
+                    TableReader reader = newOffPoolReader(configuration, "x");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                EntityColumnFilter entityColumnFilter = new EntityColumnFilter();
+                entityColumnFilter.of(reader.getMetadata().getColumnCount());
+
+                try (
+                        OrderedMap map = new OrderedMap(
+                                Numbers.SIZE_1MB,
+                                new SymbolAsStrTypes(reader.getMetadata()),
+                                new ArrayColumnTypes()
+                                        .add(ColumnType.LONG)
+                                        .add(ColumnType.INT)
+                                        .add(ColumnType.SHORT)
+                                        .add(ColumnType.BYTE)
+                                        .add(ColumnType.FLOAT)
+                                        .add(ColumnType.DOUBLE)
+                                        .add(ColumnType.DATE)
+                                        .add(ColumnType.TIMESTAMP)
+                                        .add(ColumnType.BOOLEAN)
+                                        .add(ColumnType.UUID),
+                                N,
+                                0.9f,
+                                1
+                        )
+                ) {
+                    BitSet writeSymbolAsString = new BitSet();
+                    for (int i = 0, n = reader.getMetadata().getColumnCount(); i < n; i++) {
+                        if (reader.getMetadata().getColumnType(i) == ColumnType.SYMBOL) {
+                            writeSymbolAsString.set(i);
+                        }
+                    }
+                    RecordSink sink = RecordSinkFactory.getInstance(configuration, asm, reader.getMetadata(), entityColumnFilter, writeSymbolAsString);
+
+                    populateMap(map, new Rnd(), cursor, sink);
+
+                    try (OrderedMap.ProbeView view = new OrderedMap.ProbeView().of(map)) {
+                        cursor.toTop();
+                        final Record record = cursor.getRecord();
+                        long counter = 0;
+                        while (cursor.hasNext()) {
+                            sink.copy(record, view.withKey());
+                            MapValue value = view.findValue();
+                            Assert.assertNotNull(value);
+                            Assert.assertEquals(++counter, value.getLong(0));
+                        }
+                        Assert.assertEquals(N, counter);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewConcurrentProbes() throws Exception {
+        // The point of the view: many threads read one frozen map at once. The map's own MapKey
+        // cannot serve this, since it stages the searched key inside the map's heap and hands
+        // every caller the same value flyweight.
+        assertMemoryLeak(() -> {
+            final int keyCount = 10_000;
+            final int workerCount = 4;
+            try (OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024)) {
+                fillLongKeys(map, keyCount);
+
+                final ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+                final CountDownLatch start = new CountDownLatch(1);
+                final List<Future<?>> futures = new ArrayList<>();
+                try {
+                    for (int worker = 0; worker < workerCount; worker++) {
+                        final int shift = worker;
+                        // The owner allocates every view before publication.
+                        final OrderedMap.ProbeView a = new OrderedMap.ProbeView().of(map);
+                        final OrderedMap.ProbeView b = new OrderedMap.ProbeView().of(map);
+                        futures.add(executor.submit(() -> {
+                            try {
+                                // Task submission and the latch publish the filled map.
+                                start.await();
+                                for (int i = 0; i < keyCount; i++) {
+                                    final int key = (i + shift * 997) % keyCount;
+                                    final int otherKey = (key + 1) % keyCount;
+                                    a.withKey().putLong(key);
+                                    b.withKey().putLong(otherKey);
+                                    MapValue hit = a.findValue();
+                                    Assert.assertNotNull(hit);
+                                    Assert.assertEquals(otherKey, b.findValue().getLong(0));
+                                    // Another view's flyweight does not overwrite this one.
+                                    Assert.assertEquals(key, hit.getLong(0));
+                                    b.withKey().putLong(keyCount + key);
+                                    Assert.assertNull(b.findValue());
+                                    Assert.assertEquals(key, hit.getLong(0));
+                                }
+                            } finally {
+                                a.close();
+                                b.close();
+                            }
+                            return null;
+                        }));
+                    }
+                    start.countDown();
+                    for (Future<?> future : futures) {
+                        future.get(60, TimeUnit.SECONDS);
+                    }
+                } finally {
+                    start.countDown();
+                    executor.shutdownNow();
+                    // Do not release native backing until readers have stopped even on failure.
+                    Assert.assertTrue(executor.awaitTermination(60, TimeUnit.SECONDS));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewFixedSizeKey() throws Exception {
+        assertMemoryLeak(() -> {
+            final int N = 10_000;
+            try (OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024)) {
+                fillLongKeys(map, N);
+                try (OrderedMap.ProbeView view = new OrderedMap.ProbeView().of(map)) {
+                    final long capacity = view.getSizeInBytes();
+                    Assert.assertTrue(capacity >= Long.BYTES);
+                    for (int i = 0; i < N; i++) {
+                        view.withKey().putLong(i);
+                        MapValue value = view.findValue();
+                        Assert.assertNotNull(value);
+                        Assert.assertEquals(i, value.getLong(0));
+                    }
+                    for (int i = N; i < N + 100; i++) {
+                        view.withKey().putLong(i);
+                        Assert.assertNull(view.findValue());
+                    }
+                    Assert.assertEquals("a fixed-size key never grows the staging buffer", capacity, view.getSizeInBytes());
+                }
+                // Probing staged nothing in the map's own heap, so it still appends where it left off.
+                MapKey key = map.withKey();
+                key.putLong(N);
+                MapValue value = key.createValue();
+                Assert.assertTrue(value.isNew());
+                value.putLong(0, N);
+                Assert.assertEquals(N + 1, map.size());
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewRejectsAClosedMap() throws Exception {
+        assertMemoryLeak(() -> {
+            try (
+                    OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024, false);
+                    OrderedMap.ProbeView view = new OrderedMap.ProbeView()
+            ) {
+                try {
+                    view.of(map);
+                    Assert.fail();
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "map probe view needs an open map");
+                }
+                map.reopen();
+                fillLongKeys(map, 8);
+                view.of(map).withKey().putLong(3);
+                Assert.assertEquals(3, view.findValue().getLong(0));
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewRejectsAnIncompatibleLayout() throws Exception {
+        assertMemoryLeak(() -> {
+            try (
+                    OrderedMap longKeys = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024);
+                    OrderedMap strKeys = new OrderedMap(1024, new SingleColumnType(ColumnType.STRING), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024);
+                    OrderedMap wideValues = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new ArrayColumnTypes().add(ColumnType.LONG).add(ColumnType.INT), 64, 0.5, 1024);
+                    OrderedMap.ProbeView view = new OrderedMap.ProbeView().of(longKeys)
+            ) {
+                try {
+                    view.of(strKeys);
+                    Assert.fail();
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "map probe view is bound to a different key or value layout");
+                }
+                try {
+                    view.of(wideValues);
+                    Assert.fail();
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "map probe view is bound to a different key or value layout");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewRejectsVarSizePutsOnAFixedSizeKey() throws Exception {
+        // One view class serves both key layouts, so it cannot lean on FixedSizeKey's missing
+        // put methods. A var-size column on a fixed-size layout would stage a key that matches
+        // nothing, so the view rejects it outright rather than return an empty result.
+        assertMemoryLeak(() -> {
+            try (
+                    OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024);
+                    OrderedMap.ProbeView view = new OrderedMap.ProbeView().of(map)
+            ) {
+                final ObjList<Consumer<? super OrderedMap.ProbeView>> puts = new ObjList<>();
+                puts.add(v -> v.putArray(null));
+                puts.add(v -> v.putBin(null));
+                puts.add(v -> v.putStr(null));
+                puts.add(v -> v.putStr(null, 0, 0));
+                puts.add(v -> v.putStrLowerCase(null));
+                puts.add(v -> v.putStrLowerCase(null, 0, 0));
+                puts.add(v -> v.putVarchar((Utf8Sequence) null));
+                for (int i = 0, n = puts.size(); i < n; i++) {
+                    final int index = i;
+                    UnsupportedOperationException e = Assert.assertThrows(
+                            "put " + index + " must be rejected on a fixed-size key",
+                            UnsupportedOperationException.class,
+                            () -> puts.getQuick(index).accept(view.withKey())
+                    );
+                    TestUtils.assertContains(e.getMessage(), "var-size put on a fixed-size key layout");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewRetargetsToAnotherMap() throws Exception {
+        // Stage and hash once, then probe every map with the same layout. A partitioned build
+        // needs exactly this: one key, one hash, a lookup per partition.
+        assertMemoryLeak(() -> {
+            final int N = 1000;
+            try (
+                    OrderedMap a = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024);
+                    OrderedMap b = new OrderedMap(1024, new SingleColumnType(ColumnType.LONG), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024)
+            ) {
+                fillLongKeys(a, N);
+                for (int i = 0; i < N; i++) {
+                    MapKey key = b.withKey();
+                    key.putLong(i);
+                    key.createValue().putLong(0, i + 1_000_000);
+                }
+                try (OrderedMap.ProbeView view = new OrderedMap.ProbeView().of(a)) {
+                    for (int i = 0; i < N; i++) {
+                        view.withKey().putLong(i);
+                        Assert.assertEquals(i, view.of(a).findValue().getLong(0));
+                        // Rebinding leaves the staged key and its hash code in place.
+                        Assert.assertEquals(i + 1_000_000, view.of(b).findValue().getLong(0));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewReuseAcrossReopen() throws Exception {
+        assertMemoryLeak(() -> {
+            try (
+                    OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.STRING), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024, false);
+                    OrderedMap.ProbeView view = new OrderedMap.ProbeView()
+            ) {
+                map.reopen();
+                fillVarSizeKeys(map, 100);
+                view.of(map);
+                view.withKey().putStr(varSizeKeyOfLength(99));
+                Assert.assertEquals(99, view.findValue().getLong(0));
+                final long capacity = view.getSizeInBytes();
+                Assert.assertTrue("the 99-char key must have grown the staging buffer", capacity > 64);
+
+                map.close();
+                map.reopen();
+                fillVarSizeKeys(map, 50);
+                view.of(map);
+                view.withKey().putStr(varSizeKeyOfLength(49));
+                Assert.assertEquals(49, view.findValue().getLong(0));
+                view.withKey().putStr(varSizeKeyOfLength(99));
+                Assert.assertNull("the view reads the reopened map, not the closed one", view.findValue());
+                Assert.assertEquals("the staging buffer keeps its capacity across executions", capacity, view.getSizeInBytes());
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewStagesAndSplitsKeysOverSeveralMaps() throws Exception {
+        // A partitioned hash join build stages each key once through a view bound to the key
+        // layout alone, inserts the raw key into the map that the top bits of its hash select, and
+        // probes with a view that picks the map the same way.
+        assertMemoryLeak(() -> {
+            final int n = 1_000;
+            final int mapCount = 4;
+            final long rawCapacity = 256;
+            for (boolean isVarSize : new boolean[]{false, true}) {
+                // A twelve-byte fixed-size key, and a var-size one with NULL and empty strings.
+                final ColumnTypes keyTypes = new ArrayColumnTypes().add(ColumnType.INT).add(isVarSize ? ColumnType.STRING : ColumnType.LONG);
+                final ObjList<OrderedMap> maps = new ObjList<>();
+                final long raw = Unsafe.malloc(rawCapacity, MemoryTag.NATIVE_DEFAULT);
+                try (OrderedMap.ProbeView stager = new OrderedMap.ProbeView(); OrderedMap.ProbeView view = new OrderedMap.ProbeView()) {
+                    for (int m = 0; m < mapCount; m++) {
+                        maps.add(new OrderedMap(1024, keyTypes, new SingleColumnType(ColumnType.LONG), 16, 0.5, Integer.MAX_VALUE, false));
+                    }
+                    // The layout binds a map that has not opened.
+                    stager.ofLayout(maps.getQuick(0));
+                    for (int m = 0; m < mapCount; m++) {
+                        maps.getQuick(m).reopen();
+                    }
+                    for (int i = 0; i < n; i++) {
+                        stageSplitKey(stager.withKey(), i, isVarSize);
+                        final long size = stager.copyStagedKey(raw);
+                        Assert.assertEquals(size, stager.getStagedKeySize());
+                        Assert.assertTrue(size <= rawCapacity);
+                        final OrderedMap target = maps.getQuick((int) (stager.hash() >>> 62));
+                        final MapKey key = target.withRawKey(raw, size);
+                        key.commit();
+                        // The map hashes the raw key as the view hashed the staged one.
+                        Assert.assertEquals(stager.hash(), key.hash());
+                        final MapValue value = key.createValue();
+                        Assert.assertTrue(value.isNew());
+                        value.putLong(0, i);
+                    }
+                    long keyCount = 0;
+                    for (int m = 0; m < mapCount; m++) {
+                        final OrderedMap map = maps.getQuick(m);
+                        keyCount += map.size();
+                        Assert.assertTrue("map " + m + " holds " + map.size(), map.size() > n / (2 * mapCount));
+                        view.of(map);
+                    }
+                    Assert.assertEquals(n, keyCount);
+                    for (int i = 0; i < n + 100; i++) {
+                        stageSplitKey(view.withKey(), i, isVarSize);
+                        final int selected = (int) (view.hash() >>> 62);
+                        for (int m = 0; m < mapCount; m++) {
+                            final MapValue value = view.findValueIn(maps.getQuick(m));
+                            if (m == selected && i < n) {
+                                Assert.assertNotNull("key " + i, value);
+                                Assert.assertEquals(i, value.getLong(0));
+                            } else {
+                                Assert.assertNull("key " + i + " in map " + m, value);
+                            }
+                        }
+                        // The map's own key, staged through its put methods, lands on the raw key's entry.
+                        if (i < n) {
+                            final MapKey key = maps.getQuick(selected).withKey();
+                            stageSplitKey(key, i, isVarSize);
+                            Assert.assertEquals(i, key.findValue().getLong(0));
+                        }
+                    }
+                } finally {
+                    Unsafe.free(raw, rawCapacity, MemoryTag.NATIVE_DEFAULT);
+                    Misc.freeObjList(maps);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testProbeViewVarSizeKeyOutgrowsStagingBuffer() throws Exception {
+        assertMemoryLeak(() -> {
+            final int N = 200;
+            try (OrderedMap map = new OrderedMap(1024, new SingleColumnType(ColumnType.STRING), new SingleColumnType(ColumnType.LONG), 64, 0.5, 1024)) {
+                fillVarSizeKeys(map, N);
+                MapKey nullKey = map.withKey();
+                nullKey.putStr(null);
+                MapValue nullValue = nullKey.createValue();
+                Assert.assertTrue(nullValue.isNew());
+                nullValue.putLong(0, -1);
+
+                try (OrderedMap.ProbeView view = new OrderedMap.ProbeView().of(map)) {
+                    final long initialCapacity = view.getSizeInBytes();
+                    for (int i = 0; i < N; i++) {
+                        view.withKey().putStr(varSizeKeyOfLength(i));
+                        MapValue value = view.findValue();
+                        Assert.assertNotNull("key of length " + i, value);
+                        Assert.assertEquals(i, value.getLong(0));
+                    }
+                    Assert.assertTrue("the longest key must have grown the staging buffer", view.getSizeInBytes() > initialCapacity);
+
+                    // A miss on a key longer than anything the map holds.
+                    view.withKey().putStr(varSizeKeyOfLength(N + 1));
+                    Assert.assertNull(view.findValue());
+
+                    // NULL is an ordinary var-size key and matches the NULL the map holds.
+                    view.withKey().putStr(null);
+                    Assert.assertEquals(-1, view.findValue().getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRecordAsKey() throws Exception {
+        assertMemoryLeak(() -> {
+            final int N = 5000;
+            final Rnd rnd = new Rnd();
+            TestRecord.ArrayBinarySequence binarySequence = new TestRecord.ArrayBinarySequence();
+
+            createTestTable(N, rnd, binarySequence);
+
+            BytecodeAssembler asm = new BytecodeAssembler();
+
+            try (
+                    TableReader reader = newOffPoolReader(configuration, "x");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                EntityColumnFilter entityColumnFilter = new EntityColumnFilter();
+                entityColumnFilter.of(reader.getMetadata().getColumnCount());
+
+                try (
+                        OrderedMap map = new OrderedMap(
+                                Numbers.SIZE_1MB,
+                                new SymbolAsStrTypes(reader.getMetadata()),
+                                new ArrayColumnTypes()
+                                        .add(ColumnType.LONG)
+                                        .add(ColumnType.INT)
+                                        .add(ColumnType.SHORT)
+                                        .add(ColumnType.BYTE)
+                                        .add(ColumnType.FLOAT)
+                                        .add(ColumnType.DOUBLE)
+                                        .add(ColumnType.DATE)
+                                        .add(ColumnType.TIMESTAMP)
+                                        .add(ColumnType.BOOLEAN)
+                                        .add(ColumnType.UUID),
+                                N,
+                                0.9f,
+                                1
+                        )
+                ) {
+                    BitSet writeSymbolAsString = new BitSet();
+                    for (int i = 0, n = reader.getMetadata().getColumnCount(); i < n; i++) {
+                        if (reader.getMetadata().getColumnType(i) == ColumnType.SYMBOL) {
+                            writeSymbolAsString.set(i);
+                        }
+                    }
+                    RecordSink sink = RecordSinkFactory.getInstance(configuration, asm, reader.getMetadata(), entityColumnFilter, writeSymbolAsString);
+
+                    final int keyColumnOffset = map.getValueColumnCount();
+
+                    // this random will be populating values
+                    Rnd rnd2 = new Rnd();
+
+                    populateMap(map, rnd2, cursor, sink);
+
+                    try (RecordCursor mapCursor = map.getCursor()) {
+                        assertCursor2(rnd, binarySequence, keyColumnOffset, rnd2, mapCursor);
+                        mapCursor.toTop();
+                        assertCursor2(rnd, binarySequence, keyColumnOffset, rnd2, mapCursor);
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRehashPreservesTopBitOffsetSlots() throws Exception {
+        // rehash() rebuilds the table straight from the raw slots. It has to carry a top-bit offset
+        // across, and must not overwrite one while placing a colliding entry. Reading such a slot
+        // as empty drops a live group outright.
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (OrderedMap map = new OrderedMap(1024, keyTypes, valueTypes, 16, 0.5, 24)) {
+                MapKey k = map.withKey();
+                k.putInt(0);
+                Assert.assertTrue(k.createValue().isNew());
+                final int anchorHash = hashCodeAt(map, onlyOccupiedSlot(map));
+
+                // Both planted hashes share their low bits with a live key's, so all three collide
+                // at the same index of the rebuilt table and the inner placement probe has to walk
+                // over them. Flipping only high bits keeps the hashes distinct, so no consumer ever
+                // compares keys against a planted slot.
+                final int plantedOffsetA = 0x8000_0001;
+                final int plantedOffsetB = 0xFFFF_FFFE;
+                final int plantedHashA = anchorHash ^ 0x8000_0000;
+                final int plantedHashB = anchorHash ^ 0x4000_0000;
+                int planted = 0;
+                for (int i = 0, n = map.getKeyCapacity(); i < n && planted < 2; i++) {
+                    if (!isSlotOccupied(map, i)) {
+                        map.pokeRawSlot(
+                                i,
+                                planted == 0 ? plantedOffsetA : plantedOffsetB,
+                                planted == 0 ? plantedHashA : plantedHashB
+                        );
+                        planted++;
+                    }
+                }
+                Assert.assertEquals(2, planted);
+
+                // The three poke siblings establish that their planted hash hits no live key before
+                // planting it. This test plants first and fills afterwards, so it has to establish
+                // the same precondition against the keys the fill loop is about to insert: a
+                // collision would put Vect.memeq on a 2^34 offset and abort the fork instead of
+                // failing. A scratch map over the same key range answers that without disturbing
+                // the map under test.
+                try (OrderedMap scratch = new OrderedMap(1024, keyTypes, valueTypes, 16, 0.5, 24)) {
+                    for (int i = 0; i < 1000; i++) {
+                        MapKey scratchKey = scratch.withKey();
+                        scratchKey.putInt(i);
+                        scratchKey.createValue();
+                    }
+                    assertHashUnused(scratch, plantedHashA);
+                    assertHashUnused(scratch, plantedHashB);
+                }
+
+                // Grow past the load factor so that rehash() runs.
+                final int initialCapacity = map.getKeyCapacity();
+                for (int i = 1; i < 1000 && map.getKeyCapacity() == initialCapacity; i++) {
+                    k = map.withKey();
+                    k.putInt(i);
+                    k.createValue();
+                }
+                Assert.assertTrue("rehash must have run", map.getKeyCapacity() > initialCapacity);
+
+                // Every real key plus both planted slots must have survived the rebuild.
+                Assert.assertEquals(map.size() + 2, occupiedSlotCount(map));
+
+                // Counting rather than flagging also detects a real key whose hash collided with a
+                // planted one, which would put a 2^34 offset on the hash-match branch.
+                int countA = 0;
+                int countB = 0;
+                for (int i = 0, n = map.getKeyCapacity(); i < n; i++) {
+                    final long slot = map.rawSlotAt(i);
+                    final int rawOffset = Numbers.decodeLowInt(slot);
+                    final int hash = Numbers.decodeHighInt(slot);
+                    if (hash == plantedHashA) {
+                        Assert.assertEquals(plantedOffsetA, rawOffset);
+                        countA++;
+                    } else if (hash == plantedHashB) {
+                        Assert.assertEquals(plantedOffsetB, rawOffset);
+                        countB++;
+                    }
+                }
+                Assert.assertEquals("planted slot A must survive the rehash exactly once", 1, countA);
+                Assert.assertEquals("planted slot B must survive the rehash exactly once", 1, countB);
+            }
+        });
+    }
+
+    @Test
+    public void testResizeAcceptsTargetEqualToMaxHeapSize() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A 2064-byte ceiling is an exact multiple of the 16-byte entry, and the heap doubles
+            // 32 -> ... -> 2048, so the 129th entry makes target exactly 2064. That is the boundary
+            // of the throw predicate: an entry that fits exactly must be accepted, so the map holds
+            // 129 entries rather than stopping at the 128 that fitted in the 2048-byte heap.
+            final long maxHeapSize = 2_064;
+            final int clampedEntries = 129;
+
+            try (
+                    OrderedMap map = new OrderedMap(
+                            32,
+                            new SingleColumnType(ColumnType.LONG),
+                            new SingleColumnType(ColumnType.LONG),
+                            16,
+                            0.5,
+                            Integer.MAX_VALUE,
+                            true,
+                            maxHeapSize
+                    )
+            ) {
+                for (int i = 0; i < clampedEntries; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(i);
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i);
+                }
+                Assert.assertEquals(maxHeapSize, map.getHeapSize());
+                Assert.assertEquals(clampedEntries, map.size());
+                Assert.assertEquals(16L * clampedEntries, map.getUsedHeapSize());
+
+                try {
+                    MapKey overflowing = map.withKey();
+                    overflowing.putLong(clampedEntries);
+                    overflowing.createValue();
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "limit of 2064 memory exceeded in FastMap");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testResizeClampedHeapVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Same clamp as the fixed-size case, but reached through VarSizeKey.checkCapacity(),
+            // which resizes mid-key and has to shift startAddr/appendAddr by the realloc delta.
+            // A 4-char STRING key plus a LONG value is a 24-byte entry: the heap grows
+            // 32 -> 64 -> ... -> 2048, then clamps to 3064 instead of overshooting to 4096.
+            // 3064 bytes hold 127 entries; the pre-clamp 2048 held 85.
+            final long maxHeapSize = 3_064;
+            final int clampedEntries = 127;
+
+            try (
+                    OrderedMap map = new OrderedMap(
+                            32,
+                            new SingleColumnType(ColumnType.STRING),
+                            new SingleColumnType(ColumnType.LONG),
+                            16,
+                            0.5,
+                            Integer.MAX_VALUE,
+                            true,
+                            maxHeapSize
+                    )
+            ) {
+                // Fill to one entry short of the ceiling. The clamp happens well before that.
+                for (int i = 0; i < clampedEntries - 1; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(varSizeKey(i));
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i);
+                }
+                Assert.assertEquals(maxHeapSize, map.getHeapSize());
+
+                // Every entry written into the clamped heap must still be readable.
+                for (int i = 0; i < clampedEntries - 1; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(varSizeKey(i));
+                    MapValue value = key.findValue();
+                    Assert.assertNotNull(value);
+                    Assert.assertEquals(i, value.getLong(0));
+                }
+
+                // The last entry fits exactly, the one after it does not.
+                MapKey key = map.withKey();
+                key.putStr(varSizeKey(clampedEntries - 1));
+                key.createValue().putLong(0, clampedEntries - 1);
+                Assert.assertEquals(clampedEntries, map.size());
+                Assert.assertEquals(24L * clampedEntries, map.getUsedHeapSize());
+
+                try {
+                    MapKey overflowing = map.withKey();
+                    overflowing.putStr(varSizeKey(clampedEntries));
+                    overflowing.createValue();
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "limit of 3064 memory exceeded in FastMap");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testResizeClampsHeapToMaxHeapSize() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // The heap ceiling is 16 bytes below 2^35, so it is never a power of two, while
+            // every doubling step is. Model that at KB scale: growing 32 -> 64 -> ... -> 2048,
+            // the next step (4096) overshoots the 3064-byte ceiling and must clamp to it
+            // rather than fail. 3064 bytes hold 191 16-byte entries; the pre-clamp 2048 held 128.
+            final long maxHeapSize = 3_064;
+            final int clampedEntries = 191;
+
+            try (
+                    OrderedMap map = new OrderedMap(
+                            32,
+                            new SingleColumnType(ColumnType.LONG),
+                            new SingleColumnType(ColumnType.LONG),
+                            16,
+                            0.5,
+                            Integer.MAX_VALUE,
+                            true,
+                            maxHeapSize
+                    )
+            ) {
+                // Fill to one entry short of the ceiling. The clamp happens at 2048 -> 3064,
+                // so everything past entry 128 only exists because resize() clamped.
+                for (int i = 0; i < clampedEntries - 1; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(i);
+                    MapValue value = key.createValue();
+                    Assert.assertTrue(value.isNew());
+                    value.putLong(0, i);
+                }
+                // 3064 is not a power of two, so nothing downstream may assume the heap is one.
+                // Without the clamp this would have stopped at the 2048-byte doubling step.
+                Assert.assertEquals(maxHeapSize, map.getHeapSize());
+
+                // Probing works over the clamped heap. It needs one entry of headroom at kPos,
+                // where withKey() stages the search key, so it has to run before the last insert.
+                for (int i = 0; i < clampedEntries - 1; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(i);
+                    MapValue value = key.findValue();
+                    Assert.assertNotNull(value);
+                    Assert.assertEquals(i, value.getLong(0));
+                }
+
+                // The last entry fits exactly, the one after it does not.
+                MapKey lastKey = map.withKey();
+                lastKey.putLong(clampedEntries - 1);
+                lastKey.createValue().putLong(0, clampedEntries - 1);
+                Assert.assertEquals(clampedEntries, map.size());
+                Assert.assertEquals(16L * clampedEntries, map.getUsedHeapSize());
+
+                try {
+                    MapKey overflowing = map.withKey();
+                    overflowing.putLong(clampedEntries);
+                    overflowing.createValue();
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "limit of 3064 memory exceeded in FastMap");
+                }
+
+                // Cursor iteration over the clamped heap yields every entry, in insertion order.
+                int i = 0;
+                try (RecordCursor cursor = map.getCursor()) {
+                    MapRecord record = map.getRecord();
+                    while (cursor.hasNext()) {
+                        Assert.assertEquals(i, record.getLong(1));
+                        Assert.assertEquals(i, record.getValue().getLong(0));
+                        i++;
+                    }
+                }
+                Assert.assertEquals(clampedEntries, i);
+
+                // restoreInitialCapacity() must cope with the clamped, non-power-of-two heap.
+                map.restoreInitialCapacity();
+                Assert.assertEquals(32L, map.getHeapSize());
+                Assert.assertEquals(0, map.size());
+            }
+        });
+    }
+
+    @Test
+    public void testResizeThrowsWhenEntryExceedsMaxHeapSize() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // A single entry larger than the ceiling can never fit, clamp or no clamp.
+            try (
+                    OrderedMap map = new OrderedMap(
+                            32,
+                            new SingleColumnType(ColumnType.STRING),
+                            new SingleColumnType(ColumnType.LONG),
+                            16,
+                            0.5,
+                            Integer.MAX_VALUE,
+                            true,
+                            3_064
+                    )
+            ) {
+                try {
+                    MapKey key = map.withKey();
+                    key.putStr("a".repeat(4_000));
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "limit of 3064 memory exceeded in FastMap");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testRestoreInitialCapacityBillsTheTrackerForEveryBlockItReleases() throws Exception {
+        // Every heap realloc and free bills the tracker for the block it actually touches, and the
+        // map takes that size from the [heapAddr, heapLimit) pair it manages the block through
+        // rather than from a cached size that could name a different block. Growing the heap,
+        // shrinking it back and closing it must therefore return the tracker to exactly zero.
+        //
+        // The map opens lazily and the test binds the tracker before reopen(), so the tracker sees
+        // every allocation from the first one and the closing balance is a complete account rather
+        // than a difference between two arbitrary points.
+        TestUtils.assertMemoryLeak(() -> {
+            final SingleColumnType keyTypes = new SingleColumnType(ColumnType.LONG);
+            final SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+            try (LimitedMemoryTracker tracker = new LimitedMemoryTracker(64 * 1024)) {
+                // This leg grows the heap, restores it, then closes it. The balance it takes
+                // mid-flight is the part the enclosing leak check cannot reach, since that reading
+                // falls while the map is still open.
+                try (OrderedMap map = new OrderedMap(32, keyTypes, valueTypes, 16, 0.5, 1024, false)) {
+                    map.setMemoryTracker(tracker);
+                    map.reopen();
+                    fillLongKeys(map, 100);
+                    // A 32-byte heap holds two 16-byte entries, so 100 of them force several
+                    // resizes, and the 0.5 load factor over 32 slots grows the offsets array too.
+                    Assert.assertTrue("the map must have outgrown its initial heap", map.getHeapSize() > 32L);
+                    Assert.assertTrue("the map must have outgrown its initial offsets array", map.getKeyCapacity() > 32);
+
+                    map.restoreInitialCapacity();
+                    Assert.assertEquals(32L, map.getHeapSize());
+                    // 32-byte heap plus a 32-slot offsets array, and nothing else outstanding. The
+                    // test pins the capacity separately so a sizing change names itself here
+                    // instead of surfacing as an unexplained byte count.
+                    Assert.assertEquals(32, map.getKeyCapacity());
+                    Assert.assertEquals(32 + (32L << 3), tracker.getUsed());
+                }
+                Assert.assertEquals("close() must return every tracker-charged byte", 0, tracker.getUsed());
+
+                // This leg closes straight off a grown heap, with no restore in between, so close()
+                // has to size the free off a heap it never shrank.
+                try (OrderedMap map = new OrderedMap(32, keyTypes, valueTypes, 16, 0.5, 1024, false)) {
+                    map.setMemoryTracker(tracker);
+                    map.reopen();
+                    fillLongKeys(map, 100);
+                    Assert.assertTrue("the map must have outgrown its initial heap", map.getHeapSize() > 32L);
+                }
+                Assert.assertEquals("close() must return every tracker-charged byte", 0, tracker.getUsed());
+            }
+        });
+    }
+
+    @Test
+    public void testRestoreInitialCapacityHeapFailureLeavesMapClosed() throws Exception {
+        // restoreInitialCapacity() reallocs the key heap and then the offsets array, and rolls the
+        // whole thing back through close() if either throws. A lazily opened map reaches that path
+        // from reopen(): both reallocs grow from address and size zero, so a per-query limit can
+        // reject them.
+        //
+        // A failing realloc cannot leave the map describing a block it no longer owns: the map
+        // derives the heap size from the pointer pair, so no second copy of it exists to commit
+        // early. That leaves the rollback itself to cover, which is reachable and was untested.
+        // This half pins the tag the breach reports and the map staying reusable once the test
+        // lifts the limit; close() has nothing to do here, since the failing realloc left heapAddr
+        // at 0.
+        assertRestoreInitialCapacityRollback(16, "memoryTag=" + MemoryTag.NATIVE_FAST_MAP);
+    }
+
+    @Test
+    public void testRestoreInitialCapacityOffsetsFailureLeavesMapClosed() throws Exception {
+        // A limit of exactly initialHeapSize lets the heap realloc through - the check is
+        // used + size > limit, so 0 + 32 > 32 is false - and stops the offsets realloc that follows
+        // it. That is the half-restored state the catch has to unwind, and the only one of the two
+        // that pins close() staying in the catch: drop it and the map is left open on a heap with a
+        // stale key capacity.
+        assertRestoreInitialCapacityRollback(32, "memoryTag=" + MemoryTag.NATIVE_FAST_MAP_INT_LIST);
+    }
+
+    @Test
+    public void testRowIdAccess() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int N = 10000;
+            final Rnd rnd = new Rnd();
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, new SingleColumnType(ColumnType.STRING), new SingleColumnType(ColumnType.INT), 64, 0.5, 1)) {
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(rnd.nextString(10));
+                    MapValue values = key.createValue();
+                    Assert.assertTrue(values.isNew());
+                    values.putInt(0, i + 1);
+                }
+
+                rnd.reset();
+                LongList rowIds = new LongList();
+                try (RecordCursor cursor = map.getCursor()) {
+                    // iterate map to double the value
+                    final MapRecord recordA = (MapRecord) cursor.getRecord();
+                    while (cursor.hasNext()) {
+                        rowIds.add(recordA.getRowId());
+                        TestUtils.assertEquals(rnd.nextString(10), recordA.getStrA(1));
+                        MapValue value = recordA.getValue();
+                        value.putInt(0, value.getInt(0) * 2);
+                    }
+
+                    final MapRecord recordB = (MapRecord) cursor.getRecordB();
+                    Assert.assertNotSame(recordB, recordA);
+
+                    rnd.reset();
+                    for (int i = 0, n = rowIds.size(); i < n; i++) {
+                        cursor.recordAt(recordB, rowIds.getQuick(i));
+                        Assert.assertEquals((i + 1) * 2, recordB.getInt(0));
+                        TestUtils.assertEquals(rnd.nextString(10), recordB.getStrA(1));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTopKFixedSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int heapCapacity = 10;
+            SingleColumnType keyTypes = new SingleColumnType(ColumnType.LONG);
+            SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+
+            try (
+                    OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, valueTypes, 64, 0.8, Integer.MAX_VALUE);
+                    DirectLongLongSortedList list = new DirectLongLongAscList(heapCapacity, MemoryTag.NATIVE_DEFAULT)
+            ) {
+                for (int i = 0; i < 100; i++) {
+                    MapKey key = map.withKey();
+                    key.putLong(i);
+
+                    MapValue value = key.createValue();
+                    value.putLong(0, i);
+                }
+
+                MapRecordCursor mapCursor = map.getCursor();
+                mapCursor.longTopK(list, LongColumn.newInstance(0));
+
+                Assert.assertEquals(heapCapacity, list.size());
+
+                MapRecord mapRecord = mapCursor.getRecord();
+                DirectLongLongSortedList.Cursor heapCursor = list.getCursor();
+                for (int i = 0; i < heapCapacity; i++) {
+                    Assert.assertTrue(heapCursor.hasNext());
+                    mapCursor.recordAt(mapRecord, heapCursor.index());
+                    Assert.assertEquals(heapCursor.value(), mapRecord.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testTopKVarSizeKey() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final int heapCapacity = 10;
+            SingleColumnType keyTypes = new SingleColumnType(ColumnType.STRING);
+            SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+
+            try (
+                    OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, valueTypes, 64, 0.8, Integer.MAX_VALUE);
+                    DirectLongLongSortedList list = new DirectLongLongAscList(heapCapacity, MemoryTag.NATIVE_DEFAULT)
+            ) {
+                for (int i = 0; i < 100; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(String.valueOf(i));
+
+                    MapValue value = key.createValue();
+                    value.putLong(0, i);
+                }
+
+                MapRecordCursor mapCursor = map.getCursor();
+                mapCursor.longTopK(list, LongColumn.newInstance(0));
+
+                Assert.assertEquals(heapCapacity, list.size());
+
+                MapRecord mapRecord = mapCursor.getRecord();
+                DirectLongLongSortedList.Cursor heapCursor = list.getCursor();
+                for (int i = 0; i < heapCapacity; i++) {
+                    Assert.assertTrue(heapCursor.hasNext());
+                    mapCursor.recordAt(mapRecord, heapCursor.index());
+                    Assert.assertEquals(heapCursor.value(), mapRecord.getLong(0));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testUsefulErrorMessageWhenPageSizeExceeded() throws Exception {
+        assertMemoryLeak(() -> {
+            final int columnCount = 1600;
+            TableModel model = new TableModel(configuration, "testUsefulErrorMessageWhenPageSizeExceeded", PartitionBy.DAY);
+            for (int i = 0; i < columnCount; i++) {
+                model.col("f" + i, ColumnType.FLOAT);
+            }
+            model.timestamp("t");
+            model.wal();
+            AbstractCairoTest.create(model);
+
+            sink.put("SELECT t, ");
+            for (int i = 0; i < columnCount; i++) {
+                sink.put("max(f").put(i).put("),");
+                sink.put("min(f").put(i).put("),");
+                sink.put("avg(f").put(i).put(")");
+                if (i + 1 < columnCount) {
+                    sink.put(',');
+                }
+            }
+            sink.put(" FROM testUsefulErrorMessageWhenPageSizeExceeded SAMPLE BY 1h");
+
+            try {
+                assertException(sink, 0, "page size is too small to fit a single key, consider increasing `cairo.sql.small.map.page.size` [expected=38408, actual=32768]");
+            } finally {
+                sink.clear();
+            }
+        });
+    }
+
+    @Test
+    public void testValueAccess() throws Exception {
+        assertMemoryLeak(() -> {
+            final int N = 1000;
+            final Rnd rnd = new Rnd();
+            TestRecord.ArrayBinarySequence binarySequence = new TestRecord.ArrayBinarySequence();
+
+            createTestTable(N, rnd, binarySequence);
+
+            BytecodeAssembler asm = new BytecodeAssembler();
+
+            try (
+                    TableReader reader = newOffPoolReader(configuration, "x");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                EntityColumnFilter entityColumnFilter = new EntityColumnFilter();
+                entityColumnFilter.of(reader.getMetadata().getColumnCount());
+
+                try (
+                        OrderedMap map = new OrderedMap(
+                                Numbers.SIZE_1MB,
+                                new SymbolAsStrTypes(reader.getMetadata()),
+                                new ArrayColumnTypes()
+                                        .add(ColumnType.LONG)
+                                        .add(ColumnType.INT)
+                                        .add(ColumnType.SHORT)
+                                        .add(ColumnType.BYTE)
+                                        .add(ColumnType.FLOAT)
+                                        .add(ColumnType.DOUBLE)
+                                        .add(ColumnType.DATE)
+                                        .add(ColumnType.TIMESTAMP)
+                                        .add(ColumnType.BOOLEAN)
+                                        .add(ColumnType.getGeoHashTypeWithBits(5))
+                                        .add(ColumnType.getGeoHashTypeWithBits(10))
+                                        .add(ColumnType.getGeoHashTypeWithBits(20))
+                                        .add(ColumnType.getGeoHashTypeWithBits(40)),
+                                N,
+                                0.9f,
+                                1
+                        )
+                ) {
+                    BitSet writeSymbolAsString = new BitSet();
+                    for (int i = 0, n = reader.getMetadata().getColumnCount(); i < n; i++) {
+                        if (reader.getMetadata().getColumnType(i) == ColumnType.SYMBOL) {
+                            writeSymbolAsString.set(i);
+                        }
+                    }
+                    RecordSink sink = RecordSinkFactory.getInstance(configuration, asm, reader.getMetadata(), entityColumnFilter, writeSymbolAsString);
+
+                    // this random will be populating values
+                    Rnd rnd2 = new Rnd();
+
+                    Record record = cursor.getRecord();
+                    populateMapGeo(map, rnd2, cursor, sink);
+
+                    cursor.toTop();
+                    rnd2.reset();
+                    long c = 0;
+                    while (cursor.hasNext()) {
+                        MapKey key = map.withKey();
+                        key.put(record, sink);
+                        MapValue value = key.findValue();
+                        Assert.assertNotNull(value);
+                        Assert.assertEquals(++c, value.getLong(0));
+                        Assert.assertEquals(rnd2.nextInt(), value.getInt(1));
+                        Assert.assertEquals(rnd2.nextShort(), value.getShort(2));
+                        Assert.assertEquals(rnd2.nextByte(), value.getByte(3));
+                        Assert.assertEquals(rnd2.nextFloat(), value.getFloat(4), 0.000001f);
+                        Assert.assertEquals(rnd2.nextDouble(), value.getDouble(5), 0.000000001);
+                        Assert.assertEquals(rnd2.nextLong(), value.getDate(6));
+                        Assert.assertEquals(rnd2.nextLong(), value.getTimestamp(7));
+                        Assert.assertEquals(rnd2.nextBoolean(), value.getBool(8));
+                        Assert.assertEquals((byte) Math.abs(rnd2.nextByte()), value.getGeoByte(9));
+                        Assert.assertEquals((short) Math.abs(rnd2.nextShort()), value.getGeoShort(10));
+                        Assert.assertEquals(Math.abs(rnd2.nextInt()), value.getGeoInt(11));
+                        Assert.assertEquals(Math.abs(rnd2.nextLong()), value.getGeoLong(12));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testValueRandomWrite() throws Exception {
+        assertMemoryLeak(() -> {
+            final int N = 10000;
+            final Rnd rnd = new Rnd();
+            TestRecord.ArrayBinarySequence binarySequence = new TestRecord.ArrayBinarySequence();
+
+            createTestTable(N, rnd, binarySequence);
+
+            BytecodeAssembler asm = new BytecodeAssembler();
+
+            try (
+                    TableReader reader = newOffPoolReader(configuration, "x");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                ListColumnFilter listColumnFilter = new ListColumnFilter();
+                for (int i = 0, n = reader.getMetadata().getColumnCount(); i < n; i++) {
+                    listColumnFilter.add(i + 1);
+                }
+
+                try (
+                        OrderedMap map = new OrderedMap(
+                                Numbers.SIZE_1MB,
+                                new SymbolAsIntTypes().of(reader.getMetadata()),
+                                new ArrayColumnTypes()
+                                        .add(ColumnType.LONG)
+                                        .add(ColumnType.INT)
+                                        .add(ColumnType.SHORT)
+                                        .add(ColumnType.BYTE)
+                                        .add(ColumnType.FLOAT)
+                                        .add(ColumnType.DOUBLE)
+                                        .add(ColumnType.DATE)
+                                        .add(ColumnType.TIMESTAMP)
+                                        .add(ColumnType.BOOLEAN),
+                                N, 0.9f, 1
+                        )
+                ) {
+                    RecordSink sink = RecordSinkFactory.getInstance(configuration, asm, reader.getMetadata(), listColumnFilter);
+
+                    // this random will be populating values
+                    Rnd rnd2 = new Rnd();
+
+                    final Record record = cursor.getRecord();
+                    long counter = 0;
+                    while (cursor.hasNext()) {
+                        MapKey key = map.withKey();
+                        key.put(record, sink);
+                        MapValue value = key.createValue();
+                        Assert.assertTrue(value.isNew());
+                        value.putFloat(4, rnd2.nextFloat());
+                        value.putDouble(5, rnd2.nextDouble());
+                        value.putDate(6, rnd2.nextLong());
+                        value.putTimestamp(7, rnd2.nextLong());
+                        value.putBool(8, rnd2.nextBoolean());
+
+                        value.putLong(0, ++counter);
+                        value.putInt(1, rnd2.nextInt());
+                        value.putShort(2, rnd2.nextShort());
+                        value.putByte(3, rnd2.nextByte());
+                    }
+
+                    cursor.toTop();
+                    rnd2.reset();
+                    long c = 0;
+                    while (cursor.hasNext()) {
+                        MapKey key = map.withKey();
+                        key.put(record, sink);
+                        MapValue value = key.findValue();
+                        Assert.assertNotNull(value);
+
+                        Assert.assertEquals(rnd2.nextFloat(), value.getFloat(4), 0.000001f);
+                        Assert.assertEquals(rnd2.nextDouble(), value.getDouble(5), 0.000000001);
+                        Assert.assertEquals(rnd2.nextLong(), value.getDate(6));
+                        Assert.assertEquals(rnd2.nextLong(), value.getTimestamp(7));
+                        Assert.assertEquals(rnd2.nextBoolean(), value.getBool(8));
+
+                        Assert.assertEquals(++c, value.getLong(0));
+                        Assert.assertEquals(rnd2.nextInt(), value.getInt(1));
+                        Assert.assertEquals(rnd2.nextShort(), value.getShort(2));
+                        Assert.assertEquals(rnd2.nextByte(), value.getByte(3));
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testVarSizeKeyOnly() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ColumnTypes types = new SingleColumnType(ColumnType.STRING);
+
+            final int N = 10000;
+            try (OrderedMap map = new OrderedMap(Numbers.SIZE_1MB, types, null, 64, 0.5, Integer.MAX_VALUE)) {
+                for (int i = 0; i < N; i++) {
+                    MapKey key = map.withKey();
+                    key.putStr(Chars.repeat("a", i % 32));
+                    key.createValue();
+                }
+
+                try (RecordCursor cursor = map.getCursor()) {
+                    final MapRecord record = (MapRecord) cursor.getRecord();
+                    int i = 0;
+                    while (cursor.hasNext()) {
+                        TestUtils.assertEquals(Chars.repeat("a", i % 32), record.getStrA(0));
+                        i++;
+                    }
+                }
+            }
+        });
+    }
+
+    private static void assertHashUnused(OrderedMap map, int hashCodeLo) {
+        for (int i = 0, n = map.getKeyCapacity(); i < n; i++) {
+            long slot = map.rawSlotAt(i);
+            if (Numbers.decodeLowInt(slot) != 0) {
+                Assert.assertNotEquals(
+                        "planted hash must not collide with a live key",
+                        hashCodeLo,
+                        Numbers.decodeHighInt(slot)
+                );
+            }
+        }
+    }
+
+    /**
+     * Plants an occupied slot with the top bit set in the destination table, right where the source
+     * key probes to, then merges. The merge probe has to walk over the planted slot; reading it as
+     * empty overwrites it with the merged entry.
+     */
+    private static void assertMergeSkipsPlantedSlot(boolean isVarSizeKey) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            ArrayColumnTypes keyTypes = new ArrayColumnTypes();
+            keyTypes.add(ColumnType.INT);
+            if (isVarSizeKey) {
+                keyTypes.add(ColumnType.STRING);
+            }
+
+            ArrayColumnTypes valueTypes = new ArrayColumnTypes();
+            valueTypes.add(ColumnType.LONG);
+
+            try (
+                    OrderedMap dest = new OrderedMap(1024, keyTypes, valueTypes, 16, 0.5, 24);
+                    OrderedMap src = new OrderedMap(1024, keyTypes, valueTypes, 16, 0.5, 24)
+            ) {
+                // Learn which destination slot the key probes to, then empty the table again.
+                MapKey k = dest.withKey();
+                k.putInt(7);
+                if (isVarSizeKey) {
+                    k.putStr("abc");
+                }
+                k.createValue().putLong(0, 1);
+                final int home = onlyOccupiedSlot(dest);
+                final int keyHash = hashCodeAt(dest, home);
+                dest.clear();
+
+                // Flipping only the top hash bit keeps the planted hash distinct from the key's, so
+                // the merge stays on the hash-mismatch branch and never dereferences the offset.
+                final int plantedOffset = 0x8000_0001;
+                final int plantedHash = keyHash ^ 0x8000_0000;
+                dest.pokeRawSlot(home, plantedOffset, plantedHash);
+
+                k = src.withKey();
+                k.putInt(7);
+                if (isVarSizeKey) {
+                    k.putStr("abc");
+                }
+                k.createValue().putLong(0, 2);
+
+                dest.merge(src, new TestMapValueMergeFunction());
+
+                Assert.assertEquals("planted slot must survive the merge", plantedOffset, rawOffsetAt(dest, home));
+                Assert.assertEquals(plantedHash, hashCodeAt(dest, home));
+
+                final int next = (home + 1) & (dest.getKeyCapacity() - 1);
+                Assert.assertTrue("merged key must land in the slot after the planted one", isSlotOccupied(dest, next));
+                Assert.assertEquals(keyHash, hashCodeAt(dest, next));
+                Assert.assertEquals(1, dest.size());
+
+                // The source entry was inserted, not merged into the planted slot, so the value is
+                // the source's own rather than a sum.
+                try (RecordCursor destCursor = dest.getCursor()) {
+                    Assert.assertTrue(destCursor.hasNext());
+                    Assert.assertEquals(2, dest.getRecord().getValue().getLong(0));
+                    Assert.assertFalse(destCursor.hasNext());
+                }
+            }
+        });
+    }
+
+    /**
+     * Drives {@code restoreInitialCapacity()} on a lazily opened map under a per-query limit tight
+     * enough to fail one of its two reallocs, and asserts the rollback: the breach surfaces as an
+     * out-of-memory {@code CairoException} naming the expected memory tag, the map is left fully
+     * closed with nothing charged to the tracker, and it is reusable once the limit is lifted.
+     * <p>
+     * The tracker rather than the RSS ceiling, because {@code used + size > limit} selects the
+     * failing allocation byte-exactly, while the process-wide ceiling moves under other threads.
+     */
+    private static void assertRestoreInitialCapacityRollback(long limitBytes, String expectedTag) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final SingleColumnType keyTypes = new SingleColumnType(ColumnType.LONG);
+            final SingleColumnType valueTypes = new SingleColumnType(ColumnType.LONG);
+            // openOnInit = false: the constructor allocates nothing, so initialHeapSize is 32 and
+            // initialKeyCapacity is 32 - a 256-byte offsets array - and reopen() has to grow both
+            // from zero. An eagerly opened map cannot reach a failing realloc here at all: the
+            // restore would be a shrink, and a non-positive delta bypasses the limit check.
+            try (
+                    LimitedMemoryTracker tracker = new LimitedMemoryTracker(limitBytes);
+                    OrderedMap map = new OrderedMap(32, keyTypes, valueTypes, 16, 0.5, 1024, false)
+            ) {
+                map.setMemoryTracker(tracker);
+                try {
+                    map.reopen();
+                    Assert.fail("expected CairoException");
+                } catch (CairoException e) {
+                    Assert.assertTrue("expected isOutOfMemory(), got: " + e.getFlyweightMessage(), e.isOutOfMemory());
+                    TestUtils.assertContains(e.getFlyweightMessage(), "query memory limit exceeded");
+                    // Pins which of the two reallocs failed. Without it the test passes vacuously
+                    // when a sizing change moves the breach to the other allocation.
+                    TestUtils.assertContains(e.getFlyweightMessage(), expectedTag);
+                }
+
+                Assert.assertFalse("the failed restore must leave the map closed", map.isOpen());
+                Assert.assertEquals(0, map.getHeapSize());
+                Assert.assertEquals("the rollback must return every tracker-charged byte", 0, tracker.getUsed());
+
+                // Recovery: with room to spare the same map reopens and round trips a key.
+                tracker.setLimit(64 * 1024);
+                map.reopen();
+                Assert.assertTrue(map.isOpen());
+                MapKey key = map.withKey();
+                key.putLong(42);
+                key.createValue().putLong(0, 7);
+                Assert.assertEquals(1, map.size());
+                key = map.withKey();
+                key.putLong(42);
+                MapValue value = key.findValue();
+                Assert.assertNotNull(value);
+                Assert.assertEquals(7, value.getLong(0));
+            }
+        });
+    }
+
+    private static void fillLongKeys(OrderedMap map, int count) {
+        for (int i = 0; i < count; i++) {
+            MapKey key = map.withKey();
+            key.putLong(i);
+            MapValue value = key.createValue();
+            Assert.assertTrue(value.isNew());
+            value.putLong(0, i);
+        }
+    }
+
+    private static void fillVarSizeKeys(OrderedMap map, int count) {
+        for (int i = 0; i < count; i++) {
+            MapKey key = map.withKey();
+            key.putStr(varSizeKeyOfLength(i));
+            MapValue value = key.createValue();
+            Assert.assertTrue(value.isNew());
+            value.putLong(0, i);
+        }
+    }
+
+    private static int firstEmptySlot(OrderedMap map) {
+        for (int i = 0, n = map.getKeyCapacity(); i < n; i++) {
+            if (!isSlotOccupied(map, i)) {
+                return i;
+            }
+        }
+        Assert.fail("expected a free slot to plant into");
+        return -1;
+    }
+
+    /**
+     * The hash half of a raw slot. Keeps knowledge of the slot's
+     * {@code [rawOffset | hashCodeLo]} packing in this file to the three accessors below.
+     */
+    private static int hashCodeAt(OrderedMap map, int slot) {
+        return Numbers.decodeHighInt(map.rawSlotAt(slot));
+    }
+
+    /**
+     * A slot is empty when its biased offset half reads 0, which is exactly the predicate the
+     * map's eight scans route through {@code CompressedOffsets.isEmptyBiased8}.
+     */
+    private static boolean isSlotOccupied(OrderedMap map, int slot) {
+        return Numbers.decodeLowInt(map.rawSlotAt(slot)) != 0;
+    }
+
+    private static int occupiedSlotCount(OrderedMap map) {
+        int count = 0;
+        for (int i = 0, n = map.getKeyCapacity(); i < n; i++) {
+            if (isSlotOccupied(map, i)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static int onlyOccupiedSlot(OrderedMap map) {
+        int found = -1;
+        for (int i = 0, n = map.getKeyCapacity(); i < n; i++) {
+            if (isSlotOccupied(map, i)) {
+                Assert.assertEquals("expected exactly one occupied slot", -1, found);
+                found = i;
+            }
+        }
+        Assert.assertNotEquals("expected exactly one occupied slot", -1, found);
+        return found;
+    }
+
+    /**
+     * The biased-offset half of a raw slot, as {@code pokeRawSlot} takes it.
+     */
+    private static int rawOffsetAt(OrderedMap map, int slot) {
+        return Numbers.decodeLowInt(map.rawSlotAt(slot));
+    }
+
+    /**
+     * Builds a 4-char key that is distinct by construction, so an entry count can be asserted
+     * without depending on a random generator not colliding. The width is what matters: a 4-char
+     * STRING key plus a LONG value is exactly a 24-byte entry.
+     */
+    private static String varSizeKey(int i) {
+        return "k"
+                + (char) ('a' + i / 676 % 26)
+                + (char) ('a' + i / 26 % 26)
+                + (char) ('a' + i % 26);
+    }
+
+    /**
+     * A distinct STRING key of exactly {@code len} characters, so that a test can drive the probe
+     * view's staging buffer past its initial capacity. Every length yields a different key, since
+     * each one is a prefix of the next.
+     */
+    // Unique per i: the INT column tells apart the NULL and empty strings of the var-size key.
+    private static void stageSplitKey(RecordSinkSPI key, int i, boolean isVarSize) {
+        key.putInt(i);
+        if (isVarSize) {
+            key.putStr(i % 97 == 0 ? null : i % 89 == 0 ? "" : "key" + i);
+        } else {
+            key.putLong(i * 31L);
+        }
+    }
+
+    private static String varSizeKeyOfLength(int len) {
+        StringBuilder sink = new StringBuilder(len);
+        for (int i = 0; i < len; i++) {
+            sink.append((char) ('a' + i % 26));
+        }
+        return sink.toString();
+    }
+
+    private void assertCursor2(Rnd rnd, TestRecord.ArrayBinarySequence binarySequence, int keyColumnOffset, Rnd rnd2, RecordCursor mapCursor) {
+        long c = 0;
+        rnd.reset();
+        rnd2.reset();
+        final Record record = mapCursor.getRecord();
+        while (mapCursor.hasNext()) {
+            // value
+            Assert.assertEquals(++c, record.getLong(0));
+            Assert.assertEquals(rnd2.nextInt(), record.getInt(1));
+            Assert.assertEquals(rnd2.nextShort(), record.getShort(2));
+            Assert.assertEquals(rnd2.nextByte(), record.getByte(3));
+            Assert.assertEquals(rnd2.nextFloat(), record.getFloat(4), 0.000001f);
+            Assert.assertEquals(rnd2.nextDouble(), record.getDouble(5), 0.000000001);
+            Assert.assertEquals(rnd2.nextLong(), record.getDate(6));
+            Assert.assertEquals(rnd2.nextLong(), record.getTimestamp(7));
+            Assert.assertEquals(rnd2.nextBoolean(), record.getBool(8));
+            Assert.assertEquals(rnd2.nextLong(), record.getLong128Lo(9));
+            Assert.assertEquals(rnd2.nextLong(), record.getLong128Hi(9));
+            // key fields
+            Assert.assertEquals(rnd.nextByte(), record.getByte(keyColumnOffset));
+            Assert.assertEquals(rnd.nextShort(), record.getShort(keyColumnOffset + 1));
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertEquals(Numbers.INT_NULL, record.getInt(keyColumnOffset + 2));
+            } else {
+                Assert.assertEquals(rnd.nextInt(), record.getInt(keyColumnOffset + 2));
+            }
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertEquals(Numbers.LONG_NULL, record.getLong(keyColumnOffset + 3));
+            } else {
+                Assert.assertEquals(rnd.nextLong(), record.getLong(keyColumnOffset + 3));
+            }
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertEquals(Numbers.LONG_NULL, record.getDate(keyColumnOffset + 4));
+            } else {
+                Assert.assertEquals(rnd.nextLong(), record.getDate(keyColumnOffset + 4));
+            }
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertEquals(Numbers.LONG_NULL, record.getTimestamp(keyColumnOffset + 5));
+            } else {
+                Assert.assertEquals(rnd.nextLong(), record.getTimestamp(keyColumnOffset + 5));
+            }
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertTrue(Float.isNaN(record.getFloat(keyColumnOffset + 6)));
+            } else {
+                Assert.assertEquals(rnd.nextFloat(), record.getFloat(keyColumnOffset + 6), 0.00000001f);
+            }
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertTrue(Double.isNaN(record.getDouble(keyColumnOffset + 7)));
+            } else {
+                Assert.assertEquals(rnd.nextDouble(), record.getDouble(keyColumnOffset + 7), 0.0000000001d);
+            }
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertNull(record.getStrA(keyColumnOffset + 8));
+                Assert.assertNull(record.getStrB(keyColumnOffset + 8));
+                Assert.assertEquals(-1, record.getStrLen(keyColumnOffset + 8));
+                AbstractCairoTest.sink.clear();
+            } else {
+                CharSequence tmp = rnd.nextChars(5);
+                TestUtils.assertEquals(tmp, record.getStrA(keyColumnOffset + 8));
+                TestUtils.assertEquals(tmp, record.getStrB(keyColumnOffset + 8));
+                Assert.assertEquals(tmp.length(), record.getStrLen(keyColumnOffset + 8));
+                AbstractCairoTest.sink.clear();
+            }
+
+            // we are storing symbol as string, assert as such
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertNull(record.getStrA(keyColumnOffset + 9));
+            } else {
+                TestUtils.assertEquals(rnd.nextChars(3), record.getStrA(keyColumnOffset + 9));
+            }
+
+            Assert.assertEquals(rnd.nextBoolean(), record.getBool(keyColumnOffset + 10));
+
+            if (rnd.nextInt() % 4 == 0) {
+                TestUtils.assertEquals(null, record.getBin(keyColumnOffset + 11), record.getBinLen(keyColumnOffset + 11));
+            } else {
+                binarySequence.of(rnd.nextBytes(25));
+                TestUtils.assertEquals(binarySequence, record.getBin(keyColumnOffset + 11), record.getBinLen(keyColumnOffset + 11));
+            }
+
+            if (rnd.nextInt() % 4 == 0) {
+                Assert.assertEquals(Numbers.LONG_NULL, record.getLong128Hi(keyColumnOffset + 12));
+                Assert.assertEquals(Numbers.LONG_NULL, record.getLong128Lo(keyColumnOffset + 12));
+            } else {
+                Assert.assertEquals(rnd.nextLong(), record.getLong128Lo(keyColumnOffset + 12));
+                Assert.assertEquals(rnd.nextLong(), record.getLong128Hi(keyColumnOffset + 12));
+            }
+        }
+        Assert.assertEquals(5000, c);
+    }
+
+    private void assertCursorAllTypesReverseOrder(RecordCursor cursor) {
+        final Record record = cursor.getRecord();
+        Assert.assertTrue(cursor.hasNext());
+
+        final Long256Impl long256 = new Long256Impl();
+
+        final int keys = 21;
+        final int values = 17;
+        int col = keys + values;
+        // key
+        var decimal256 = new Decimal256();
+        record.getDecimal256(col--, decimal256);
+        Assert.assertEquals(21, decimal256.getHh());
+        Assert.assertEquals(21, decimal256.getHl());
+        Assert.assertEquals(21, decimal256.getLh());
+        Assert.assertEquals(21, decimal256.getLl());
+        var decimal128 = new Decimal128();
+        record.getDecimal128(col--, decimal128);
+        Assert.assertEquals(20, decimal128.getHigh());
+        Assert.assertEquals(20, decimal128.getLow());
+        Assert.assertEquals(19, record.getDecimal64(col--));
+        Assert.assertEquals(18, record.getDecimal32(col--));
+        Assert.assertEquals(17, record.getDecimal16(col--));
+        Assert.assertEquals(16, record.getDecimal8(col--));
+        long256.setAll(15, 15, 15, 15);
+        Assert.assertEquals(long256, record.getLong256A(col--));
+        Assert.assertEquals(14, record.getShort(col--));
+        Assert.assertEquals(13, record.getTimestamp(col--));
+        Assert.assertEquals(12, record.getDate(col--));
+        Assert.assertTrue(record.getBool(col--));
+        BinarySequence binarySequence = record.getBin(col--);
+        Assert.assertEquals(1, binarySequence.length());
+        Assert.assertEquals(10, binarySequence.byteAt(0));
+        TestUtils.assertEquals("9", record.getStrA(col--));
+        TestUtils.assertEquals("8", record.getStrA(col--));
+        Assert.assertEquals(7, record.getDouble(col--), 0.000000001d);
+        Assert.assertEquals(6, record.getFloat(col--), 0.000000001f);
+        Assert.assertEquals(5, record.getLong(col--));
+        Assert.assertEquals(4, record.getInt(col--));
+        Assert.assertEquals('3', record.getChar(col--));
+        Assert.assertEquals(2, record.getShort(col--));
+        Assert.assertEquals(1, record.getByte(col--));
+
+        // value
+        record.getDecimal256(col--, decimal256);
+        Assert.assertEquals(18, decimal256.getHh());
+        Assert.assertEquals(18, decimal256.getHl());
+        Assert.assertEquals(18, decimal256.getLh());
+        Assert.assertEquals(18, decimal256.getLl());
+        record.getDecimal128(col--, decimal128);
+        Assert.assertEquals(17, decimal128.getHigh());
+        Assert.assertEquals(17, decimal128.getLow());
+        Assert.assertEquals(16, record.getDecimal64(col--));
+        Assert.assertEquals(15, record.getDecimal32(col--));
+        Assert.assertEquals(14, record.getDecimal16(col--));
+        Assert.assertEquals(13, record.getDecimal8(col--));
+        long256.setAll(12, 12, 12, 12);
+        Assert.assertEquals(long256, record.getLong256A(col--));
+        Assert.assertEquals(11, record.getInt(col--));
+        Assert.assertEquals(10, record.getTimestamp(col--));
+        Assert.assertEquals(9, record.getDate(col--));
+        Assert.assertTrue(record.getBool(col--));
+        Assert.assertEquals(7, record.getDouble(col--), 0.000000001d);
+        Assert.assertEquals(6, record.getFloat(col--), 0.000000001f);
+        Assert.assertEquals(5, record.getLong(col--));
+        Assert.assertEquals(4, record.getInt(col--));
+        Assert.assertEquals('3', record.getChar(col--));
+        Assert.assertEquals(2, record.getShort(col--));
+        Assert.assertEquals(1, record.getByte(col));
+
+        Assert.assertFalse(cursor.hasNext());
+    }
+
+    private void assertCursorAllTypesVarSizeKey(Rnd rnd, RecordCursor cursor, DirectArray array) {
+        final Utf8StringSink utf8Sink = new Utf8StringSink();
+        final Record record = cursor.getRecord();
+        while (cursor.hasNext()) {
+            // key part, comes after value part in records
+            int col = 13;
+            Assert.assertEquals(rnd.nextByte(), record.getByte(col++));
+            Assert.assertEquals(rnd.nextShort(), record.getShort(col++));
+            Assert.assertEquals(rnd.nextChar(), record.getChar(col++));
+            Assert.assertEquals(rnd.nextInt(), record.getInt(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getLong(col++));
+            Assert.assertEquals(rnd.nextFloat(), record.getFloat(col++), 0.000000001f);
+            Assert.assertEquals(rnd.nextDouble(), record.getDouble(col++), 0.000000001d);
+
+            if ((rnd.nextPositiveInt() % 4) == 0) {
+                Assert.assertNull(record.getStrA(col));
+                Assert.assertEquals(-1, record.getStrLen(col++));
+                Assert.assertNull(record.getVarcharA(col));
+                Assert.assertEquals(-1, record.getVarcharSize(col++));
+            } else {
+                CharSequence expected = rnd.nextChars(rnd.nextPositiveInt() % 32);
+                TestUtils.assertEquals(expected, record.getStrA(col++));
+                utf8Sink.clear();
+                rnd.nextUtf8Str(rnd.nextPositiveInt() % 32, utf8Sink);
+                Utf8Sequence varchar = record.getVarcharA(col);
+                Assert.assertNotNull(varchar);
+                TestUtils.assertEquals(utf8Sink, varchar);
+                Assert.assertEquals(varchar.size(), record.getVarcharSize(col++));
+            }
+
+            Assert.assertEquals(rnd.nextBoolean(), record.getBool(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getDate(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getTimestamp(col++));
+            Assert.assertEquals(rnd.nextShort(), record.getShort(col++));
+            Long256Impl long256 = new Long256Impl();
+            long256.fromRnd(rnd);
+            Assert.assertEquals(long256, record.getLong256A(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getLong128Lo(col));
+            Assert.assertEquals(rnd.nextLong(), record.getLong128Hi(col++));
+            Interval interval = record.getInterval(col++);
+            Assert.assertEquals(rnd.nextPositiveInt(), interval.getLo());
+            Assert.assertEquals(rnd.nextPositiveInt(), interval.getHi());
+
+            array.clear();
+            rnd.nextDoubleArray(1, array, 0, 8, -1);
+            Assert.assertTrue(array.arrayEquals(record.getArray(col, ColumnType.encodeArrayType(ColumnType.DOUBLE, 1))));
+
+            // value part, it comes first in record
+            col = 0;
+            Assert.assertEquals(rnd.nextByte(), record.getByte(col++));
+            Assert.assertEquals(rnd.nextShort(), record.getShort(col++));
+            Assert.assertEquals(rnd.nextChar(), record.getChar(col++));
+            Assert.assertEquals(rnd.nextInt(), record.getInt(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getLong(col++));
+            Assert.assertEquals(rnd.nextFloat(), record.getFloat(col++), 0.000000001f);
+            Assert.assertEquals(rnd.nextDouble(), record.getDouble(col++), 0.000000001d);
+            Assert.assertEquals(rnd.nextBoolean(), record.getBool(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getDate(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getTimestamp(col++));
+            Assert.assertEquals(rnd.nextInt(), record.getInt(col++));
+            Assert.assertEquals(long256, record.getLong256A(col++));
+            Assert.assertEquals(rnd.nextLong(), record.getLong128Lo(col));
+            Assert.assertEquals(rnd.nextLong(), record.getLong128Hi(col));
+        }
+    }
+
+    private void assertCursorLong256(Rnd rnd, RecordCursor cursor, Long256Impl long256) {
+        final Record record = cursor.getRecord();
+        while (cursor.hasNext()) {
+            long256.fromRnd(rnd);
+            Long256 long256a = record.getLong256A(1);
+            Long256 long256b = record.getLong256B(1);
+
+            Assert.assertEquals(long256a.getLong0(), long256.getLong0());
+            Assert.assertEquals(long256a.getLong1(), long256.getLong1());
+            Assert.assertEquals(long256a.getLong2(), long256.getLong2());
+            Assert.assertEquals(long256a.getLong3(), long256.getLong3());
+
+            Assert.assertEquals(long256b.getLong0(), long256.getLong0());
+            Assert.assertEquals(long256b.getLong1(), long256.getLong1());
+            Assert.assertEquals(long256b.getLong2(), long256.getLong2());
+            Assert.assertEquals(long256b.getLong3(), long256.getLong3());
+
+            Assert.assertEquals(rnd.nextChar(), record.getChar(2));
+
+
+            // value part, it comes first in record
+
+            Assert.assertEquals(rnd.nextDouble(), record.getDouble(0), 0.000000001d);
+        }
+    }
+
+    private void createTestTable(int n, Rnd rnd, TestRecord.ArrayBinarySequence binarySequence) {
+        TableModel model = new TableModel(configuration, "x", PartitionBy.NONE);
+        model
+                .col("a", ColumnType.BYTE)
+                .col("b", ColumnType.SHORT)
+                .col("c", ColumnType.INT)
+                .col("d", ColumnType.LONG)
+                .col("e", ColumnType.DATE)
+                .col("f", ColumnType.TIMESTAMP)
+                .col("g", ColumnType.FLOAT)
+                .col("h", ColumnType.DOUBLE)
+                .col("i", ColumnType.STRING)
+                .col("j", ColumnType.SYMBOL)
+                .col("k", ColumnType.BOOLEAN)
+                .col("l", ColumnType.BINARY)
+                .col("m", ColumnType.UUID);
+        AbstractCairoTest.create(model);
+
+        try (TableWriter writer = newOffPoolWriter(configuration, "x")) {
+            for (int i = 0; i < n; i++) {
+                TableWriter.Row row = writer.newRow();
+                row.putByte(0, rnd.nextByte());
+                row.putShort(1, rnd.nextShort());
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putInt(2, Numbers.INT_NULL);
+                } else {
+                    row.putInt(2, rnd.nextInt());
+                }
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putLong(3, Numbers.LONG_NULL);
+                } else {
+                    row.putLong(3, rnd.nextLong());
+                }
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putLong(4, Numbers.LONG_NULL);
+                } else {
+                    row.putDate(4, rnd.nextLong());
+                }
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putLong(5, Numbers.LONG_NULL);
+                } else {
+                    row.putTimestamp(5, rnd.nextLong());
+                }
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putFloat(6, Float.NaN);
+                } else {
+                    row.putFloat(6, rnd.nextFloat());
+                }
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putDouble(7, Double.NaN);
+                } else {
+                    row.putDouble(7, rnd.nextDouble());
+                }
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putStr(8, null);
+                } else {
+                    row.putStr(8, rnd.nextChars(5));
+                }
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putSym(9, null);
+                } else {
+                    row.putSym(9, rnd.nextChars(3));
+                }
+
+                row.putBool(10, rnd.nextBoolean());
+
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putBin(11, null);
+                } else {
+                    binarySequence.of(rnd.nextBytes(25));
+                    row.putBin(11, binarySequence);
+                }
+
+                // UUID
+                if (rnd.nextInt() % 4 == 0) {
+                    row.putLong128(12, Numbers.LONG_NULL, Numbers.LONG_NULL);
+                } else {
+                    row.putLong128(12, rnd.nextLong(), rnd.nextLong());
+                }
+                row.append();
+            }
+            writer.commit();
+        }
+    }
+
+    private void populateMap(OrderedMap map, Rnd rnd2, RecordCursor cursor, RecordSink sink) {
+        long counter = 0;
+        final Record record = cursor.getRecord();
+        while (cursor.hasNext()) {
+            MapKey key = map.withKey();
+            key.put(record, sink);
+            MapValue value = key.createValue();
+            Assert.assertTrue(value.isNew());
+            value.putLong(0, ++counter);
+            value.putInt(1, rnd2.nextInt());
+            value.putShort(2, rnd2.nextShort());
+            value.putByte(3, rnd2.nextByte());
+            value.putFloat(4, rnd2.nextFloat());
+            value.putDouble(5, rnd2.nextDouble());
+            value.putDate(6, rnd2.nextLong());
+            value.putTimestamp(7, rnd2.nextLong());
+            value.putBool(8, rnd2.nextBoolean());
+            value.putLong128(9, rnd2.nextLong(), rnd2.nextLong());
+        }
+    }
+
+    private void populateMapGeo(Map map, Rnd rnd2, RecordCursor cursor, RecordSink sink) {
+        long counter = 0;
+        final Record record = cursor.getRecord();
+        while (cursor.hasNext()) {
+            MapKey key = map.withKey();
+            key.put(record, sink);
+            MapValue value = key.createValue();
+            Assert.assertTrue(value.isNew());
+            value.putLong(0, ++counter);
+            value.putInt(1, rnd2.nextInt());
+            value.putShort(2, rnd2.nextShort());
+            value.putByte(3, rnd2.nextByte());
+            value.putFloat(4, rnd2.nextFloat());
+            value.putDouble(5, rnd2.nextDouble());
+            value.putDate(6, rnd2.nextLong());
+            value.putTimestamp(7, rnd2.nextLong());
+            value.putBool(8, rnd2.nextBoolean());
+            value.putByte(9, (byte) Math.abs(rnd2.nextByte()));
+            value.putShort(10, (short) Math.abs(rnd2.nextShort()));
+            value.putInt(11, Math.abs(rnd2.nextInt()));
+            value.putLong(12, Math.abs(rnd2.nextLong()));
+        }
+    }
+
+    private static class TestMapValueMergeFunction implements MapValueMergeFunction {
+
+        @Override
+        public void merge(MapValue destValue, MapValue srcValue) {
+            destValue.addLong(0, srcValue.getLong(0));
+        }
+    }
+}

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,19 +25,21 @@
 package io.questdb.griffin.engine.functions.date;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.TimestampFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
-import io.questdb.griffin.model.IntervalUtils;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
 import io.questdb.std.ObjList;
 
 public class ToTimestampFunctionFactory implements FunctionFactory {
+    private static final String NAME = "to_timestamp";
+
     @Override
     public String getSignature() {
         return "to_timestamp(S)";
@@ -46,15 +48,17 @@ public class ToTimestampFunctionFactory implements FunctionFactory {
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
         final Function arg = args.getQuick(0);
-        return new ToTimestampFunction(arg);
+        return new ToTimestampFunction(arg, ColumnType.TIMESTAMP_MICRO, NAME);
     }
 
     public static final class ToTimestampFunction extends TimestampFunction implements UnaryFunction {
-
         private final Function arg;
+        private final String name;
 
-        public ToTimestampFunction(Function arg) {
+        public ToTimestampFunction(Function arg, int timestampType, String name) {
+            super(timestampType);
             this.arg = arg;
+            this.name = name;
         }
 
         @Override
@@ -63,15 +67,18 @@ public class ToTimestampFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public String getName() {
+            return name;
+        }
+
+        @Override
         public long getTimestamp(Record rec) {
-            final CharSequence value = arg.getStr(rec);
+            final CharSequence value = arg.getStrA(rec);
             try {
-                if (value != null) {
-                    return IntervalUtils.parseFloorPartialDate(value);
-                }
+                return Numbers.parseLong(value);
             } catch (NumericException ignore) {
             }
-            return Numbers.LONG_NaN;
+            return Numbers.LONG_NULL;
         }
     }
 }

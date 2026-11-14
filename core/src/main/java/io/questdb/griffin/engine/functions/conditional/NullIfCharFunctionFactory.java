@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -58,18 +58,26 @@ public class NullIfCharFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public char getChar(Record rec) {
+            // Read once: a second read of a non-deterministic argument is a fresh draw, and
+            // returning that draw hands back the very value the comparison just excluded.
+            final char value = chrFunc1.getChar(rec);
+            return value == chrFunc2.getChar(rec) ? Character.MIN_VALUE : value;
+        }
+
+        @Override
         public Function getLeft() {
             return chrFunc1;
         }
 
         @Override
-        public Function getRight() {
-            return chrFunc2;
+        public String getName() {
+            return "nullif";
         }
 
         @Override
-        public char getChar(Record rec) {
-            return chrFunc1.getChar(rec) == chrFunc2.getChar(rec) ? Character.MIN_VALUE : chrFunc1.getChar(rec);
+        public Function getRight() {
+            return chrFunc2;
         }
     }
 }

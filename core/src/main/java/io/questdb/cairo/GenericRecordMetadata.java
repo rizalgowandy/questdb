@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,38 +25,40 @@
 package io.questdb.cairo;
 
 import io.questdb.cairo.sql.RecordMetadata;
-import io.questdb.std.LowerCaseCharSequenceIntHashMap;
-import io.questdb.std.ObjList;
+import io.questdb.cairo.sql.TableRecordMetadata;
 
-public class GenericRecordMetadata extends BaseRecordMetadata {
-    public static final GenericRecordMetadata EMPTY = new GenericRecordMetadata();
-    private final LowerCaseCharSequenceIntHashMap columnNameIndexMap;
+public class GenericRecordMetadata extends AbstractRecordMetadata {
 
-    public GenericRecordMetadata() {
-        this.columnMetadata = new ObjList<>();
-        this.columnNameIndexMap = new LowerCaseCharSequenceIntHashMap();
-        this.timestampIndex = -1;
+    /**
+     * This method will throw duplicate column exception when called on table writer metadata in case
+     * if it has deleted and re-created columns.
+     */
+    public static void copyColumns(RecordMetadata from, GenericRecordMetadata to) {
+        for (int i = 0, n = from.getColumnCount(); i < n; i++) {
+            to.add(from.getColumnMetadata(i));
+        }
     }
 
-    public static void copyColumns(RecordMetadata from, GenericRecordMetadata to) {
-        if (from instanceof BaseRecordMetadata) {
-            final BaseRecordMetadata gm = (BaseRecordMetadata) from;
-            for (int i = 0, n = gm.getColumnCount(); i < n; i++) {
-                to.add(gm.getColumnQuick(i));
-            }
-        } else {
-            for (int i = 0, n = from.getColumnCount(); i < n; i++) {
-                to.add(new TableColumnMetadata(
-                        from.getColumnName(i),
-                        from.getColumnHash(i),
-                        from.getColumnType(i),
-                        from.isColumnIndexed(i),
-                        from.getIndexValueBlockCapacity(i),
-                        from.isSymbolTableStatic(i),
-                        GenericRecordMetadata.copyOf(from.getMetadata(i))
-                ));
+    public static void copyColumns(RecordMetadata from, GenericRecordMetadata to, int columnCount) {
+        for (int i = 0, n = Math.min(from.getColumnCount(), columnCount); i < n; i++) {
+            to.add(from.getColumnMetadata(i));
+        }
+    }
+
+    public static GenericRecordMetadata copyDense(TableRecordMetadata tableMetadata) {
+        GenericRecordMetadata metadata = new GenericRecordMetadata();
+        int columnCount = tableMetadata.getColumnCount();
+        int timestampIndex = tableMetadata.getTimestampIndex();
+        for (int i = 0; i < columnCount; i++) {
+            TableColumnMetadata column = tableMetadata.getColumnMetadata(i);
+            if (!column.isDeleted()) {
+                metadata.add(column);
+                if (i == timestampIndex) {
+                    metadata.setTimestampIndex(metadata.getColumnCount() - 1);
+                }
             }
         }
+        return metadata;
     }
 
     public static GenericRecordMetadata copyOf(RecordMetadata that) {
@@ -71,10 +73,62 @@ public class GenericRecordMetadata extends BaseRecordMetadata {
         return null;
     }
 
+    public static GenericRecordMetadata copyOf(RecordMetadata that, int columnCount) {
+        if (that != null) {
+            if (that instanceof GenericRecordMetadata) {
+                return (GenericRecordMetadata) that;
+            }
+            GenericRecordMetadata metadata = copyOfSansTimestamp(that, columnCount);
+            int timestampIndex = that.getTimestampIndex();
+            if (timestampIndex < columnCount) {
+                metadata.setTimestampIndex(timestampIndex);
+            }
+            return metadata;
+        }
+        return null;
+    }
+
+    public static GenericRecordMetadata copyOfSansTimestamp(RecordMetadata that, int columnCount) {
+        GenericRecordMetadata metadata = new GenericRecordMetadata();
+        copyColumns(that, metadata, columnCount);
+        return metadata;
+    }
+
     public static GenericRecordMetadata copyOfSansTimestamp(RecordMetadata that) {
         GenericRecordMetadata metadata = new GenericRecordMetadata();
         copyColumns(that, metadata);
         return metadata;
+    }
+
+    /**
+     * Creates a new GenericRecordMetadata instance, copying column references (shallow copy).
+     * Unlike {@link #copyOf}, this method always creates a new instance even if the input
+     * is already a GenericRecordMetadata.
+     */
+    public static GenericRecordMetadata copyOfNew(RecordMetadata that, int columnCount) {
+        if (that != null) {
+            GenericRecordMetadata metadata = copyOfSansTimestamp(that, columnCount);
+            int timestampIndex = that.getTimestampIndex();
+            if (timestampIndex < columnCount) {
+                metadata.setTimestampIndex(timestampIndex);
+            }
+            return metadata;
+        }
+        return null;
+    }
+
+    /**
+     * Creates a new GenericRecordMetadata instance, copying column references (shallow copy).
+     * Unlike {@link #copyOf}, this method always creates a new instance even if the input
+     * is already a GenericRecordMetadata.
+     */
+    public static GenericRecordMetadata copyOfNew(RecordMetadata that) {
+        if (that != null) {
+            GenericRecordMetadata metadata = copyOfSansTimestamp(that);
+            metadata.setTimestampIndex(that.getTimestampIndex());
+            return metadata;
+        }
+        return null;
     }
 
     public static RecordMetadata removeTimestamp(RecordMetadata that) {
@@ -93,31 +147,23 @@ public class GenericRecordMetadata extends BaseRecordMetadata {
     }
 
     public GenericRecordMetadata add(int i, TableColumnMetadata meta) {
-        int index = columnNameIndexMap.keyIndex(meta.getName());
+        int index = columnNameIndexMap.keyIndex(meta.getColumnName());
         if (index > -1) {
-            columnNameIndexMap.putAt(index, meta.getName(), i);
+            columnNameIndexMap.putAt(index, meta.getColumnName(), i);
             columnMetadata.extendAndSet(i, meta);
             columnCount++;
             return this;
-        } else {
-            throw CairoException.instance(0).put("Duplicate column [name=").put(meta.getName()).put(']');
         }
+        throw CairoException.duplicateColumn(meta.getColumnName());
     }
 
-    public void clear() {
-        columnMetadata.clear();
-        columnNameIndexMap.clear();
-        columnCount = 0;
-        timestampIndex = -1;
-    }
-
-    @Override
-    public int getColumnIndexQuiet(CharSequence columnName, int lo, int hi) {
-        final int index = columnNameIndexMap.keyIndex(columnName, lo, hi);
-        if (index < 0) {
-            return columnNameIndexMap.valueAt(index);
+    public void addIfNotExists(int i, TableColumnMetadata meta) {
+        int index = columnNameIndexMap.keyIndex(meta.getColumnName());
+        if (index > -1) {
+            columnNameIndexMap.putAt(index, meta.getColumnName(), i);
+            columnMetadata.extendAndSet(i, meta);
+            columnCount++;
         }
-        return -1;
     }
 
     public void setTimestampIndex(int index) {

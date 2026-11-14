@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,14 +25,16 @@
 package io.questdb.cutlass.http.ex;
 
 import io.questdb.cutlass.http.HttpException;
+import io.questdb.std.FiberLocal;
 import io.questdb.std.FlyweightMessageContainer;
-import io.questdb.std.Sinkable;
-import io.questdb.std.ThreadLocal;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public class NotEnoughLinesException extends HttpException implements Sinkable, FlyweightMessageContainer {
-    private static final ThreadLocal<NotEnoughLinesException> tlException = new ThreadLocal<>(NotEnoughLinesException::new);
+    private static final FiberLocal<NotEnoughLinesException> tlException = new FiberLocal<>(NotEnoughLinesException::new);
     private final StringSink message = new StringSink();
 
     public static NotEnoughLinesException $(CharSequence message) {
@@ -53,7 +55,7 @@ public class NotEnoughLinesException extends HttpException implements Sinkable, 
         return message.toString();
     }
 
-    public NotEnoughLinesException put(CharSequence cs) {
+    public NotEnoughLinesException put(@Nullable CharSequence cs) {
         message.put(cs);
         return this;
     }
@@ -69,7 +71,7 @@ public class NotEnoughLinesException extends HttpException implements Sinkable, 
     }
 
     @Override
-    public void toSink(CharSink sink) {
+    public void toSink(@NotNull CharSink<?> sink) {
         sink.put(message);
     }
 }

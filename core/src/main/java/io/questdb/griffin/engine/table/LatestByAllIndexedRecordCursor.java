@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,50 +25,146 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.MessageBus;
-import io.questdb.cairo.BitmapIndexReader;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
-import io.questdb.cairo.TableReader;
-import io.questdb.cairo.sql.DataFrame;
-import io.questdb.cairo.vm.api.MemoryR;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.AtomicBooleanCircuitBreaker;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.async.AsyncQueryErrorState;
+import io.questdb.cairo.sql.async.AsyncQueryProgressState;
+import io.questdb.cairo.sql.async.QueryParallelFiberDispatcher;
+import io.questdb.cairo.sql.async.QueryParallelOwnerLoop;
+import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.geohash.GeoHashNative;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.SOUnboundedCountDownLatch;
 import io.questdb.mp.Sequence;
 import io.questdb.std.DirectLongList;
-import io.questdb.std.IntList;
 import io.questdb.std.Rows;
+import io.questdb.std.Transient;
 import io.questdb.std.Vect;
 import io.questdb.tasks.LatestByTask;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
-class LatestByAllIndexedRecordCursor extends AbstractRecordListCursor {
-    protected final DirectLongList prefixes;
+class LatestByAllIndexedRecordCursor extends AbstractPageFrameRecordCursor {
     private final int columnIndex;
     private final SOUnboundedCountDownLatch doneLatch = new SOUnboundedCountDownLatch();
-    protected long indexShift = 0;
-    protected long aIndex;
-    protected long aLimit;
+    private final long indexShift = 0;
+    private final QueryParallelOwnerLoop ownerLoop = new QueryParallelOwnerLoop();
+    private final DirectLongList prefixes;
+    private final AsyncQueryProgressState progressState = new AsyncQueryProgressState();
+    private final DirectLongList rows;
+    private final AsyncQueryErrorState scanError = new AsyncQueryErrorState();
+    private final AtomicBooleanCircuitBreaker sharedCircuitBreaker;
+    private long aIndex;
+    private long aLimit;
+    private long argumentsAddress;
+    private MessageBus bus;
+    private SqlExecutionCircuitBreaker circuitBreaker;
+    private boolean isFrameCacheBuilt;
+    private boolean isTreeMapBuilt;
+    private int keyCount;
+    private int sharedQueryWorkerCount;
 
     public LatestByAllIndexedRecordCursor(
+            CairoEngine engine,
+            @NotNull CairoConfiguration configuration,
+            @NotNull @Transient RecordMetadata metadata,
             int columnIndex,
             @NotNull DirectLongList rows,
-            @NotNull IntList columnIndexes,
             @NotNull DirectLongList prefixes
     ) {
-        super(rows, columnIndexes);
+        super(configuration, metadata);
+        sharedCircuitBreaker = new AtomicBooleanCircuitBreaker(engine);
+        this.rows = rows;
         this.columnIndex = columnIndex;
         this.prefixes = prefixes;
     }
 
     @Override
+    public void close() {
+        // The shared rows list is freed here, under the per-query tracker bound in of();
+        // prefixes is bounded and stays factory-owned (freed at factory close).
+        rows.close();
+        super.close();
+    }
+
+    @Override
     public boolean hasNext() {
+        circuitBreaker.statefulThrowExceptionIfTrippedOrYield();
+        if (!isTreeMapBuilt) {
+            buildTreeMap();
+            isTreeMapBuilt = true;
+        }
         if (aIndex < aLimit) {
-            long row = rows.get(aIndex++) - 1; // we added 1 on cpp side
-            recordA.jumpTo(Rows.toPartitionIndex(row), Rows.toLocalRowID(row));
+            // We added 1 on cpp side.
+            final long rowId = rows.get(aIndex++) - 1;
+            // We inverted frame indexes when posting tasks.
+            final int frameIndex = Rows.MAX_SAFE_PARTITION_INDEX - Rows.toPartitionIndex(rowId);
+            frameMemoryPool.navigateTo(frameIndex, recordA);
+            recordA.setRowIndex(Rows.toLocalRowID(rowId));
             return true;
         }
         return false;
+    }
+
+    @Override
+    public void of(PageFrameCursor pageFrameCursor, SqlExecutionContext executionContext) {
+        this.frameCursor = pageFrameCursor;
+        recordA.of(pageFrameCursor);
+        recordB.of(pageFrameCursor);
+        circuitBreaker = executionContext.getCircuitBreaker();
+        bus = executionContext.getMessageBus();
+        // If the worker count is 0
+        sharedQueryWorkerCount = executionContext.getSharedQueryWorkerCount();
+        rows.setMemoryTracker(executionContext.getMemoryTracker());
+        rows.reopen();
+        keyCount = -1;
+        argumentsAddress = 0;
+        isFrameCacheBuilt = false;
+        isTreeMapBuilt = false;
+        // prepare for page frame iteration
+        super.init(executionContext.getMemoryTracker());
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return isTreeMapBuilt ? 1 : 0;
+    }
+
+    @Override
+    public long size() {
+        return isTreeMapBuilt ? aLimit - indexShift : -1;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Async index backward scan").meta("on").putColumnName(columnIndex);
+        sink.meta("workers").val(sharedQueryWorkerCount + 1);
+
+        if (prefixes.size() > 2) {
+            int geoHashColumnIndex = (int) prefixes.get(0);
+            int geoHashColumnType = (int) prefixes.get(1);
+            int geoHashBits = ColumnType.getGeoHashBits(geoHashColumnType);
+
+            if (geoHashColumnIndex > -1 && ColumnType.isGeoHash(geoHashColumnType)) {
+                sink.attr("filter").putColumnName(geoHashColumnIndex).val(" within(");
+                for (long i = 2, n = prefixes.size(); i < n; i += 2) {
+                    if (i > 2) {
+                        sink.val(',');
+                    }
+                    sink.val(prefixes.get(i), geoHashBits);
+                }
+                sink.val(')');
+            }
+        }
     }
 
     @Override
@@ -76,176 +172,267 @@ class LatestByAllIndexedRecordCursor extends AbstractRecordListCursor {
         aIndex = indexShift;
     }
 
-    @Override
-    public long size() {
-        return aLimit - indexShift;
+    private static long getChunkSize(int keyCount, int sharedWorkerCount) {
+        return sharedWorkerCount > 0 ? (keyCount + sharedWorkerCount - 1) / sharedWorkerCount : keyCount;
     }
 
-    @Override
-    protected void buildTreeMap(SqlExecutionContext executionContext) {
-        final MessageBus bus = executionContext.getMessageBus();
+    private static int getTaskCount(int keyCount, long chunkSize) {
+        return (int) ((keyCount + chunkSize - 1) / chunkSize);
+    }
 
-        final RingQueue<LatestByTask> queue = bus.getLatestByQueue();
-        final Sequence pubSeq = bus.getLatestByPubSeq();
-        final Sequence subSeq = bus.getLatestBySubSeq();
+    private void buildTreeMap() {
+        int taskCount;
+        if (keyCount < 0) {
+            keyCount = getSymbolTable(columnIndex).getSymbolCount() + 1;
+            final long chunkSize = getChunkSize(keyCount, sharedQueryWorkerCount);
+            taskCount = getTaskCount(keyCount, chunkSize);
+            rows.setCapacity(keyCount);
+            GeoHashNative.iota(rows.getAddress(), rows.getCapacity(), 0);
 
-        int keyCount = getSymbolTable(columnIndex).getSymbolCount() + 1;
-        rows.setCapacity(keyCount);
-        GeoHashNative.iota(rows.getAddress(), rows.getCapacity(), 0);
+            argumentsAddress = LatestByArguments.allocateMemoryArray(taskCount);
+            for (long i = 0; i < taskCount; ++i) {
+                final long keyLo = i * chunkSize;
+                final long keyHi = Long.min(keyLo + chunkSize, keyCount);
+                final long argsAddress = argumentsAddress + i * LatestByArguments.MEMORY_SIZE;
+                LatestByArguments.setRowsAddress(argsAddress, rows.getAddress());
+                LatestByArguments.setRowsCapacity(argsAddress, rows.getCapacity());
+                LatestByArguments.setKeyLo(argsAddress, keyLo);
+                LatestByArguments.setKeyHi(argsAddress, keyHi);
+                LatestByArguments.setRowsSize(argsAddress, 0);
+            }
 
-        final int workerCount = executionContext.getWorkerCount();
-
-        final long chunkSize = (keyCount + workerCount - 1) / workerCount;
-        final int taskCount = (int) ((keyCount + chunkSize - 1) / chunkSize);
-
-        final long argumentsAddress = LatestByArguments.allocateMemoryArray(taskCount);
-        for (long i = 0; i < taskCount; ++i) {
-            final long klo = i * chunkSize;
-            final long khi = Long.min(klo + chunkSize, keyCount);
-            final long argsAddress = argumentsAddress + i * LatestByArguments.MEMORY_SIZE;
-            LatestByArguments.setRowsAddress(argsAddress, rows.getAddress());
-            LatestByArguments.setRowsCapacity(argsAddress, rows.getCapacity());
-            LatestByArguments.setKeyLo(argsAddress, klo);
-            LatestByArguments.setKeyHi(argsAddress, khi);
-            LatestByArguments.setRowsSize(argsAddress, 0);
+            sharedCircuitBreaker.reset();
+            scanError.clear();
+        } else {
+            final long chunkSize = getChunkSize(keyCount, sharedQueryWorkerCount);
+            taskCount = getTaskCount(keyCount, chunkSize);
         }
 
-        int hashColumnIndex = -1;
-        int hashColumnType = ColumnType.UNDEFINED;
-
+        int geoHashColumnIndex = -1;
+        int geoHashColumnType = ColumnType.UNDEFINED;
         long prefixesAddress = 0;
         long prefixesCount = 0;
 
-        if(this.prefixes.size() > 2) {
-            hashColumnIndex = (int) prefixes.get(0);
-            hashColumnType = (int) prefixes.get(1);
+        if (prefixes.size() > 2) {
+            // Looks like we have WITHIN clause in the filter.
+            geoHashColumnIndex = (int) prefixes.get(0);
+            geoHashColumnType = (int) prefixes.get(1);
             prefixesAddress = prefixes.getAddress() + 2 * Long.BYTES;
             prefixesCount = prefixes.size() - 2;
         }
 
-        DataFrame frame;
-        // frame metadata is based on TableReader, which is "full" metadata
-        // this cursor works with subset of columns, which warrants column index remap
-        int frameColumnIndex = columnIndexes.getQuick(columnIndex);
+        final RingQueue<LatestByTask> queue = bus.getLatestByQueue();
+        final Sequence pubSeq = bus.getLatestByPubSeq();
+        final Sequence subSeq = bus.getLatestBySubSeq();
+        final QueryParallelFiberDispatcher dispatcher = bus.getQueryParallelFiberDispatcher();
+        ownerLoop.of(dispatcher, circuitBreaker, progressState);
 
-        final TableReader reader = this.dataFrameCursor.getTableReader();
-
+        int queuedCount = 0;
         long foundRowCount = 0;
-        while ((frame = this.dataFrameCursor.next()) != null && foundRowCount < keyCount) {
-            doneLatch.reset();
-            final BitmapIndexReader indexReader = frame.getBitmapIndexReader(frameColumnIndex, BitmapIndexReader.DIR_BACKWARD);
-
-            final long rowLo = frame.getRowLo();
-            final long rowHi = frame.getRowHi() - 1;
-
-            final long keyBaseAddress = indexReader.getKeyBaseAddress();
-            final long keysMemorySize = indexReader.getKeyMemorySize();
-            final long valueBaseAddress = indexReader.getValueBaseAddress();
-            final long valuesMemorySize = indexReader.getValueMemorySize();
-            final int valueBlockCapacity = indexReader.getValueBlockCapacity();
-            final long unIndexedNullCount = indexReader.getUnIndexedNullCount();
-            final int partitionIndex = frame.getPartitionIndex();
-
-            long hashColumnAddress = 0;
-
-            //hashColumnIndex can be -1 for latest by part only (no prefixes to match)
-            if (hashColumnIndex > -1) {
-                final int columnBase = reader.getColumnBase(partitionIndex);
-                final int primaryColumnIndex = TableReader.getPrimaryColumnIndex(columnBase, hashColumnIndex);
-                final MemoryR column = reader.getColumn(primaryColumnIndex);
-                hashColumnAddress = column.getPageAddress(0);
+        try {
+            // First, build address cache as we'll be publishing it to other threads.
+            PageFrame frame;
+            if (!isFrameCacheBuilt) {
+                while ((frame = frameCursor.next()) != null) {
+                    frameAddressCache.add(frameCount++, frame);
+                }
+                isFrameCacheBuilt = true;
             }
 
-            // -1 must be dead case here
-            final int hashesColumnSize = ColumnType.isGeoHash(hashColumnType) ? getPow2SizeOfGeoHashType(hashColumnType) : -1;
+            int frameIndex = 0;
+            frameCursor.toTop();
+            while ((frame = frameCursor.next()) != null && foundRowCount < keyCount) {
+                final IndexReader indexReader = frame.getIndexReader(columnIndex, IndexReader.DIR_BACKWARD);
+                final long indexRowLo = frame.getIndexRowLo();
+                final long indexRowHi = frame.getIndexRowHi() - 1;
 
-            int queuedCount = 0;
-            for (long i = 0; i < taskCount; ++i) {
-                final long argsAddress = argumentsAddress + i * LatestByArguments.MEMORY_SIZE;
-                final long found = LatestByArguments.getRowsSize(argsAddress);
-                final long keyHi = LatestByArguments.getKeyHi(argsAddress);
-                final long keyLo = LatestByArguments.getKeyLo(argsAddress);
+                final long keyBaseAddress = indexReader.getKeyBaseAddress();
+                final long keysMemorySize = indexReader.getKeyMemorySize();
+                final long valueBaseAddress = indexReader.getValueBaseAddress();
+                final long valuesMemorySize = indexReader.getValueMemorySize();
+                final int valueBlockCapacity = indexReader.getValueBlockCapacity();
+                // The native fallback answers NULL's latest row as top - 1 without checking max_value, and the
+                // directory-wide column top may lie beyond this frame on a composite piece or an interval-limited
+                // frame, so clamp it to the frame's exclusive index row hi.
+                final long unIndexedNullCount = Math.min(indexReader.getColumnTop(), frame.getIndexRowHi());
 
-                // Skip range if all keys found
-                if (found >= keyHi - keyLo) {
-                    continue;
+                doneLatch.reset();
+
+                queuedCount = 0;
+                ownerLoop.tryAcquirePublication();
+                try {
+                    for (long i = 0; i < taskCount; i++) {
+                        final long argsAddress = argumentsAddress + i * LatestByArguments.MEMORY_SIZE;
+                        final long found = LatestByArguments.getRowsSize(argsAddress);
+                        final long keyHi = LatestByArguments.getKeyHi(argsAddress);
+                        final long keyLo = LatestByArguments.getKeyLo(argsAddress);
+
+                        if (found >= keyHi - keyLo) {
+                            continue;
+                        }
+
+                        final long seq = ownerLoop.hasPublication() ? pubSeq.next() : -1;
+                        if (seq < 0) {
+                            ownerLoop.checkBeforeHelpingNoThrottle();
+                            GeoHashNative.latestByAndFilterPrefix(
+                                    frameMemoryPool,
+                                    keyBaseAddress,
+                                    keysMemorySize,
+                                    valueBaseAddress,
+                                    valuesMemorySize,
+                                    argsAddress,
+                                    unIndexedNullCount,
+                                    indexRowHi,
+                                    indexRowLo,
+                                    frameIndex,
+                                    valueBlockCapacity,
+                                    geoHashColumnIndex,
+                                    geoHashColumnType,
+                                    prefixesAddress,
+                                    prefixesCount
+                            );
+                        } else {
+                            queue.get(seq).of(
+                                    frameAddressCache,
+                                    keyBaseAddress,
+                                    keysMemorySize,
+                                    valueBaseAddress,
+                                    valuesMemorySize,
+                                    argsAddress,
+                                    unIndexedNullCount,
+                                    indexRowHi,
+                                    indexRowLo,
+                                    frameIndex,
+                                    valueBlockCapacity,
+                                    geoHashColumnIndex,
+                                    geoHashColumnType,
+                                    prefixesAddress,
+                                    prefixesCount,
+                                    doneLatch,
+                                    sharedCircuitBreaker,
+                                    progressState,
+                                    scanError
+                            );
+                            pubSeq.done(seq);
+                            queuedCount++;
+                        }
+                    }
+                } finally {
+                    ownerLoop.releasePublication();
                 }
-                // Update hash column address with current frame value
-                LatestByArguments.setHashesAddress(argsAddress, hashColumnAddress);
 
-                final long seq = pubSeq.next();
-
-                if (seq < 0) {
-                    GeoHashNative.latestByAndFilterPrefix(
-                            keyBaseAddress,
-                            keysMemorySize,
-                            valueBaseAddress,
-                            valuesMemorySize,
-                            argsAddress,
-                            unIndexedNullCount,
-                            rowHi,
-                            rowLo,
-                            partitionIndex,
-                            valueBlockCapacity,
-                            hashColumnAddress,
-                            hashesColumnSize,
-                            prefixesAddress,
-                            prefixesCount
-                    );
-                } else {
-                    queue.get(seq).of(
-                            keyBaseAddress,
-                            keysMemorySize,
-                            valueBaseAddress,
-                            valuesMemorySize,
-                            argsAddress,
-                            unIndexedNullCount,
-                            rowHi,
-                            rowLo,
-                            partitionIndex,
-                            valueBlockCapacity,
-                            hashColumnAddress,
-                            hashesColumnSize,
-                            prefixesAddress,
-                            prefixesCount,
-                            doneLatch
-                    );
-                    pubSeq.done(seq);
-                    queuedCount++;
+                while (true) {
+                    ownerLoop.observeProgress();
+                    if (doneLatch.done(queuedCount)) {
+                        break;
+                    }
+                    if (!ownerLoop.awaitProgress()) {
+                        long seq = subSeq.next();
+                        if (seq > -1) {
+                            runStolenTask(queue, subSeq, seq, dispatcher);
+                        } else {
+                            ownerLoop.pause();
+                        }
+                    }
                 }
+
+                foundRowCount = 0; // Reset found counter
+                for (int i = 0; i < taskCount; i++) {
+                    final long address = argumentsAddress + i * LatestByArguments.MEMORY_SIZE;
+                    foundRowCount += LatestByArguments.getRowsSize(address);
+                }
+
+                frameIndex++;
             }
-
-            // process our own queue
-            // this should fix deadlock with 1 worker configuration
-            while (doneLatch.getCount() > -queuedCount) {
-                long seq = subSeq.next();
-                if (seq > -1) {
-                    queue.get(seq).run();
-                    subSeq.done(seq);
-                }
-            }
-
-            doneLatch.await(queuedCount);
-
-            foundRowCount = 0; // Reset found counter
-            for (int i = 0; i < taskCount; i++) {
-                final long address = argumentsAddress + i * LatestByArguments.MEMORY_SIZE;
-                foundRowCount += LatestByArguments.getRowsSize(address);
+        } catch (Throwable th) {
+            sharedCircuitBreaker.cancel();
+            throw th;
+        } finally {
+            processTasks(queuedCount);
+            if (sharedCircuitBreaker.checkIfTrippedOrYield()) {
+                LatestByArguments.releaseMemoryArray(argumentsAddress, taskCount);
+                argumentsAddress = 0;
             }
         }
-        final long rowCount = GeoHashNative.slideFoundBlocks(argumentsAddress, taskCount);
-        LatestByArguments.releaseMemoryArray(argumentsAddress, taskCount);
+
+        if (sharedCircuitBreaker.checkIfTrippedOrYield()) {
+            // A tripped shared breaker on the non-throw path means a worker scan failed, or the
+            // dispatcher aborted queued tasks (quiesce); either way the row set is incomplete, so
+            // the query must fail rather than return partial rows.
+            if (scanError.hasError()) {
+                scanError.throwError();
+            }
+            circuitBreaker.statefulThrowExceptionIfTrippedNoThrottleOrYield();
+            throw CairoException.queryCancelled();
+        }
+
+        long rowCount = 0;
+        if (argumentsAddress > 0) {
+            rowCount = GeoHashNative.slideFoundBlocks(argumentsAddress, taskCount);
+            LatestByArguments.releaseMemoryArray(argumentsAddress, taskCount);
+            argumentsAddress = 0;
+        }
         aLimit = rowCount;
         aIndex = indexShift;
         postProcessRows();
     }
 
-    private static int getPow2SizeOfGeoHashType(int type) {
-        return 1 << ColumnType.pow2SizeOfBits(ColumnType.getGeoHashBits(type));
-    }
-
-    protected void postProcessRows() {
+    private void postProcessRows() {
         Vect.sortULongAscInPlace(rows.getAddress(), aLimit);
     }
 
+    // A stolen task publishes its own failure to its owner's error state and breaker before
+    // rethrowing. Propagating a foreign task's exception here would fail this healthy query with
+    // another query's error, so only an own-task failure escapes.
+    private void runStolenTask(
+            RingQueue<LatestByTask> queue,
+            Sequence subSeq,
+            long seq,
+            @Nullable QueryParallelFiberDispatcher dispatcher
+    ) {
+        final LatestByTask task = queue.get(seq);
+        final boolean isOwnTask = task.getCircuitBreaker() == sharedCircuitBreaker;
+        final AsyncQueryProgressState stolenProgress = task.getProgressState();
+        try {
+            task.run();
+        } catch (Throwable th) {
+            if (isOwnTask) {
+                throw th;
+            }
+        } finally {
+            try {
+                task.clear();
+            } finally {
+                // done(seq) releases the slot
+                subSeq.done(seq);
+                if (dispatcher != null) {
+                    dispatcher.signalOwnerProgress(stolenProgress);
+                }
+            }
+        }
+    }
+
+    private void processTasks(int queuedCount) {
+        final RingQueue<LatestByTask> queue = bus.getLatestByQueue();
+        final Sequence subSeq = bus.getLatestBySubSeq();
+        final QueryParallelFiberDispatcher dispatcher = bus.getQueryParallelFiberDispatcher();
+        while (true) {
+            ownerLoop.observeProgress();
+            if (doneLatch.done(queuedCount)) {
+                break;
+            }
+            final boolean isOwnerTripped = circuitBreaker.checkIfTrippedOrYield();
+            if (isOwnerTripped) {
+                sharedCircuitBreaker.cancel();
+            }
+            if (!ownerLoop.awaitProgressWhileDraining(isOwnerTripped)) {
+                long seq = subSeq.next();
+                if (seq > -1) {
+                    runStolenTask(queue, subSeq, seq, dispatcher);
+                } else {
+                    ownerLoop.pause();
+                }
+            }
+        }
+    }
 }

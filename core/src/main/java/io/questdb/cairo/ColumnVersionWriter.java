@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,30 +24,57 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.frm.ColumnTopSink;
+import io.questdb.cairo.frm.Frame;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.std.FilesFacade;
+import io.questdb.std.LongHashSet;
 import io.questdb.std.LongList;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import io.questdb.std.str.LPSZ;
+import org.jetbrains.annotations.Nullable;
 
 public class ColumnVersionWriter extends ColumnVersionReader {
+    private final ColumnTopSinkImpl columnTopSink = new ColumnTopSinkImpl();
+    private final CairoConfiguration configuration;
     private final MemoryCMARW mem;
-    private long version;
-    private long size;
+    private final boolean partitioned;
+    // Adaptive column-file obligations, including UPDATEs with no partition-metadata change.
+    // Null without a consumer; TableWriter intersects sentinel timestamps with live partitions.
+    private LongHashSet dirtyPartitions;
     private boolean hasChanges;
+    private long size;
+    // The commit mode this writer flushes _cv under. Seeded from the instance-global cairo.commit.mode
+    // and overridden by TableWriter via setCommitMode() while a table is not yet enrolled in adaptive.
+    private int commitMode;
+    private long version;
 
     // size should be read from the transaction file
     // it can be zero when there are no columns deviating from the main
     // data branch
-    public ColumnVersionWriter(FilesFacade ff, LPSZ fileName, long size) {
-        this.mem = Vm.getCMARWInstance(ff, fileName, ff.getPageSize(), size, MemoryTag.MMAP_TABLE_READER, CairoConfiguration.O_NONE);
+    public ColumnVersionWriter(CairoConfiguration configuration, LPSZ fileName, boolean partitioned) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        this.mem = Vm.getCMARWInstance(ff, fileName, ff.getPageSize(), 0, MemoryTag.MMAP_TABLE_READER, CairoConfiguration.O_NONE);
+        this.configuration = configuration;
+        this.commitMode = configuration.getCommitMode();
+        this.partitioned = partitioned;
         this.size = this.mem.size();
         super.ofRO(mem);
         if (this.size > 0) {
-            this.version = super.readUnsafe();
+            this.version = unsafeReadLiveArea(true);
         }
+    }
+
+    /**
+     * Arms this writer's {@link ColumnTopSink} view for one partition and returns it, until the next
+     * {@code asColumnTopSink} call re-arms it. Always the same reused instance.
+     */
+    public ColumnTopSink asColumnTopSink(long partitionTimestamp) {
+        columnTopSink.partitionTimestamp = partitionTimestamp;
+        return columnTopSink;
     }
 
     @Override
@@ -57,12 +84,8 @@ public class ColumnVersionWriter extends ColumnVersionReader {
 
     @Override
     public void close() {
+        dirtyPartitions = null;
         mem.close(false);
-    }
-
-    @Override
-    public long getVersion() {
-        return version;
     }
 
     public void commit() {
@@ -73,6 +96,47 @@ public class ColumnVersionWriter extends ColumnVersionReader {
         hasChanges = false;
     }
 
+    /**
+     * Overrides the mode this writer flushes {@code _cv} under. TableWriter uses it to hold a table at SYNC
+     * grade until its first save point exists, then to hand it ADAPTIVE.
+     */
+    public void setCommitMode(int commitMode) {
+        this.commitMode = commitMode;
+    }
+
+    /**
+     * The commit mode for the per-commit {@code _cv} flush, as in {@code TxWriter.resolveCommitMode()}: under
+     * ADAPTIVE, {@code _cv} is flushed lazily like the columns, and a save point's {@link #fsync()} and
+     * recovery from the save point make it crash-safe.
+     */
+    private int resolveCommitMode() {
+        return commitMode;
+    }
+
+    /**
+     * Makes the {@code _cv} file durable whatever the commit mode: msync(MS_SYNC) of the mapping, then an
+     * fsync of the fd. A save point ({@link TableWriter#fsyncMaterializedState()}) calls it after the column
+     * data is durable and before {@code _txn}, so a pointer never lands before its data. Under NOSYNC and
+     * ADAPTIVE the last {@link #commit()} did not sync, so both calls are needed.
+     */
+    public void fsync() {
+        mem.sync(false);
+        configuration.getFilesFacade().fsync(mem.getFd());
+    }
+
+    public void copyColumnVersions(long srcTimestamp, long dstTimestamp) {
+        int index = copyColumnVersions(srcTimestamp, dstTimestamp, cachedColumnVersionList);
+        if (index > -1) {
+            for (int n = cachedColumnVersionList.size(); index < n; index += BLOCK_SIZE) {
+                if (cachedColumnVersionList.get(index) == srcTimestamp) {
+                    cachedColumnVersionList.setQuick(index, dstTimestamp);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     public long getOffsetA() {
         return mem.getLong(OFFSET_OFFSET_A_64);
     }
@@ -81,22 +145,148 @@ public class ColumnVersionWriter extends ColumnVersionReader {
         return mem.getLong(OFFSET_OFFSET_B_64);
     }
 
+    @Override
+    public long getVersion() {
+        return version;
+    }
+
     public boolean hasChanges() {
         return hasChanges;
+    }
+
+    /**
+     * Records a column top a Frame write just established, reconciled against what this writer already resolves for
+     * {@code (partitionTimestamp, columnIndex)} instead of blindly recorded like {@link #upsertColumnTop} does.
+     */
+    public void mergeColumnTop(long partitionTimestamp, int columnIndex, long colTop) {
+        if (colTop != 0 || getColumnTop(partitionTimestamp, columnIndex) != 0) {
+            upsertColumnTop(partitionTimestamp, columnIndex, colTop);
+        }
+    }
+
+    public void overrideColumnVersions(long partitionTimestamp, ColumnVersionReader src) {
+        copyColumnVersions(partitionTimestamp, partitionTimestamp, src.cachedColumnVersionList);
+    }
+
+    @Override
+    public long readUnsafe() {
+        this.hasChanges = false;
+        return this.version = unsafeReadLiveArea(true);
     }
 
     public void removeColumnTop(long partitionTimestamp, int columnIndex) {
         int recordIndex = getRecordIndex(partitionTimestamp, columnIndex);
         if (recordIndex >= 0) {
-            getCachedList().setQuick(recordIndex + 3, 0);
+            cachedColumnVersionList.setQuick(recordIndex + COLUMN_TOP_OFFSET, 0);
             hasChanges = true;
         }
     }
 
+    public void removePartition(long partitionTimestamp) {
+        int from = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, partitionTimestamp, Vect.BIN_SEARCH_SCAN_UP);
+        if (from > -1) {
+            int to = cachedColumnVersionList.binarySearchBlock(from, BLOCK_SIZE_MSB, partitionTimestamp, Vect.BIN_SEARCH_SCAN_DOWN);
+            int len = to - from + BLOCK_SIZE;
+            cachedColumnVersionList.removeIndexBlock(from, len);
+            hasChanges = true;
+        }
+    }
+
+    public void replaceInitialPartitionRecords(long lastPartitionTimestamp, long transientRowCount) {
+        // Remove all default partitions that point beyond the last partition
+        // Replace them as if the column was added to the last partition
+        for (int i = 0, n = cachedColumnVersionList.size(); i < n; i += BLOCK_SIZE) {
+            long partitionTimestamp = cachedColumnVersionList.getQuick(i);
+            long initialPartitionTimestamp = cachedColumnVersionList.get(i + TIMESTAMP_ADDED_PARTITION_OFFSET);
+            int columnIndex = (int) cachedColumnVersionList.get(i + COLUMN_INDEX_OFFSET);
+            long columnNameTxn = cachedColumnVersionList.getQuick(i + COLUMN_NAME_TXN_OFFSET);
+
+            if (partitionTimestamp == COL_TOP_DEFAULT_PARTITION) {
+                if (initialPartitionTimestamp > lastPartitionTimestamp) {
+                    // There is an initial partition record that point beyond the last partition.
+                    // This can happen as a resul of partition drop.
+                    // Move the initial partition record to the last partition, as if column was added there.
+                    cachedColumnVersionList.set(i + TIMESTAMP_ADDED_PARTITION_OFFSET, lastPartitionTimestamp);
+                    // Because column we not really added there, put the column top to the value
+                    // of the last partition row count (e.g. transientRowCount)
+                    // Add the column top if there is no explicit record for this column, if there is one
+                    // keep the existing value.
+                    int recordIndex = getRecordIndex(lastPartitionTimestamp, columnIndex);
+                    if (recordIndex < 0) {
+                        upsert(lastPartitionTimestamp, columnIndex, columnNameTxn, transientRowCount);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /*
+     * Rollback to previous version that is stored before the current version in the file.
+     * This function cannot be called multiple times in a row without commit() in between because
+     * only one previous version is stored.
+     */
+    public void rollback() {
+        mem.putLong(OFFSET_VERSION_64, version - 1);
+        // load version and other fields from mem
+        readUnsafe();
+    }
+
+    public void squashPartition(long targetPartitionTimestamp, long sourcePartitionTimestamp) {
+        removePartition(sourcePartitionTimestamp);
+        // Remove all default partitions that point to the targetPartitionTimestamp
+        for (int i = 0, n = cachedColumnVersionList.size(); i < n; i += BLOCK_SIZE) {
+            long partitionTimestamp = cachedColumnVersionList.getQuick(i);
+            long defaultPartitionTimestamp = cachedColumnVersionList.get(i + TIMESTAMP_ADDED_PARTITION_OFFSET);
+
+            if (partitionTimestamp == COL_TOP_DEFAULT_PARTITION) {
+                if (defaultPartitionTimestamp == sourcePartitionTimestamp) {
+                    // replace with target block
+                    cachedColumnVersionList.set(i + TIMESTAMP_ADDED_PARTITION_OFFSET, targetPartitionTimestamp);
+                    // removePartition() above only flags a change when the source had explicit records, so
+                    // a source carrying nothing but this marker would leave it on disk naming a partition
+                    // that no longer exists - reading as "column absent".
+                    hasChanges = true;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
     public void truncate() {
-        LongList cachedList = getCachedList();
-        if (cachedList.size() > 0) {
-            cachedList.clear();
+        if (cachedColumnVersionList.size() > 0) {
+
+            int from = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, SYMBOL_TABLE_VERSION_PARTITION + 1, Vect.BIN_SEARCH_SCAN_UP);
+            if (from < 0) {
+                from = -from - 1;
+            }
+
+            if (partitioned) {
+                // Remove all partitions after SYMBOL_TABLE_VERSION_PARTITION
+                if (from < cachedColumnVersionList.size()) {
+                    cachedColumnVersionList.setPos(from);
+                }
+                // Keep default column version but reset the added timestamp to min
+                for (int i = 0, n = cachedColumnVersionList.size(); i < n; i += BLOCK_SIZE) {
+                    cachedColumnVersionList.setQuick(i + TIMESTAMP_ADDED_PARTITION_OFFSET, SYMBOL_TABLE_VERSION_PARTITION);
+                }
+            } else {
+                // We have to keep all the column name txns because the files are truncated but not re-created.
+                // But we want to remove all the column tops.
+                // The column name txn can be added when the column is added via alter table or when column is updated.
+                // When ALTER table add column is executed it creates a record in the NaN partition with the column name txn
+                // and a record in 0 (default) partition with the column top.
+                // When the column is changed using UPDATE SQL, the column name txn is only set in 0 (default) partition.
+                // These 2 scenarios are test covered in TruncateTest.
+
+                // Result action is to remove all column tops and keep all column name txns.
+                for (int i = from; i < cachedColumnVersionList.size(); i += BLOCK_SIZE) {
+                    cachedColumnVersionList.setQuick(i + COLUMN_TOP_OFFSET, 0);
+                }
+            }
+
             hasChanges = true;
             commit();
         }
@@ -113,20 +303,22 @@ public class ColumnVersionWriter extends ColumnVersionReader {
      * @param columnTop   column top
      */
     public void upsert(long timestamp, int columnIndex, long txn, long columnTop) {
-        LongList cachedList = getCachedList();
-        final int sz = cachedList.size();
-        int index = cachedList.binarySearchBlock(BLOCK_SIZE_MSB, timestamp, BinarySearch.SCAN_UP);
+        if (dirtyPartitions != null) {
+            dirtyPartitions.add(timestamp);
+        }
+        final int sz = cachedColumnVersionList.size();
+        int index = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, timestamp, Vect.BIN_SEARCH_SCAN_UP);
         boolean insert = true;
         if (index > -1) {
             // brute force columns for this timestamp
-            while (index < sz && cachedList.getQuick(index) == timestamp) {
-                final long thisIndex = cachedList.getQuick(index + 1);
+            while (index < sz && cachedColumnVersionList.getQuick(index) == timestamp) {
+                final long thisIndex = cachedColumnVersionList.getQuick(index + COLUMN_INDEX_OFFSET);
 
                 if (thisIndex == columnIndex) {
                     if (txn > -1) {
-                        cachedList.setQuick(index + 2, txn);
+                        cachedColumnVersionList.setQuick(index + COLUMN_NAME_TXN_OFFSET, txn);
                     }
-                    cachedList.setQuick(index + 3, columnTop);
+                    cachedColumnVersionList.setQuick(index + COLUMN_TOP_OFFSET, columnTop);
                     insert = false;
                     break;
                 }
@@ -143,32 +335,58 @@ public class ColumnVersionWriter extends ColumnVersionReader {
 
         if (insert) {
             if (index < sz) {
-                cachedList.insert(index, BLOCK_SIZE);
+                cachedColumnVersionList.insert(index, BLOCK_SIZE);
             } else {
-                cachedList.setPos(Math.max(index + BLOCK_SIZE, sz + BLOCK_SIZE));
+                cachedColumnVersionList.setPos(Math.max(index + BLOCK_SIZE, sz + BLOCK_SIZE));
             }
-            cachedList.setQuick(index, timestamp);
-            cachedList.setQuick(index + 1, columnIndex);
-            cachedList.setQuick(index + 2, txn);
-            cachedList.setQuick(index + 3, columnTop);
+            cachedColumnVersionList.setQuick(index, timestamp);
+            cachedColumnVersionList.setQuick(index + COLUMN_INDEX_OFFSET, columnIndex);
+            cachedColumnVersionList.setQuick(index + COLUMN_NAME_TXN_OFFSET, txn);
+            cachedColumnVersionList.setQuick(index + COLUMN_TOP_OFFSET, columnTop);
         }
         hasChanges = true;
     }
 
+    /**
+     * Column files changed since the last successful epoch, or null when tracking is disabled.
+     */
+    public @Nullable LongHashSet getDirtyPartitions() {
+        return dirtyPartitions;
+    }
+
+    /**
+     * Drops the accumulated write set. A save point calls this only after its flush succeeded.
+     */
+    public void clearDirtyPartitions() {
+        if (dirtyPartitions != null) {
+            dirtyPartitions.clear();
+        }
+    }
+
+    public void setDirtyPartitionTracking(boolean isEnabled) {
+        if (!isEnabled) {
+            dirtyPartitions = null;
+        } else if (dirtyPartitions == null) {
+            dirtyPartitions = new LongHashSet();
+        }
+    }
+
     public void upsertColumnTop(long partitionTimestamp, int columnIndex, long colTop) {
         int recordIndex = getRecordIndex(partitionTimestamp, columnIndex);
-        LongList cachedList = getCachedList();
         if (recordIndex > -1L) {
-            cachedList.setQuick(recordIndex + 3, colTop);
+            if (dirtyPartitions != null) {
+                dirtyPartitions.add(partitionTimestamp);
+            }
+            cachedColumnVersionList.setQuick(recordIndex + COLUMN_TOP_OFFSET, colTop);
             hasChanges = true;
         } else {
             // This is a 0 column top record we need to store it
             // to mark that the column is written in O3 even before the partition the column was originally added
             int defaultRecordIndex = getRecordIndex(COL_TOP_DEFAULT_PARTITION, columnIndex);
             if (defaultRecordIndex >= 0) {
-                long columnNameTxn = cachedList.getQuick(defaultRecordIndex + 2);
-                long defaultPartitionTimestamp = cachedList.getQuick(defaultRecordIndex + 3);
-                // Do not add 0 column top if the default parttion
+                long columnNameTxn = cachedColumnVersionList.getQuick(defaultRecordIndex + COLUMN_NAME_TXN_OFFSET);
+                long defaultPartitionTimestamp = cachedColumnVersionList.getQuick(defaultRecordIndex + TIMESTAMP_ADDED_PARTITION_OFFSET);
+                // Do not add 0 column top if the default partition
                 if (defaultPartitionTimestamp > partitionTimestamp || colTop > 0) {
                     upsert(partitionTimestamp, columnIndex, columnNameTxn, colTop);
                 }
@@ -185,6 +403,12 @@ public class ColumnVersionWriter extends ColumnVersionReader {
         upsert(COL_TOP_DEFAULT_PARTITION, columnIndex, columnNameTxn, partitionTimestamp);
     }
 
+    public void upsertSymbolTableTxnName(int columnIndex, long columnNameTxn) {
+        // Store the column name txn for the symbol-table, this txn can increase independently of column name txn in
+        // partitions, when symbol capacity is changed; columnTop is unused here and set to 0.
+        upsert(SYMBOL_TABLE_VERSION_PARTITION, columnIndex, columnNameTxn, 0);
+    }
+
     private void bumpFileSize(long size) {
         mem.setSize(size);
         this.size = size;
@@ -198,31 +422,78 @@ public class ColumnVersionWriter extends ColumnVersionReader {
     }
 
     private long calculateWriteOffset(long areaSize) {
+        // An area's on-disk footprint is its data (areaSize) plus the 16-byte trailer that doCommit() writes
+        // at [offset + size, offset + size + 16). The new area must not land on the live area's data or its
+        // trailer, or after the version flip the other area would fail its checksum and the A/B fallback or a
+        // rollback would see corruption on a healthy table. So placement uses size + CV_CHECKSUM_TRAILER_SIZE
+        // as the footprint, while OFFSET_SIZE_{A,B} keeps storing the data length only.
+        //
+        // The branches below return HEADER_SIZE only when HEADER_SIZE + areaSize + 16 <= currentOffset, or
+        // else currentOffset + currentSize + 16, so [writeOffset, writeOffset + areaSize + 16) never overlaps
+        // [currentOffset, currentOffset + currentSize + 16).
         boolean currentIsA = isCurrentA();
         long currentOffset = currentIsA ? getOffsetA() : getOffsetB();
         currentOffset = Math.max(currentOffset, HEADER_SIZE);
-        if (HEADER_SIZE + areaSize <= currentOffset) {
+        // Fits-before: reuse the space between the header and the live area only if the new area and its
+        // trailer both fit before the live area's data.
+        if (HEADER_SIZE + areaSize + TableUtils.CV_CHECKSUM_TRAILER_SIZE <= currentOffset) {
             return HEADER_SIZE;
         }
+        // Append-after: place the new area past the live area's data and trailer.
         long currentSize = currentIsA ? getSizeA() : getSizeB();
-        return currentOffset + currentSize;
+        return currentOffset + currentSize + TableUtils.CV_CHECKSUM_TRAILER_SIZE;
+    }
+
+    private int copyColumnVersions(long srcTimestamp, long dstTimestamp, LongList srcColumnVersionList) {
+        int srcIndex = srcColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, srcTimestamp, Vect.BIN_SEARCH_SCAN_UP);
+        if (srcIndex < 0) { // source does not have partition information
+            return -1;
+        }
+
+        int index = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, dstTimestamp, Vect.BIN_SEARCH_SCAN_UP);
+        if (index > -1L) {
+            // Wipe out all the information about this partition to replace with the new one.
+            removePartition(dstTimestamp);
+            index = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, dstTimestamp, Vect.BIN_SEARCH_SCAN_UP);
+        }
+
+        if (index < 0) { // the cache does not contain this partition
+            index = -index - 1;
+            int srcEnd = srcColumnVersionList.binarySearchBlock(srcIndex, BLOCK_SIZE_MSB, srcTimestamp, Vect.BIN_SEARCH_SCAN_DOWN);
+            cachedColumnVersionList.insertFromSource(index, srcColumnVersionList, srcIndex, srcEnd + BLOCK_SIZE);
+        } else {
+            throw CairoException.critical(0).put("invalid Column Version state ").put(dstTimestamp).put(" column version state, cannot update partition information");
+        }
+        hasChanges = true;
+        return index;
     }
 
     private void doCommit() {
-        LongList cachedList = getCachedList();
-        int entryCount = cachedList.size() / BLOCK_SIZE;
+        int entryCount = cachedColumnVersionList.size() / BLOCK_SIZE;
         long areaSize = calculateSize(entryCount);
         long writeOffset = calculateWriteOffset(areaSize);
-        bumpFileSize(writeOffset + areaSize);
+        // Reserve the area and its 16-byte trailer; calculateWriteOffset placed this footprint clear of the
+        // other area.
+        bumpFileSize(writeOffset + areaSize + TableUtils.CV_CHECKSUM_TRAILER_SIZE);
         store(entryCount, writeOffset);
+        // Stamp and checksum the body before publishing the new version.
+        storeAreaChecksum(writeOffset, areaSize);
+        // OFFSET_SIZE_{A,B} records the data length only (areaSize, a multiple of BLOCK_SIZE_BYTES); the
+        // reader finds the trailer at offset + size.
         if (isCurrentA()) {
             updateB(writeOffset, areaSize);
         } else {
             updateA(writeOffset, areaSize);
         }
 
-        Unsafe.getUnsafe().storeFence();
+        Unsafe.storeFence();
         storeNewVersion();
+
+        final int commitMode = resolveCommitMode();
+        // SYNC and ASYNC only; see resolveCommitMode().
+        if (CommitMode.appliesColumnSync(commitMode)) {
+            mem.sync(commitMode == CommitMode.ASYNC);
+        }
     }
 
     private long getSizeA() {
@@ -238,19 +509,25 @@ public class ColumnVersionWriter extends ColumnVersionReader {
     }
 
     private void store(int entryCount, long offset) {
-        LongList cachedList = getCachedList();
         for (int i = 0; i < entryCount; i++) {
             int x = i * BLOCK_SIZE;
-            mem.putLong(offset, cachedList.getQuick(x));
-            mem.putLong(offset + 8, cachedList.getQuick(x + 1));
-            mem.putLong(offset + 16, cachedList.getQuick(x + 2));
-            mem.putLong(offset + 24, cachedList.getQuick(x + 3));
+            mem.putLong(offset, cachedColumnVersionList.getQuick(x));
+            mem.putLong(offset + 8, cachedColumnVersionList.getQuick(x + COLUMN_INDEX_OFFSET));
+            mem.putLong(offset + 16, cachedColumnVersionList.getQuick(x + COLUMN_NAME_TXN_OFFSET));
+            mem.putLong(offset + 24, cachedColumnVersionList.getQuick(x + COLUMN_TOP_OFFSET));
             offset += BLOCK_SIZE * 8;
         }
     }
 
+    // Store [CV_CHECKSUM_MAGIC][checksum] after the data, before publishing the next version.
+    private void storeAreaChecksum(long areaOffset, long areaSize) {
+        long checksum = TableUtils.calculateCvAreaChecksum(mem.addressOf(areaOffset), areaSize);
+        mem.putLong(areaOffset + areaSize, TableUtils.CV_CHECKSUM_MAGIC);
+        mem.putLong(areaOffset + areaSize + Long.BYTES, checksum);
+    }
+
     private void storeNewVersion() {
-        mem.putLong(OFFSET_VERSION_64, ++this.version);
+        mem.putLong(OFFSET_VERSION_64, ++version);
     }
 
     private void updateA(long aOffset, long aSize) {
@@ -264,6 +541,21 @@ public class ColumnVersionWriter extends ColumnVersionReader {
     }
 
     static {
+        //noinspection ConstantValue
         assert HEADER_SIZE == TableUtils.COLUMN_VERSION_FILE_HEADER_SIZE;
+    }
+
+    /**
+     * The {@link ColumnTopSink} view {@link #asColumnTopSink} hands out - one reused instance, forwarding to {@link
+     * #mergeColumnTop} against whichever partition was last armed.
+     */
+    private final class ColumnTopSinkImpl implements ColumnTopSink {
+        private long partitionTimestamp = Long.MIN_VALUE;
+
+        @Override
+        public void setColumnTop(int columnIndex, long columnTop) {
+            assert partitionTimestamp != Long.MIN_VALUE : "asColumnTopSink not called";
+            mergeColumnTop(partitionTimestamp, columnIndex, columnTop);
+        }
     }
 }

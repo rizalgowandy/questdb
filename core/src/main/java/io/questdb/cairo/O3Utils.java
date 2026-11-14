@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,75 +24,66 @@
 
 package io.questdb.cairo;
 
-import io.questdb.MessageBus;
-import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
-import io.questdb.cairo.sql.async.PageFrameReduceJob;
-import io.questdb.griffin.FunctionFactoryCache;
-import io.questdb.griffin.SqlException;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.mp.Job;
-import io.questdb.mp.WorkerPool;
-import io.questdb.std.*;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
-import org.jetbrains.annotations.Nullable;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Vect;
 
 public class O3Utils {
 
     private static final Log LOG = LogFactory.getLog(O3Utils.class);
 
-    public static void setupWorkerPool(
-            WorkerPool workerPool,
-            CairoEngine cairoEngine,
-            @Nullable SqlExecutionCircuitBreakerConfiguration sqlExecutionCircuitBreakerConfiguration,
-            @Nullable FunctionFactoryCache functionFactoryCache
-    ) throws SqlException {
-        final MessageBus messageBus = cairoEngine.getMessageBus();
-        final int workerCount = workerPool.getWorkerCount();
-        final O3PartitionPurgeJob purgeDiscoveryJob = new O3PartitionPurgeJob(messageBus, workerPool.getWorkerCount());
-        final ColumnPurgeJob columnPurgeJob = new ColumnPurgeJob(cairoEngine, functionFactoryCache);
+    public static void copyFixedSizeCol(
+            FilesFacade ff,
+            long srcAddr,
+            long srcLo,
+            long dstAddr,
+            long dstFixFileOffset,
+            long dstFd,
+            boolean mixedIOFlag,
+            long len,
+            int shl
+    ) {
+        final long fromAddress = srcAddr + (srcLo << shl);
+        o3Copy(ff, dstAddr, dstFixFileOffset, dstFd, fromAddress, len, mixedIOFlag);
+    }
 
-        workerPool.assign(purgeDiscoveryJob);
-        workerPool.assign(columnPurgeJob);
-        workerPool.assign(new O3PartitionJob(messageBus));
-        workerPool.assign(new O3OpenColumnJob(messageBus));
-        workerPool.assign(new O3CopyJob(messageBus));
-        workerPool.assign(new O3CallbackJob(messageBus));
-        workerPool.freeOnHalt(purgeDiscoveryJob);
-        workerPool.freeOnHalt(columnPurgeJob);
-
-        final MicrosecondClock microsecondClock = messageBus.getConfiguration().getMicrosecondClock();
-        final NanosecondClock nanosecondClock = messageBus.getConfiguration().getNanosecondClock();
-
-        for (int i = 0; i < workerCount; i++) {
-            // create job per worker to allow each worker to have
-            // own shard walk sequence
-            final PageFrameReduceJob pageFrameReduceJob = new PageFrameReduceJob(
-                    messageBus,
-                    new Rnd(microsecondClock.getTicks(), nanosecondClock.getTicks()),
-                    sqlExecutionCircuitBreakerConfiguration
-            );
-            workerPool.assign(i, (Job) pageFrameReduceJob);
-            workerPool.freeOnHalt(pageFrameReduceJob);
+    public static void o3Copy(
+            FilesFacade ff,
+            long dstAddr,
+            long dstFileOffset,
+            long dstFd,
+            long fromAddress,
+            long len,
+            boolean mixedIOFlag
+    ) {
+        if (mixedIOFlag) {
+            if (ff.write(Math.abs(dstFd), fromAddress, len, dstFileOffset) != len) {
+                throw CairoException.critical(ff.errno()).put("cannot copy fixed column prefix [fd=")
+                        .put(dstFd).put(", len=").put(len).put(", offset=").put(fromAddress).put(']');
+            }
+        } else {
+            Vect.memcpy(dstAddr, fromAddress, len);
         }
     }
 
-    static long getVarColumnLength(long srcLo, long srcHi, long srcFixAddr) {
-        return findVarOffset(srcFixAddr, srcHi + 1) - findVarOffset(srcFixAddr, srcLo);
+    static void close(FilesFacade ff, long fd) {
+        if (fd > 0) {
+            LOG.debug().$("closed [fd=").$(fd).$(']').$();
+            ff.close(fd);
+        }
     }
 
-    static long findVarOffset(long srcFixAddr, long srcLo) {
-        return Unsafe.getUnsafe().getLong(srcFixAddr + srcLo * Long.BYTES);
-    }
-
-    static void shiftCopyFixedSizeColumnData(
-            long shift,
-            long src,
-            long srcLo,
-            long srcHi,
-            long dstAddr
-    ) {
-        Vect.shiftCopyFixedSizeColumnData(shift, src, srcLo, srcHi, dstAddr);
+    // For cleanup that runs on behalf of an O3 commit that already failed. A release that throws, a double close
+    // or a failed munmap, is logged instead of propagated: the rest of the cleanup and the count-down that follows
+    // still run, and the error that failed the commit stays the one that propagates.
+    static void closeQuietly(FilesFacade ff, long fd) {
+        try {
+            close(ff, fd);
+        } catch (Throwable th) {
+            LOG.error().$("could not close [fd=").$(fd).$(", e=").$(th).I$();
+        }
     }
 
     static void copyFromTimestampIndex(
@@ -104,21 +95,27 @@ public class O3Utils {
         Vect.copyFromTimestampIndex(src, srcLo, srcHi, dstAddr);
     }
 
-    static void unmapAndClose(FilesFacade ff, long dstFixFd, long dstFixAddr, long dstFixSize) {
-        unmap(ff, dstFixAddr, dstFixSize);
-        close(ff, dstFixFd);
-    }
-
     static void unmap(FilesFacade ff, long addr, long size) {
         if (addr != 0 && size > 0) {
             ff.munmap(addr, size, MemoryTag.MMAP_O3);
         }
     }
 
-    static void close(FilesFacade ff, long fd) {
-        if (fd > 0) {
-            LOG.debug().$("closed [fd=").$(fd).$(']').$();
-            ff.close(fd);
+    static void unmapAndClose(FilesFacade ff, long dstFixFd, long dstFixAddr, long dstFixSize) {
+        try {
+            unmap(ff, dstFixAddr, dstFixSize);
+        } finally {
+            close(ff, dstFixFd);
         }
+    }
+
+    // The failed-commit counterpart of unmapAndClose(), see closeQuietly().
+    static void unmapAndCloseQuietly(FilesFacade ff, long fd, long addr, long size) {
+        try {
+            unmap(ff, addr, size);
+        } catch (Throwable th) {
+            LOG.error().$("could not unmap [addr=").$(addr).$(", size=").$(size).$(", e=").$(th).I$();
+        }
+        closeQuietly(ff, fd);
     }
 }
